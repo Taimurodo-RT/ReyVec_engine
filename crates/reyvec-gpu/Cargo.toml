@@ -12,6 +12,7 @@ publish.workspace = true
 ash.workspace = true
 ash-window.workspace = true
 gpu-allocator.workspace = true
+notify.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

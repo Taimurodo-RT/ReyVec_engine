@@ -17,6 +17,8 @@ mod demo;
 mod headless;
 mod pipeline;
 mod resources;
+mod shaders;
+mod slangc;
 mod window;
 
 pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};

@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub gpu: GpuOptions,
     /// Вертикальная синхронизация.
     pub vsync: bool,
+    /// Перезагружать шейдеры после сохранения их файлов.
+    pub hot_reload: bool,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -119,6 +121,7 @@ impl App {
             &RendererOptions {
                 gpu: self.config.gpu.clone(),
                 vsync: self.config.vsync,
+                hot_reload: self.config.hot_reload,
             },
         )?;
         self.stats.adapter = renderer.adapter().name.clone();
@@ -129,6 +132,9 @@ impl App {
             size.height,
             self.stats.mode
         );
+        if renderer.shaders_hot_reload() {
+            tracing::info!("Перезагрузка шейдеров включена");
+        }
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.start = Instant::now();
@@ -147,7 +153,11 @@ impl App {
             Ok(FrameStatus::Presented) => {
                 self.frames += 1;
                 let now = Instant::now();
-                if let Some(title) = self.stats.frame(now, &self.config.title) {
+                let base = match renderer.shader_error() {
+                    Some(err) => format!("ОШИБКА ШЕЙДЕРА: {err} | {}", self.config.title),
+                    None => self.config.title.clone(),
+                };
+                if let Some(title) = self.stats.frame(now, &base) {
                     window.set_title(&title);
                 }
                 if self.config.max_frames.is_some_and(|max| self.frames >= max) {

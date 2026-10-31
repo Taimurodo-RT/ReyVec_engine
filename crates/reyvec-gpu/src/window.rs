@@ -9,6 +9,7 @@ use crate::context::{Core, GpuContext, GpuOptions};
 use crate::demo::Demo;
 use crate::pipeline::{color_range, image_barrier};
 use crate::resources::GpuResources;
+use crate::shaders::ShaderLibrary;
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
 /// Сколько кадров видеокарта может готовить одновременно с процессором.
@@ -25,6 +26,8 @@ pub struct RendererOptions {
     pub gpu: GpuOptions,
     /// Вертикальная синхронизация: кадров не больше частоты монитора, без разрывов.
     pub vsync: bool,
+    /// Следить за файлами шейдеров и перезагружать их на лету.
+    pub hot_reload: bool,
 }
 
 /// Что произошло с кадром.
@@ -61,6 +64,7 @@ pub struct WindowRenderer {
     needs_recreate: bool,
     resources: Option<GpuResources>,
     demo: Option<Demo>,
+    shaders: ShaderLibrary,
     /// Сквозной номер кадра, нужен очереди отложенного удаления.
     frame_number: u64,
     swapchain_loader: khr::swapchain::Device,
@@ -123,6 +127,7 @@ impl WindowRenderer {
             needs_recreate: true,
             resources: None,
             demo: None,
+            shaders: ShaderLibrary::new(options.hot_reload),
             frame_number: 0,
             swapchain_loader,
             surface_loader,
@@ -160,6 +165,16 @@ impl WindowRenderer {
         }
     }
 
+    /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
+    pub fn shader_error(&self) -> Option<String> {
+        self.shaders.error()
+    }
+
+    /// Следит ли движок за файлами шейдеров.
+    pub fn shaders_hot_reload(&self) -> bool {
+        self.shaders.is_watching()
+    }
+
     /// Сообщить, что окно поменяло размер: swapchain пересоздастся перед следующим кадром.
     pub fn resize(&mut self) {
         self.needs_recreate = true;
@@ -173,6 +188,15 @@ impl WindowRenderer {
         if self.needs_recreate && !self.recreate_swapchain(size)? {
             return Ok(FrameStatus::Skipped);
         }
+        let changed = self.shaders.poll();
+        if !changed.is_empty()
+            && let (Some(demo), Some(res)) = (self.demo.as_mut(), self.resources.as_ref())
+        {
+            // SAFETY: ждём, пока видеокарта перестанет использовать старые конвейеры.
+            unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
+            demo.reload(&self.ctx, res, &mut self.shaders, &changed);
+        }
+        let shader_error = self.shaders.error().is_some();
 
         let device = &self.ctx.device;
         let frame = &self.frames[self.frame_index];
@@ -260,6 +284,7 @@ impl WindowRenderer {
                     view,
                     extent,
                     time,
+                    shader_error,
                 );
             }
 
@@ -454,9 +479,15 @@ impl WindowRenderer {
         if let Some(res) = self.resources.as_mut() {
             match self.demo.as_mut() {
                 // Видеокарта простаивает (device_wait_idle выше), конвейеры можно менять.
-                Some(demo) => demo.set_format(&self.ctx, res, format.format)?,
+                Some(demo) => demo.set_format(&self.ctx, res, &self.shaders, format.format)?,
                 None => {
-                    self.demo = Some(Demo::new(&self.ctx, res, format.format, FRAMES_IN_FLIGHT)?)
+                    self.demo = Some(Demo::new(
+                        &self.ctx,
+                        res,
+                        &self.shaders,
+                        format.format,
+                        FRAMES_IN_FLIGHT,
+                    )?)
                 }
             }
         }

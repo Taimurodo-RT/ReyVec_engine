@@ -1,11 +1,13 @@
 //! Песочница ReyVec: программа, которую запускают для проверки каждого этапа.
 //!
-//! Этап 1: окно с вращающимся цветным треугольником, FPS в заголовке.
+//! Окно с тестовой сценой: треугольник и спрайты с текстурами, FPS в заголовке.
+//! Шейдеры можно править на ходу: после сохранения файла картинка обновится.
 //!
 //! Флаги:
 //! - `--list-gpus`: показать видеокарты и выйти;
 //! - `--gpu <номер или часть названия>`: выбрать видеокарту, например `--gpu radeon`;
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
+//! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
@@ -23,6 +25,7 @@ const HELP: &str = "\
   --list-gpus            показать видеокарты и выйти
   --gpu <номер|имя>      выбрать видеокарту, например --gpu radeon или --gpu 1
   --no-vsync             без вертикальной синхронизации
+  --no-hot-reload        не перезагружать шейдеры после сохранения файлов
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
   --seconds <S>          закрыть окно через S секунд
@@ -38,6 +41,7 @@ struct Args {
     list_gpus: bool,
     gpu: Option<String>,
     no_vsync: bool,
+    no_hot_reload: bool,
     validation: bool,
     frames: Option<u64>,
     seconds: Option<f64>,
@@ -52,6 +56,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--version" | "-V" => out.version = true,
             "--list-gpus" => out.list_gpus = true,
             "--no-vsync" => out.no_vsync = true,
+            "--no-hot-reload" => out.no_hot_reload = true,
             "--validation" => out.validation = true,
             "--gpu" => {
                 out.gpu = Some(it.next().ok_or("после --gpu нужен номер или название")?);
@@ -126,6 +131,7 @@ fn main() -> ExitCode {
             gpu: args.gpu,
         },
         vsync: !args.no_vsync,
+        hot_reload: !args.no_hot_reload,
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
@@ -171,10 +177,13 @@ mod tests {
 
     #[test]
     fn all_flags() {
-        let a = parse("--gpu radeon --no-vsync --validation --frames 120 --seconds 2.5").unwrap();
+        let a = parse(
+            "--gpu radeon --no-vsync --no-hot-reload --validation --frames 120 --seconds 2.5",
+        )
+        .unwrap();
         assert_eq!(a.seconds, Some(2.5));
         assert_eq!(a.gpu.as_deref(), Some("radeon"));
-        assert!(a.no_vsync && a.validation);
+        assert!(a.no_vsync && a.no_hot_reload && a.validation);
         assert_eq!(a.frames, Some(120));
     }
 

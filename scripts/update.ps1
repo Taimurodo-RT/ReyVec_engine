@@ -53,8 +53,22 @@ Write-Ok "git и cargo найдены"
 if ($env:VULKAN_SDK) {
     Write-Ok "Vulkan SDK: $env:VULKAN_SDK"
 } else {
-    Write-Warn "Vulkan SDK не найден. Сейчас он не обязателен, но понадобится с этапа 1 (docs\setup-windows.md)."
+    Write-Warn "Переменная VULKAN_SDK не задана. Если Vulkan SDK уже установлен, открой новое окно."
 }
+# Компилятор шейдеров Slang входит в Vulkan SDK. Без него движок не соберётся.
+$slangc = $null
+if ($env:REYVEC_SLANGC -and (Test-Path $env:REYVEC_SLANGC)) {
+    $slangc = $env:REYVEC_SLANGC
+} elseif ($env:VULKAN_SDK -and (Test-Path (Join-Path $env:VULKAN_SDK "Bin\slangc.exe"))) {
+    $slangc = Join-Path $env:VULKAN_SDK "Bin\slangc.exe"
+} else {
+    $found = Get-Command "slangc" -ErrorAction SilentlyContinue
+    if ($found) { $slangc = $found.Source }
+}
+if (-not $slangc) {
+    Stop-WithError "не найден компилятор шейдеров slangc. Он входит в Vulkan SDK: установи SDK по инструкции docs\setup-windows.md и открой новое окно."
+}
+Write-Ok "Компилятор шейдеров: $slangc"
 
 if (-not $NoPull) {
     Write-Step "Скачиваю свежий код (ветка $Branch)"

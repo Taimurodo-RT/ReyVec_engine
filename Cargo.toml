@@ -15,6 +15,7 @@ reyvec-app = { path = "crates/reyvec-app" }
 reyvec-gpu = { path = "crates/reyvec-gpu" }
 ash = "0.38"
 ash-window = "0.13"
+notify = "8"
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 raw-window-handle = "0.6"
 thiserror = "2"
