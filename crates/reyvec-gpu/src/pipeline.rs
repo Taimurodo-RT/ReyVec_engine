@@ -1,17 +1,11 @@
 //! Общие части конвейеров: сборка графического конвейера из SPIR-V, барьеры, начало прохода.
+//! Сам SPIR-V берётся из библиотеки шейдеров (`shaders.rs`).
 
 use std::io::Cursor;
 
 use ash::vk;
 
 use crate::{GpuError, VkResultExt};
-
-pub(crate) const TRIANGLE_VERT: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
-pub(crate) const TRIANGLE_FRAG: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
-pub(crate) const SPRITE_VERT: &[u8] = include_bytes!("../shaders/sprite.vert.spv");
-pub(crate) const SPRITE_FRAG: &[u8] = include_bytes!("../shaders/sprite.frag.spv");
-#[cfg(test)]
-const ALL_SPV: [&[u8]; 4] = [TRIANGLE_VERT, TRIANGLE_FRAG, SPRITE_VERT, SPRITE_FRAG];
 
 /// Цвет фона в линейном пространстве (тёмно-синий).
 pub const CLEAR_COLOR: [f32; 4] = [0.010, 0.012, 0.024, 1.0];
@@ -194,19 +188,4 @@ pub(crate) fn color_range() -> vk::ImageSubresourceRange {
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .level_count(1)
         .layer_count(1)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn spirv_is_embedded() {
-        for spv in super::ALL_SPV {
-            assert!(spv.len() > 20 && spv.len() % 4 == 0);
-            assert_eq!(
-                &spv[..4],
-                &0x0723_0203u32.to_le_bytes(),
-                "магическое число SPIR-V"
-            );
-        }
-    }
 }

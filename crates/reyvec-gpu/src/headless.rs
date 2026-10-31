@@ -7,6 +7,7 @@ use crate::context::{Core, GpuContext, GpuOptions};
 use crate::demo::Demo;
 use crate::pipeline::{color_range, image_barrier};
 use crate::resources::GpuResources;
+use crate::shaders::ShaderLibrary;
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -190,6 +191,7 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
         r.demo = Some(Demo::new(
             ctx,
             r.gpu.as_mut().expect("создано выше"),
+            &ShaderLibrary::new(false),
             FORMAT,
             1,
         )?);
@@ -238,6 +240,7 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
             r.view,
             extent,
             0.0,
+            false,
         );
         let to_transfer = [image_barrier(
             r.image,

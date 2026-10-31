@@ -13,6 +13,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Компилятор шейдеров Slang той же версии, что в Vulkan SDK на ПК Романа.
+  SLANG_VERSION: "2026.17"
 
 jobs:
   windows:
@@ -23,6 +25,15 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Install Slang shader compiler
+        shell: pwsh
+        run: |
+          $url = "https://github.com/shader-slang/slang/releases/download/v$env:SLANG_VERSION/slang-$env:SLANG_VERSION-windows-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile slang.zip
+          Expand-Archive slang.zip -DestinationPath "$env:RUNNER_TEMP\slang"
+          Remove-Item slang.zip
+          "$env:RUNNER_TEMP\slang\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          & "$env:RUNNER_TEMP\slang\bin\slangc.exe" -v
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -48,19 +59,23 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install software Vulkan, validation layers, shader compiler, virtual display
+      - name: Install software Vulkan, validation layers, virtual display
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools glslang-tools xvfb libxkbcommon-x11-0
+          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools xvfb libxkbcommon-x11-0
           vulkaninfo --summary | grep -E "deviceName|apiVersion"
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: Precompiled SPIR-V matches GLSL sources
+      - name: Install Slang shader compiler
         run: |
-          crates/reyvec-gpu/shaders/compile.sh
-          git diff --exit-code -- crates/reyvec-gpu/shaders
-      - name: GPU tests (headless triangle with validation)
+          mkdir -p "$RUNNER_TEMP/slang"
+          curl -sSfL "https://github.com/shader-slang/slang/releases/download/v$SLANG_VERSION/slang-$SLANG_VERSION-linux-x86_64.tar.gz" | tar xz -C "$RUNNER_TEMP/slang"
+          echo "REYVEC_SLANGC=$RUNNER_TEMP/slang/bin/slangc" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/slang/bin/slangc" -v
+      # Включая проверку перезагрузки шейдеров: правка файла пересобирает шейдер,
+      # ошибка в шейдере не ломает прошлую версию.
+      - name: GPU tests (headless scene with validation, shader hot reload)
         run: cargo test -p reyvec-gpu -- --include-ignored
       # 7 секунд: за это время сцена несколько раз загружает новую текстуру и удаляет старую.
       - name: Sandbox window, 7 seconds, validation on

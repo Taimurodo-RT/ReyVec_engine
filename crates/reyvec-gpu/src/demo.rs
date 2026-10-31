@@ -9,9 +9,10 @@ use ash::vk;
 use crate::GpuError;
 use crate::bindless::SamplerKind;
 use crate::context::GpuContext;
-use crate::pipeline::{Blend, SPRITE_FRAG, SPRITE_VERT, TRIANGLE_FRAG, TRIANGLE_VERT};
+use crate::pipeline::Blend;
 use crate::pipeline::{begin_color_pass, graphics_pipeline};
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
+use crate::shaders::ShaderLibrary;
 
 /// Данные одного спрайта. Раскладка совпадает со структурой `Sprite` в `sprite.vert` (std430).
 #[repr(C)]
@@ -65,6 +66,8 @@ pub(crate) struct Demo {
     /// Какой вариант шахматки сейчас загружен (меняется каждые 2 секунды).
     checker_phase: u32,
     disk: TextureId,
+    /// Белая точка 1×1: из неё рисуются одноцветные прямоугольники (рамка ошибки шейдера).
+    white: TextureId,
     /// Свой буфер спрайтов на каждый кадр в работе: пока видеокарта читает один,
     /// процессор пишет в другой.
     instance_buffers: Vec<BufferId>,
@@ -74,6 +77,7 @@ impl Demo {
     pub fn new(
         ctx: &GpuContext,
         res: &mut GpuResources,
+        shaders: &ShaderLibrary,
         format: vk::Format,
         frames_in_flight: usize,
     ) -> Result<Self, GpuError> {
@@ -86,6 +90,7 @@ impl Demo {
             "шахматка",
         )?;
         let disk = res.create_texture_rgba8(ctx, 128, 128, &disk_pixels(128), true, "круг")?;
+        let white = res.create_texture_rgba8(ctx, 1, 1, &[255; 4], true, "белый")?;
         let mut instance_buffers = Vec::new();
         for i in 0..frames_in_flight {
             instance_buffers.push(res.create_buffer(
@@ -103,9 +108,10 @@ impl Demo {
             checker,
             checker_phase: 0,
             disk,
+            white,
             instance_buffers,
         };
-        demo.set_format(ctx, res, format)?;
+        demo.set_format(ctx, res, shaders, format)?;
         Ok(demo)
     }
 
@@ -114,35 +120,53 @@ impl Demo {
         &mut self,
         ctx: &GpuContext,
         res: &GpuResources,
+        shaders: &ShaderLibrary,
         format: vk::Format,
     ) -> Result<(), GpuError> {
         if format == self.format {
             return Ok(());
         }
-        let layout = res.bindless.pipeline_layout;
-        let d = &ctx.device;
-        let triangle = graphics_pipeline(
-            d,
-            layout,
-            TRIANGLE_VERT,
-            TRIANGLE_FRAG,
-            format,
-            Blend::Opaque,
-        )?;
-        let sprites =
-            match graphics_pipeline(d, layout, SPRITE_VERT, SPRITE_FRAG, format, Blend::Alpha) {
-                Ok(p) => p,
-                Err(e) => {
-                    // SAFETY: конвейер только что создан и нигде не используется.
-                    unsafe { d.destroy_pipeline(triangle, None) };
-                    return Err(e);
-                }
-            };
+        let triangle = build(ctx, res, shaders, "triangle", format)?;
+        let sprites = match build(ctx, res, shaders, "sprite", format) {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: конвейер только что создан и нигде не используется.
+                unsafe { ctx.device.destroy_pipeline(triangle, None) };
+                return Err(e);
+            }
+        };
         self.destroy_pipelines(ctx);
         self.triangle = triangle;
         self.sprites = sprites;
         self.format = format;
         Ok(())
+    }
+
+    /// Пересобирает конвейеры шейдеров `names` после их перезагрузки. Если драйвер не
+    /// принял новый шейдер, остаётся прошлый конвейер, а ошибка записывается в библиотеку.
+    /// Вызывать, когда видеокарта простаивает.
+    pub fn reload(
+        &mut self,
+        ctx: &GpuContext,
+        res: &GpuResources,
+        shaders: &mut ShaderLibrary,
+        names: &[String],
+    ) {
+        for name in names {
+            let slot = match name.as_str() {
+                "triangle" => &mut self.triangle,
+                "sprite" => &mut self.sprites,
+                _ => continue,
+            };
+            match build(ctx, res, shaders, name, self.format) {
+                Ok(new) => {
+                    let old = std::mem::replace(slot, new);
+                    // SAFETY: видеокарта простаивает (условие функции).
+                    unsafe { ctx.device.destroy_pipeline(old, None) };
+                }
+                Err(e) => shaders.set_error(name, e.to_string()),
+            }
+        }
     }
 
     /// Обновляет сцену перед записью кадра. Каждые 2 секунды загружает новую шахматку
@@ -167,9 +191,9 @@ impl Demo {
         Ok(())
     }
 
-    /// Спрайты сцены в момент `time` (секунды).
-    pub fn sprites_at(&self, time: f32) -> Vec<Sprite> {
-        let mut out = Vec::with_capacity(2 + ORBITERS);
+    /// Спрайты сцены в момент `time` (секунды). `shader_error`: обвести окно красной рамкой.
+    pub fn sprites_at(&self, time: f32, aspect: f32, shader_error: bool) -> Vec<Sprite> {
+        let mut out = Vec::with_capacity(6 + ORBITERS);
         out.push(Sprite {
             pos: [-1.15, 0.0],
             size: [0.7, 0.7],
@@ -203,6 +227,28 @@ impl Demo {
                 pad: 0,
             });
         }
+        if shader_error {
+            // Рамка по краю окна: слева, справа, сверху, снизу.
+            let w = 0.03;
+            let red = [1.0, 0.05, 0.05, 1.0];
+            let bars = [
+                ([-aspect + w / 2.0, 0.0], [w, 2.0]),
+                ([aspect - w / 2.0, 0.0], [w, 2.0]),
+                ([0.0, 1.0 - w / 2.0], [2.0 * aspect, w]),
+                ([0.0, -1.0 + w / 2.0], [2.0 * aspect, w]),
+            ];
+            for (pos, size) in bars {
+                out.push(Sprite {
+                    pos,
+                    size,
+                    tint: red,
+                    rotation: 0.0,
+                    texture: self.white.0,
+                    sampler: SamplerKind::Nearest as u32,
+                    pad: 0,
+                });
+            }
+        }
         out
     }
 
@@ -221,10 +267,11 @@ impl Demo {
         view: vk::ImageView,
         extent: vk::Extent2D,
         time: f32,
+        shader_error: bool,
     ) {
         let d = &ctx.device;
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
-        let sprites = self.sprites_at(time);
+        let sprites = self.sprites_at(time, aspect, shader_error);
         let count = sprites.len().min(MAX_SPRITES);
         let bytes: Vec<u8> = sprites[..count].iter().flat_map(|s| s.to_bytes()).collect();
         let buffer = self.instance_buffers[slot];
@@ -267,6 +314,29 @@ impl Demo {
     pub fn destroy(mut self, ctx: &GpuContext) {
         self.destroy_pipelines(ctx);
     }
+}
+
+fn build(
+    ctx: &GpuContext,
+    res: &GpuResources,
+    shaders: &ShaderLibrary,
+    name: &str,
+    format: vk::Format,
+) -> Result<vk::Pipeline, GpuError> {
+    let pair = shaders.get(name);
+    let blend = if name == "sprite" {
+        Blend::Alpha
+    } else {
+        Blend::Opaque
+    };
+    graphics_pipeline(
+        &ctx.device,
+        res.bindless.pipeline_layout,
+        &pair.vs,
+        &pair.fs,
+        format,
+        blend,
+    )
 }
 
 /// Шахматная доска `size × size` с клетками по `cell` пикселей, RGBA8 sRGB.
