@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  windows:
+    name: Windows (fmt, clippy, test, update script)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+      - name: Tests
+        run: cargo test --workspace
+      # Проверяем тот же путь, которым Роман обновляет локальную версию,
+      # причём в Windows PowerShell 5.1, как при запуске update.bat.
+      - name: Local update script (Windows PowerShell)
+        shell: powershell
+        run: |
+          .\scripts\update.ps1 -NoPull
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\run.ps1 --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\run.ps1
+          exit $LASTEXITCODE
+
+  deny:
+    name: Licenses and advisories (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
