@@ -36,7 +36,8 @@ pub struct AppConfig {
     pub scene: DemoScene,
     /// Сглаживание сцены (клавиша M переключает).
     pub msaa: Msaa,
-    /// Края при MSAA «как в редакторах» (клавиша G переключает).
+    /// Края при MSAA «как в редакторах» (клавиша G переключает). Дороже обычных: см.
+    /// `docs/decisions/0009-vector-layer.md`.
     pub perceptual_edges: bool,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,

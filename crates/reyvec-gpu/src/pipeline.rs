@@ -149,6 +149,36 @@ pub(crate) unsafe fn begin_color_pass(
     unsafe { begin_rendering(device, cmd, &attachments, extent) };
 }
 
+/// Начинает проход рисования с очисткой фоном в картинку с несколькими точками на пиксель
+/// `msaa_view`. В конце прохода точки каждого пикселя усредняются в `resolve_view`
+/// (обе картинки в раскладке `COLOR_ATTACHMENT_OPTIMAL`), а сама `msaa_view` не сохраняется.
+///
+/// # Safety
+/// `cmd` в состоянии записи, обе картинки живы до конца выполнения команд.
+pub(crate) unsafe fn begin_color_pass_resolved(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    msaa_view: vk::ImageView,
+    resolve_view: vk::ImageView,
+    extent: vk::Extent2D,
+) {
+    let attachments = [vk::RenderingAttachmentInfo::default()
+        .image_view(msaa_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+        .resolve_image_view(resolve_view)
+        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .clear_value(vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: CLEAR_COLOR,
+            },
+        })];
+    // SAFETY: условия описаны в контракте функции.
+    unsafe { begin_rendering(device, cmd, &attachments, extent) };
+}
+
 /// Начинает рисование в `attachments` и ставит область вывода на всю картинку.
 ///
 /// # Safety

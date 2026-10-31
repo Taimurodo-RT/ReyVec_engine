@@ -12,7 +12,7 @@
 //! - `--no-tracy`: не ждать подключения программы Tracy;
 //! - `--scene gpu|vector`: с какой сцены начать (по умолчанию `vector`);
 //! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
-//! - `--linear-edges`: сводить края MSAA физически точно, а не как в редакторах;
+//! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
@@ -36,7 +36,7 @@ const HELP: &str = "\
   --no-tracy             не включать замеры для программы Tracy
   --scene <gpu|vector>   с какой сцены начать: gpu (этап 2) или vector (векторы, по умолчанию)
   --msaa <off|4|8>       сглаживание краёв (по умолчанию 4)
-  --linear-edges         края физически точные, а не как в редакторах
+  --editor-edges         края «как в редакторах» (дороже, особенно на встроенной видеокарте)
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
   --seconds <S>          закрыть окно через S секунд
@@ -66,7 +66,7 @@ struct Args {
     size: Option<(u32, u32)>,
     scene: Option<reyvec_app::DemoScene>,
     msaa: Option<reyvec_app::Msaa>,
-    linear_edges: bool,
+    editor_edges: bool,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -81,7 +81,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--no-hot-reload" => out.no_hot_reload = true,
             "--no-tracy" => out.no_tracy = true,
             "--validation" => out.validation = true,
-            "--linear-edges" => out.linear_edges = true,
+            "--editor-edges" => out.editor_edges = true,
             "--gpu" => {
                 out.gpu = Some(it.next().ok_or("после --gpu нужен номер или название")?);
             }
@@ -156,7 +156,7 @@ fn snapshot_headless(path: &str, args: &Args, validation: bool) -> ExitCode {
         shader_error: false,
         scene: args.scene.unwrap_or_default(),
         msaa: args.msaa.unwrap_or_default(),
-        perceptual_edges: !args.linear_edges,
+        perceptual_edges: args.editor_edges,
     };
     let options = reyvec_app::GpuOptions {
         validation,
@@ -253,7 +253,7 @@ fn main() -> ExitCode {
         tracy: !args.no_tracy,
         scene: args.scene.unwrap_or_default(),
         msaa: args.msaa.unwrap_or_default(),
-        perceptual_edges: !args.linear_edges,
+        perceptual_edges: args.editor_edges,
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
