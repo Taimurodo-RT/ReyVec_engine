@@ -154,7 +154,12 @@ impl App {
                 }
             }
             Ok(FrameStatus::Skipped) => {}
-            Err(e) => self.fail(event_loop, e.into()),
+            Err(e) => return self.fail(event_loop, e.into()),
+        }
+        // Сразу просим следующий кадр. На Windows, пока окно тянут мышкой, система крутит
+        // свой цикл сообщений и about_to_wait не вызывается; без этого картинка замирает.
+        if !self.minimized {
+            window.request_redraw();
         }
     }
 }
@@ -185,6 +190,9 @@ impl ApplicationHandler for App {
                 self.minimized = size.width == 0 || size.height == 0;
                 if let Some(r) = &mut self.renderer {
                     r.resize();
+                }
+                if let (false, Some(w)) = (self.minimized, &self.window) {
+                    w.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
