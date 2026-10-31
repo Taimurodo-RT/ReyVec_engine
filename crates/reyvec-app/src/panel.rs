@@ -33,6 +33,8 @@ pub(crate) struct PanelInfo<'a> {
     pub scene: &'a str,
     /// Сглаживание сцены словами.
     pub msaa: &'a str,
+    /// Края при MSAA «как в редакторах», а не физически точные.
+    pub perceptual_edges: bool,
 }
 
 pub(crate) struct Panel {
@@ -176,8 +178,16 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         "Сцена: {}, сглаживание: {}",
         info.scene, info.msaa
     )));
+    ui.label(mono(format!(
+        "Края: {}",
+        if info.perceptual_edges {
+            "как в редакторах"
+        } else {
+            "физически точные"
+        }
+    )));
     ui.label(
-        RichText::new("1 и 2 меняют сцену, M сглаживание, F1 прячет панель, F12 снимок кадра")
+        RichText::new("1 и 2 сцена, M сглаживание, G края, F1 прячет панель, F12 снимок кадра")
             .weak(),
     );
 }
@@ -293,6 +303,7 @@ mod tests {
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
             msaa: "MSAA 4×",
+            perceptual_edges: true,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {

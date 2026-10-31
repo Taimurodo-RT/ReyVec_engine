@@ -18,7 +18,7 @@ use crate::context::GpuContext;
 use crate::demo_vector::VectorDemo;
 use crate::graph::{Access, ImageHandle, RenderGraph};
 use crate::pipeline::Blend;
-use crate::pipeline::{begin_color_pass, begin_color_pass_resolved, graphics_pipeline};
+use crate::pipeline::{begin_color_pass, graphics_pipeline};
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
 use crate::vector::{VectorData, VectorRenderer};
@@ -162,6 +162,7 @@ impl Sprite {
 pub(crate) struct FrameData {
     scene: DemoScene,
     msaa: Msaa,
+    perceptual_edges: bool,
     vector: Option<VectorData>,
     sprites_address: vk::DeviceAddress,
     sprite_count: u32,
@@ -175,6 +176,8 @@ pub(crate) struct Demo {
     sprites: vk::Pipeline,
     /// Копирует кадр сцены в окно; зависит от формата окна.
     present: vk::Pipeline,
+    /// Сводит картинку MSAA в обычный кадр сцены.
+    resolve: vk::Pipeline,
     /// Формат картинки, в которую выводится кадр (окно или картинка теста).
     format: vk::Format,
     checker: TextureId,
@@ -192,6 +195,8 @@ pub(crate) struct Demo {
     msaa: Msaa,
     /// Какие числа точек на пиксель видеокарта умеет для кадра сцены.
     msaa_counts: vk::SampleCountFlags,
+    /// Сводить MSAA «как в редакторах» (в цвете экрана), а не в линейном цвете.
+    perceptual_edges: bool,
 }
 
 impl Demo {
@@ -238,6 +243,7 @@ impl Demo {
             triangle: vk::Pipeline::null(),
             sprites: vk::Pipeline::null(),
             present: vk::Pipeline::null(),
+            resolve: vk::Pipeline::null(),
             format: vk::Format::UNDEFINED,
             checker,
             checker_phase: 0,
@@ -247,12 +253,16 @@ impl Demo {
             vector,
             vector_demo,
             msaa: Msaa::Off,
-            msaa_counts: limits.framebuffer_color_sample_counts,
+            // Картинку MSAA и рисуют, и читают в шейдере сведения.
+            msaa_counts: limits.framebuffer_color_sample_counts
+                & limits.sampled_image_color_sample_counts,
+            perceptual_edges: true,
         };
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
             demo.triangle = build(ctx, res, shaders, "triangle", SCENE_FORMAT, Msaa::Off)?;
             demo.sprites = build(ctx, res, shaders, "sprite", SCENE_FORMAT, Msaa::Off)?;
+            demo.resolve = build(ctx, res, shaders, "resolve", SCENE_FORMAT, Msaa::Off)?;
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -267,6 +277,16 @@ impl Demo {
     /// Сглаживание, с которым рисуется сцена.
     pub fn msaa(&self) -> Msaa {
         self.msaa
+    }
+
+    /// Края сводятся «как в редакторах» (`true`) или физически точно.
+    pub fn perceptual_edges(&self) -> bool {
+        self.perceptual_edges
+    }
+
+    /// Как сводить края при MSAA, см. `resolve.slang`.
+    pub fn set_perceptual_edges(&mut self, on: bool) {
+        self.perceptual_edges = on;
     }
 
     /// Что получится, если попросить `wanted`: видеокарта может уметь меньше.
@@ -364,6 +384,7 @@ impl Demo {
                 "triangle" => (&mut self.triangle, SCENE_FORMAT, self.msaa),
                 "sprite" => (&mut self.sprites, SCENE_FORMAT, self.msaa),
                 "present" => (&mut self.present, self.format, Msaa::Off),
+                "resolve" => (&mut self.resolve, SCENE_FORMAT, Msaa::Off),
                 _ => continue,
             };
             match build(ctx, res, shaders, name, format, msaa) {
@@ -482,6 +503,7 @@ impl Demo {
         FrameData {
             scene,
             msaa: self.msaa,
+            perceptual_edges: self.perceptual_edges,
             vector,
             sprites_address: res.buffer_address(buffer),
             sprite_count: count as u32,
@@ -501,8 +523,8 @@ impl Demo {
         target: ImageHandle,
     ) {
         let scene = graph.create("кадр сцены", frame.extent, SCENE_FORMAT);
-        // Со сглаживанием сцена рисуется в картинку с несколькими точками на пиксель, а в
-        // конце прохода точки усредняются в обычный кадр сцены.
+        // Со сглаживанием сцена рисуется в картинку с несколькими точками на пиксель, а
+        // проход «сведение MSAA» усредняет точки в обычный кадр сцены (resolve.slang).
         let msaa = (frame.msaa != Msaa::Off).then(|| {
             graph.create_multisampled(
                 "кадр сцены MSAA",
@@ -512,49 +534,76 @@ impl Demo {
             )
         });
         let layout = bindless.pipeline_layout;
-        let mut uses = vec![(scene, Access::ColorAttachment)];
-        uses.extend(msaa.map(|m| (m, Access::ColorAttachment)));
+        let target_image = msaa.unwrap_or(scene);
 
-        graph.add_pass("сцена", &uses, move |p| {
-            let mut triangle_push = [0u8; 8];
-            triangle_push[..4].copy_from_slice(&frame.time.to_ne_bytes());
-            triangle_push[4..].copy_from_slice(&frame.aspect.to_ne_bytes());
-            let mut sprite_push = [0u8; 16];
-            sprite_push[..8].copy_from_slice(&frame.sprites_address.to_ne_bytes());
-            sprite_push[8..12].copy_from_slice(&frame.aspect.to_ne_bytes());
-            let (d, cmd) = (p.device, p.cmd);
-            // SAFETY: граф перевёл картинку сцены в раскладку цели рисования; конвейеры
-            // и буфер спрайтов живы, пока видеокарта рисует этот кадр.
-            unsafe {
-                match msaa {
-                    Some(m) => {
-                        begin_color_pass_resolved(
-                            d,
+        graph.add_pass(
+            "сцена",
+            &[(target_image, Access::ColorAttachment)],
+            move |p| {
+                let mut triangle_push = [0u8; 8];
+                triangle_push[..4].copy_from_slice(&frame.time.to_ne_bytes());
+                triangle_push[4..].copy_from_slice(&frame.aspect.to_ne_bytes());
+                let mut sprite_push = [0u8; 16];
+                sprite_push[..8].copy_from_slice(&frame.sprites_address.to_ne_bytes());
+                sprite_push[8..12].copy_from_slice(&frame.aspect.to_ne_bytes());
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл картинку сцены в раскладку цели рисования; конвейеры
+                // и буфер спрайтов живы, пока видеокарта рисует этот кадр.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(target_image), p.extent(target_image));
+                    bindless.bind(d, cmd);
+                    if frame.scene == DemoScene::Gpu {
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
+                        d.cmd_push_constants(
                             cmd,
-                            p.view(m),
-                            p.view(scene),
-                            p.extent(scene),
+                            layout,
+                            vk::ShaderStageFlags::ALL,
+                            0,
+                            &triangle_push,
                         );
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
                     }
-                    None => begin_color_pass(d, cmd, p.view(scene), p.extent(scene)),
+                    if let Some(vector) = frame.vector {
+                        self.vector.record(d, cmd, layout, vector);
+                    }
+                    if frame.sprite_count > 0 {
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
+                        d.cmd_push_constants(
+                            cmd,
+                            layout,
+                            vk::ShaderStageFlags::ALL,
+                            0,
+                            &sprite_push,
+                        );
+                        d.cmd_draw(cmd, 6, frame.sprite_count, 0, 0);
+                    }
+                    d.cmd_end_rendering(cmd);
                 }
-                bindless.bind(d, cmd);
-                if frame.scene == DemoScene::Gpu {
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
-                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &triangle_push);
-                    d.cmd_draw(cmd, 3, 1, 0, 0);
-                }
-                if let Some(vector) = frame.vector {
-                    self.vector.record(d, cmd, layout, vector);
-                }
-                if frame.sprite_count > 0 {
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
-                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &sprite_push);
-                    d.cmd_draw(cmd, 6, frame.sprite_count, 0, 0);
-                }
-                d.cmd_end_rendering(cmd);
-            }
-        });
+            },
+        );
+
+        if let Some(m) = msaa {
+            graph.add_pass(
+                "сведение MSAA",
+                &[(m, Access::Sampled), (scene, Access::ColorAttachment)],
+                move |p| {
+                    let mut push = [0u8; 12];
+                    push[..4].copy_from_slice(&p.texture(m).to_ne_bytes());
+                    push[4..8].copy_from_slice(&frame.msaa.samples().as_raw().to_ne_bytes());
+                    push[8..].copy_from_slice(&u32::from(frame.perceptual_edges).to_ne_bytes());
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинку MSAA в чтение, а кадр сцены в цель рисования.
+                    unsafe {
+                        begin_color_pass(d, cmd, p.view(scene), p.extent(scene));
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.resolve);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                },
+            );
+        }
 
         graph.add_pass(
             "вывод",
@@ -581,10 +630,12 @@ impl Demo {
             ctx.device.destroy_pipeline(self.triangle, None);
             ctx.device.destroy_pipeline(self.sprites, None);
             ctx.device.destroy_pipeline(self.present, None);
+            ctx.device.destroy_pipeline(self.resolve, None);
         }
         self.triangle = vk::Pipeline::null();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
+        self.resolve = vk::Pipeline::null();
         self.vector.destroy(ctx);
     }
 
