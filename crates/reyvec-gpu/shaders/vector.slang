@@ -20,7 +20,7 @@ struct Instance
     float4 linear;    // матрица 2×2 (a, b, c, d): x' = a·x + c·y, y' = b·x + d·y
     float2 offset;    // сдвиг (e, f)
     uint first_index; // где в общем списке номеров начинаются треугольники фигуры
-    uint pad;
+    uint curve_first_index; // треугольники способа 2 (трафарет), см. vector_stencil.slang
     float4 color;     // линейный цвет с альфой (цвет фигуры × оттенок экземпляра)
 };
 

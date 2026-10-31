@@ -13,7 +13,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use crate::bindless::Bindless;
 use crate::context::GpuContext;
-use crate::pipeline::{color_range, image_barrier};
+use crate::pipeline::{full_range, image_barrier};
 use crate::{GpuError, VkResultExt};
 
 /// Номер текстуры. Это же номер в общем списке текстур, по которому шейдер её читает.
@@ -629,7 +629,7 @@ pub(crate) fn create_texture(
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
-        .subresource_range(color_range());
+        .subresource_range(full_range(format));
     // SAFETY: картинка с привязанной памятью.
     match unsafe { d.create_image_view(&view_info, None) } {
         Ok(v) => texture.view = v,

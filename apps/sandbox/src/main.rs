@@ -13,6 +13,8 @@
 //! - `--scene gpu|vector`: с какой сцены начать (по умолчанию `vector`);
 //! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
+//! - `--fill triangles|stencil`: как рисовать заливки векторных фигур;
+//! - `--zoom`: лупа векторной сцены (увеличение в 8 раз у края сердца);
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
@@ -37,6 +39,8 @@ const HELP: &str = "\
   --scene <gpu|vector>   с какой сцены начать: gpu (этап 2) или vector (векторы, по умолчанию)
   --msaa <off|4|8>       сглаживание краёв (по умолчанию 4)
   --editor-edges         края «как в редакторах» (дороже, особенно на встроенной видеокарте)
+  --fill <triangles|stencil>  заливки векторов: треугольники (по умолчанию) или трафарет
+  --zoom                 лупа векторной сцены: увеличение в 8 раз у края сердца
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
   --seconds <S>          закрыть окно через S секунд
@@ -67,6 +71,8 @@ struct Args {
     scene: Option<reyvec_app::DemoScene>,
     msaa: Option<reyvec_app::Msaa>,
     editor_edges: bool,
+    fill: Option<reyvec_app::FillMethod>,
+    zoom: bool,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -112,6 +118,17 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                         .ok_or_else(|| format!("--msaa: «{n}», а нужно off, 4 или 8"))?,
                 );
             }
+            "--fill" => {
+                let n = it
+                    .next()
+                    .ok_or("после --fill нужно triangles или stencil")?;
+                out.fill = Some(match n.as_str() {
+                    "triangles" => reyvec_app::FillMethod::Triangles,
+                    "stencil" => reyvec_app::FillMethod::Stencil,
+                    _ => return Err(format!("--fill: «{n}», а нужно triangles или stencil")),
+                });
+            }
+            "--zoom" => out.zoom = true,
             "--snapshot" => {
                 out.snapshot = Some(it.next().ok_or("после --snapshot нужно имя файла")?);
             }
@@ -157,6 +174,8 @@ fn snapshot_headless(path: &str, args: &Args, validation: bool) -> ExitCode {
         scene: args.scene.unwrap_or_default(),
         msaa: args.msaa.unwrap_or_default(),
         perceptual_edges: args.editor_edges,
+        fill: args.fill.unwrap_or_default(),
+        zoom: args.zoom,
     };
     let options = reyvec_app::GpuOptions {
         validation,
@@ -254,6 +273,8 @@ fn main() -> ExitCode {
         scene: args.scene.unwrap_or_default(),
         msaa: args.msaa.unwrap_or_default(),
         perceptual_edges: args.editor_edges,
+        fill: args.fill.unwrap_or_default(),
+        zoom: args.zoom,
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
