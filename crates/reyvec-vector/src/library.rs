@@ -2,7 +2,7 @@
 
 use kurbo::Affine;
 
-use crate::{Color, Mesh, Shape, TessellationError, tessellate};
+use crate::{Color, Mesh, Shape, TessellationError, tessellate_smooth};
 
 /// Номер фигуры в [`ShapeLibrary`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -32,9 +32,10 @@ impl ShapeLibrary {
         }
     }
 
-    /// Добавляет фигуру и сразу разбивает её на треугольники.
+    /// Добавляет фигуру и сразу разбивает её на треугольники. Обводки получают запас под
+    /// сглаживание в шейдере: [`Self::aa_margin`].
     pub fn add(&mut self, shape: Shape) -> Result<ShapeId, TessellationError> {
-        let mesh = tessellate(&shape, self.tolerance)?;
+        let mesh = tessellate_smooth(&shape, self.tolerance, self.aa_margin())?;
         self.entries.push(Entry { shape, mesh });
         self.revision += 1;
         Ok(ShapeId(self.entries.len() as u32 - 1))
@@ -77,6 +78,13 @@ impl ShapeLibrary {
     /// Допуск разбиения кривых.
     pub fn tolerance(&self) -> f64 {
         self.tolerance
+    }
+
+    /// Запас вокруг обводок под мягкий край, в единицах фигур. Допуск выбирают как
+    /// четверть пикселя в самом крупном показе, поэтому запас в четыре допуска равен
+    /// примерно одному пикселю. Если показать фигуру мельче, мягкий край станет уже.
+    pub fn aa_margin(&self) -> f64 {
+        self.tolerance * 4.0
     }
 }
 
