@@ -39,6 +39,10 @@ pub struct AppConfig {
     /// Края при MSAA «как в редакторах» (клавиша G переключает). Дороже обычных: см.
     /// `docs/decisions/0009-vector-layer.md`.
     pub perceptual_edges: bool,
+    /// Как рисовать залитые векторные фигуры (клавиша F переключает).
+    pub fill: reyvec_gpu::FillMethod,
+    /// Лупа векторной сцены (клавиша Z переключает).
+    pub zoom: bool,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -198,6 +202,8 @@ impl App {
         renderer.set_scene(self.config.scene);
         renderer.set_msaa(self.config.msaa);
         renderer.set_perceptual_edges(self.config.perceptual_edges);
+        renderer.set_fill(self.config.fill);
+        renderer.set_zoom(self.config.zoom);
         self.renderer = Some(renderer);
         self.start = Instant::now();
         self.stats.last_title = self.start;
@@ -232,6 +238,8 @@ impl App {
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),
                 perceptual_edges: renderer.perceptual_edges(),
+                fill: renderer.fill().label(),
+                zoom: renderer.zoom(),
             };
             panel.frame(window, &info)
         });
@@ -410,6 +418,38 @@ impl ApplicationHandler for App {
                             "физически точные"
                         }
                     );
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyF),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    let fill = r.fill().next();
+                    r.set_fill(fill);
+                    tracing::info!("Заливка векторных фигур: {}", fill.label());
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyZ),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    let on = !r.zoom();
+                    r.set_zoom(on);
+                    tracing::info!("Лупа векторной сцены: {}", if on { "×8" } else { "выкл" });
                 }
             }
             WindowEvent::Resized(size) => {

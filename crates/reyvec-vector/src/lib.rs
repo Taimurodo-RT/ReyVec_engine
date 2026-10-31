@@ -15,11 +15,13 @@
 //! добавлять и менять (см. `docs/decisions/0009-vector-layer.md`).
 
 mod color;
+mod curves;
 mod library;
 mod shape;
 mod tessellate;
 
 pub use color::Color;
+pub use curves::{CurveMesh, curve_mesh};
 /// Библиотека кривых целиком: прямоугольники, круги, эллипсы и прочее (`kurbo::Shape::to_path`).
 pub use kurbo;
 pub use kurbo::{Affine, BezPath, Circle, PathEl, Point, Rect, Vec2};

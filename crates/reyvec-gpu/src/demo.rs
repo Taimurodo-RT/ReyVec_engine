@@ -18,10 +18,12 @@ use crate::context::GpuContext;
 use crate::demo_vector::VectorDemo;
 use crate::graph::{Access, ImageHandle, RenderGraph};
 use crate::pipeline::Blend;
-use crate::pipeline::{begin_color_pass, begin_color_pass_resolved, graphics_pipeline};
+use crate::pipeline::{
+    Stencil, StencilUse, begin_color_pass, begin_scene_pass, graphics_pipeline_stencil,
+};
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
-use crate::vector::{VectorData, VectorRenderer};
+use crate::vector::{FillMethod, VectorData, VectorRenderer};
 
 /// Какую сцену песочницы рисовать.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -197,7 +199,16 @@ pub(crate) struct Demo {
     msaa_counts: vk::SampleCountFlags,
     /// Сводить MSAA «как в редакторах» (в цвете экрана), а не в линейном цвете.
     perceptual_edges: bool,
+    /// Формат трафарета прохода сцены (нужен заливке через трафарет).
+    stencil_format: vk::Format,
+    /// Лупа: векторная сцена увеличена в [`ZOOM`] раз вокруг края сердца.
+    zoom: bool,
 }
+
+/// Во сколько раз увеличивает лупа векторной сцены.
+pub(crate) const ZOOM: f64 = 8.0;
+/// Точка сцены, которая под лупой оказывается в центре окна: край левой половинки сердца.
+const ZOOM_CENTER: (f64, f64) = (0.95, 0.6);
 
 impl Demo {
     pub fn new(
@@ -228,7 +239,8 @@ impl Demo {
             )?);
         }
         let vector_demo = VectorDemo::new();
-        let mut vector = VectorRenderer::new(ctx, res, shaders, frames_in_flight)?;
+        let stencil_format = pick_stencil_format(ctx)?;
+        let mut vector = VectorRenderer::new(ctx, res, shaders, frames_in_flight, stencil_format)?;
         // SAFETY: physical получен из этого экземпляра.
         let limits = unsafe {
             ctx.instance()
@@ -253,16 +265,35 @@ impl Demo {
             vector,
             vector_demo,
             msaa: Msaa::Off,
-            // Картинку MSAA и рисуют, и читают в шейдере сведения.
+            // Картинку MSAA и рисуют, и читают в шейдере сведения; трафарет того же размера.
             msaa_counts: limits.framebuffer_color_sample_counts
-                & limits.sampled_image_color_sample_counts,
+                & limits.sampled_image_color_sample_counts
+                & limits.framebuffer_stencil_sample_counts,
             perceptual_edges: false,
+            stencil_format,
+            zoom: false,
         };
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
-            demo.triangle = build(ctx, res, shaders, "triangle", SCENE_FORMAT, Msaa::Off)?;
-            demo.sprites = build(ctx, res, shaders, "sprite", SCENE_FORMAT, Msaa::Off)?;
-            demo.resolve = build(ctx, res, shaders, "resolve", SCENE_FORMAT, Msaa::Off)?;
+            demo.triangle = build(
+                ctx,
+                res,
+                shaders,
+                "triangle",
+                SCENE_FORMAT,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.sprites = build(
+                ctx,
+                res,
+                shaders,
+                "sprite",
+                SCENE_FORMAT,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.resolve = build(ctx, res, shaders, "resolve", SCENE_FORMAT, Msaa::Off, None)?;
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -277,6 +308,26 @@ impl Demo {
     /// Сглаживание, с которым рисуется сцена.
     pub fn msaa(&self) -> Msaa {
         self.msaa
+    }
+
+    /// Как рисуются залитые векторные фигуры.
+    pub fn fill(&self) -> FillMethod {
+        self.vector.fill()
+    }
+
+    /// Способ рисования залитых фигур со следующего кадра.
+    pub fn set_fill(&mut self, fill: FillMethod) {
+        self.vector.set_fill(fill);
+    }
+
+    /// Включена ли лупа векторной сцены.
+    pub fn zoom(&self) -> bool {
+        self.zoom
+    }
+
+    /// Лупа векторной сцены: увеличение в [`ZOOM`] раз, чтобы были видны изгибы кривых.
+    pub fn set_zoom(&mut self, on: bool) {
+        self.zoom = on;
     }
 
     /// Края сводятся «как в редакторах» (`true`) или физически точно.
@@ -307,8 +358,24 @@ impl Demo {
         if msaa == self.msaa {
             return Ok(msaa);
         }
-        let triangle = build(ctx, res, shaders, "triangle", SCENE_FORMAT, msaa)?;
-        let sprites = match build(ctx, res, shaders, "sprite", SCENE_FORMAT, msaa) {
+        let triangle = build(
+            ctx,
+            res,
+            shaders,
+            "triangle",
+            SCENE_FORMAT,
+            msaa,
+            Some(self.stencil_format),
+        )?;
+        let sprites = match build(
+            ctx,
+            res,
+            shaders,
+            "sprite",
+            SCENE_FORMAT,
+            msaa,
+            Some(self.stencil_format),
+        ) {
             Ok(p) => p,
             Err(e) => {
                 // SAFETY: конвейер только что создан и нигде не используется.
@@ -360,7 +427,7 @@ impl Demo {
         if format == self.format {
             return Ok(());
         }
-        let present = build(ctx, res, shaders, "present", format, Msaa::Off)?;
+        let present = build(ctx, res, shaders, "present", format, Msaa::Off, None)?;
         // SAFETY: условие функции; null допустим.
         unsafe { ctx.device.destroy_pipeline(self.present, None) };
         self.present = present;
@@ -380,14 +447,15 @@ impl Demo {
     ) {
         self.vector.reload(ctx, res, shaders, names);
         for name in names {
-            let (slot, format, msaa) = match name.as_str() {
-                "triangle" => (&mut self.triangle, SCENE_FORMAT, self.msaa),
-                "sprite" => (&mut self.sprites, SCENE_FORMAT, self.msaa),
-                "present" => (&mut self.present, self.format, Msaa::Off),
-                "resolve" => (&mut self.resolve, SCENE_FORMAT, Msaa::Off),
+            let stencil = Some(self.stencil_format);
+            let (slot, format, msaa, stencil) = match name.as_str() {
+                "triangle" => (&mut self.triangle, SCENE_FORMAT, self.msaa, stencil),
+                "sprite" => (&mut self.sprites, SCENE_FORMAT, self.msaa, stencil),
+                "present" => (&mut self.present, self.format, Msaa::Off, None),
+                "resolve" => (&mut self.resolve, SCENE_FORMAT, Msaa::Off, None),
                 _ => continue,
             };
-            match build(ctx, res, shaders, name, format, msaa) {
+            match build(ctx, res, shaders, name, format, msaa, stencil) {
                 Ok(new) => {
                     let old = std::mem::replace(slot, new);
                     // SAFETY: видеокарта простаивает (условие функции).
@@ -490,7 +558,14 @@ impl Demo {
         let vector = match scene {
             DemoScene::Vector => {
                 let _zone = crate::cpu_zone!("векторные фигуры");
-                let instances = self.vector_demo.instances(time);
+                let mut instances = self.vector_demo.instances(time);
+                if self.zoom {
+                    let lens = reyvec_vector::Affine::scale(ZOOM)
+                        * reyvec_vector::Affine::translate((-ZOOM_CENTER.0, -ZOOM_CENTER.1));
+                    for i in &mut instances {
+                        i.transform = lens * i.transform;
+                    }
+                }
                 self.vector.prepare(res, slot, &instances, aspect)
             }
             DemoScene::Gpu => None,
@@ -539,7 +614,18 @@ impl Demo {
         let target_image = msaa.unwrap_or(scene);
         let own_resolve = msaa.filter(|_| frame.perceptual_edges);
         let hardware_resolve = msaa.filter(|_| !frame.perceptual_edges);
-        let mut uses = vec![(target_image, Access::ColorAttachment)];
+        // Трафарет нужен заливке через трафарет. Он есть у прохода всегда, чтобы все
+        // конвейеры сцены были собраны под один и тот же проход.
+        let stencil = graph.create_multisampled(
+            "трафарет сцены",
+            frame.extent,
+            self.stencil_format,
+            frame.msaa.samples(),
+        );
+        let mut uses = vec![
+            (target_image, Access::ColorAttachment),
+            (stencil, Access::StencilAttachment),
+        ];
         if hardware_resolve.is_some() {
             uses.push((scene, Access::ColorAttachment));
         }
@@ -555,12 +641,14 @@ impl Demo {
             // SAFETY: граф перевёл картинку сцены в раскладку цели рисования; конвейеры
             // и буфер спрайтов живы, пока видеокарта рисует этот кадр.
             unsafe {
-                match hardware_resolve {
-                    Some(m) => {
-                        begin_color_pass_resolved(d, cmd, p.view(m), p.view(scene), p.extent(scene))
-                    }
-                    None => begin_color_pass(d, cmd, p.view(target_image), p.extent(target_image)),
-                }
+                begin_scene_pass(
+                    d,
+                    cmd,
+                    p.view(target_image),
+                    hardware_resolve.map(|_| p.view(scene)),
+                    Some(p.view(stencil)),
+                    p.extent(scene),
+                );
                 bindless.bind(d, cmd);
                 if frame.scene == DemoScene::Gpu {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
@@ -649,6 +737,7 @@ fn build(
     name: &str,
     format: vk::Format,
     msaa: Msaa,
+    stencil: Option<vk::Format>,
 ) -> Result<vk::Pipeline, GpuError> {
     let pair = shaders.get(name);
     let blend = if name == "sprite" {
@@ -656,7 +745,7 @@ fn build(
     } else {
         Blend::Opaque
     };
-    graphics_pipeline(
+    graphics_pipeline_stencil(
         &ctx.device,
         res.bindless.pipeline_layout,
         &pair.vs,
@@ -664,7 +753,38 @@ fn build(
         format,
         blend,
         msaa.samples(),
+        stencil.map(|format| Stencil {
+            format,
+            usage: StencilUse::Ignore,
+        }),
     )
+}
+
+/// Формат трафарета для прохода сцены: первый, который видеокарта умеет как цель рисования.
+/// Только трафарет (S8) экономнее всего; AMD не умеет D24S8, поэтому есть и D32S8.
+fn pick_stencil_format(ctx: &GpuContext) -> Result<vk::Format, GpuError> {
+    let candidates = [
+        vk::Format::S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+    ];
+    candidates
+        .into_iter()
+        .find(|&f| {
+            // SAFETY: physical получен из этого экземпляра.
+            let props = unsafe {
+                ctx.instance()
+                    .get_physical_device_format_properties(ctx.physical, f)
+            };
+            props
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+        })
+        .ok_or_else(|| {
+            GpuError::NoSuitableAdapter(
+                "видеокарта не умеет ни один формат трафарета (S8, D24S8, D32S8)".into(),
+            )
+        })
 }
 
 /// Шахматная доска `size × size` с клетками по `cell` пикселей, RGBA8 sRGB.

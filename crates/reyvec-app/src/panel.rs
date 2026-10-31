@@ -35,6 +35,10 @@ pub(crate) struct PanelInfo<'a> {
     pub msaa: &'a str,
     /// Края при MSAA «как в редакторах», а не физически точные.
     pub perceptual_edges: bool,
+    /// Как рисуются заливки векторных фигур.
+    pub fill: &'a str,
+    /// Лупа векторной сцены включена.
+    pub zoom: bool,
 }
 
 pub(crate) struct Panel {
@@ -186,9 +190,16 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             "физически точные"
         }
     )));
+    ui.label(mono(format!(
+        "Заливка: {}{}",
+        info.fill,
+        if info.zoom { ", лупа ×8" } else { "" }
+    )));
     ui.label(
-        RichText::new("1 и 2 сцена, M сглаживание, G края, F1 прячет панель, F12 снимок кадра")
-            .weak(),
+        RichText::new(
+            "1 и 2 сцена, M сглаживание, G края, F заливка, Z лупа, F1 прячет панель, F12 снимок",
+        )
+        .weak(),
     );
 }
 
@@ -304,6 +315,8 @@ mod tests {
             scene: "векторы",
             msaa: "MSAA 4×",
             perceptual_edges: true,
+            fill: "треугольники",
+            zoom: false,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {

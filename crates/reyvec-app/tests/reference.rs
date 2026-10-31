@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use reyvec_app::snapshot::{compare, diff_image, load_png, save_png};
 use reyvec_app::{
-    DemoScene, GpuOptions, HeadlessScene, Msaa, render_headless, validation_error_count,
+    DemoScene, FillMethod, GpuOptions, HeadlessScene, Msaa, render_headless, validation_error_count,
 };
 
 /// Насколько может отличаться канал пикселя (из 255): разные версии драйвера чуть
@@ -37,6 +37,8 @@ fn cases() -> Vec<Case> {
         scene,
         msaa: Msaa::Off,
         perceptual_edges: false,
+        fill: FillMethod::Triangles,
+        zoom: false,
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
@@ -69,6 +71,38 @@ fn cases() -> Vec<Case> {
             name: "vector-2s-msaa4",
             scene: HeadlessScene {
                 msaa: Msaa::X4,
+                ..at(DemoScene::Vector, 2.0, false)
+            },
+        },
+        Case {
+            name: "vector-2s-stencil",
+            scene: HeadlessScene {
+                fill: FillMethod::Stencil,
+                ..at(DemoScene::Vector, 2.0, false)
+            },
+        },
+        Case {
+            name: "vector-2s-stencil-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                fill: FillMethod::Stencil,
+                ..at(DemoScene::Vector, 2.0, false)
+            },
+        },
+        Case {
+            name: "vector-zoom-triangles-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                zoom: true,
+                ..at(DemoScene::Vector, 2.0, false)
+            },
+        },
+        Case {
+            name: "vector-zoom-stencil-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                fill: FillMethod::Stencil,
+                zoom: true,
                 ..at(DemoScene::Vector, 2.0, false)
             },
         },

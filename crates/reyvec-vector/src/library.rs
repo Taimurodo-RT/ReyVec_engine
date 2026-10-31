@@ -2,7 +2,9 @@
 
 use kurbo::Affine;
 
-use crate::{Color, Mesh, Shape, TessellationError, tessellate_smooth};
+use crate::{
+    Color, CurveMesh, Mesh, Shape, Style, TessellationError, curve_mesh, tessellate_smooth,
+};
 
 /// Номер фигуры в [`ShapeLibrary`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -11,6 +13,8 @@ pub struct ShapeId(pub u32);
 struct Entry {
     shape: Shape,
     mesh: Mesh,
+    /// Треугольники для заливки через трафарет (только у заливок).
+    curves: Option<CurveMesh>,
 }
 
 /// Фигуры, уже разбитые на треугольники. Разбиение делается один раз в [`Self::add`],
@@ -36,7 +40,13 @@ impl ShapeLibrary {
     /// сглаживание в шейдере: [`Self::aa_margin`].
     pub fn add(&mut self, shape: Shape) -> Result<ShapeId, TessellationError> {
         let mesh = tessellate_smooth(&shape, self.tolerance, self.aa_margin())?;
-        self.entries.push(Entry { shape, mesh });
+        let curves =
+            matches!(shape.style, Style::Fill(_)).then(|| curve_mesh(&shape.path, self.tolerance));
+        self.entries.push(Entry {
+            shape,
+            mesh,
+            curves,
+        });
         self.revision += 1;
         Ok(ShapeId(self.entries.len() as u32 - 1))
     }
@@ -49,6 +59,11 @@ impl ShapeLibrary {
     /// Треугольники фигуры по номеру.
     pub fn mesh(&self, id: ShapeId) -> Option<&Mesh> {
         self.entries.get(id.0 as usize).map(|e| &e.mesh)
+    }
+
+    /// Треугольники заливки через трафарет (`None` у обводок и неизвестных номеров).
+    pub fn curves(&self, id: ShapeId) -> Option<&CurveMesh> {
+        self.entries.get(id.0 as usize)?.curves.as_ref()
     }
 
     /// Все фигуры по порядку номеров.

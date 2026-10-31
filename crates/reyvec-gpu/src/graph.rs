@@ -16,7 +16,7 @@ use ash::vk;
 use crate::GpuError;
 use crate::bindless::{Bindless, MAX_TEXTURES};
 use crate::context::GpuContext;
-use crate::pipeline::image_barrier;
+use crate::pipeline::{full_range, image_barrier};
 use crate::resources::{Texture, create_texture, destroy_texture};
 use crate::timing::GpuTimer;
 
@@ -34,6 +34,8 @@ pub(crate) struct ImageHandle(usize);
 pub(crate) enum Access {
     /// Рисует в неё (цель рисования).
     ColorAttachment,
+    /// Трафарет прохода рисования (картинка формата глубины и трафарета).
+    StencilAttachment,
     /// Читает её в пиксельном шейдере (через общий список текстур).
     Sampled,
     /// Копирует из неё.
@@ -77,6 +79,13 @@ impl Access {
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ,
             ),
+            Access::StencilAttachment => (
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            ),
             Access::Sampled => (
                 vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                 vk::PipelineStageFlags2::FRAGMENT_SHADER,
@@ -108,6 +117,7 @@ impl Access {
     fn usage(self) -> vk::ImageUsageFlags {
         match self {
             Access::ColorAttachment => vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            Access::StencilAttachment => vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             Access::Sampled => vk::ImageUsageFlags::SAMPLED,
             Access::TransferSrc => vk::ImageUsageFlags::TRANSFER_SRC,
             Access::TransferDst => vk::ImageUsageFlags::TRANSFER_DST,
@@ -435,6 +445,7 @@ impl<'a> RenderGraph<'a> {
         let finals: Vec<_> = self.images.iter().map(|i| i.final_access).collect();
         let (before, after, end_states) = plan(&initial, &uses, &finals);
 
+        let formats: Vec<_> = self.images.iter().map(|i| i.format).collect();
         let d = &ctx.device;
         let report = GraphReport {
             passes: self.passes.iter().map(|p| p.name).collect(),
@@ -457,6 +468,7 @@ impl<'a> RenderGraph<'a> {
                         b.new.stage,
                         b.new.access,
                     )
+                    .subresource_range(full_range(formats[b.image.0]))
                 })
                 .collect();
             // SAFETY: cmd в состоянии записи (условие функции), картинки живы.

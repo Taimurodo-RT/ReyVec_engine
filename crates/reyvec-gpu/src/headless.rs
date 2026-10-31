@@ -55,6 +55,10 @@ pub struct HeadlessScene {
     pub msaa: Msaa,
     /// Края при MSAA «как в редакторах» (`true`) или физически точные.
     pub perceptual_edges: bool,
+    /// Как рисовать залитые векторные фигуры.
+    pub fill: crate::FillMethod,
+    /// Лупа векторной сцены (увеличение в 8 раз у края сердца).
+    pub zoom: bool,
 }
 
 /// Кадр, нарисованный без окна.
@@ -133,6 +137,8 @@ pub fn render_triangle_headless(
             scene: DemoScene::Gpu,
             msaa: Msaa::Off,
             perceptual_edges: false,
+            fill: crate::FillMethod::Triangles,
+            zoom: false,
         },
     )
 }
@@ -271,6 +277,8 @@ fn render(
             demo.update(ctx, gpu, scene.time)?;
             demo.set_msaa(ctx, gpu, &ShaderLibrary::new(false), scene.msaa)?;
             demo.set_perceptual_edges(scene.perceptual_edges);
+            demo.set_fill(scene.fill);
+            demo.set_zoom(scene.zoom);
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
