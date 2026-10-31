@@ -346,6 +346,7 @@ impl GpuResources {
             vk::Extent2D { width, height },
             format,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::SampleCountFlags::TYPE_1,
             name,
         )?;
         let view = texture.view;
@@ -580,6 +581,7 @@ pub(crate) fn create_texture(
     extent: vk::Extent2D,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
+    samples: vk::SampleCountFlags,
     name: &str,
 ) -> Result<Texture, GpuError> {
     let d = &ctx.device;
@@ -593,7 +595,7 @@ pub(crate) fn create_texture(
         })
         .mip_levels(1)
         .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
+        .samples(samples)
         .tiling(vk::ImageTiling::OPTIMAL)
         .usage(usage)
         .initial_layout(vk::ImageLayout::UNDEFINED);

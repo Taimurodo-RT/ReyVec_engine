@@ -15,7 +15,7 @@ use reyvec_vector::{Color, Instance, ShapeLibrary};
 
 use crate::GpuError;
 use crate::context::GpuContext;
-use crate::demo::SCENE_FORMAT;
+use crate::demo::{Msaa, SCENE_FORMAT};
 use crate::pipeline::{Blend, graphics_pipeline};
 use crate::resources::{BufferId, BufferMemory, GpuResources};
 use crate::shaders::ShaderLibrary;
@@ -63,6 +63,8 @@ pub(crate) struct VectorData {
 
 pub(crate) struct VectorRenderer {
     pipeline: vk::Pipeline,
+    /// Сглаживание, под которое собран конвейер.
+    msaa: Msaa,
     meshes: Option<Meshes>,
     frames: Vec<FrameBuffers>,
     /// Предупреждение о переполнении уже было в логе.
@@ -96,7 +98,8 @@ impl VectorRenderer {
             });
         }
         Ok(Self {
-            pipeline: build(ctx, res, shaders)?,
+            pipeline: build(ctx, res, shaders, Msaa::Off)?,
+            msaa: Msaa::Off,
             meshes: None,
             frames,
             warned_overflow: false,
@@ -114,7 +117,7 @@ impl VectorRenderer {
         if !names.iter().any(|n| n == "vector") {
             return;
         }
-        match build(ctx, res, shaders) {
+        match build(ctx, res, shaders, self.msaa) {
             Ok(new) => {
                 // SAFETY: видеокарта простаивает (условие функции).
                 unsafe { ctx.device.destroy_pipeline(self.pipeline, None) };
@@ -122,6 +125,25 @@ impl VectorRenderer {
             }
             Err(e) => shaders.set_error("vector", e.to_string()),
         }
+    }
+
+    /// Пересобирает конвейер под другое сглаживание. Видеокарта простаивает.
+    pub fn set_msaa(
+        &mut self,
+        ctx: &GpuContext,
+        res: &GpuResources,
+        shaders: &ShaderLibrary,
+        msaa: Msaa,
+    ) -> Result<(), GpuError> {
+        if msaa == self.msaa {
+            return Ok(());
+        }
+        let new = build(ctx, res, shaders, msaa)?;
+        // SAFETY: видеокарта простаивает (условие функции).
+        unsafe { ctx.device.destroy_pipeline(self.pipeline, None) };
+        self.pipeline = new;
+        self.msaa = msaa;
+        Ok(())
     }
 
     /// Загружает треугольники фигур на видеокарту, если набор фигур изменился с прошлой
@@ -327,6 +349,7 @@ fn build(
     ctx: &GpuContext,
     res: &GpuResources,
     shaders: &ShaderLibrary,
+    msaa: Msaa,
 ) -> Result<vk::Pipeline, GpuError> {
     let pair = shaders.get("vector");
     graphics_pipeline(
@@ -336,6 +359,7 @@ fn build(
         &pair.fs,
         SCENE_FORMAT,
         Blend::Alpha,
+        msaa.samples(),
     )
 }
 

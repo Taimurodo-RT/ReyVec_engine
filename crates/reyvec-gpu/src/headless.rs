@@ -4,7 +4,7 @@
 use ash::vk;
 
 use crate::context::{Core, GpuContext, GpuOptions};
-use crate::demo::{Demo, DemoScene};
+use crate::demo::{Demo, DemoScene, Msaa};
 use crate::graph::{Access, ImageState, RenderGraph, TransientPool};
 use crate::pipeline::color_range;
 use crate::resources::GpuResources;
@@ -51,6 +51,8 @@ pub struct HeadlessScene {
     pub shader_error: bool,
     /// Какая сцена песочницы.
     pub scene: DemoScene,
+    /// Сглаживание (если видеокарта не умеет столько, берётся ближайшее меньшее).
+    pub msaa: Msaa,
 }
 
 /// Кадр, нарисованный без окна.
@@ -127,6 +129,7 @@ pub fn render_triangle_headless(
             time: 0.0,
             shader_error: false,
             scene: DemoScene::Gpu,
+            msaa: Msaa::Off,
         },
     )
 }
@@ -263,6 +266,7 @@ fn render(
         // Шахматка меняет клетки со временем: загружаем ту, что нужна в момент scene.time.
         if let (Some(demo), Some(gpu)) = (r.demo.as_mut(), r.gpu.as_mut()) {
             demo.update(ctx, gpu, scene.time)?;
+            demo.set_msaa(ctx, gpu, &ShaderLibrary::new(false), scene.msaa)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d

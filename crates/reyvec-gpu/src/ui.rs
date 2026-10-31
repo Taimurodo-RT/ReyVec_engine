@@ -449,6 +449,7 @@ fn build(
         &pair.fs,
         format,
         Blend::Premultiplied,
+        vk::SampleCountFlags::TYPE_1,
     )
 }
 

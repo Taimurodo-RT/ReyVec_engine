@@ -29,6 +29,7 @@ pub(crate) fn graphics_pipeline(
     frag_spv: &[u8],
     format: vk::Format,
     blend: Blend,
+    samples: vk::SampleCountFlags,
 ) -> Result<vk::Pipeline, GpuError> {
     let vert = create_shader(device, vert_spv)?;
     let frag = match create_shader(device, frag_spv) {
@@ -61,8 +62,8 @@ pub(crate) fn graphics_pipeline(
         .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0);
-    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let multisample =
+        vk::PipelineMultisampleStateCreateInfo::default().rasterization_samples(samples);
     let mut attachment = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(vk::ColorComponentFlags::RGBA);
     if blend == Blend::Alpha {
@@ -123,6 +124,36 @@ pub(crate) fn graphics_pipeline(
     }
 }
 
+/// Начинает проход рисования с очисткой фоном в картинку с несколькими точками на пиксель
+/// `msaa_view`. В конце прохода точки каждого пикселя усредняются в `resolve_view`
+/// (обе картинки в раскладке `COLOR_ATTACHMENT_OPTIMAL`), а сама `msaa_view` не сохраняется.
+///
+/// # Safety
+/// `cmd` в состоянии записи, обе картинки живы до конца выполнения команд.
+pub(crate) unsafe fn begin_color_pass_resolved(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    msaa_view: vk::ImageView,
+    resolve_view: vk::ImageView,
+    extent: vk::Extent2D,
+) {
+    let attachments = [vk::RenderingAttachmentInfo::default()
+        .image_view(msaa_view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+        .resolve_image_view(resolve_view)
+        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .clear_value(vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: CLEAR_COLOR,
+            },
+        })];
+    // SAFETY: условия описаны в контракте функции.
+    unsafe { begin_rendering(device, cmd, &attachments, extent) };
+}
+
 /// Начинает проход рисования в `view` с очисткой фоном и ставит область вывода на всю картинку.
 /// Картинка уже должна быть в раскладке `COLOR_ATTACHMENT_OPTIMAL`.
 ///
@@ -144,11 +175,25 @@ pub(crate) unsafe fn begin_color_pass(
                 float32: CLEAR_COLOR,
             },
         })];
+    // SAFETY: условия описаны в контракте функции.
+    unsafe { begin_rendering(device, cmd, &attachments, extent) };
+}
+
+/// Начинает рисование в `attachments` и ставит область вывода на всю картинку.
+///
+/// # Safety
+/// `cmd` в состоянии записи, картинки живы до конца выполнения команд.
+unsafe fn begin_rendering(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    attachments: &[vk::RenderingAttachmentInfo],
+    extent: vk::Extent2D,
+) {
     let area = vk::Rect2D::default().extent(extent);
     let rendering = vk::RenderingInfo::default()
         .render_area(area)
         .layer_count(1)
-        .color_attachments(&attachments);
+        .color_attachments(attachments);
     let viewport = vk::Viewport::default()
         .width(extent.width as f32)
         .height(extent.height as f32)
