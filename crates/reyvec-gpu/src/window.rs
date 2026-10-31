@@ -301,6 +301,19 @@ impl WindowRenderer {
         self.demo.as_ref().map_or(Msaa::Off, Demo::msaa)
     }
 
+    /// Края при MSAA сводятся «как в редакторах» (в цвете экрана), а не физически точно.
+    pub fn perceptual_edges(&self) -> bool {
+        self.demo.as_ref().is_none_or(Demo::perceptual_edges)
+    }
+
+    /// Как сводить края при MSAA со следующего кадра: `true` как в редакторах (Illustrator,
+    /// браузеры), `false` физически точно (в линейном цвете).
+    pub fn set_perceptual_edges(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_perceptual_edges(on);
+        }
+    }
+
     /// Что получится, если попросить сглаживание `msaa` (видеокарта может уметь меньше).
     pub fn msaa_supported(&self, msaa: Msaa) -> Msaa {
         self.demo

@@ -36,6 +36,7 @@ fn cases() -> Vec<Case> {
         shader_error,
         scene,
         msaa: Msaa::Off,
+        perceptual_edges: true,
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
