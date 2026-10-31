@@ -36,6 +36,8 @@ pub struct AppConfig {
     pub scene: DemoScene,
     /// Сглаживание сцены (клавиша M переключает).
     pub msaa: Msaa,
+    /// Края при MSAA «как в редакторах» (клавиша G переключает).
+    pub perceptual_edges: bool,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -194,6 +196,7 @@ impl App {
         let mut renderer = renderer;
         renderer.set_scene(self.config.scene);
         renderer.set_msaa(self.config.msaa);
+        renderer.set_perceptual_edges(self.config.perceptual_edges);
         self.renderer = Some(renderer);
         self.start = Instant::now();
         self.stats.last_title = self.start;
@@ -227,6 +230,7 @@ impl App {
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),
+                perceptual_edges: renderer.perceptual_edges(),
             };
             panel.frame(window, &info)
         });
@@ -382,6 +386,29 @@ impl ApplicationHandler for App {
                         next = next.next();
                     }
                     r.set_msaa(next);
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyG),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    let on = !r.perceptual_edges();
+                    r.set_perceptual_edges(on);
+                    tracing::info!(
+                        "Края при MSAA: {}",
+                        if on {
+                            "как в редакторах"
+                        } else {
+                            "физически точные"
+                        }
+                    );
                 }
             }
             WindowEvent::Resized(size) => {

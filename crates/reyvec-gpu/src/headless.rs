@@ -53,6 +53,8 @@ pub struct HeadlessScene {
     pub scene: DemoScene,
     /// Сглаживание (если видеокарта не умеет столько, берётся ближайшее меньшее).
     pub msaa: Msaa,
+    /// Края при MSAA «как в редакторах» (`true`) или физически точные.
+    pub perceptual_edges: bool,
 }
 
 /// Кадр, нарисованный без окна.
@@ -130,6 +132,7 @@ pub fn render_triangle_headless(
             shader_error: false,
             scene: DemoScene::Gpu,
             msaa: Msaa::Off,
+            perceptual_edges: true,
         },
     )
 }
@@ -267,6 +270,7 @@ fn render(
         if let (Some(demo), Some(gpu)) = (r.demo.as_mut(), r.gpu.as_mut()) {
             demo.update(ctx, gpu, scene.time)?;
             demo.set_msaa(ctx, gpu, &ShaderLibrary::new(false), scene.msaa)?;
+            demo.set_perceptual_edges(scene.perceptual_edges);
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
