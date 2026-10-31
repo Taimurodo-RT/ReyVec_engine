@@ -51,7 +51,7 @@ jobs:
       - name: Install software Vulkan, validation layers, shader compiler, virtual display
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools glslang-tools xvfb
+          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools glslang-tools xvfb libxkbcommon-x11-0
           vulkaninfo --summary | grep -E "deviceName|apiVersion"
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
