@@ -72,13 +72,22 @@ Write-Ok "Компилятор шейдеров: $slangc"
 
 if (-not $NoPull) {
     Write-Step "Скачиваю свежий код (ветка $Branch)"
-    $changes = git status --porcelain
-    if ($changes) {
-        Write-Host $changes
-        Stop-WithError "в папке есть изменённые файлы, и обновление могло бы их затереть. Сохрани их в другом месте или верни как было (git checkout -- .), потом запусти снова."
-    }
     Invoke-Checked "git" @("fetch", "origin", $Branch) "не удалось скачать ветку $Branch"
-    Invoke-Checked "git" @("checkout", "-B", $Branch, "origin/$Branch") "не удалось переключиться на ветку $Branch"
+    # Главная версия кода та, что в репозитории: изменённые вручную файлы заменяются ею.
+    # Чтобы правки не пропали совсем, перед заменой они сохраняются в папку dist\local-changes.
+    $changes = git status --porcelain --untracked-files=no
+    if ($changes) {
+        $backupDir = Join-Path $Root "dist\local-changes"
+        New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+        $backup = Join-Path $backupDir ("changes-" + (Get-Date -Format "yyyy-MM-dd_HH-mm-ss") + ".patch")
+        $diff = git diff HEAD --binary
+        [System.IO.File]::WriteAllText($backup, (($diff -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Warn "Эти файлы были изменены и будут заменены версией из репозитория:"
+        $changes | ForEach-Object { Write-Host "    $_" }
+        Write-Warn "Копия правок сохранена: $backup"
+    }
+    Invoke-Checked "git" @("checkout", "--force", "-B", $Branch, "origin/$Branch") "не удалось переключиться на ветку $Branch"
+    Invoke-Checked "git" @("reset", "--hard", "origin/$Branch") "не удалось заменить изменённые файлы"
     Write-Ok "Код обновлён"
 } else {
     Write-Step "Пропускаю скачивание (-NoPull)"
