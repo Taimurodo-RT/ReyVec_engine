@@ -13,7 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use reyvec_app::snapshot::{compare, diff_image, load_png, save_png};
-use reyvec_app::{DemoScene, GpuOptions, HeadlessScene, render_headless, validation_error_count};
+use reyvec_app::{
+    DemoScene, GpuOptions, HeadlessScene, Msaa, render_headless, validation_error_count,
+};
 
 /// Насколько может отличаться канал пикселя (из 255): разные версии драйвера чуть
 /// по-разному сглаживают текстуры.
@@ -33,6 +35,7 @@ fn cases() -> Vec<Case> {
         time,
         shader_error,
         scene,
+        msaa: Msaa::Off,
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
@@ -59,6 +62,14 @@ fn cases() -> Vec<Case> {
         Case {
             name: "vector-2s",
             scene: at(DemoScene::Vector, 2.0, false),
+        },
+        // Та же сцена со сглаживанием MSAA 4×: края мягкие, без «лесенки».
+        Case {
+            name: "vector-2s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Vector, 2.0, false)
+            },
         },
     ]
 }

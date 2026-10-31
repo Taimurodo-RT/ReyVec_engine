@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reyvec_gpu::{
-    DemoScene, FrameStatus, GpuError, GpuFrameTimings, GpuOptions, GpuTimingAverage,
+    DemoScene, FrameStatus, GpuError, GpuFrameTimings, GpuOptions, GpuTimingAverage, Msaa,
     RendererOptions, WindowRenderer,
 };
 use winit::application::ApplicationHandler;
@@ -34,6 +34,8 @@ pub struct AppConfig {
     pub tracy: bool,
     /// С какой сцены песочницы начать (клавиши 1 и 2 переключают).
     pub scene: DemoScene,
+    /// Сглаживание сцены (клавиша M переключает).
+    pub msaa: Msaa,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -191,6 +193,7 @@ impl App {
         self.window = Some(window);
         let mut renderer = renderer;
         renderer.set_scene(self.config.scene);
+        renderer.set_msaa(self.config.msaa);
         self.renderer = Some(renderer);
         self.start = Instant::now();
         self.stats.last_title = self.start;
@@ -223,6 +226,7 @@ impl App {
                 shader_error: renderer.shader_error(),
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
+                msaa: renderer.msaa().title(),
             };
             panel.frame(window, &info)
         });
@@ -355,6 +359,29 @@ impl ApplicationHandler for App {
             } if scene_for_key(code).is_some() => {
                 if let (Some(r), Some(scene)) = (self.renderer.as_mut(), scene_for_key(code)) {
                     r.set_scene(scene);
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyM),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    // Если видеокарта не умеет следующий вариант, пропускаем его.
+                    let current = r.msaa();
+                    let mut next = current.next();
+                    for _ in 0..2 {
+                        if r.msaa_supported(next) == next {
+                            break;
+                        }
+                        next = next.next();
+                    }
+                    r.set_msaa(next);
                 }
             }
             WindowEvent::Resized(size) => {

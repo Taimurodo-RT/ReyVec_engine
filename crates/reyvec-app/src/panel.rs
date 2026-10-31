@@ -31,6 +31,8 @@ pub(crate) struct PanelInfo<'a> {
     pub last_snapshot: Option<&'a str>,
     /// Название сцены песочницы.
     pub scene: &'a str,
+    /// Сглаживание сцены словами.
+    pub msaa: &'a str,
 }
 
 pub(crate) struct Panel {
@@ -170,8 +172,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
     if let Some(name) = info.last_snapshot {
         ui.label(mono(format!("Снимок: {name}")));
     }
-    ui.label(mono(format!("Сцена: {}", info.scene)));
-    ui.label(RichText::new("1 и 2 меняют сцену, F1 прячет панель, F12 снимок кадра").weak());
+    ui.label(mono(format!(
+        "Сцена: {}, сглаживание: {}",
+        info.scene, info.msaa
+    )));
+    ui.label(
+        RichText::new("1 и 2 меняют сцену, M сглаживание, F1 прячет панель, F12 снимок кадра")
+            .weak(),
+    );
 }
 
 /// Зелёный, пока видеокарта укладывается в бюджет с запасом, жёлтый у края, красный сверх.
@@ -284,6 +292,7 @@ mod tests {
             shader_error: None,
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
+            msaa: "MSAA 4×",
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {

@@ -11,6 +11,7 @@
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
 //! - `--scene gpu|vector`: с какой сцены начать (по умолчанию `vector`);
+//! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
@@ -33,6 +34,7 @@ const HELP: &str = "\
   --no-hot-reload        не перезагружать шейдеры после сохранения файлов
   --no-tracy             не включать замеры для программы Tracy
   --scene <gpu|vector>   с какой сцены начать: gpu (этап 2) или vector (векторы, по умолчанию)
+  --msaa <off|4|8>       сглаживание краёв (по умолчанию 4)
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
   --seconds <S>          закрыть окно через S секунд
@@ -42,7 +44,7 @@ const HELP: &str = "\
   --version, -V          версия
   --help, -h             эта справка
 
-В окне: Esc закрывает окно, 1 и 2 переключают сцену, F1 прячет и показывает панель счётчиков,
+В окне: Esc закрывает окно, 1 и 2 переключают сцену, M переключает сглаживание, F1 прячет и показывает панель счётчиков,
 F12 сохраняет снимок кадра в папку snapshots рядом с программой.";
 
 #[derive(Debug, Default, PartialEq)]
@@ -61,6 +63,7 @@ struct Args {
     time: Option<f32>,
     size: Option<(u32, u32)>,
     scene: Option<reyvec_app::DemoScene>,
+    msaa: Option<reyvec_app::Msaa>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -96,6 +99,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 out.scene = Some(
                     reyvec_app::DemoScene::from_name(&n)
                         .ok_or_else(|| format!("--scene: «{n}», а нужно gpu или vector"))?,
+                );
+            }
+            "--msaa" => {
+                let n = it.next().ok_or("после --msaa нужно off, 4 или 8")?;
+                out.msaa = Some(
+                    reyvec_app::Msaa::from_name(&n)
+                        .ok_or_else(|| format!("--msaa: «{n}», а нужно off, 4 или 8"))?,
                 );
             }
             "--snapshot" => {
@@ -141,6 +151,7 @@ fn snapshot_headless(path: &str, args: &Args, validation: bool) -> ExitCode {
         time: args.time.unwrap_or(0.0),
         shader_error: false,
         scene: args.scene.unwrap_or_default(),
+        msaa: args.msaa.unwrap_or_default(),
     };
     let options = reyvec_app::GpuOptions {
         validation,
@@ -236,6 +247,7 @@ fn main() -> ExitCode {
         hot_reload: !args.no_hot_reload,
         tracy: !args.no_tracy,
         scene: args.scene.unwrap_or_default(),
+        msaa: args.msaa.unwrap_or_default(),
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
@@ -319,6 +331,12 @@ mod tests {
             Some(reyvec_app::DemoScene::Vector)
         );
         assert!(parse("--scene 3d").is_err());
+        assert_eq!(parse("--msaa 8").unwrap().msaa, Some(reyvec_app::Msaa::X8));
+        assert_eq!(
+            parse("--msaa off").unwrap().msaa,
+            Some(reyvec_app::Msaa::Off)
+        );
+        assert!(parse("--msaa 2").is_err());
         assert!(parse("--scene").is_err());
     }
 

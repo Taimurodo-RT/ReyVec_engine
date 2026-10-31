@@ -6,7 +6,7 @@ use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Core, GpuContext, GpuOptions};
-use crate::demo::{Demo, DemoScene};
+use crate::demo::{Demo, DemoScene, Msaa};
 use crate::graph::{Access, GraphReport, ImageHandle, ImageState, RenderGraph, TransientPool};
 use crate::headless::FrameImage;
 use crate::pipeline::color_range;
@@ -151,6 +151,8 @@ pub struct WindowRenderer {
     demo: Option<Demo>,
     /// Какую сцену песочницы рисовать.
     scene: DemoScene,
+    /// Какое сглаживание просили (видеокарта может уметь меньше).
+    msaa_wanted: Msaa,
     ui: Option<UiRenderer>,
     /// Изменения текстур панели, ещё не попавшие на видеокарту. Копятся, пока кадры
     /// пропускаются (окно свёрнуто): иначе, например, атлас шрифта потерялся бы.
@@ -232,6 +234,7 @@ impl WindowRenderer {
             resources: None,
             demo: None,
             scene: DemoScene::default(),
+            msaa_wanted: Msaa::default(),
             ui: None,
             ui_textures: egui::TexturesDelta::default(),
             shaders: ShaderLibrary::new(options.hot_reload),
@@ -291,6 +294,24 @@ impl WindowRenderer {
             tracing::info!("Сцена: {}", scene.title());
         }
         self.scene = scene;
+    }
+
+    /// Сглаживание, с которым сейчас рисуется сцена.
+    pub fn msaa(&self) -> Msaa {
+        self.demo.as_ref().map_or(Msaa::Off, Demo::msaa)
+    }
+
+    /// Что получится, если попросить сглаживание `msaa` (видеокарта может уметь меньше).
+    pub fn msaa_supported(&self, msaa: Msaa) -> Msaa {
+        self.demo
+            .as_ref()
+            .map_or(Msaa::Off, |d| d.msaa_supported(msaa))
+    }
+
+    /// Просит сглаживание со следующего кадра. Если видеокарта не умеет столько точек на
+    /// пиксель, берётся ближайшее меньшее. Смена сглаживания на миг останавливает видеокарту.
+    pub fn set_msaa(&mut self, msaa: Msaa) {
+        self.msaa_wanted = msaa;
     }
 
     /// Режим показа кадров словами: с вертикальной синхронизацией или без.
@@ -380,6 +401,13 @@ impl WindowRenderer {
             if let Some(ui) = self.ui.as_mut() {
                 ui.reload(&self.ctx, res, &mut self.shaders, &changed);
             }
+        }
+        if let (Some(demo), Some(res)) = (self.demo.as_mut(), self.resources.as_ref())
+            && demo.msaa() != demo.msaa_supported(self.msaa_wanted)
+        {
+            // SAFETY: ждём, пока видеокарта перестанет использовать старые конвейеры.
+            unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
+            demo.set_msaa(&self.ctx, res, &self.shaders, self.msaa_wanted)?;
         }
         let shader_error = self.shaders.error().is_some();
         let in_flight = self.frames[self.frame_index].in_flight;

@@ -203,6 +203,7 @@ struct GraphImage {
     source: Source,
     extent: vk::Extent2D,
     format: vk::Format,
+    samples: vk::SampleCountFlags,
     initial: ImageState,
     final_access: Option<Access>,
 }
@@ -308,6 +309,7 @@ impl<'a> RenderGraph<'a> {
             source: Source::Imported { image, view },
             extent,
             format,
+            samples: vk::SampleCountFlags::TYPE_1,
             initial,
             final_access,
         });
@@ -321,11 +323,25 @@ impl<'a> RenderGraph<'a> {
         extent: vk::Extent2D,
         format: vk::Format,
     ) -> ImageHandle {
+        self.create_multisampled(name, extent, format, vk::SampleCountFlags::TYPE_1)
+    }
+
+    /// Временная картинка с несколькими точками на пиксель (MSAA). Читать её в шейдере
+    /// нельзя: в неё только рисуют, а потом сводят в обычную картинку (resolve) в том же
+    /// проходе рисования.
+    pub fn create_multisampled(
+        &mut self,
+        name: &'static str,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        samples: vk::SampleCountFlags,
+    ) -> ImageHandle {
         self.images.push(GraphImage {
             name,
             source: Source::Transient,
             extent,
             format,
+            samples,
             initial: ImageState::UNDEFINED,
             final_access: None,
         });
@@ -394,6 +410,7 @@ impl<'a> RenderGraph<'a> {
                         extent: img.extent,
                         format: img.format,
                         usage: usage[i],
+                        samples: img.samples,
                     };
                     let entry = pool.acquire(ctx, bindless, key, frame, img.name)?;
                     let e = &pool.entries[entry];
@@ -488,6 +505,7 @@ struct TransientKey {
     extent: vk::Extent2D,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
+    samples: vk::SampleCountFlags,
 }
 
 struct PoolEntry {
@@ -561,7 +579,7 @@ impl TransientPool {
             self.entries[i].last_used = frame;
             return Ok(i);
         }
-        let texture = create_texture(ctx, key.extent, key.format, key.usage, name)?;
+        let texture = create_texture(ctx, key.extent, key.format, key.usage, key.samples, name)?;
         let slot = if key.usage.contains(vk::ImageUsageFlags::SAMPLED) {
             match self.free_slots.pop() {
                 Some(s) => {

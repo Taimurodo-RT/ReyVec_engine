@@ -18,7 +18,7 @@ use crate::context::GpuContext;
 use crate::demo_vector::VectorDemo;
 use crate::graph::{Access, ImageHandle, RenderGraph};
 use crate::pipeline::Blend;
-use crate::pipeline::{begin_color_pass, graphics_pipeline};
+use crate::pipeline::{begin_color_pass, begin_color_pass_resolved, graphics_pipeline};
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
 use crate::vector::{VectorData, VectorRenderer};
@@ -49,6 +49,65 @@ impl DemoScene {
             "vector" => Some(Self::Vector),
             _ => None,
         }
+    }
+}
+
+/// Сглаживание краёв сцены через MSAA: видеокарта берёт несколько точек на пиксель, но
+/// пиксельный шейдер считает один раз на пиксель, поэтому дорого только на краях фигур.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Msaa {
+    /// Без сглаживания: края «лесенкой».
+    Off,
+    /// 4 точки на пиксель.
+    #[default]
+    X4,
+    /// 8 точек на пиксель.
+    X8,
+}
+
+impl Msaa {
+    /// Название для панели и лога.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Off => "выкл",
+            Self::X4 => "MSAA 4×",
+            Self::X8 => "MSAA 8×",
+        }
+    }
+
+    /// Следующий вариант по кругу: выкл → 4× → 8× → выкл.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::X4,
+            Self::X4 => Self::X8,
+            Self::X8 => Self::Off,
+        }
+    }
+
+    /// Вариант по имени из командной строки: `off`, `4` или `8`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "off" | "0" | "1" => Some(Self::Off),
+            "4" => Some(Self::X4),
+            "8" => Some(Self::X8),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn samples(self) -> vk::SampleCountFlags {
+        match self {
+            Self::Off => vk::SampleCountFlags::TYPE_1,
+            Self::X4 => vk::SampleCountFlags::TYPE_4,
+            Self::X8 => vk::SampleCountFlags::TYPE_8,
+        }
+    }
+
+    /// Самый близкий вариант не больше `self`, который видеокарта умеет для кадра сцены.
+    pub(crate) fn supported(self, counts: vk::SampleCountFlags) -> Self {
+        [Self::X8, Self::X4, Self::Off]
+            .into_iter()
+            .find(|m| *m <= self && counts.contains(m.samples()))
+            .unwrap_or(Self::Off)
     }
 }
 
@@ -102,6 +161,7 @@ impl Sprite {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameData {
     scene: DemoScene,
+    msaa: Msaa,
     vector: Option<VectorData>,
     sprites_address: vk::DeviceAddress,
     sprite_count: u32,
@@ -128,6 +188,10 @@ pub(crate) struct Demo {
     instance_buffers: Vec<BufferId>,
     vector: VectorRenderer,
     vector_demo: VectorDemo,
+    /// Сглаживание, под которое собраны конвейеры сцены.
+    msaa: Msaa,
+    /// Какие числа точек на пиксель видеокарта умеет для кадра сцены.
+    msaa_counts: vk::SampleCountFlags,
 }
 
 impl Demo {
@@ -160,6 +224,12 @@ impl Demo {
         }
         let vector_demo = VectorDemo::new();
         let mut vector = VectorRenderer::new(ctx, res, shaders, frames_in_flight)?;
+        // SAFETY: physical получен из этого экземпляра.
+        let limits = unsafe {
+            ctx.instance()
+                .get_physical_device_properties(ctx.physical)
+                .limits
+        };
         if let Err(e) = vector.upload(ctx, res, &vector_demo.library) {
             vector.destroy(ctx);
             return Err(e);
@@ -176,11 +246,13 @@ impl Demo {
             instance_buffers,
             vector,
             vector_demo,
+            msaa: Msaa::Off,
+            msaa_counts: limits.framebuffer_color_sample_counts,
         };
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
-            demo.triangle = build(ctx, res, shaders, "triangle", SCENE_FORMAT)?;
-            demo.sprites = build(ctx, res, shaders, "sprite", SCENE_FORMAT)?;
+            demo.triangle = build(ctx, res, shaders, "triangle", SCENE_FORMAT, Msaa::Off)?;
+            demo.sprites = build(ctx, res, shaders, "sprite", SCENE_FORMAT, Msaa::Off)?;
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -190,6 +262,65 @@ impl Demo {
                 Err(e)
             }
         }
+    }
+
+    /// Сглаживание, с которым рисуется сцена.
+    pub fn msaa(&self) -> Msaa {
+        self.msaa
+    }
+
+    /// Что получится, если попросить `wanted`: видеокарта может уметь меньше.
+    pub fn msaa_supported(&self, wanted: Msaa) -> Msaa {
+        wanted.supported(self.msaa_counts)
+    }
+
+    /// Пересобирает конвейеры сцены под сглаживание `wanted` (или ближайшее, которое
+    /// умеет видеокарта). Вызывать, когда видеокарта простаивает. Возвращает, что вышло.
+    pub fn set_msaa(
+        &mut self,
+        ctx: &GpuContext,
+        res: &GpuResources,
+        shaders: &ShaderLibrary,
+        wanted: Msaa,
+    ) -> Result<Msaa, GpuError> {
+        let msaa = self.msaa_supported(wanted);
+        if msaa == self.msaa {
+            return Ok(msaa);
+        }
+        let triangle = build(ctx, res, shaders, "triangle", SCENE_FORMAT, msaa)?;
+        let sprites = match build(ctx, res, shaders, "sprite", SCENE_FORMAT, msaa) {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: конвейер только что создан и нигде не используется.
+                unsafe { ctx.device.destroy_pipeline(triangle, None) };
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.vector.set_msaa(ctx, res, shaders, msaa) {
+            // SAFETY: конвейеры только что созданы и нигде не используются.
+            unsafe {
+                ctx.device.destroy_pipeline(triangle, None);
+                ctx.device.destroy_pipeline(sprites, None);
+            }
+            return Err(e);
+        }
+        // SAFETY: видеокарта простаивает (условие функции).
+        unsafe {
+            ctx.device.destroy_pipeline(self.triangle, None);
+            ctx.device.destroy_pipeline(self.sprites, None);
+        }
+        self.triangle = triangle;
+        self.sprites = sprites;
+        self.msaa = msaa;
+        if msaa != wanted {
+            tracing::warn!(
+                "Видеокарта не умеет {}, сглаживание: {}",
+                wanted.title(),
+                msaa.title()
+            );
+        }
+        tracing::info!("Сглаживание сцены: {}", msaa.title());
+        Ok(msaa)
     }
 
     /// Формат картинки, в которую выводится кадр.
@@ -209,7 +340,7 @@ impl Demo {
         if format == self.format {
             return Ok(());
         }
-        let present = build(ctx, res, shaders, "present", format)?;
+        let present = build(ctx, res, shaders, "present", format, Msaa::Off)?;
         // SAFETY: условие функции; null допустим.
         unsafe { ctx.device.destroy_pipeline(self.present, None) };
         self.present = present;
@@ -229,13 +360,13 @@ impl Demo {
     ) {
         self.vector.reload(ctx, res, shaders, names);
         for name in names {
-            let (slot, format) = match name.as_str() {
-                "triangle" => (&mut self.triangle, SCENE_FORMAT),
-                "sprite" => (&mut self.sprites, SCENE_FORMAT),
-                "present" => (&mut self.present, self.format),
+            let (slot, format, msaa) = match name.as_str() {
+                "triangle" => (&mut self.triangle, SCENE_FORMAT, self.msaa),
+                "sprite" => (&mut self.sprites, SCENE_FORMAT, self.msaa),
+                "present" => (&mut self.present, self.format, Msaa::Off),
                 _ => continue,
             };
-            match build(ctx, res, shaders, name, format) {
+            match build(ctx, res, shaders, name, format, msaa) {
                 Ok(new) => {
                     let old = std::mem::replace(slot, new);
                     // SAFETY: видеокарта простаивает (условие функции).
@@ -350,6 +481,7 @@ impl Demo {
         res.write_buffer(buffer, 0, &bytes);
         FrameData {
             scene,
+            msaa: self.msaa,
             vector,
             sprites_address: res.buffer_address(buffer),
             sprite_count: count as u32,
@@ -369,53 +501,60 @@ impl Demo {
         target: ImageHandle,
     ) {
         let scene = graph.create("кадр сцены", frame.extent, SCENE_FORMAT);
+        // Со сглаживанием сцена рисуется в картинку с несколькими точками на пиксель, а в
+        // конце прохода точки усредняются в обычный кадр сцены.
+        let msaa = (frame.msaa != Msaa::Off).then(|| {
+            graph.create_multisampled(
+                "кадр сцены MSAA",
+                frame.extent,
+                SCENE_FORMAT,
+                frame.msaa.samples(),
+            )
+        });
         let layout = bindless.pipeline_layout;
+        let mut uses = vec![(scene, Access::ColorAttachment)];
+        uses.extend(msaa.map(|m| (m, Access::ColorAttachment)));
 
-        graph.add_pass(
-            "сцена",
-            &[(scene, Access::ColorAttachment)],
-            move |p| {
-                let mut triangle_push = [0u8; 8];
-                triangle_push[..4].copy_from_slice(&frame.time.to_ne_bytes());
-                triangle_push[4..].copy_from_slice(&frame.aspect.to_ne_bytes());
-                let mut sprite_push = [0u8; 16];
-                sprite_push[..8].copy_from_slice(&frame.sprites_address.to_ne_bytes());
-                sprite_push[8..12].copy_from_slice(&frame.aspect.to_ne_bytes());
-                let (d, cmd) = (p.device, p.cmd);
-                // SAFETY: граф перевёл картинку сцены в раскладку цели рисования; конвейеры
-                // и буфер спрайтов живы, пока видеокарта рисует этот кадр.
-                unsafe {
-                    begin_color_pass(d, cmd, p.view(scene), p.extent(scene));
-                    bindless.bind(d, cmd);
-                    if frame.scene == DemoScene::Gpu {
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
-                        d.cmd_push_constants(
+        graph.add_pass("сцена", &uses, move |p| {
+            let mut triangle_push = [0u8; 8];
+            triangle_push[..4].copy_from_slice(&frame.time.to_ne_bytes());
+            triangle_push[4..].copy_from_slice(&frame.aspect.to_ne_bytes());
+            let mut sprite_push = [0u8; 16];
+            sprite_push[..8].copy_from_slice(&frame.sprites_address.to_ne_bytes());
+            sprite_push[8..12].copy_from_slice(&frame.aspect.to_ne_bytes());
+            let (d, cmd) = (p.device, p.cmd);
+            // SAFETY: граф перевёл картинку сцены в раскладку цели рисования; конвейеры
+            // и буфер спрайтов живы, пока видеокарта рисует этот кадр.
+            unsafe {
+                match msaa {
+                    Some(m) => {
+                        begin_color_pass_resolved(
+                            d,
                             cmd,
-                            layout,
-                            vk::ShaderStageFlags::ALL,
-                            0,
-                            &triangle_push,
+                            p.view(m),
+                            p.view(scene),
+                            p.extent(scene),
                         );
-                        d.cmd_draw(cmd, 3, 1, 0, 0);
                     }
-                    if let Some(vector) = frame.vector {
-                        self.vector.record(d, cmd, layout, vector);
-                    }
-                    if frame.sprite_count > 0 {
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
-                        d.cmd_push_constants(
-                            cmd,
-                            layout,
-                            vk::ShaderStageFlags::ALL,
-                            0,
-                            &sprite_push,
-                        );
-                        d.cmd_draw(cmd, 6, frame.sprite_count, 0, 0);
-                    }
-                    d.cmd_end_rendering(cmd);
+                    None => begin_color_pass(d, cmd, p.view(scene), p.extent(scene)),
                 }
-            },
-        );
+                bindless.bind(d, cmd);
+                if frame.scene == DemoScene::Gpu {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &triangle_push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                }
+                if let Some(vector) = frame.vector {
+                    self.vector.record(d, cmd, layout, vector);
+                }
+                if frame.sprite_count > 0 {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &sprite_push);
+                    d.cmd_draw(cmd, 6, frame.sprite_count, 0, 0);
+                }
+                d.cmd_end_rendering(cmd);
+            }
+        });
 
         graph.add_pass(
             "вывод",
@@ -461,6 +600,7 @@ fn build(
     shaders: &ShaderLibrary,
     name: &str,
     format: vk::Format,
+    msaa: Msaa,
 ) -> Result<vk::Pipeline, GpuError> {
     let pair = shaders.get(name);
     let blend = if name == "sprite" {
@@ -475,6 +615,7 @@ fn build(
         &pair.fs,
         format,
         blend,
+        msaa.samples(),
     )
 }
 
