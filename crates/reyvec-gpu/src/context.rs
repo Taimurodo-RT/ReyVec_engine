@@ -35,6 +35,8 @@ pub(crate) struct Core {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
     debug: Option<(ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+    /// Включено расширение экземпляра VK_EXT_surface_maintenance1 (нужно для заборов показа).
+    surface_maintenance1: bool,
 }
 
 impl Core {
@@ -55,10 +57,25 @@ impl Core {
         }
 
         let mut extensions: Vec<*const c_char> = Vec::new();
+        let mut surface_maintenance1 = false;
         if let Some(display) = display {
             let required =
                 ash_window::enumerate_required_extensions(display).ctx("расширения для окна")?;
             extensions.extend_from_slice(required);
+            // Необязательные: с ними видеокарта сообщает, когда кадр показан (см. window.rs).
+            // SAFETY: вызов без слоя.
+            let available = unsafe { entry.enumerate_instance_extension_properties(None) }
+                .ctx("расширения экземпляра")?;
+            let has = |name: &CStr| {
+                available
+                    .iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(name))
+            };
+            if has(ext::surface_maintenance1::NAME) && has(khr::get_surface_capabilities2::NAME) {
+                extensions.push(ext::surface_maintenance1::NAME.as_ptr());
+                extensions.push(khr::get_surface_capabilities2::NAME.as_ptr());
+                surface_maintenance1 = true;
+            }
         }
 
         let mut layers: Vec<*const c_char> = Vec::new();
@@ -121,6 +138,7 @@ impl Core {
             entry,
             instance,
             debug,
+            surface_maintenance1,
         })
     }
 
@@ -318,6 +336,8 @@ pub(crate) struct GpuContext {
     pub queue_family: u32,
     pub physical: vk::PhysicalDevice,
     pub adapter: AdapterInfo,
+    /// Видеокарта умеет сообщать забором, что кадр показан (VK_EXT_swapchain_maintenance1).
+    pub present_fences: bool,
     // Последним: уничтожается после устройства.
     pub core: Core,
 }
@@ -333,7 +353,7 @@ impl GpuContext {
         surface: Option<(&khr::surface::Instance, vk::SurfaceKHR)>,
     ) -> Result<Self, Box<(GpuError, Core)>> {
         match Self::create_device(&core, options, surface) {
-            Ok((device, queue, queue_family, physical, adapter)) => {
+            Ok((device, queue, queue_family, physical, adapter, present_fences)) => {
                 let allocator = gpu_allocator::vulkan::Allocator::new(
                     &gpu_allocator::vulkan::AllocatorCreateDesc {
                         instance: core.instance.clone(),
@@ -359,6 +379,7 @@ impl GpuContext {
                     queue_family,
                     physical,
                     adapter,
+                    present_fences,
                     core,
                 })
             }
@@ -371,7 +392,17 @@ impl GpuContext {
         core: &Core,
         options: &GpuOptions,
         surface: Option<(&khr::surface::Instance, vk::SurfaceKHR)>,
-    ) -> Result<(ash::Device, vk::Queue, u32, vk::PhysicalDevice, AdapterInfo), GpuError> {
+    ) -> Result<
+        (
+            ash::Device,
+            vk::Queue,
+            u32,
+            vk::PhysicalDevice,
+            AdapterInfo,
+            bool,
+        ),
+        GpuError,
+    > {
         let adapters = core.adapters(surface)?;
         let infos: Vec<AdapterInfo> = adapters.iter().map(|(_, a, _)| a.clone()).collect();
         for a in &infos {
@@ -397,23 +428,61 @@ impl GpuContext {
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true);
-        let extensions: Vec<*const c_char> = if surface.is_some() {
-            vec![khr::swapchain::NAME.as_ptr()]
-        } else {
-            Vec::new()
-        };
-        let create_info = vk::DeviceCreateInfo::default()
+        let mut extensions: Vec<*const c_char> = Vec::new();
+        let mut present_fences = false;
+        if surface.is_some() {
+            extensions.push(khr::swapchain::NAME.as_ptr());
+            if core.surface_maintenance1 {
+                // SAFETY: physical получен из этого экземпляра.
+                let available = unsafe {
+                    core.instance
+                        .enumerate_device_extension_properties(physical)
+                }
+                .ctx("расширения видеокарты")?;
+                let has_ext = available
+                    .iter()
+                    .any(|e| e.extension_name_as_c_str() == Ok(ext::swapchain_maintenance1::NAME));
+                let mut sm1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+                let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut sm1);
+                // SAFETY: структуры живут до конца вызова.
+                unsafe {
+                    core.instance
+                        .get_physical_device_features2(physical, &mut f2)
+                };
+                present_fences = has_ext && sm1.swapchain_maintenance1 == vk::TRUE;
+                // Для проверки запасного пути (видеокарты без заборов показа) в CI.
+                if std::env::var_os("REYVEC_NO_PRESENT_FENCES").is_some() {
+                    present_fences = false;
+                }
+            }
+            if present_fences {
+                extensions.push(ext::swapchain_maintenance1::NAME.as_ptr());
+            }
+        }
+        let mut sm1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
+            .swapchain_maintenance1(true);
+        let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_extension_names(&extensions)
             .push_next(&mut f12)
             .push_next(&mut f13);
+        if present_fences {
+            create_info = create_info.push_next(&mut sm1);
+        }
 
         // SAFETY: видеокарта проверена в find_problem, все возможности поддерживаются.
         let device = unsafe { core.instance.create_device(physical, &create_info, None) }
             .ctx("создание устройства")?;
         // SAFETY: очередь 0 этого семейства запрошена выше.
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
-        Ok((device, queue, queue_family, physical, adapter))
+        Ok((
+            device,
+            queue,
+            queue_family,
+            physical,
+            adapter,
+            present_fences,
+        ))
     }
 
     pub fn instance(&self) -> &ash::Instance {

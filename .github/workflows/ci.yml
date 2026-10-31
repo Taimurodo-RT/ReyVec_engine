@@ -62,7 +62,7 @@ jobs:
       - name: Install software Vulkan, validation layers, virtual display
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools xvfb libxkbcommon-x11-0
+          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools xvfb xdotool libxkbcommon-x11-0
           vulkaninfo --summary | grep -E "deviceName|apiVersion"
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
@@ -83,6 +83,12 @@ jobs:
           cargo build -p reyvec-sandbox
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --list-gpus
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --seconds 7
+      # Окно всё время меняет размер: swapchain пересоздаётся без остановки видеокарты,
+      # старый удаляется по заборам показа. Второй прогон: запасной путь без заборов.
+      - name: Window resizing with validation (present fences and fallback)
+        run: |
+          xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 5
+          REYVEC_NO_PRESENT_FENCES=1 xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 3
 
   deny:
     name: Licenses and advisories (cargo-deny)

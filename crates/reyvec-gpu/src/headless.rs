@@ -5,7 +5,8 @@ use ash::vk;
 
 use crate::context::{Core, GpuContext, GpuOptions};
 use crate::demo::Demo;
-use crate::pipeline::{color_range, image_barrier};
+use crate::graph::{Access, ImageState, RenderGraph, TransientPool};
+use crate::pipeline::color_range;
 use crate::resources::GpuResources;
 use crate::shaders::ShaderLibrary;
 use crate::{AdapterInfo, GpuError, VkResultExt};
@@ -49,6 +50,7 @@ struct Resources<'a> {
     fence: vk::Fence,
     gpu: Option<GpuResources>,
     demo: Option<Demo>,
+    transients: TransientPool,
 }
 
 impl Drop for Resources<'_> {
@@ -60,6 +62,7 @@ impl Drop for Resources<'_> {
             if let Some(demo) = self.demo.take() {
                 demo.destroy(self.ctx);
             }
+            self.transients.destroy(self.ctx);
             if let Some(gpu) = self.gpu.take() {
                 gpu.destroy(self.ctx);
             }
@@ -104,6 +107,7 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
         fence: vk::Fence::null(),
         gpu: None,
         demo: None,
+        transients: TransientPool::new(),
     };
     let extent = vk::Extent2D { width, height };
     let size = u64::from(width) * u64::from(height) * 4;
@@ -219,73 +223,59 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
         )
         .ctx("запись команд")?;
-        let to_color = [image_barrier(
+        let gpu = r.gpu.as_mut().expect("ресурсы созданы выше");
+        let demo = r.demo.as_ref().expect("сцена создана выше");
+        let data = demo.prepare(gpu, 0, extent, 0.0, false);
+        let gpu = &*gpu;
+        let mut graph = RenderGraph::new();
+        let target = graph.import(
+            "картинка теста",
             r.image,
-            vk::ImageLayout::UNDEFINED,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::PipelineStageFlags2::NONE,
-            vk::AccessFlags2::NONE,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        )];
-        d.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&to_color),
-        );
-        r.demo.as_ref().expect("сцена создана выше").record(
-            ctx,
-            r.gpu.as_mut().expect("ресурсы созданы выше"),
-            cmd,
-            0,
             r.view,
             extent,
-            0.0,
-            false,
+            FORMAT,
+            ImageState::UNDEFINED,
+            None,
         );
-        let to_transfer = [image_barrier(
-            r.image,
-            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            vk::PipelineStageFlags2::COPY,
-            vk::AccessFlags2::TRANSFER_READ,
-        )];
-        d.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().image_memory_barriers(&to_transfer),
-        );
-        let region = vk::BufferImageCopy::default()
-            .image_subresource(
-                vk::ImageSubresourceLayers::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .layer_count(1),
-            )
-            .image_extent(vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            });
-        d.cmd_copy_image_to_buffer(
-            cmd,
-            r.image,
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-            r.buffer,
-            &[region],
-        );
-        let to_host = [vk::BufferMemoryBarrier2::default()
-            .buffer(r.buffer)
-            .size(vk::WHOLE_SIZE)
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-            .dst_access_mask(vk::AccessFlags2::HOST_READ)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
-        d.cmd_pipeline_barrier2(
-            cmd,
-            &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
-        );
+        demo.add_passes(&mut graph, &gpu.bindless, data, target);
+        let buffer = r.buffer;
+        // Последний проход копирует готовую картинку в буфер, который читает процессор.
+        graph.add_pass("чтение", &[(target, Access::TransferSrc)], move |p| {
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+            let to_host = [vk::BufferMemoryBarrier2::default()
+                .buffer(buffer)
+                .size(vk::WHOLE_SIZE)
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
+            // Замыкание внутри общего unsafe-блока функции. Граф перевёл картинку в
+            // раскладку копирования, буфер жив до конца ожидания забора.
+            p.device.cmd_copy_image_to_buffer(
+                p.cmd,
+                p.image(target),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &[region],
+            );
+            p.device.cmd_pipeline_barrier2(
+                p.cmd,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
+            );
+        });
+        graph.execute(ctx, cmd, &mut r.transients, &gpu.bindless, 0)?;
         d.end_command_buffer(cmd).ctx("конец записи команд")?;
 
         let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];

@@ -1,14 +1,16 @@
 //! Сцена песочницы этапа 2: треугольник этапа 1 плюс спрайты с текстурами.
 //!
 //! Показывает, что работают память видеокарты, загрузка текстур, общий список
-//! текстур (bindless) и чтение данных спрайтов из буфера по адресу.
-//! На этапе 2 эту сцену заменит граф рендера, а спрайты станут частью векторного слоя.
+//! текстур (bindless), чтение данных спрайтов из буфера по адресу и граф кадра:
+//! сцена рисуется во временную картинку (проход «сцена»), а потом копируется в окно
+//! (проход «вывод»). Позже спрайты станут частью векторного слоя.
 
 use ash::vk;
 
 use crate::GpuError;
-use crate::bindless::SamplerKind;
+use crate::bindless::{Bindless, SamplerKind};
 use crate::context::GpuContext;
+use crate::graph::{Access, ImageHandle, RenderGraph};
 use crate::pipeline::Blend;
 use crate::pipeline::{begin_color_pass, graphics_pipeline};
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
@@ -28,6 +30,8 @@ pub(crate) struct Sprite {
 }
 
 const SPRITE_SIZE: usize = std::mem::size_of::<Sprite>();
+/// Формат кадра сцены: линейный цвет с запасом точности (для будущих эффектов и HDR).
+pub(crate) const SCENE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const MAX_SPRITES: usize = 64;
 /// Размеры клеток шахматки по очереди, в пикселях текстуры.
 const CHECKER_CELLS: [u32; 3] = [16, 32, 8];
@@ -58,9 +62,22 @@ impl Sprite {
     }
 }
 
+/// Всё, что проходам кадра нужно знать о сцене. Готовится до сборки графа.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameData {
+    sprites_address: vk::DeviceAddress,
+    sprite_count: u32,
+    time: f32,
+    aspect: f32,
+    extent: vk::Extent2D,
+}
+
 pub(crate) struct Demo {
     triangle: vk::Pipeline,
     sprites: vk::Pipeline,
+    /// Копирует кадр сцены в окно; зависит от формата окна.
+    present: vk::Pipeline,
+    /// Формат картинки, в которую выводится кадр (окно или картинка теста).
     format: vk::Format,
     checker: TextureId,
     /// Какой вариант шахматки сейчас загружен (меняется каждые 2 секунды).
@@ -104,6 +121,7 @@ impl Demo {
         let mut demo = Self {
             triangle: vk::Pipeline::null(),
             sprites: vk::Pipeline::null(),
+            present: vk::Pipeline::null(),
             format: vk::Format::UNDEFINED,
             checker,
             checker_phase: 0,
@@ -111,11 +129,28 @@ impl Demo {
             white,
             instance_buffers,
         };
-        demo.set_format(ctx, res, shaders, format)?;
-        Ok(demo)
+        // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
+        let built = (|| {
+            demo.triangle = build(ctx, res, shaders, "triangle", SCENE_FORMAT)?;
+            demo.sprites = build(ctx, res, shaders, "sprite", SCENE_FORMAT)?;
+            demo.set_format(ctx, res, shaders, format)
+        })();
+        match built {
+            Ok(()) => Ok(demo),
+            Err(e) => {
+                demo.destroy_pipelines(ctx);
+                Err(e)
+            }
+        }
     }
 
-    /// Пересобирает конвейеры, если поменялся формат картинки, в которую рисуем.
+    /// Формат картинки, в которую выводится кадр.
+    pub fn output_format(&self) -> vk::Format {
+        self.format
+    }
+
+    /// Пересобирает конвейер вывода, если поменялся формат окна. Вызывать, когда
+    /// видеокарта не использует старый конвейер вывода.
     pub fn set_format(
         &mut self,
         ctx: &GpuContext,
@@ -126,18 +161,10 @@ impl Demo {
         if format == self.format {
             return Ok(());
         }
-        let triangle = build(ctx, res, shaders, "triangle", format)?;
-        let sprites = match build(ctx, res, shaders, "sprite", format) {
-            Ok(p) => p,
-            Err(e) => {
-                // SAFETY: конвейер только что создан и нигде не используется.
-                unsafe { ctx.device.destroy_pipeline(triangle, None) };
-                return Err(e);
-            }
-        };
-        self.destroy_pipelines(ctx);
-        self.triangle = triangle;
-        self.sprites = sprites;
+        let present = build(ctx, res, shaders, "present", format)?;
+        // SAFETY: условие функции; null допустим.
+        unsafe { ctx.device.destroy_pipeline(self.present, None) };
+        self.present = present;
         self.format = format;
         Ok(())
     }
@@ -153,12 +180,13 @@ impl Demo {
         names: &[String],
     ) {
         for name in names {
-            let slot = match name.as_str() {
-                "triangle" => &mut self.triangle,
-                "sprite" => &mut self.sprites,
+            let (slot, format) = match name.as_str() {
+                "triangle" => (&mut self.triangle, SCENE_FORMAT),
+                "sprite" => (&mut self.sprites, SCENE_FORMAT),
+                "present" => (&mut self.present, self.format),
                 _ => continue,
             };
-            match build(ctx, res, shaders, name, self.format) {
+            match build(ctx, res, shaders, name, format) {
                 Ok(new) => {
                     let old = std::mem::replace(slot, new);
                     // SAFETY: видеокарта простаивает (условие функции).
@@ -252,52 +280,87 @@ impl Demo {
         out
     }
 
-    /// Записывает кадр: фон, треугольник, спрайты. `slot`: номер кадра в работе.
-    ///
-    /// # Safety
-    /// `cmd` в состоянии записи; `view` в раскладке `COLOR_ATTACHMENT_OPTIMAL` и жив до
-    /// конца выполнения; буфер спрайтов `slot` видеокарта сейчас не читает.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn record(
+    /// Готовит данные кадра: пишет спрайты в буфер `slot` (номер кадра в работе).
+    /// Буфер `slot` видеокарта в этот момент читать не должна.
+    pub fn prepare(
         &self,
-        ctx: &GpuContext,
         res: &mut GpuResources,
-        cmd: vk::CommandBuffer,
         slot: usize,
-        view: vk::ImageView,
         extent: vk::Extent2D,
         time: f32,
         shader_error: bool,
-    ) {
-        let d = &ctx.device;
+    ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let sprites = self.sprites_at(time, aspect, shader_error);
         let count = sprites.len().min(MAX_SPRITES);
         let bytes: Vec<u8> = sprites[..count].iter().flat_map(|s| s.to_bytes()).collect();
         let buffer = self.instance_buffers[slot];
         res.write_buffer(buffer, 0, &bytes);
-        let address = res.buffer_address(buffer);
-
-        let mut triangle_push = [0u8; 8];
-        triangle_push[..4].copy_from_slice(&time.to_ne_bytes());
-        triangle_push[4..].copy_from_slice(&aspect.to_ne_bytes());
-        let mut sprite_push = [0u8; 16];
-        sprite_push[..8].copy_from_slice(&address.to_ne_bytes());
-        sprite_push[8..12].copy_from_slice(&aspect.to_ne_bytes());
-
-        let layout = res.bindless.pipeline_layout;
-        // SAFETY: условия описаны в контракте функции.
-        unsafe {
-            begin_color_pass(d, cmd, view, extent);
-            res.bindless.bind(d, cmd);
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
-            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &triangle_push);
-            d.cmd_draw(cmd, 3, 1, 0, 0);
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
-            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &sprite_push);
-            d.cmd_draw(cmd, 6, count as u32, 0, 0);
-            d.cmd_end_rendering(cmd);
+        FrameData {
+            sprites_address: res.buffer_address(buffer),
+            sprite_count: count as u32,
+            time,
+            aspect,
+            extent,
         }
+    }
+
+    /// Добавляет в граф проходы сцены: «сцена» рисует фон, треугольник и спрайты во
+    /// временную картинку, «вывод» копирует её в `target`.
+    pub fn add_passes<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        bindless: &'a Bindless,
+        frame: FrameData,
+        target: ImageHandle,
+    ) {
+        let scene = graph.create("кадр сцены", frame.extent, SCENE_FORMAT);
+        let layout = bindless.pipeline_layout;
+
+        graph.add_pass(
+            "сцена",
+            &[(scene, Access::ColorAttachment)],
+            move |p| {
+                let mut triangle_push = [0u8; 8];
+                triangle_push[..4].copy_from_slice(&frame.time.to_ne_bytes());
+                triangle_push[4..].copy_from_slice(&frame.aspect.to_ne_bytes());
+                let mut sprite_push = [0u8; 16];
+                sprite_push[..8].copy_from_slice(&frame.sprites_address.to_ne_bytes());
+                sprite_push[8..12].copy_from_slice(&frame.aspect.to_ne_bytes());
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл картинку сцены в раскладку цели рисования; конвейеры
+                // и буфер спрайтов живы, пока видеокарта рисует этот кадр.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(scene), p.extent(scene));
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &triangle_push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &sprite_push);
+                    d.cmd_draw(cmd, 6, frame.sprite_count, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            },
+        );
+
+        graph.add_pass(
+            "вывод",
+            &[(scene, Access::Sampled), (target, Access::ColorAttachment)],
+            move |p| {
+                let push = p.texture(scene).to_ne_bytes();
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл сцену в чтение, а цель в раскладку рисования.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(target), p.extent(target));
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.present);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            },
+        );
     }
 
     fn destroy_pipelines(&mut self, ctx: &GpuContext) {
@@ -305,9 +368,11 @@ impl Demo {
         unsafe {
             ctx.device.destroy_pipeline(self.triangle, None);
             ctx.device.destroy_pipeline(self.sprites, None);
+            ctx.device.destroy_pipeline(self.present, None);
         }
         self.triangle = vk::Pipeline::null();
         self.sprites = vk::Pipeline::null();
+        self.present = vk::Pipeline::null();
     }
 
     /// Уничтожает конвейеры. Текстуры и буферы уходят вместе с [`GpuResources`].

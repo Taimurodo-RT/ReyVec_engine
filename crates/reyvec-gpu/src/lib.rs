@@ -14,6 +14,7 @@ mod adapter;
 mod bindless;
 mod context;
 mod demo;
+mod graph;
 mod headless;
 mod pipeline;
 mod resources;
