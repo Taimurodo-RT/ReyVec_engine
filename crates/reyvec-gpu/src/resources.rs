@@ -31,6 +31,8 @@ pub enum BufferMemory {
     GpuOnly,
     /// Процессор пишет напрямую, видеокарта читает. Для данных, которые меняются каждый кадр.
     CpuToGpu,
+    /// Видеокарта пишет, процессор читает (снимки кадра, результаты замеров).
+    GpuToCpu,
 }
 
 pub(crate) struct Buffer {
@@ -243,6 +245,17 @@ impl GpuResources {
         if end > offset {
             slice[offset..end].copy_from_slice(&bytes[..end - offset]);
         }
+    }
+
+    /// Читает первые `len` байт буфера, доступного процессору ([`BufferMemory::GpuToCpu`]).
+    /// Видеокарта должна закончить запись в него (кадр с записью закончен).
+    pub fn read_buffer(&self, id: BufferId, len: usize) -> Option<Vec<u8>> {
+        let buffer = self.buffers.get(id.0)?;
+        // gpu-allocator всегда даёт такой памяти HOST_COHERENT: записи видеокарты видны
+        // процессору после ожидания забора, без vkInvalidateMappedMemoryRanges.
+        let slice = buffer.allocation.as_ref()?.mapped_slice()?;
+        let bytes = &slice[..len.min(slice.len())];
+        Some(bytes.to_vec())
     }
 
     /// Загружает данные в буфер [`BufferMemory::GpuOnly`] через временный буфер.
@@ -525,6 +538,7 @@ pub(crate) fn create_buffer(
     let location = match memory {
         BufferMemory::GpuOnly => MemoryLocation::GpuOnly,
         BufferMemory::CpuToGpu => MemoryLocation::CpuToGpu,
+        BufferMemory::GpuToCpu => MemoryLocation::GpuToCpu,
     };
     let allocation = match allocate(ctx, name, requirements, location, true) {
         Ok(a) => a,

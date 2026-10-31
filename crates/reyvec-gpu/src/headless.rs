@@ -12,23 +12,21 @@ use crate::shaders::ShaderLibrary;
 use crate::timing::{GpuFrameTimings, GpuTimer};
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
-const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+/// Картинка в sRGB, как окно: в файле и на экране цвета одинаковые.
+const FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 
-/// Картинка, нарисованная без окна.
-pub struct HeadlessImage {
+/// Картинка кадра: пиксели RGBA по 8 бит в sRGB (как на экране), строка за строкой сверху вниз.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameImage {
     /// Ширина в пикселях.
     pub width: u32,
     /// Высота в пикселях.
     pub height: u32,
-    /// Пиксели RGBA по 8 бит, строка за строкой сверху вниз.
+    /// Пиксели RGBA, `width * height * 4` байт.
     pub rgba: Vec<u8>,
-    /// На какой видеокарте нарисовано.
-    pub adapter: AdapterInfo,
-    /// Сколько видеокарта потратила на кадр (нет, если видеокарта не умеет замерять).
-    pub gpu_timings: Option<GpuFrameTimings>,
 }
 
-impl HeadlessImage {
+impl FrameImage {
     /// Цвет пикселя `(x, y)`, отсчёт от левого верхнего угла.
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * self.width + x) * 4) as usize;
@@ -38,6 +36,35 @@ impl HeadlessImage {
             self.rgba[i + 2],
             self.rgba[i + 3],
         ]
+    }
+}
+
+/// Какой кадр песочницы нарисовать без окна.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadlessScene {
+    /// Размер картинки в пикселях.
+    pub width: u32,
+    pub height: u32,
+    /// Момент времени сцены, секунды с запуска.
+    pub time: f32,
+    /// Нарисовать красную рамку ошибки шейдера.
+    pub shader_error: bool,
+}
+
+/// Кадр, нарисованный без окна.
+pub struct HeadlessImage {
+    /// Сама картинка.
+    pub image: FrameImage,
+    /// На какой видеокарте нарисовано.
+    pub adapter: AdapterInfo,
+    /// Сколько видеокарта потратила на кадр (нет, если видеокарта не умеет замерять).
+    pub gpu_timings: Option<GpuFrameTimings>,
+}
+
+impl HeadlessImage {
+    /// Цвет пикселя `(x, y)`, отсчёт от левого верхнего угла.
+    pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
+        self.image.pixel(x, y)
     }
 }
 
@@ -90,13 +117,31 @@ pub fn render_triangle_headless(
     width: u32,
     height: u32,
 ) -> Result<HeadlessImage, GpuError> {
+    render_headless(
+        options,
+        &HeadlessScene {
+            width,
+            height,
+            time: 0.0,
+            shader_error: false,
+        },
+    )
+}
+
+/// Рисует кадр песочницы без окна: тот же кадр, что в окне, только без панели счётчиков.
+pub fn render_headless(
+    options: &GpuOptions,
+    scene: &HeadlessScene,
+) -> Result<HeadlessImage, GpuError> {
     let core = Core::new(options.validation, None)?;
     let ctx = GpuContext::new(core, options, None).map_err(|failed| failed.0)?;
-    let (rgba, gpu_timings) = render(&ctx, width, height)?;
+    let (rgba, gpu_timings) = render(&ctx, scene)?;
     Ok(HeadlessImage {
-        width,
-        height,
-        rgba,
+        image: FrameImage {
+            width: scene.width,
+            height: scene.height,
+            rgba,
+        },
         adapter: ctx.adapter.clone(),
         gpu_timings,
     })
@@ -104,9 +149,9 @@ pub fn render_triangle_headless(
 
 fn render(
     ctx: &GpuContext,
-    width: u32,
-    height: u32,
+    scene: &HeadlessScene,
 ) -> Result<(Vec<u8>, Option<GpuFrameTimings>), GpuError> {
+    let (width, height) = (scene.width, scene.height);
     let d = &ctx.device;
     let mut r = Resources {
         ctx,
@@ -212,6 +257,10 @@ fn render(
             FORMAT,
             1,
         )?);
+        // Шахматка меняет клетки со временем: загружаем ту, что нужна в момент scene.time.
+        if let (Some(demo), Some(gpu)) = (r.demo.as_mut(), r.gpu.as_mut()) {
+            demo.update(ctx, gpu, scene.time)?;
+        }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
             .create_command_pool(
@@ -239,7 +288,7 @@ fn render(
         .ctx("запись команд")?;
         let gpu = r.gpu.as_mut().expect("ресурсы созданы выше");
         let demo = r.demo.as_ref().expect("сцена создана выше");
-        let data = demo.prepare(gpu, 0, extent, 0.0, false);
+        let data = demo.prepare(gpu, 0, extent, scene.time, scene.shader_error);
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();
         let target = graph.import(
@@ -343,9 +392,17 @@ mod tests {
         let img = render_triangle_headless(&options, 128, 64).expect("рисование без окна");
         eprintln!("Нарисовано на: {}", img.adapter);
 
-        // Угол: фон. UNORM-картинка хранит линейный цвет как есть.
+        // Угол: фон. Картинка в sRGB, как окно: видеокарта перевела линейный цвет в sRGB.
         let corner = img.pixel(0, 0);
-        let expect_bg = crate::CLEAR_COLOR.map(|c| (c * 255.0).round() as u8);
+        let srgb = |c: f32| {
+            if c <= 0.003_130_8 {
+                c * 12.92
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            }
+        };
+        let [r, g, b, a] = crate::CLEAR_COLOR;
+        let expect_bg = [srgb(r), srgb(g), srgb(b), a].map(|c| (c * 255.0).round() as u8);
         for ch in 0..4 {
             assert!(
                 corner[ch].abs_diff(expect_bg[ch]) <= 1,
@@ -378,7 +435,7 @@ mod tests {
         // Справа: круг с оранжевым оттенком.
         let disk = img.pixel(101, 32);
         assert!(
-            disk[0] > 220 && disk[1] > 150 && disk[2] < 100,
+            disk[0] > 220 && disk[1] > 180 && disk[2] < 160,
             "круг {disk:?}"
         );
 

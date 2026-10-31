@@ -11,3 +11,4 @@
 | [0005-license-and-scope.md](0005-license-and-scope.md) | Лицензия, языки, отношения с Forge и Motif |
 | [0006-render-graph.md](0006-render-graph.md) | Граф кадра, временные картинки, пересоздание swapchain без остановки видеокарты |
 | [0007-profiling.md](0007-profiling.md) | Время проходов на видеокарте, Tracy 0.14.1, панель счётчиков egui |
+| [0008-reference-images.md](0008-reference-images.md) | Снимки кадра (F12, `--snapshot`) и проверка по эталонным картинкам |

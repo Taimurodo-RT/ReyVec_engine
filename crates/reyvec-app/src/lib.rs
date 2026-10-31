@@ -6,10 +6,14 @@
 mod app;
 mod logging;
 mod panel;
+pub mod snapshot;
 
 pub use app::{AppConfig, AppError, RunSummary, run};
 pub use logging::{LogGuard, init_logging};
-pub use reyvec_gpu::{AdapterInfo, GpuOptions, list_adapters, validation_error_count};
+pub use reyvec_gpu::{
+    AdapterInfo, FrameImage, GpuOptions, HeadlessImage, HeadlessScene, list_adapters,
+    render_headless, validation_error_count,
+};
 
 /// Название движка.
 pub const ENGINE_NAME: &str = "ReyVec";

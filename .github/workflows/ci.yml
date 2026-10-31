@@ -98,12 +98,28 @@ jobs:
       # ошибка в шейдере не ломает прошлую версию.
       - name: GPU tests (headless scene with validation, shader hot reload)
         run: cargo test -p reyvec-gpu -- --include-ignored
+      # Кадры без окна сравниваются с эталонными картинками (crates/reyvec-app/tests/reference).
+      - name: Frames match reference images
+        run: cargo test -p reyvec-app --test reference -- --include-ignored
+      - name: Upload frames that did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-failures
+          path: target/reference-failures
+          if-no-files-found: ignore
       # 7 секунд: за это время сцена несколько раз загружает новую текстуру и удаляет старую.
       - name: Sandbox window, 7 seconds, validation on
         run: |
           cargo build -p reyvec-sandbox
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --list-gpus
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --seconds 7
+      # Снимки кадра: без окна (--snapshot) и из окна по F12.
+      - name: Frame snapshots (headless and F12 in window)
+        run: |
+          ./target/debug/reyvec-sandbox --snapshot "$RUNNER_TEMP/headless.png" --time 1.5 --size 800x450
+          test -s "$RUNNER_TEMP/headless.png"
+          xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/snapshot-check.sh ./target/debug/reyvec-sandbox
       # Окно всё время меняет размер: swapchain пересоздаётся без остановки видеокарты,
       # старый удаляется по заборам показа. Второй прогон: запасной путь без заборов.
       - name: Window resizing with validation (present fences and fallback)

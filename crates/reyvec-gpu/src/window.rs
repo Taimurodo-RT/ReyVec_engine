@@ -7,9 +7,10 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Core, GpuContext, GpuOptions};
 use crate::demo::Demo;
-use crate::graph::{Access, GraphReport, ImageState, RenderGraph, TransientPool};
+use crate::graph::{Access, GraphReport, ImageHandle, ImageState, RenderGraph, TransientPool};
+use crate::headless::FrameImage;
 use crate::pipeline::color_range;
-use crate::resources::GpuResources;
+use crate::resources::{BufferId, BufferMemory, GpuResources};
 use crate::shaders::ShaderLibrary;
 use crate::timing::{GpuFrameTimings, GpuTimer};
 use crate::ui::{UiFrame, UiRenderer};
@@ -112,6 +113,17 @@ impl PresentFences {
     }
 }
 
+/// Снимок кадра, записанный в команды кадра и ждущий, пока видеокарта его закончит.
+struct PendingSnapshot {
+    /// Ячейка кадра в работе: снимок готов, когда дождались её забора.
+    slot: usize,
+    buffer: BufferId,
+    width: u32,
+    height: u32,
+    /// Картинка окна в порядке BGRA (переставляем в RGBA при чтении).
+    bgra: bool,
+}
+
 struct FrameSync {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
@@ -148,6 +160,11 @@ pub struct WindowRenderer {
     present_fences: PresentFences,
     /// Замер времени проходов на видеокарте (нет, если видеокарта не умеет).
     timer: Option<GpuTimer>,
+    /// Картинки окна можно копировать (нужно для снимков кадра).
+    snapshot_supported: bool,
+    snapshot_requested: bool,
+    snapshot_pending: Option<PendingSnapshot>,
+    snapshot_ready: Option<FrameImage>,
     /// Устройство графа последнего кадра (в лог пишется, когда оно меняется).
     last_graph: Option<GraphReport>,
     /// Сквозной номер кадра, нужен очереди отложенного удаления.
@@ -219,6 +236,10 @@ impl WindowRenderer {
             retired: Vec::new(),
             present_fences: PresentFences::default(),
             timer: None,
+            snapshot_supported: false,
+            snapshot_requested: false,
+            snapshot_pending: None,
+            snapshot_ready: None,
             last_graph: None,
             frame_number: 0,
             swapchain_loader,
@@ -283,6 +304,21 @@ impl WindowRenderer {
         self.last_graph.as_ref()
     }
 
+    /// Попросить снимок кадра: следующий нарисованный кадр (с панелью, как на экране)
+    /// скопируется в память, а через пару кадров его отдаст [`Self::take_snapshot`].
+    /// `false`, если видеокарта не умеет копировать картинки окна.
+    pub fn request_snapshot(&mut self) -> bool {
+        if self.snapshot_supported {
+            self.snapshot_requested = true;
+        }
+        self.snapshot_supported
+    }
+
+    /// Готовый снимок кадра, если он есть (каждый снимок отдаётся один раз).
+    pub fn take_snapshot(&mut self) -> Option<FrameImage> {
+        self.snapshot_ready.take()
+    }
+
     /// Размер картинки окна в пикселях.
     pub fn extent(&self) -> [u32; 2] {
         [self.extent.width, self.extent.height]
@@ -343,6 +379,28 @@ impl WindowRenderer {
         }
         if let Some(timer) = self.timer.as_mut() {
             timer.begin_frame(&self.ctx, self.frame_index)?;
+        }
+        if self
+            .snapshot_pending
+            .as_ref()
+            .is_some_and(|p| p.slot == self.frame_index)
+            && let (Some(p), Some(res)) = (self.snapshot_pending.take(), self.resources.as_mut())
+        {
+            // Кадр со снимком закончен (его забор дождались выше): читаем пиксели.
+            let len = (p.width * p.height * 4) as usize;
+            if let Some(mut rgba) = res.read_buffer(p.buffer, len) {
+                if p.bgra {
+                    for px in rgba.chunks_exact_mut(4) {
+                        px.swap(0, 2);
+                    }
+                }
+                self.snapshot_ready = Some(FrameImage {
+                    width: p.width,
+                    height: p.height,
+                    rgba,
+                });
+            }
+            res.destroy_buffer(p.buffer);
         }
         // Забор этой ячейки дождались, значит кадр, что был в ней раньше, закончен.
         let completed = self.frame_number.checked_sub(FRAMES_IN_FLIGHT as u64);
@@ -430,6 +488,32 @@ impl WindowRenderer {
                     }
                     _ => None,
                 };
+                let snapshot = if self.snapshot_requested
+                    && self.snapshot_pending.is_none()
+                    && self.snapshot_supported
+                {
+                    self.snapshot_requested = false;
+                    let id = res.create_buffer(
+                        &self.ctx,
+                        u64::from(extent.width) * u64::from(extent.height) * 4,
+                        vk::BufferUsageFlags::TRANSFER_DST,
+                        BufferMemory::GpuToCpu,
+                        "снимок кадра",
+                    )?;
+                    self.snapshot_pending = Some(PendingSnapshot {
+                        slot: self.frame_index,
+                        buffer: id,
+                        width: extent.width,
+                        height: extent.height,
+                        bgra: matches!(
+                            self.format.format,
+                            vk::Format::B8G8R8A8_SRGB | vk::Format::B8G8R8A8_UNORM
+                        ),
+                    });
+                    res.buffer_raw(id)
+                } else {
+                    None
+                };
                 let res = &*res;
                 let mut graph = RenderGraph::new();
                 // Картинку окна только что выдал acquire: содержимого нет, рисовать в неё
@@ -450,6 +534,9 @@ impl WindowRenderer {
                 demo.add_passes(&mut graph, &res.bindless, data, target);
                 if let (Some(data), Some(renderer)) = (ui_data, self.ui.as_ref()) {
                     renderer.add_pass(&mut graph, &res.bindless, data, target);
+                }
+                if let Some(buffer) = snapshot {
+                    add_snapshot_pass(&mut graph, target, buffer);
                 }
                 let report = graph.execute(
                     &self.ctx,
@@ -587,6 +674,15 @@ impl WindowRenderer {
             )
         };
         let extent = choose_extent(&caps, size);
+        // Копирование из картинок окна нужно только для снимков кадра.
+        self.snapshot_supported = caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_SRC);
+        let usage = if self.snapshot_supported {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
+        } else {
+            vk::ImageUsageFlags::COLOR_ATTACHMENT
+        };
         if extent.width == 0 || extent.height == 0 {
             return Ok(false);
         }
@@ -608,7 +704,7 @@ impl WindowRenderer {
             .image_color_space(format.color_space)
             .image_extent(extent)
             .image_array_layers(1)
-            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .image_usage(usage)
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -815,6 +911,48 @@ impl Drop for WindowRenderer {
         }
         // Дальше Rust сам уничтожит ctx (устройство и экземпляр), а затем отпустит окно.
     }
+}
+
+/// Проход «снимок»: копирует готовую картинку окна в `buffer`, доступный процессору.
+fn add_snapshot_pass(graph: &mut RenderGraph<'_>, target: ImageHandle, buffer: vk::Buffer) {
+    graph.add_pass("снимок", &[(target, Access::TransferSrc)], move |p| {
+        let extent = p.extent(target);
+        let region = vk::BufferImageCopy::default()
+            .image_subresource(
+                vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .layer_count(1),
+            )
+            .image_extent(vk::Extent3D {
+                width: extent.width,
+                height: extent.height,
+                depth: 1,
+            });
+        let to_host = [vk::BufferMemoryBarrier2::default()
+            .buffer(buffer)
+            .size(vk::WHOLE_SIZE)
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+            .dst_access_mask(vk::AccessFlags2::HOST_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
+        // SAFETY: граф перевёл картинку окна в раскладку копирования; буфер живёт, пока
+        // кадр не закончен (его удаляют только после чтения).
+        unsafe {
+            p.device.cmd_copy_image_to_buffer(
+                p.cmd,
+                p.image(target),
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                buffer,
+                &[region],
+            );
+            p.device.cmd_pipeline_barrier2(
+                p.cmd,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
+            );
+        }
+    });
 }
 
 /// Уничтожает объекты старого swapchain.

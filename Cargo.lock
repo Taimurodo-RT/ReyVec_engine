@@ -1859,6 +1859,7 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui-winit",
+ "png",
  "reyvec-gpu",
  "thiserror 2.0.21",
  "tracing",
