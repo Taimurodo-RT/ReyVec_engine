@@ -13,6 +13,8 @@
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
+//! - `--snapshot <файл.png>`: нарисовать кадр без окна и сохранить его в файл
+//!   (`--time <S>`: момент сцены, `--size <ШxВ>`: размер, по умолчанию 1280x720);
 //! - `--version`: показать версию.
 
 use std::process::ExitCode;
@@ -32,10 +34,14 @@ const HELP: &str = "\
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
   --seconds <S>          закрыть окно через S секунд
+  --snapshot <файл.png>  без окна: нарисовать кадр и сохранить в PNG
+  --time <S>             для --snapshot: момент сцены в секундах (по умолчанию 0)
+  --size <ШxВ>           для --snapshot: размер картинки (по умолчанию 1280x720)
   --version, -V          версия
   --help, -h             эта справка
 
-В окне: Esc закрывает окно, F1 прячет и показывает панель счётчиков.";
+В окне: Esc закрывает окно, F1 прячет и показывает панель счётчиков,
+F12 сохраняет снимок кадра в папку snapshots рядом с программой.";
 
 #[derive(Debug, Default, PartialEq)]
 struct Args {
@@ -49,6 +55,9 @@ struct Args {
     validation: bool,
     frames: Option<u64>,
     seconds: Option<f64>,
+    snapshot: Option<String>,
+    time: Option<f32>,
+    size: Option<(u32, u32)>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -79,10 +88,81 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                         .ok_or_else(|| format!("--seconds: «{n}» не число"))?,
                 );
             }
+            "--snapshot" => {
+                out.snapshot = Some(it.next().ok_or("после --snapshot нужно имя файла")?);
+            }
+            "--time" => {
+                let n = it.next().ok_or("после --time нужно число")?;
+                out.time = Some(
+                    n.parse()
+                        .ok()
+                        .filter(|t: &f32| t.is_finite() && *t >= 0.0)
+                        .ok_or_else(|| format!("--time: «{n}» не число"))?,
+                );
+            }
+            "--size" => {
+                let n = it
+                    .next()
+                    .ok_or("после --size нужен размер, например 1280x720")?;
+                out.size =
+                    Some(parse_size(&n).ok_or_else(|| {
+                        format!("--size: «{n}» не размер (нужно вроде 1280x720)")
+                    })?);
+            }
             other => return Err(format!("неизвестный флаг «{other}». Справка: --help")),
         }
     }
     Ok(out)
+}
+
+/// «1280x720» (или с русской «х», или «×») в ширину и высоту, от 1 до 8192.
+fn parse_size(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.split_once(['x', 'X', 'х', 'Х', '×'])?;
+    let ok = |v: u32| (1..=8192).contains(&v).then_some(v);
+    Some((ok(w.trim().parse().ok()?)?, ok(h.trim().parse().ok()?)?))
+}
+
+/// Рисует кадр без окна и сохраняет его в `path`.
+fn snapshot_headless(path: &str, args: &Args, validation: bool) -> ExitCode {
+    let (width, height) = args.size.unwrap_or((1280, 720));
+    let scene = reyvec_app::HeadlessScene {
+        width,
+        height,
+        time: args.time.unwrap_or(0.0),
+        shader_error: false,
+    };
+    let options = reyvec_app::GpuOptions {
+        validation,
+        gpu: args.gpu.clone(),
+    };
+    let image = match reyvec_app::render_headless(&options, &scene) {
+        Ok(img) => img,
+        Err(e) => {
+            tracing::error!("Не удалось нарисовать кадр без окна: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = reyvec_app::snapshot::save_png(std::path::Path::new(path), &image.image) {
+        tracing::error!("Снимок не сохранён: {e}");
+        return ExitCode::FAILURE;
+    }
+    tracing::info!(
+        "Кадр {width}×{height} (момент {:.2} с) нарисован без окна на «{}» и сохранён: {path}",
+        scene.time,
+        image.adapter.name
+    );
+    if let Some(t) = &image.gpu_timings {
+        tracing::info!("Видеокарта на кадр: {}", t.describe());
+    }
+    let errors = reyvec_app::validation_error_count();
+    if errors > 0 {
+        tracing::error!("Слои валидации нашли ошибок: {errors}. Пришлите reyvec.log");
+        return ExitCode::FAILURE;
+    }
+    if validation {
+        tracing::info!("Ошибок валидации Vulkan: 0");
+    }
+    ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
@@ -129,6 +209,9 @@ fn main() -> ExitCode {
 
     // В отладочной сборке валидация включена всегда: так ошибки ловятся сразу.
     let validation = args.validation || cfg!(debug_assertions);
+    if let Some(path) = &args.snapshot {
+        return snapshot_headless(path, &args, validation);
+    }
     let config = reyvec_app::AppConfig {
         title: reyvec_app::engine_title(),
         gpu: reyvec_app::GpuOptions {
@@ -195,6 +278,18 @@ mod tests {
         assert_eq!(a.gpu.as_deref(), Some("radeon"));
         assert!(a.no_vsync && a.no_hot_reload && a.validation);
         assert_eq!(a.frames, Some(120));
+    }
+
+    #[test]
+    fn snapshot_args() {
+        let a = parse("--snapshot out/кадр.png --time 2.5 --size 640x360").unwrap();
+        assert_eq!(a.snapshot.as_deref(), Some("out/кадр.png"));
+        assert_eq!(a.time, Some(2.5));
+        assert_eq!(a.size, Some((640, 360)));
+        assert_eq!(parse_size("1920х1080"), Some((1920, 1080)));
+        assert_eq!(parse_size("0x10"), None);
+        assert!(parse("--size big").is_err());
+        assert!(parse("--time -1").is_err());
     }
 
     #[test]

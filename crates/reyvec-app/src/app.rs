@@ -79,6 +79,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         window: None,
         renderer: None,
         panel: None,
+        last_snapshot: None,
+        saving: Vec::new(),
         error: None,
         start: Instant::now(),
         frames: 0,
@@ -91,6 +93,9 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
     event_loop
         .run_app(&mut app)
         .map_err(|e| AppError::Window(e.to_string()))?;
+    for handle in app.saving.drain(..) {
+        let _ = handle.join();
+    }
     if let Some(e) = app.error.take() {
         return Err(e);
     }
@@ -114,6 +119,10 @@ struct App {
     renderer: Option<WindowRenderer>,
     panel: Option<Panel>,
     window: Option<Arc<Window>>,
+    /// Имя файла последнего снимка кадра (для панели).
+    last_snapshot: Option<String>,
+    /// Потоки, которые пишут снимки: перед выходом ждём их, иначе файл оборвётся.
+    saving: Vec<std::thread::JoinHandle<()>>,
     error: Option<AppError>,
     start: Instant,
     frames: u64,
@@ -208,12 +217,19 @@ impl App {
                 validation_errors: reyvec_gpu::validation_error_count(),
                 hot_reload: renderer.shaders_hot_reload(),
                 shader_error: renderer.shader_error(),
+                last_snapshot: self.last_snapshot.as_deref(),
             };
             panel.frame(window, &info)
         });
         match renderer.render([size.width, size.height], time, ui) {
             Ok(FrameStatus::Presented) => {
                 self.frames += 1;
+                if let Some(image) = renderer.take_snapshot()
+                    && let Some((name, handle)) = save_snapshot(image)
+                {
+                    self.last_snapshot = Some(name);
+                    self.saving.push(handle);
+                }
                 if let Some(client) = tracy_client::Client::running() {
                     client.frame_mark();
                 }
@@ -292,6 +308,24 @@ impl ApplicationHandler for App {
             } => {
                 if let Some(panel) = self.panel.as_mut() {
                     panel.toggle();
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F12),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut()
+                    && !r.request_snapshot()
+                {
+                    tracing::warn!(
+                        "Эта видеокарта не умеет копировать картинку окна: снимка не будет"
+                    );
                 }
             }
             WindowEvent::Resized(size) => {
@@ -393,6 +427,33 @@ fn format_title(
 ) -> String {
     let gpu = gpu_ms.map_or(String::new(), |g| format!(", видеокарта {g:.2} мс"));
     format!("{base} | {adapter} | {fps:.0} FPS, {ms:.2} мс{gpu} | {mode}")
+}
+
+/// Сохраняет снимок кадра в `snapshots` рядом с программой. PNG пишется в отдельном потоке,
+/// чтобы не задерживать кадры. Возвращает имя файла.
+fn save_snapshot(image: reyvec_gpu::FrameImage) -> Option<(String, std::thread::JoinHandle<()>)> {
+    let dir = crate::snapshot::snapshot_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::error!("Снимок кадра: не создать папку {}: {e}", dir.display());
+        return None;
+    }
+    let path = crate::snapshot::next_snapshot_path(&dir);
+    // Занимаем имя сразу, чтобы следующий снимок не выбрал его, пока этот пишется.
+    if let Err(e) = std::fs::File::create(&path) {
+        tracing::error!("Снимок кадра: {}: {e}", path.display());
+        return None;
+    }
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    let handle = std::thread::spawn(move || match crate::snapshot::save_png(&path, &image) {
+        Ok(()) => tracing::info!(
+            "Снимок кадра {}×{} сохранён: {}",
+            image.width,
+            image.height,
+            path.display()
+        ),
+        Err(e) => tracing::error!("Снимок кадра не сохранён: {e}"),
+    });
+    Some((name, handle))
 }
 
 #[cfg(test)]

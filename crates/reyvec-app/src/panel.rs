@@ -27,6 +27,8 @@ pub(crate) struct PanelInfo<'a> {
     pub validation_errors: u32,
     pub hot_reload: bool,
     pub shader_error: Option<String>,
+    /// Имя файла последнего снимка кадра.
+    pub last_snapshot: Option<&'a str>,
 }
 
 pub(crate) struct Panel {
@@ -163,7 +165,10 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         }
         None => {}
     }
-    ui.label(RichText::new("F1 прячет панель").weak());
+    if let Some(name) = info.last_snapshot {
+        ui.label(mono(format!("Снимок: {name}")));
+    }
+    ui.label(RichText::new("F1 прячет панель, F12 снимок кадра").weak());
 }
 
 /// Зелёный, пока видеокарта укладывается в бюджет с запасом, жёлтый у края, красный сверх.
@@ -274,6 +279,7 @@ mod tests {
             validation_errors: 0,
             hot_reload: true,
             shader_error: None,
+            last_snapshot: Some("кадр-001.png"),
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {
