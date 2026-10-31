@@ -5,10 +5,11 @@
 //!
 //! - [`list_adapters`] перечисляет видеокарты и объясняет, почему какая-то не подходит;
 //! - [`WindowRenderer`] рисует кадры в окно (этап 1: вращающийся треугольник);
-//! - [`render_triangle_headless`] рисует тот же кадр без окна, для автотестов.
+//! - [`render_headless`] рисует тот же кадр без окна, для автотестов;
+//! - [`DemoScene`]: какую сцену песочницы рисовать (этап 2 или векторы этапа 3).
 //!
 //! Требования к видеокарте: Vulkan 1.3 с `dynamicRendering`, `synchronization2`,
-//! индексированием дескрипторов и адресами буферов (см. `docs/decisions/0001-stack.md`).
+//! индексированием дескрипторов, адресами буферов и `multiDrawIndirect` (см. `docs/decisions/0001-stack.md`).
 
 #[doc(hidden)]
 pub use tracy_client as __tracy;
@@ -31,6 +32,7 @@ mod adapter;
 mod bindless;
 mod context;
 mod demo;
+mod demo_vector;
 mod graph;
 mod headless;
 mod pipeline;
@@ -39,11 +41,13 @@ mod shaders;
 mod slangc;
 mod timing;
 mod ui;
+mod vector;
 mod window;
 
 pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
 pub use bindless::{MAX_TEXTURES, SamplerKind};
 pub use context::{GpuOptions, list_adapters, validation_error_count};
+pub use demo::DemoScene;
 pub use graph::GraphReport;
 pub use headless::{
     FrameImage, HeadlessImage, HeadlessScene, render_headless, render_triangle_headless,

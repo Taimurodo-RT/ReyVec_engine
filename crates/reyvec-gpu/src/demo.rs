@@ -1,4 +1,9 @@
-//! Сцена песочницы этапа 2: треугольник этапа 1 плюс спрайты с текстурами.
+//! Сцены песочницы. Их две, переключаются клавишами 1 и 2 ([`DemoScene`]):
+//!
+//! - «GPU-фундамент» (этап 2): треугольник этапа 1 плюс спрайты с текстурами;
+//! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`.
+//!
+//! Про сцену этапа 2.
 //!
 //! Показывает, что работают память видеокарты, загрузка текстур, общий список
 //! текстур (bindless), чтение данных спрайтов из буфера по адресу и граф кадра:
@@ -10,11 +15,42 @@ use ash::vk;
 use crate::GpuError;
 use crate::bindless::{Bindless, SamplerKind};
 use crate::context::GpuContext;
+use crate::demo_vector::VectorDemo;
 use crate::graph::{Access, ImageHandle, RenderGraph};
 use crate::pipeline::Blend;
 use crate::pipeline::{begin_color_pass, graphics_pipeline};
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
+use crate::vector::{VectorData, VectorRenderer};
+
+/// Какую сцену песочницы рисовать.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DemoScene {
+    /// Этап 2: треугольник и спрайты с текстурами.
+    Gpu,
+    /// Этап 3: векторные фигуры.
+    #[default]
+    Vector,
+}
+
+impl DemoScene {
+    /// Название для панели и лога.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Gpu => "GPU-фундамент",
+            Self::Vector => "векторы",
+        }
+    }
+
+    /// Сцена по имени из командной строки: `gpu` или `vector`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "gpu" => Some(Self::Gpu),
+            "vector" => Some(Self::Vector),
+            _ => None,
+        }
+    }
+}
 
 /// Данные одного спрайта. Раскладка совпадает со структурой `Sprite` в `sprite.vert` (std430).
 #[repr(C)]
@@ -65,6 +101,8 @@ impl Sprite {
 /// Всё, что проходам кадра нужно знать о сцене. Готовится до сборки графа.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameData {
+    scene: DemoScene,
+    vector: Option<VectorData>,
     sprites_address: vk::DeviceAddress,
     sprite_count: u32,
     time: f32,
@@ -88,6 +126,8 @@ pub(crate) struct Demo {
     /// Свой буфер спрайтов на каждый кадр в работе: пока видеокарта читает один,
     /// процессор пишет в другой.
     instance_buffers: Vec<BufferId>,
+    vector: VectorRenderer,
+    vector_demo: VectorDemo,
 }
 
 impl Demo {
@@ -118,6 +158,12 @@ impl Demo {
                 &format!("спрайты кадра {i}"),
             )?);
         }
+        let vector_demo = VectorDemo::new();
+        let mut vector = VectorRenderer::new(ctx, res, shaders, frames_in_flight)?;
+        if let Err(e) = vector.upload(ctx, res, &vector_demo.library) {
+            vector.destroy(ctx);
+            return Err(e);
+        }
         let mut demo = Self {
             triangle: vk::Pipeline::null(),
             sprites: vk::Pipeline::null(),
@@ -128,6 +174,8 @@ impl Demo {
             disk,
             white,
             instance_buffers,
+            vector,
+            vector_demo,
         };
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
@@ -179,6 +227,7 @@ impl Demo {
         shaders: &mut ShaderLibrary,
         names: &[String],
     ) {
+        self.vector.reload(ctx, res, shaders, names);
         for name in names {
             let (slot, format) = match name.as_str() {
                 "triangle" => (&mut self.triangle, SCENE_FORMAT),
@@ -220,8 +269,25 @@ impl Demo {
     }
 
     /// Спрайты сцены в момент `time` (секунды). `shader_error`: обвести окно красной рамкой.
-    pub fn sprites_at(&self, time: f32, aspect: f32, shader_error: bool) -> Vec<Sprite> {
+    /// В векторной сцене спрайты нужны только для рамки.
+    pub fn sprites_at(
+        &self,
+        scene: DemoScene,
+        time: f32,
+        aspect: f32,
+        shader_error: bool,
+    ) -> Vec<Sprite> {
         let mut out = Vec::with_capacity(6 + ORBITERS);
+        if scene == DemoScene::Gpu {
+            self.stage2_sprites(time, &mut out);
+        }
+        if shader_error {
+            error_frame(aspect, self.white, &mut out);
+        }
+        out
+    }
+
+    fn stage2_sprites(&self, time: f32, out: &mut Vec<Sprite>) {
         out.push(Sprite {
             pos: [-1.15, 0.0],
             size: [0.7, 0.7],
@@ -255,48 +321,36 @@ impl Demo {
                 pad: 0,
             });
         }
-        if shader_error {
-            // Рамка по краю окна: слева, справа, сверху, снизу.
-            let w = 0.03;
-            let red = [1.0, 0.05, 0.05, 1.0];
-            let bars = [
-                ([-aspect + w / 2.0, 0.0], [w, 2.0]),
-                ([aspect - w / 2.0, 0.0], [w, 2.0]),
-                ([0.0, 1.0 - w / 2.0], [2.0 * aspect, w]),
-                ([0.0, -1.0 + w / 2.0], [2.0 * aspect, w]),
-            ];
-            for (pos, size) in bars {
-                out.push(Sprite {
-                    pos,
-                    size,
-                    tint: red,
-                    rotation: 0.0,
-                    texture: self.white.0,
-                    sampler: SamplerKind::Nearest as u32,
-                    pad: 0,
-                });
-            }
-        }
-        out
     }
 
     /// Готовит данные кадра: пишет спрайты в буфер `slot` (номер кадра в работе).
     /// Буфер `slot` видеокарта в этот момент читать не должна.
     pub fn prepare(
-        &self,
+        &mut self,
         res: &mut GpuResources,
         slot: usize,
         extent: vk::Extent2D,
         time: f32,
         shader_error: bool,
+        scene: DemoScene,
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
-        let sprites = self.sprites_at(time, aspect, shader_error);
+        let vector = match scene {
+            DemoScene::Vector => {
+                let _zone = crate::cpu_zone!("векторные фигуры");
+                let instances = self.vector_demo.instances(time);
+                self.vector.prepare(res, slot, &instances, aspect)
+            }
+            DemoScene::Gpu => None,
+        };
+        let sprites = self.sprites_at(scene, time, aspect, shader_error);
         let count = sprites.len().min(MAX_SPRITES);
         let bytes: Vec<u8> = sprites[..count].iter().flat_map(|s| s.to_bytes()).collect();
         let buffer = self.instance_buffers[slot];
         res.write_buffer(buffer, 0, &bytes);
         FrameData {
+            scene,
+            vector,
             sprites_address: res.buffer_address(buffer),
             sprite_count: count as u32,
             time,
@@ -333,12 +387,31 @@ impl Demo {
                 unsafe {
                     begin_color_pass(d, cmd, p.view(scene), p.extent(scene));
                     bindless.bind(d, cmd);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
-                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &triangle_push);
-                    d.cmd_draw(cmd, 3, 1, 0, 0);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
-                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &sprite_push);
-                    d.cmd_draw(cmd, 6, frame.sprite_count, 0, 0);
+                    if frame.scene == DemoScene::Gpu {
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.triangle);
+                        d.cmd_push_constants(
+                            cmd,
+                            layout,
+                            vk::ShaderStageFlags::ALL,
+                            0,
+                            &triangle_push,
+                        );
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                    }
+                    if let Some(vector) = frame.vector {
+                        self.vector.record(d, cmd, layout, vector);
+                    }
+                    if frame.sprite_count > 0 {
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
+                        d.cmd_push_constants(
+                            cmd,
+                            layout,
+                            vk::ShaderStageFlags::ALL,
+                            0,
+                            &sprite_push,
+                        );
+                        d.cmd_draw(cmd, 6, frame.sprite_count, 0, 0);
+                    }
                     d.cmd_end_rendering(cmd);
                 }
             },
@@ -373,6 +446,7 @@ impl Demo {
         self.triangle = vk::Pipeline::null();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
+        self.vector.destroy(ctx);
     }
 
     /// Уничтожает конвейеры. Текстуры и буферы уходят вместе с [`GpuResources`].
@@ -437,6 +511,29 @@ pub(crate) fn disk_pixels(size: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Красная рамка по краю окна (ошибка шейдера): слева, справа, сверху, снизу.
+fn error_frame(aspect: f32, white: TextureId, out: &mut Vec<Sprite>) {
+    let w = 0.03;
+    let red = [1.0, 0.05, 0.05, 1.0];
+    let bars = [
+        ([-aspect + w / 2.0, 0.0], [w, 2.0]),
+        ([aspect - w / 2.0, 0.0], [w, 2.0]),
+        ([0.0, 1.0 - w / 2.0], [2.0 * aspect, w]),
+        ([0.0, -1.0 + w / 2.0], [2.0 * aspect, w]),
+    ];
+    for (pos, size) in bars {
+        out.push(Sprite {
+            pos,
+            size,
+            tint: red,
+            rotation: 0.0,
+            texture: white.0,
+            sampler: SamplerKind::Nearest as u32,
+            pad: 0,
+        });
+    }
 }
 
 fn hue_to_rgb(h: f32) -> [f32; 3] {

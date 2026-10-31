@@ -1,7 +1,7 @@
 //! Песочница ReyVec: программа, которую запускают для проверки каждого этапа.
 //!
-//! Окно с тестовой сценой: треугольник и спрайты с текстурами, FPS в заголовке,
-//! панель счётчиков (F1 прячет).
+//! Окно с тестовыми сценами (клавиши 1 и 2): треугольник и спрайты с текстурами
+//! (этап 2) и векторные фигуры (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
 //! Шейдеры можно править на ходу: после сохранения файла картинка обновится.
 //!
 //! Флаги:
@@ -10,6 +10,7 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
+//! - `--scene gpu|vector`: с какой сцены начать (по умолчанию `vector`);
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
@@ -31,6 +32,7 @@ const HELP: &str = "\
   --no-vsync             без вертикальной синхронизации
   --no-hot-reload        не перезагружать шейдеры после сохранения файлов
   --no-tracy             не включать замеры для программы Tracy
+  --scene <gpu|vector>   с какой сцены начать: gpu (этап 2) или vector (векторы, по умолчанию)
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
   --seconds <S>          закрыть окно через S секунд
@@ -40,7 +42,7 @@ const HELP: &str = "\
   --version, -V          версия
   --help, -h             эта справка
 
-В окне: Esc закрывает окно, F1 прячет и показывает панель счётчиков,
+В окне: Esc закрывает окно, 1 и 2 переключают сцену, F1 прячет и показывает панель счётчиков,
 F12 сохраняет снимок кадра в папку snapshots рядом с программой.";
 
 #[derive(Debug, Default, PartialEq)]
@@ -58,6 +60,7 @@ struct Args {
     snapshot: Option<String>,
     time: Option<f32>,
     size: Option<(u32, u32)>,
+    scene: Option<reyvec_app::DemoScene>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -86,6 +89,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                         .ok()
                         .filter(|s: &f64| s.is_finite() && *s >= 0.0)
                         .ok_or_else(|| format!("--seconds: «{n}» не число"))?,
+                );
+            }
+            "--scene" => {
+                let n = it.next().ok_or("после --scene нужно gpu или vector")?;
+                out.scene = Some(
+                    reyvec_app::DemoScene::from_name(&n)
+                        .ok_or_else(|| format!("--scene: «{n}», а нужно gpu или vector"))?,
                 );
             }
             "--snapshot" => {
@@ -130,6 +140,7 @@ fn snapshot_headless(path: &str, args: &Args, validation: bool) -> ExitCode {
         height,
         time: args.time.unwrap_or(0.0),
         shader_error: false,
+        scene: args.scene.unwrap_or_default(),
     };
     let options = reyvec_app::GpuOptions {
         validation,
@@ -224,6 +235,7 @@ fn main() -> ExitCode {
         vsync: !args.no_vsync,
         hot_reload: !args.no_hot_reload,
         tracy: !args.no_tracy,
+        scene: args.scene.unwrap_or_default(),
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
@@ -293,6 +305,21 @@ mod tests {
         assert_eq!(parse_size("0x10"), None);
         assert!(parse("--size big").is_err());
         assert!(parse("--time -1").is_err());
+    }
+
+    #[test]
+    fn scene_arg() {
+        assert_eq!(parse("").unwrap().scene, None);
+        assert_eq!(
+            parse("--scene gpu").unwrap().scene,
+            Some(reyvec_app::DemoScene::Gpu)
+        );
+        assert_eq!(
+            parse("--scene vector").unwrap().scene,
+            Some(reyvec_app::DemoScene::Vector)
+        );
+        assert!(parse("--scene 3d").is_err());
+        assert!(parse("--scene").is_err());
     }
 
     #[test]

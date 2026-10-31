@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 reyvec-app = { path = "crates/reyvec-app" }
 reyvec-gpu = { path = "crates/reyvec-gpu" }
+reyvec-vector = { path = "crates/reyvec-vector" }
 ash = "0.38"
 ash-window = "0.13"
 notify = "8"
@@ -20,6 +21,9 @@ png = "0.18"
 # Панель отладки. Без буфера обмена и ссылок: панели они не нужны, а тянут много зависимостей.
 egui = { version = "0.37", default-features = false }
 egui-winit = { version = "0.37", default-features = false, features = ["x11", "wayland"] }
+# Векторы: контуры и кривые (kurbo), разбиение фигур на треугольники (lyon).
+kurbo = "0.13"
+lyon_tessellation = "1.0"
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 raw-window-handle = "0.6"
 thiserror = "2"

@@ -160,6 +160,8 @@ pub(crate) struct AdapterProbe {
     pub synchronization2: bool,
     pub descriptor_indexing: bool,
     pub buffer_device_address: bool,
+    /// Много команд рисования одной командой (векторный слой).
+    pub multi_draw_indirect: bool,
     pub has_graphics_queue: bool,
     pub can_present: Option<bool>,
     pub has_swapchain_ext: bool,
@@ -188,6 +190,9 @@ pub(crate) fn find_problem(p: &AdapterProbe) -> Option<String> {
     }
     if !p.buffer_device_address {
         missing.push("bufferDeviceAddress");
+    }
+    if !p.multi_draw_indirect {
+        missing.push("multiDrawIndirect");
     }
     if !p.has_graphics_queue {
         missing.push("очередь графики");
@@ -287,6 +292,7 @@ mod tests {
             synchronization2: true,
             descriptor_indexing: true,
             buffer_device_address: true,
+            multi_draw_indirect: true,
             has_graphics_queue: true,
             can_present: Some(true),
             has_swapchain_ext: true,

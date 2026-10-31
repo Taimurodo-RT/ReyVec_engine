@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reyvec_gpu::{
-    FrameStatus, GpuError, GpuFrameTimings, GpuOptions, GpuTimingAverage, RendererOptions,
-    WindowRenderer,
+    DemoScene, FrameStatus, GpuError, GpuFrameTimings, GpuOptions, GpuTimingAverage,
+    RendererOptions, WindowRenderer,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::panel::{Panel, PanelInfo};
@@ -32,6 +32,8 @@ pub struct AppConfig {
     pub hot_reload: bool,
     /// Включить замеры для Tracy: программа Tracy сможет подключиться к движку.
     pub tracy: bool,
+    /// С какой сцены песочницы начать (клавиши 1 и 2 переключают).
+    pub scene: DemoScene,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -187,6 +189,8 @@ impl App {
         tracing::info!("Панель счётчиков: F1 показывает и прячет");
         self.panel = Some(Panel::new(&window));
         self.window = Some(window);
+        let mut renderer = renderer;
+        renderer.set_scene(self.config.scene);
         self.renderer = Some(renderer);
         self.start = Instant::now();
         self.stats.last_title = self.start;
@@ -218,6 +222,7 @@ impl App {
                 hot_reload: renderer.shaders_hot_reload(),
                 shader_error: renderer.shader_error(),
                 last_snapshot: self.last_snapshot.as_deref(),
+                scene: renderer.scene().title(),
             };
             panel.frame(window, &info)
         });
@@ -268,6 +273,16 @@ impl App {
         if !self.minimized {
             window.request_redraw();
         }
+    }
+}
+
+/// Клавиша выбора сцены песочницы. Клавиши по месту на клавиатуре, поэтому раскладка
+/// не важна.
+fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
+    match code {
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some(DemoScene::Gpu),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some(DemoScene::Vector),
+        _ => None,
     }
 }
 
@@ -326,6 +341,20 @@ impl ApplicationHandler for App {
                     tracing::warn!(
                         "Эта видеокарта не умеет копировать картинку окна: снимка не будет"
                     );
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if scene_for_key(code).is_some() => {
+                if let (Some(r), Some(scene)) = (self.renderer.as_mut(), scene_for_key(code)) {
+                    r.set_scene(scene);
                 }
             }
             WindowEvent::Resized(size) => {

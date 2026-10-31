@@ -177,6 +177,7 @@ impl Core {
             synchronization2: false,
             descriptor_indexing: false,
             buffer_device_address: false,
+            multi_draw_indirect: false,
             has_graphics_queue: false,
             can_present: surface.map(|_| false),
             has_swapchain_ext: false,
@@ -206,6 +207,8 @@ impl Core {
                     .push_next(&mut f13);
                 // SAFETY: цепочка структур корректна, устройство поддерживает Vulkan 1.3.
                 unsafe { instance.get_physical_device_features2(pd, &mut f2) };
+                probe.multi_draw_indirect = f2.features.multi_draw_indirect == vk::TRUE
+                    && f2.features.draw_indirect_first_instance == vk::TRUE;
             }
             probe.dynamic_rendering = f13.dynamic_rendering == vk::TRUE;
             probe.synchronization2 = f13.synchronization2 == vk::TRUE;
@@ -461,8 +464,13 @@ impl GpuContext {
         }
         let mut sm1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
             .swapchain_maintenance1(true);
+        // Векторный слой рисует много фигур одной командой (vkCmdDrawIndirect).
+        let base_features = vk::PhysicalDeviceFeatures::default()
+            .multi_draw_indirect(true)
+            .draw_indirect_first_instance(true);
         let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
+            .enabled_features(&base_features)
             .enabled_extension_names(&extensions)
             .push_next(&mut f12)
             .push_next(&mut f13);
