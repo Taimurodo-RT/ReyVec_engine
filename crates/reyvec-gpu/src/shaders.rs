@@ -248,10 +248,12 @@ mod tests {
         assert!(lib.is_watching());
         let old = lib.get("triangle").vs.clone();
 
-        let wait = |lib: &mut ShaderLibrary| {
+        // Ждём пересборки (или ошибки, если `expect_error`). Прошлая ошибка не считается:
+        // иначе после шага с ошибкой ожидание закончилось бы раньше, чем придёт правка.
+        let wait = |lib: &mut ShaderLibrary, expect_error: bool| {
             for _ in 0..100 {
                 let changed = lib.poll();
-                if !changed.is_empty() || lib.error().is_some() {
+                if !changed.is_empty() || (expect_error && lib.error().is_some()) {
                     return changed;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -260,18 +262,18 @@ mod tests {
         };
 
         std::fs::write(&file, src.replace("pc.time * 0.5", "pc.time * 2.0")).unwrap();
-        assert_eq!(wait(&mut lib), vec!["triangle".to_string()]);
+        assert_eq!(wait(&mut lib, false), vec!["triangle".to_string()]);
         assert_ne!(lib.get("triangle").vs, old);
         let good = lib.get("triangle").vs.clone();
 
         std::fs::write(&file, src.replace("pc.time * 0.5", "pc.tiem * 0.5")).unwrap();
-        assert!(wait(&mut lib).is_empty());
+        assert!(wait(&mut lib, true).is_empty());
         let err = lib.error().expect("ошибка видна");
         assert!(err.starts_with("triangle.slang:"), "{err}");
         assert_eq!(lib.get("triangle").vs, good, "работает прошлая версия");
 
         std::fs::write(&file, &src).unwrap();
-        assert_eq!(wait(&mut lib), vec!["triangle".to_string()]);
+        assert_eq!(wait(&mut lib, false), vec!["triangle".to_string()]);
         assert!(lib.error().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

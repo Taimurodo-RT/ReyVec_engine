@@ -18,6 +18,7 @@ use crate::bindless::{Bindless, MAX_TEXTURES};
 use crate::context::GpuContext;
 use crate::pipeline::image_barrier;
 use crate::resources::{Texture, create_texture, destroy_texture};
+use crate::timing::GpuTimer;
 
 /// Сколько ячеек общего списка текстур отдано временным картинкам графа (в конце списка).
 pub(crate) const TRANSIENT_TEXTURES: u32 = 256;
@@ -360,6 +361,7 @@ impl<'a> RenderGraph<'a> {
         pool: &mut TransientPool,
         bindless: &Bindless,
         frame: u64,
+        mut timer: Option<&mut GpuTimer>,
     ) -> Result<GraphReport, GpuError> {
         // Как каждую временную картинку будут использовать: от этого зависит, как её создать.
         let mut usage = vec![vk::ImageUsageFlags::empty(); self.images.len()];
@@ -449,11 +451,26 @@ impl<'a> RenderGraph<'a> {
             cmd,
             images: &resolved,
         };
+        if let Some(t) = timer.as_deref_mut() {
+            // SAFETY: cmd в состоянии записи (условие функции).
+            unsafe { t.record_start(d, cmd) };
+        }
         for (pass, barriers) in self.passes.into_iter().zip(&before) {
+            let name = pass.name;
+            if let Some(t) = timer.as_deref_mut() {
+                t.pass_begin(name);
+            }
             emit(barriers);
             (pass.record)(&pass_ctx);
+            if let Some(t) = timer.as_deref_mut() {
+                // SAFETY: cmd в состоянии записи, метка начала кадра поставлена выше.
+                unsafe { t.pass_end(d, cmd, name) };
+            }
         }
         emit(&after);
+        if let Some(t) = timer {
+            t.record_end();
+        }
 
         for (i, entry) in pooled {
             pool.entries[entry].state = end_states[i];

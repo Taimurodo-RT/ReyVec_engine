@@ -19,6 +19,10 @@ notify = "8"
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 raw-window-handle = "0.6"
 thiserror = "2"
+# Tracy 0.14.1 (эта версия у Романа): к ней подходит только tracy-client 0.19.0 с tracy-client-sys 0.30.x.
+# Протокол Tracy меняется между версиями, поэтому версии закреплены точно. Обновлять вместе с программой Tracy.
+tracy-client = { version = "=0.19.0", default-features = false, features = ["enable", "manual-lifetime", "ondemand", "only-localhost", "broadcast"] }
+tracy-client-sys = { version = ">=0.30.0, <0.31", default-features = false }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -8,6 +8,7 @@
 //! - `--gpu <номер или часть названия>`: выбрать видеокарту, например `--gpu radeon`;
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
+//! - `--no-tracy`: не ждать подключения программы Tracy;
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
@@ -26,6 +27,7 @@ const HELP: &str = "\
   --gpu <номер|имя>      выбрать видеокарту, например --gpu radeon или --gpu 1
   --no-vsync             без вертикальной синхронизации
   --no-hot-reload        не перезагружать шейдеры после сохранения файлов
+  --no-tracy             не включать замеры для программы Tracy
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
   --seconds <S>          закрыть окно через S секунд
@@ -42,6 +44,7 @@ struct Args {
     gpu: Option<String>,
     no_vsync: bool,
     no_hot_reload: bool,
+    no_tracy: bool,
     validation: bool,
     frames: Option<u64>,
     seconds: Option<f64>,
@@ -57,6 +60,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--list-gpus" => out.list_gpus = true,
             "--no-vsync" => out.no_vsync = true,
             "--no-hot-reload" => out.no_hot_reload = true,
+            "--no-tracy" => out.no_tracy = true,
             "--validation" => out.validation = true,
             "--gpu" => {
                 out.gpu = Some(it.next().ok_or("после --gpu нужен номер или название")?);
@@ -132,6 +136,7 @@ fn main() -> ExitCode {
         },
         vsync: !args.no_vsync,
         hot_reload: !args.no_hot_reload,
+        tracy: !args.no_tracy,
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
@@ -146,6 +151,9 @@ fn main() -> ExitCode {
                 summary.adapter,
                 summary.average_fps
             );
+            if let Some(gpu) = &summary.gpu {
+                tracing::info!("Видеокарта на кадр в среднем: {}", gpu.describe());
+            }
             if errors > 0 {
                 tracing::error!("Слои валидации нашли ошибок: {errors}. Пришлите reyvec.log");
                 return ExitCode::FAILURE;
@@ -178,9 +186,10 @@ mod tests {
     #[test]
     fn all_flags() {
         let a = parse(
-            "--gpu radeon --no-vsync --no-hot-reload --validation --frames 120 --seconds 2.5",
+            "--gpu radeon --no-vsync --no-hot-reload --no-tracy --validation --frames 120 --seconds 2.5",
         )
         .unwrap();
+        assert!(a.no_tracy);
         assert_eq!(a.seconds, Some(2.5));
         assert_eq!(a.gpu.as_deref(), Some("radeon"));
         assert!(a.no_vsync && a.no_hot_reload && a.validation);

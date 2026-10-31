@@ -15,6 +15,8 @@ gpu-allocator.workspace = true
 notify.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
+tracy-client.workspace = true
+tracy-client-sys.workspace = true
 tracing.workspace = true
 
 [lints]

@@ -10,6 +10,23 @@
 //! Требования к видеокарте: Vulkan 1.3 с `dynamicRendering`, `synchronization2`,
 //! индексированием дескрипторов и адресами буферов (см. `docs/decisions/0001-stack.md`).
 
+#[doc(hidden)]
+pub use tracy_client as __tracy;
+
+/// Зона процессора для Tracy: живёт до конца области видимости. Если Tracy не запущен
+/// (`tracy_client::Client::start()` не вызывали), ничего не делает.
+///
+/// ```ignore
+/// let _zone = reyvec_gpu::cpu_zone!("обновление сцены");
+/// ```
+#[macro_export]
+macro_rules! cpu_zone {
+    ($name:literal) => {
+        $crate::__tracy::Client::running()
+            .map(|c| c.span($crate::__tracy::span_location!($name), 0))
+    };
+}
+
 mod adapter;
 mod bindless;
 mod context;
@@ -20,6 +37,7 @@ mod pipeline;
 mod resources;
 mod shaders;
 mod slangc;
+mod timing;
 mod window;
 
 pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
@@ -28,6 +46,7 @@ pub use context::{GpuOptions, list_adapters, validation_error_count};
 pub use headless::{HeadlessImage, render_triangle_headless};
 pub use pipeline::CLEAR_COLOR;
 pub use resources::{BufferId, BufferMemory, TextureId};
+pub use timing::{GpuFrameTimings, GpuTimingAverage, PassTiming};
 pub use window::{FrameStatus, RendererOptions, WindowRenderer, WindowTarget};
 
 use ash::vk;

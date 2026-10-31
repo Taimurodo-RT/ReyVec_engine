@@ -11,6 +11,7 @@ use crate::graph::{Access, ImageState, RenderGraph, TransientPool};
 use crate::pipeline::color_range;
 use crate::resources::GpuResources;
 use crate::shaders::ShaderLibrary;
+use crate::timing::{GpuFrameTimings, GpuTimer};
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
 /// Сколько кадров видеокарта может готовить одновременно с процессором.
@@ -140,6 +141,8 @@ pub struct WindowRenderer {
     transients: TransientPool,
     retired: Vec<Retired>,
     present_fences: PresentFences,
+    /// Замер времени проходов на видеокарте (нет, если видеокарта не умеет).
+    timer: Option<GpuTimer>,
     /// Устройство графа уже записано в лог (пишем один раз).
     graph_logged: bool,
     /// Сквозной номер кадра, нужен очереди отложенного удаления.
@@ -208,6 +211,7 @@ impl WindowRenderer {
             transients: TransientPool::new(),
             retired: Vec::new(),
             present_fences: PresentFences::default(),
+            timer: None,
             graph_logged: false,
             frame_number: 0,
             swapchain_loader,
@@ -219,6 +223,7 @@ impl WindowRenderer {
         // Дальше при любой ошибке Drop аккуратно уберёт всё созданное.
         renderer.create_frames()?;
         renderer.resources = Some(GpuResources::new(&renderer.ctx)?);
+        renderer.timer = GpuTimer::new(&renderer.ctx, FRAMES_IN_FLIGHT)?;
         renderer.recreate_swapchain(size)?;
         tracing::info!(
             "Вывод в окно: {}×{}, формат {:?}, режим показа {:?}",
@@ -260,6 +265,12 @@ impl WindowRenderer {
         self.shaders.error()
     }
 
+    /// Сколько видеокарта потратила на недавний кадр и его проходы. Замер приходит с
+    /// опозданием на пару кадров (пока видеокарта их доделывает). `None`, если замеров нет.
+    pub fn gpu_timings(&self) -> Option<&GpuFrameTimings> {
+        self.timer.as_ref().and_then(GpuTimer::last)
+    }
+
     /// Следит ли движок за файлами шейдеров.
     pub fn shaders_hot_reload(&self) -> bool {
         self.shaders.is_watching()
@@ -288,13 +299,19 @@ impl WindowRenderer {
         }
         let shader_error = self.shaders.error().is_some();
         let in_flight = self.frames[self.frame_index].in_flight;
-        // SAFETY: забор принадлежит этому устройству.
-        unsafe {
-            self.ctx
-                .device
-                .wait_for_fences(&[in_flight], true, u64::MAX)
+        {
+            let _zone = crate::cpu_zone!("ожидание видеокарты");
+            // SAFETY: забор принадлежит этому устройству.
+            unsafe {
+                self.ctx
+                    .device
+                    .wait_for_fences(&[in_flight], true, u64::MAX)
+            }
+            .ctx("ожидание кадра")?;
         }
-        .ctx("ожидание кадра")?;
+        if let Some(timer) = self.timer.as_mut() {
+            timer.begin_frame(&self.ctx, self.frame_index)?;
+        }
         // Забор этой ячейки дождались, значит кадр, что был в ней раньше, закончен.
         let completed = self.frame_number.checked_sub(FRAMES_IN_FLIGHT as u64);
         self.transients
@@ -310,6 +327,7 @@ impl WindowRenderer {
             }
         }
 
+        let acquire_zone = crate::cpu_zone!("получение картинки окна");
         // SAFETY: swapchain и семафор живы; семафор не ждёт ни одна отправка.
         let acquired = unsafe {
             self.swapchain_loader.acquire_next_image(
@@ -338,6 +356,8 @@ impl WindowRenderer {
             }
         };
 
+        drop(acquire_zone);
+        let record_zone = crate::cpu_zone!("запись кадра");
         let image = self.images[image_index];
         let view = self.views[image_index];
         let render_finished = self.render_finished[image_index];
@@ -384,6 +404,7 @@ impl WindowRenderer {
                     &mut self.transients,
                     &res.bindless,
                     self.frame_number,
+                    self.timer.as_mut(),
                 )?;
                 if !self.graph_logged {
                     tracing::info!("Граф кадра: {}", report.describe());
@@ -411,6 +432,8 @@ impl WindowRenderer {
                 .ctx("отправка кадра")?;
         }
 
+        drop(record_zone);
+        let _present_zone = crate::cpu_zone!("показ кадра");
         let wait_present = [render_finished];
         let swapchains = [self.swapchain];
         let indices = [image_index as u32];
@@ -704,6 +727,9 @@ impl Drop for WindowRenderer {
             self.present_fences.destroy(&self.ctx.device);
             self.destroy_swapchain_objects();
             self.transients.destroy(&self.ctx);
+            if let Some(mut timer) = self.timer.take() {
+                timer.destroy(&self.ctx);
+            }
             let device = &self.ctx.device;
             if let Some(demo) = self.demo.take() {
                 demo.destroy(&self.ctx);

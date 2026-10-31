@@ -3,7 +3,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use reyvec_gpu::{FrameStatus, GpuError, GpuOptions, RendererOptions, WindowRenderer};
+use reyvec_gpu::{
+    FrameStatus, GpuError, GpuFrameTimings, GpuOptions, GpuTimingAverage, RendererOptions,
+    WindowRenderer,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -25,6 +28,8 @@ pub struct AppConfig {
     pub vsync: bool,
     /// Перезагружать шейдеры после сохранения их файлов.
     pub hot_reload: bool,
+    /// Включить замеры для Tracy: программа Tracy сможет подключиться к движку.
+    pub tracy: bool,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -40,6 +45,8 @@ pub struct RunSummary {
     pub adapter: String,
     /// Средний FPS за всё время.
     pub average_fps: f64,
+    /// Сколько в среднем видеокарта тратила на кадр и каждый проход (если умеет замерять).
+    pub gpu: Option<GpuFrameTimings>,
 }
 
 /// Ошибки запуска окна.
@@ -55,6 +62,14 @@ pub enum AppError {
 
 /// Открывает окно и рисует кадры, пока окно не закроют (или не будет нарисовано `max_frames`).
 pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
+    if config.tracy {
+        // Клиент Tracy живёт до конца процесса: остановить его безопасно нельзя, пока
+        // хоть один поток пишет замеры. Он ждёт подключения только с этого компьютера.
+        let _ = tracy_client::Client::start();
+        tracing::info!(
+            "Tracy: замеры доступны. Откройте Tracy 0.14.1 и нажмите Connect (адрес 127.0.0.1)"
+        );
+    }
     let event_loop = EventLoop::new().map_err(|e| AppError::Window(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
@@ -65,6 +80,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         start: Instant::now(),
         frames: 0,
         stats: FrameStats::new(Instant::now()),
+        gpu_total: GpuTimingAverage::default(),
         minimized: false,
         closing: false,
         closed_at: None,
@@ -85,6 +101,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         } else {
             0.0
         },
+        gpu: app.gpu_total.average(),
     })
 }
 
@@ -97,6 +114,8 @@ struct App {
     start: Instant,
     frames: u64,
     stats: FrameStats,
+    /// Замеры видеокарты за всё время работы окна.
+    gpu_total: GpuTimingAverage,
     minimized: bool,
     /// Окно уже попросили закрыть. На Windows цикл событий завершается не сразу (например,
     /// пока край окна держат мышкой), поэтому после этого кадры больше не рисуем.
@@ -167,11 +186,19 @@ impl App {
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
             return;
         };
+        let _zone = reyvec_gpu::cpu_zone!("кадр");
         let size = window.inner_size();
         let time = self.start.elapsed().as_secs_f32();
         match renderer.render([size.width, size.height], time) {
             Ok(FrameStatus::Presented) => {
                 self.frames += 1;
+                if let Some(client) = tracy_client::Client::running() {
+                    client.frame_mark();
+                }
+                if let Some(t) = renderer.gpu_timings() {
+                    self.stats.gpu.add(t);
+                    self.gpu_total.add(t);
+                }
                 let now = Instant::now();
                 let base = match renderer.shader_error() {
                     Some(err) => format!("ОШИБКА ШЕЙДЕРА: {err} | {}", self.config.title),
@@ -264,6 +291,8 @@ struct FrameStats {
     mode: &'static str,
     last_title: Instant,
     frames_since_title: u32,
+    /// Замеры видеокарты с прошлого обновления заголовка.
+    gpu: GpuTimingAverage,
 }
 
 impl FrameStats {
@@ -273,6 +302,7 @@ impl FrameStats {
             mode: "",
             last_title: now,
             frames_since_title: 0,
+            gpu: GpuTimingAverage::default(),
         }
     }
 
@@ -287,12 +317,29 @@ impl FrameStats {
         let ms = elapsed.as_secs_f64() * 1000.0 / f64::from(self.frames_since_title);
         self.last_title = now;
         self.frames_since_title = 0;
-        Some(format_title(base, &self.adapter, self.mode, fps, ms))
+        let gpu_ms = self.gpu.average().map(|t| t.total_ms);
+        self.gpu.clear();
+        Some(format_title(
+            base,
+            &self.adapter,
+            self.mode,
+            fps,
+            ms,
+            gpu_ms,
+        ))
     }
 }
 
-fn format_title(base: &str, adapter: &str, mode: &str, fps: f64, ms: f64) -> String {
-    format!("{base} | {adapter} | {fps:.0} FPS, {ms:.2} мс | {mode}")
+fn format_title(
+    base: &str,
+    adapter: &str,
+    mode: &str,
+    fps: f64,
+    ms: f64,
+    gpu_ms: Option<f64>,
+) -> String {
+    let gpu = gpu_ms.map_or(String::new(), |g| format!(", видеокарта {g:.2} мс"));
+    format!("{base} | {adapter} | {fps:.0} FPS, {ms:.2} мс{gpu} | {mode}")
 }
 
 #[cfg(test)]
@@ -307,11 +354,14 @@ mod tests {
             "VSync",
             144.2,
             6.934,
+            None,
         );
         assert_eq!(
             t,
             "ReyVec 0.1.0 | NVIDIA GeForce RTX 5080 | 144 FPS, 6.93 мс | VSync"
         );
+        let t = format_title("R", "GPU", "VSync", 144.0, 6.94, Some(0.214));
+        assert_eq!(t, "R | GPU | 144 FPS, 6.94 мс, видеокарта 0.21 мс | VSync");
     }
 
     #[test]
