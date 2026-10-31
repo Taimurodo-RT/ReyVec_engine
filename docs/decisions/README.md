@@ -10,4 +10,4 @@
 | [0004-conventions.md](0004-conventions.md) | Координаты, цвет, время, видеокарта, логи, ресурсы |
 | [0005-license-and-scope.md](0005-license-and-scope.md) | Лицензия, языки, отношения с Forge и Motif |
 | [0006-render-graph.md](0006-render-graph.md) | Граф кадра, временные картинки, пересоздание swapchain без остановки видеокарты |
-| [0007-profiling.md](0007-profiling.md) | Время проходов на видеокарте и подключение Tracy 0.14.1 |
+| [0007-profiling.md](0007-profiling.md) | Время проходов на видеокарте, Tracy 0.14.1, панель счётчиков egui |

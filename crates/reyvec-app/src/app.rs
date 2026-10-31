@@ -14,6 +14,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::panel::{Panel, PanelInfo};
+
 /// Как часто обновлять счётчик кадров в заголовке окна.
 const TITLE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -76,6 +78,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         config,
         window: None,
         renderer: None,
+        panel: None,
         error: None,
         start: Instant::now(),
         frames: 0,
@@ -109,6 +112,7 @@ struct App {
     config: AppConfig,
     // Рендерер держит своё Arc на окно, так что порядок полей здесь не опасен.
     renderer: Option<WindowRenderer>,
+    panel: Option<Panel>,
     window: Option<Arc<Window>>,
     error: Option<AppError>,
     start: Instant,
@@ -171,6 +175,8 @@ impl App {
         if renderer.shaders_hot_reload() {
             tracing::info!("Перезагрузка шейдеров включена");
         }
+        tracing::info!("Панель счётчиков: F1 показывает и прячет");
+        self.panel = Some(Panel::new(&window));
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.start = Instant::now();
@@ -189,7 +195,23 @@ impl App {
         let _zone = reyvec_gpu::cpu_zone!("кадр");
         let size = window.inner_size();
         let time = self.start.elapsed().as_secs_f32();
-        match renderer.render([size.width, size.height], time) {
+        let ui = self.panel.as_mut().and_then(|panel| {
+            let info = PanelInfo {
+                adapter: &self.stats.adapter,
+                mode: self.stats.mode,
+                extent: renderer.extent(),
+                fps: self.stats.fps,
+                frame_ms: self.stats.ms,
+                gpu: self.stats.gpu_avg.as_ref(),
+                graph: renderer.last_graph(),
+                validation: self.config.gpu.validation,
+                validation_errors: reyvec_gpu::validation_error_count(),
+                hot_reload: renderer.shaders_hot_reload(),
+                shader_error: renderer.shader_error(),
+            };
+            panel.frame(window, &info)
+        });
+        match renderer.render([size.width, size.height], time, ui) {
             Ok(FrameStatus::Presented) => {
                 self.frames += 1;
                 if let Some(client) = tracy_client::Client::running() {
@@ -198,6 +220,9 @@ impl App {
                 if let Some(t) = renderer.gpu_timings() {
                     self.stats.gpu.add(t);
                     self.gpu_total.add(t);
+                    if let Some(panel) = self.panel.as_mut() {
+                        panel.record_gpu(t.total_ms);
+                    }
                 }
                 let now = Instant::now();
                 let base = match renderer.shader_error() {
@@ -241,6 +266,9 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let (Some(panel), Some(window)) = (self.panel.as_mut(), &self.window) {
+            panel.on_window_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::KeyboardInput {
@@ -252,6 +280,20 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => self.close(event_loop),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F1),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.toggle();
+                }
+            }
             WindowEvent::Resized(size) => {
                 self.minimized = size.width == 0 || size.height == 0;
                 if let Some(r) = &mut self.renderer {
@@ -279,8 +321,9 @@ impl ApplicationHandler for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Сначала Vulkan, потом окно.
+        // Сначала Vulkan, потом панель и окно.
         self.renderer = None;
+        self.panel = None;
         self.window = None;
     }
 }
@@ -293,6 +336,10 @@ struct FrameStats {
     frames_since_title: u32,
     /// Замеры видеокарты с прошлого обновления заголовка.
     gpu: GpuTimingAverage,
+    /// Последние посчитанные значения (раз в полсекунды): для панели.
+    fps: f64,
+    ms: f64,
+    gpu_avg: Option<GpuFrameTimings>,
 }
 
 impl FrameStats {
@@ -303,6 +350,9 @@ impl FrameStats {
             last_title: now,
             frames_since_title: 0,
             gpu: GpuTimingAverage::default(),
+            fps: 0.0,
+            ms: 0.0,
+            gpu_avg: None,
         }
     }
 
@@ -317,7 +367,10 @@ impl FrameStats {
         let ms = elapsed.as_secs_f64() * 1000.0 / f64::from(self.frames_since_title);
         self.last_title = now;
         self.frames_since_title = 0;
-        let gpu_ms = self.gpu.average().map(|t| t.total_ms);
+        self.gpu_avg = self.gpu.average();
+        self.fps = fps;
+        self.ms = ms;
+        let gpu_ms = self.gpu_avg.as_ref().map(|t| t.total_ms);
         self.gpu.clear();
         Some(format_title(
             base,

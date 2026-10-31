@@ -53,8 +53,8 @@ impl GpuFrameTimings {
 pub struct GpuTimingAverage {
     frames: u32,
     total_ms: f64,
-    /// Имя прохода → (сумма мс, сколько раз встретился). Порядок проходов отдельно.
-    sums: HashMap<&'static str, (f64, u32)>,
+    /// Имя прохода → сумма мс. Порядок проходов отдельно.
+    sums: HashMap<&'static str, f64>,
     order: Vec<&'static str>,
 }
 
@@ -64,12 +64,10 @@ impl GpuTimingAverage {
         self.frames += 1;
         self.total_ms += t.total_ms;
         for p in &t.passes {
-            let e = self.sums.entry(p.name).or_insert_with(|| {
+            *self.sums.entry(p.name).or_insert_with(|| {
                 self.order.push(p.name);
-                (0.0, 0)
-            });
-            e.0 += p.ms;
-            e.1 += 1;
+                0.0
+            }) += p.ms;
         }
     }
 
@@ -78,7 +76,9 @@ impl GpuTimingAverage {
         self.frames
     }
 
-    /// Среднее за накопленные кадры. `None`, если замеров не было.
+    /// Среднее за накопленные кадры. `None`, если замеров не было. Проход, которого не было
+    /// в части кадров (например, панель спрятали), считается в них за 0 мс: так сумма
+    /// проходов равна среднему времени кадра.
     pub fn average(&self) -> Option<GpuFrameTimings> {
         if self.frames == 0 {
             return None;
@@ -88,12 +88,9 @@ impl GpuTimingAverage {
             passes: self
                 .order
                 .iter()
-                .map(|&name| {
-                    let (sum, n) = self.sums[name];
-                    PassTiming {
-                        name,
-                        ms: sum / n as f64,
-                    }
+                .map(|&name| PassTiming {
+                    name,
+                    ms: self.sums[name] / self.frames as f64,
                 })
                 .collect(),
         })
@@ -440,6 +437,17 @@ mod tests {
         assert_eq!(a.passes[0].name, "сцена");
         assert!((a.passes[0].ms - 2.0).abs() < 1e-9);
         assert_eq!(a.passes[1].name, "вывод");
+        // Проход только в одном из трёх кадров: вклад делится на все кадры.
+        avg.add(&GpuFrameTimings {
+            total_ms: 1.0,
+            passes: vec![PassTiming {
+                name: "сцена",
+                ms: 1.0,
+            }],
+        });
+        let a = avg.average().unwrap();
+        let sum: f64 = a.passes.iter().map(|p| p.ms).sum();
+        assert!((sum - a.total_ms).abs() < 1e-9);
         avg.clear();
         assert_eq!(avg.frames(), 0);
     }

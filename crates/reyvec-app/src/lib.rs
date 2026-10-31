@@ -5,6 +5,7 @@
 
 mod app;
 mod logging;
+mod panel;
 
 pub use app::{AppConfig, AppError, RunSummary, run};
 pub use logging::{LogGuard, init_logging};

@@ -7,11 +7,12 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Core, GpuContext, GpuOptions};
 use crate::demo::Demo;
-use crate::graph::{Access, ImageState, RenderGraph, TransientPool};
+use crate::graph::{Access, GraphReport, ImageState, RenderGraph, TransientPool};
 use crate::pipeline::color_range;
 use crate::resources::GpuResources;
 use crate::shaders::ShaderLibrary;
 use crate::timing::{GpuFrameTimings, GpuTimer};
+use crate::ui::{UiFrame, UiRenderer};
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
 /// Сколько кадров видеокарта может готовить одновременно с процессором.
@@ -136,6 +137,10 @@ pub struct WindowRenderer {
     needs_recreate: bool,
     resources: Option<GpuResources>,
     demo: Option<Demo>,
+    ui: Option<UiRenderer>,
+    /// Изменения текстур панели, ещё не попавшие на видеокарту. Копятся, пока кадры
+    /// пропускаются (окно свёрнуто): иначе, например, атлас шрифта потерялся бы.
+    ui_textures: egui::TexturesDelta,
     shaders: ShaderLibrary,
     /// Временные картинки графа кадра.
     transients: TransientPool,
@@ -143,8 +148,8 @@ pub struct WindowRenderer {
     present_fences: PresentFences,
     /// Замер времени проходов на видеокарте (нет, если видеокарта не умеет).
     timer: Option<GpuTimer>,
-    /// Устройство графа уже записано в лог (пишем один раз).
-    graph_logged: bool,
+    /// Устройство графа последнего кадра (в лог пишется, когда оно меняется).
+    last_graph: Option<GraphReport>,
     /// Сквозной номер кадра, нужен очереди отложенного удаления.
     frame_number: u64,
     swapchain_loader: khr::swapchain::Device,
@@ -207,12 +212,14 @@ impl WindowRenderer {
             needs_recreate: true,
             resources: None,
             demo: None,
+            ui: None,
+            ui_textures: egui::TexturesDelta::default(),
             shaders: ShaderLibrary::new(options.hot_reload),
             transients: TransientPool::new(),
             retired: Vec::new(),
             present_fences: PresentFences::default(),
             timer: None,
-            graph_logged: false,
+            last_graph: None,
             frame_number: 0,
             swapchain_loader,
             surface_loader,
@@ -271,6 +278,16 @@ impl WindowRenderer {
         self.timer.as_ref().and_then(GpuTimer::last)
     }
 
+    /// Как устроен последний нарисованный кадр: проходы, барьеры, временные картинки.
+    pub fn last_graph(&self) -> Option<&GraphReport> {
+        self.last_graph.as_ref()
+    }
+
+    /// Размер картинки окна в пикселях.
+    pub fn extent(&self) -> [u32; 2] {
+        [self.extent.width, self.extent.height]
+    }
+
     /// Следит ли движок за файлами шейдеров.
     pub fn shaders_hot_reload(&self) -> bool {
         self.shaders.is_watching()
@@ -281,8 +298,20 @@ impl WindowRenderer {
         self.needs_recreate = true;
     }
 
-    /// Рисует один кадр. `size`: текущий размер окна в пикселях, `time`: секунды с запуска.
-    pub fn render(&mut self, size: [u32; 2], time: f32) -> Result<FrameStatus, GpuError> {
+    /// Рисует один кадр. `size`: текущий размер окна в пикселях, `time`: секунды с запуска,
+    /// `ui`: панель egui поверх кадра (если есть).
+    pub fn render(
+        &mut self,
+        size: [u32; 2],
+        time: f32,
+        ui: Option<UiFrame>,
+    ) -> Result<FrameStatus, GpuError> {
+        let mut ui = ui;
+        if let Some(ui) = ui.as_mut() {
+            self.ui_textures
+                .append(std::mem::take(&mut ui.textures_delta));
+        }
+        let ui = ui.as_ref();
         if size[0] == 0 || size[1] == 0 {
             return Ok(FrameStatus::Skipped);
         }
@@ -296,6 +325,9 @@ impl WindowRenderer {
             // SAFETY: ждём, пока видеокарта перестанет использовать старые конвейеры.
             unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
             demo.reload(&self.ctx, res, &mut self.shaders, &changed);
+            if let Some(ui) = self.ui.as_mut() {
+                ui.reload(&self.ctx, res, &mut self.shaders, &changed);
+            }
         }
         let shader_error = self.shaders.error().is_some();
         let in_flight = self.frames[self.frame_index].in_flight;
@@ -380,6 +412,24 @@ impl WindowRenderer {
 
             if let (Some(demo), Some(res)) = (&self.demo, self.resources.as_mut()) {
                 let data = demo.prepare(res, self.frame_index, extent, time, shader_error);
+                let ui_data = match (ui, self.ui.as_mut()) {
+                    (Some(frame), Some(renderer)) => {
+                        let mut textures = std::mem::take(&mut self.ui_textures);
+                        let prepared = renderer.prepare(
+                            &self.ctx,
+                            res,
+                            self.frame_index,
+                            frame,
+                            &textures,
+                            extent,
+                        );
+                        // Изменения применены (или кадр всё равно не удался): egui проверяет,
+                        // что их не выбросили молча.
+                        textures.clear();
+                        Some(prepared?)
+                    }
+                    _ => None,
+                };
                 let res = &*res;
                 let mut graph = RenderGraph::new();
                 // Картинку окна только что выдал acquire: содержимого нет, рисовать в неё
@@ -398,6 +448,9 @@ impl WindowRenderer {
                     Some(Access::Present),
                 );
                 demo.add_passes(&mut graph, &res.bindless, data, target);
+                if let (Some(data), Some(renderer)) = (ui_data, self.ui.as_ref()) {
+                    renderer.add_pass(&mut graph, &res.bindless, data, target);
+                }
                 let report = graph.execute(
                     &self.ctx,
                     frame.cmd,
@@ -406,10 +459,10 @@ impl WindowRenderer {
                     self.frame_number,
                     self.timer.as_mut(),
                 )?;
-                if !self.graph_logged {
+                if self.last_graph.as_ref().map(|g| &g.passes) != Some(&report.passes) {
                     tracing::info!("Граф кадра: {}", report.describe());
-                    self.graph_logged = true;
                 }
+                self.last_graph = Some(report);
             }
 
             device
@@ -620,6 +673,9 @@ impl WindowRenderer {
                         // SAFETY: простое ожидание устройства.
                         unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
                         demo.set_format(&self.ctx, res, &self.shaders, format.format)?;
+                        if let Some(ui) = self.ui.as_mut() {
+                            ui.set_format(&self.ctx, res, &self.shaders, format.format)?;
+                        }
                     }
                 }
                 None => {
@@ -629,7 +685,14 @@ impl WindowRenderer {
                         &self.shaders,
                         format.format,
                         FRAMES_IN_FLIGHT,
-                    )?)
+                    )?);
+                    self.ui = Some(UiRenderer::new(
+                        &self.ctx,
+                        res,
+                        &self.shaders,
+                        format.format,
+                        FRAMES_IN_FLIGHT,
+                    )?);
                 }
             }
         }
@@ -734,6 +797,10 @@ impl Drop for WindowRenderer {
             if let Some(demo) = self.demo.take() {
                 demo.destroy(&self.ctx);
             }
+            if let Some(ui) = self.ui.take() {
+                ui.destroy(&self.ctx);
+            }
+            self.ui_textures.clear();
             if let Some(res) = self.resources.take() {
                 res.destroy(&self.ctx);
             }

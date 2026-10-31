@@ -38,15 +38,18 @@ mod resources;
 mod shaders;
 mod slangc;
 mod timing;
+mod ui;
 mod window;
 
 pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
 pub use bindless::{MAX_TEXTURES, SamplerKind};
 pub use context::{GpuOptions, list_adapters, validation_error_count};
+pub use graph::GraphReport;
 pub use headless::{HeadlessImage, render_triangle_headless};
 pub use pipeline::CLEAR_COLOR;
 pub use resources::{BufferId, BufferMemory, TextureId};
 pub use timing::{GpuFrameTimings, GpuTimingAverage, PassTiming};
+pub use ui::UiFrame;
 pub use window::{FrameStatus, RendererOptions, WindowRenderer, WindowTarget};
 
 use ash::vk;
