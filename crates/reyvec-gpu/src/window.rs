@@ -7,7 +7,8 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Core, GpuContext, GpuOptions};
 use crate::demo::Demo;
-use crate::pipeline::{color_range, image_barrier};
+use crate::graph::{Access, ImageState, RenderGraph, TransientPool};
+use crate::pipeline::color_range;
 use crate::resources::GpuResources;
 use crate::shaders::ShaderLibrary;
 use crate::{AdapterInfo, GpuError, VkResultExt};
@@ -39,6 +40,76 @@ pub enum FrameStatus {
     Skipped,
 }
 
+/// Если старый swapchain так долго не удаётся удалить (забор показа не сработал),
+/// останавливаем видеокарту и удаляем его наверняка.
+const RETIRE_TIMEOUT_FRAMES: u64 = 120;
+
+/// Старый swapchain после изменения размера окна. Его последние кадры могут ещё
+/// показываться, поэтому он удаляется не сразу, а когда сработают заборы всех его показов.
+struct Retired {
+    swapchain: vk::SwapchainKHR,
+    views: Vec<vk::ImageView>,
+    semaphores: Vec<vk::Semaphore>,
+    /// Номер кадра, когда swapchain стал старым.
+    frame: u64,
+}
+
+/// Заборы показа (VK_EXT_swapchain_maintenance1): забор срабатывает, когда показ кадра
+/// закончил пользоваться картинкой и семафором. Только по ним можно точно сказать,
+/// что старый swapchain больше не нужен.
+#[derive(Default)]
+struct PresentFences {
+    /// Показы в работе: в какой swapchain и какой забор.
+    pending: Vec<(vk::SwapchainKHR, vk::Fence)>,
+    free: Vec<vk::Fence>,
+}
+
+impl PresentFences {
+    fn take(&mut self, device: &ash::Device) -> Result<vk::Fence, GpuError> {
+        if let Some(f) = self.free.pop() {
+            return Ok(f);
+        }
+        // SAFETY: простой объект устройства, уничтожается в destroy().
+        unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.ctx("забор показа")
+    }
+
+    /// Возвращает в оборот заборы показов, которые уже закончились.
+    fn collect(&mut self, device: &ash::Device) -> Result<(), GpuError> {
+        let mut i = 0;
+        while i < self.pending.len() {
+            let fence = self.pending[i].1;
+            // SAFETY: забор принадлежит этому устройству.
+            if unsafe { device.get_fence_status(fence) }.ctx("состояние забора показа")?
+            {
+                // SAFETY: забор сработал, его больше никто не ждёт.
+                unsafe { device.reset_fences(&[fence]) }.ctx("сброс забора показа")?;
+                self.free.push(fence);
+                self.pending.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Есть ли незаконченные показы в `swapchain`.
+    fn busy(&self, swapchain: vk::SwapchainKHR) -> bool {
+        self.pending.iter().any(|(s, _)| *s == swapchain)
+    }
+
+    /// Уничтожает все заборы. Вызывать, когда видеокарта простаивает.
+    fn destroy(&mut self, device: &ash::Device) {
+        for f in self
+            .free
+            .drain(..)
+            .chain(self.pending.drain(..).map(|(_, f)| f))
+        {
+            // SAFETY: видеокарта простаивает (условие функции).
+            unsafe { device.destroy_fence(f, None) };
+        }
+    }
+}
+
 struct FrameSync {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
@@ -65,6 +136,12 @@ pub struct WindowRenderer {
     resources: Option<GpuResources>,
     demo: Option<Demo>,
     shaders: ShaderLibrary,
+    /// Временные картинки графа кадра.
+    transients: TransientPool,
+    retired: Vec<Retired>,
+    present_fences: PresentFences,
+    /// Устройство графа уже записано в лог (пишем один раз).
+    graph_logged: bool,
     /// Сквозной номер кадра, нужен очереди отложенного удаления.
     frame_number: u64,
     swapchain_loader: khr::swapchain::Device,
@@ -128,6 +205,10 @@ impl WindowRenderer {
             resources: None,
             demo: None,
             shaders: ShaderLibrary::new(options.hot_reload),
+            transients: TransientPool::new(),
+            retired: Vec::new(),
+            present_fences: PresentFences::default(),
+            graph_logged: false,
             frame_number: 0,
             swapchain_loader,
             surface_loader,
@@ -146,6 +227,15 @@ impl WindowRenderer {
             renderer.format.format,
             renderer.present_mode
         );
+        if renderer.ctx.present_fences {
+            tracing::info!(
+                "Заборы показа есть (VK_EXT_swapchain_maintenance1): при изменении размера окна видеокарта не останавливается"
+            );
+        } else {
+            tracing::info!(
+                "Заборов показа нет: при изменении размера окна видеокарта на миг останавливается"
+            );
+        }
         Ok(renderer)
     }
 
@@ -197,15 +287,22 @@ impl WindowRenderer {
             demo.reload(&self.ctx, res, &mut self.shaders, &changed);
         }
         let shader_error = self.shaders.error().is_some();
+        let in_flight = self.frames[self.frame_index].in_flight;
+        // SAFETY: забор принадлежит этому устройству.
+        unsafe {
+            self.ctx
+                .device
+                .wait_for_fences(&[in_flight], true, u64::MAX)
+        }
+        .ctx("ожидание кадра")?;
+        // Забор этой ячейки дождались, значит кадр, что был в ней раньше, закончен.
+        let completed = self.frame_number.checked_sub(FRAMES_IN_FLIGHT as u64);
+        self.transients
+            .begin_frame(&self.ctx, self.frame_number, completed);
+        self.collect_retired(completed)?;
 
         let device = &self.ctx.device;
         let frame = &self.frames[self.frame_index];
-
-        // SAFETY: забор принадлежит этому устройству.
-        unsafe { device.wait_for_fences(&[frame.in_flight], true, u64::MAX) }
-            .ctx("ожидание кадра")?;
-        // Забор этой ячейки дождались, значит кадр, что был в ней раньше, закончен.
-        let completed = self.frame_number.checked_sub(FRAMES_IN_FLIGHT as u64);
         if let Some(res) = self.resources.as_mut() {
             res.begin_frame(&self.ctx, self.frame_number, completed);
             if let Some(demo) = self.demo.as_mut() {
@@ -261,46 +358,39 @@ impl WindowRenderer {
                 .begin_command_buffer(frame.cmd, &begin)
                 .ctx("запись команд")?;
 
-            let to_color = [image_barrier(
-                image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::NONE,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            )];
-            device.cmd_pipeline_barrier2(
-                frame.cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_color),
-            );
-
             if let (Some(demo), Some(res)) = (&self.demo, self.resources.as_mut()) {
-                demo.record(
-                    &self.ctx,
-                    res,
-                    frame.cmd,
-                    self.frame_index,
+                let data = demo.prepare(res, self.frame_index, extent, time, shader_error);
+                let res = &*res;
+                let mut graph = RenderGraph::new();
+                // Картинку окна только что выдал acquire: содержимого нет, рисовать в неё
+                // можно после семафора image_available (он ждёт на стадии вывода цвета).
+                let target = graph.import(
+                    "окно",
+                    image,
                     view,
                     extent,
-                    time,
-                    shader_error,
+                    self.format.format,
+                    ImageState {
+                        layout: vk::ImageLayout::UNDEFINED,
+                        stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                        access: vk::AccessFlags2::NONE,
+                    },
+                    Some(Access::Present),
                 );
+                demo.add_passes(&mut graph, &res.bindless, data, target);
+                let report = graph.execute(
+                    &self.ctx,
+                    frame.cmd,
+                    &mut self.transients,
+                    &res.bindless,
+                    self.frame_number,
+                )?;
+                if !self.graph_logged {
+                    tracing::info!("Граф кадра: {}", report.describe());
+                    self.graph_logged = true;
+                }
             }
 
-            let to_present = [image_barrier(
-                image,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::NONE,
-                vk::AccessFlags2::NONE,
-            )];
-            device.cmd_pipeline_barrier2(
-                frame.cmd,
-                &vk::DependencyInfo::default().image_memory_barriers(&to_present),
-            );
             device
                 .end_command_buffer(frame.cmd)
                 .ctx("конец записи команд")?;
@@ -324,10 +414,24 @@ impl WindowRenderer {
         let wait_present = [render_finished];
         let swapchains = [self.swapchain];
         let indices = [image_index as u32];
-        let present = vk::PresentInfoKHR::default()
+        let mut present = vk::PresentInfoKHR::default()
             .wait_semaphores(&wait_present)
             .swapchains(&swapchains)
             .image_indices(&indices);
+        let present_fence = if self.ctx.present_fences {
+            let f = self.present_fences.take(&self.ctx.device)?;
+            // Забор числится в работе сразу: даже если показ вернёт ошибку, мы его не
+            // переиспользуем, пока он не сработает (или пока видеокарта не остановится).
+            self.present_fences.pending.push((self.swapchain, f));
+            Some([f])
+        } else {
+            None
+        };
+        let mut fence_info = vk::SwapchainPresentFenceInfoEXT::default();
+        if let Some(f) = &present_fence {
+            fence_info = fence_info.fences(f);
+            present = present.push_next(&mut fence_info);
+        }
         // SAFETY: изображение получено из этого swapchain и отправлено на рисование выше.
         match unsafe {
             self.swapchain_loader
@@ -417,9 +521,9 @@ impl WindowRenderer {
             image_count = image_count.min(caps.max_image_count);
         }
 
-        // SAFETY: ждём, пока видеокарта закончит со старым swapchain, прежде чем трогать его.
-        unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
-
+        // Видеокарту не останавливаем: старый swapchain отдаём в новый как old_swapchain,
+        // а удаляем его, когда сработают заборы всех его показов (см. collect_retired).
+        // Так при растягивании окна кадры не ждут полной остановки видеокарты.
         let old = self.swapchain;
         let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
@@ -439,13 +543,21 @@ impl WindowRenderer {
         let swapchain = unsafe { self.swapchain_loader.create_swapchain(&info, None) }
             .ctx("создание swapchain")?;
 
-        // SAFETY: видеокарта простаивает (device_wait_idle выше), старые объекты не используются.
-        unsafe {
-            self.destroy_swapchain_objects();
-            if old != vk::SwapchainKHR::null() {
-                self.swapchain_loader.destroy_swapchain(old, None);
+        if old != vk::SwapchainKHR::null() {
+            self.retired.push(Retired {
+                swapchain: old,
+                views: std::mem::take(&mut self.views),
+                semaphores: std::mem::take(&mut self.render_finished),
+                frame: self.frame_number,
+            });
+            if !self.ctx.present_fences {
+                // Без заборов показа нельзя узнать, что старые кадры показаны: ждём видеокарту.
+                // SAFETY: простое ожидание устройства.
+                unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
+                self.destroy_all_retired();
             }
         }
+        self.images.clear();
         self.swapchain = swapchain;
         self.format = format;
         self.extent = extent;
@@ -478,8 +590,15 @@ impl WindowRenderer {
 
         if let Some(res) = self.resources.as_mut() {
             match self.demo.as_mut() {
-                // Видеокарта простаивает (device_wait_idle выше), конвейеры можно менять.
-                Some(demo) => demo.set_format(&self.ctx, res, &self.shaders, format.format)?,
+                Some(demo) => {
+                    if demo.output_format() != format.format {
+                        // Редкий случай (окно перенесли на другой монитор): конвейер вывода
+                        // пересобирается, старый может ещё использоваться, поэтому ждём.
+                        // SAFETY: простое ожидание устройства.
+                        unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
+                        demo.set_format(&self.ctx, res, &self.shaders, format.format)?;
+                    }
+                }
                 None => {
                     self.demo = Some(Demo::new(
                         &self.ctx,
@@ -495,6 +614,67 @@ impl WindowRenderer {
         self.needs_recreate = false;
         tracing::debug!("swapchain: {}×{}", extent.width, extent.height);
         Ok(true)
+    }
+
+    /// Удаляет старые swapchain, все показы которых закончились. `completed`: последний
+    /// кадр, который видеокарта точно закончила.
+    fn collect_retired(&mut self, completed: Option<u64>) -> Result<(), GpuError> {
+        // Заборы собираем каждый кадр, иначе они копились бы, пока окно не меняет размер.
+        self.present_fences.collect(&self.ctx.device)?;
+        if self.retired.is_empty() {
+            return Ok(());
+        }
+        let oldest = self.retired.iter().map(|r| r.frame).min().unwrap_or(0);
+        if self.frame_number.saturating_sub(oldest) > RETIRE_TIMEOUT_FRAMES {
+            tracing::warn!("Старый swapchain долго не освобождается, жду видеокарту");
+            // SAFETY: простое ожидание устройства.
+            unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
+            self.destroy_all_retired();
+            return Ok(());
+        }
+        let mut i = 0;
+        while i < self.retired.len() {
+            let r = &self.retired[i];
+            // Нужны оба условия: показы его картинок закончены (сработали их заборы), и
+            // закончен кадр r.frame, первый после него. Кадры, рисовавшие в старые картинки,
+            // все раньше r.frame; ждём ещё один кадр сверху, чтобы и показ последнего из них,
+            // стоявший в очереди перед кадром r.frame, точно считался завершённым.
+            let frames_done = completed.is_some_and(|c| c >= r.frame);
+            if !frames_done || self.present_fences.busy(r.swapchain) {
+                i += 1;
+                continue;
+            }
+            let r = self.retired.swap_remove(i);
+            // SAFETY: кадры и показы со старыми объектами закончены (проверено выше), а новые
+            // кадры в этот swapchain больше не рисуются.
+            unsafe { destroy_retired(&self.ctx.device, &self.swapchain_loader, r) };
+        }
+        Ok(())
+    }
+
+    /// Удаляет все старые swapchain. Вызывать, когда видеокарта простаивает.
+    fn destroy_all_retired(&mut self) {
+        let device = &self.ctx.device;
+        for r in self.retired.drain(..) {
+            let fences = &mut self.present_fences;
+            fences.pending.retain(|&(s, f)| {
+                if s != r.swapchain {
+                    return true;
+                }
+                // Видеокарта простаивает: забор либо сработал, либо уже не сработает
+                // никогда. Сбрасываем и возвращаем в оборот.
+                // SAFETY: забор этого устройства, его никто не ждёт.
+                if unsafe { device.reset_fences(&[f]) }.is_ok() {
+                    fences.free.push(f);
+                } else {
+                    // SAFETY: см. выше.
+                    unsafe { device.destroy_fence(f, None) };
+                }
+                false
+            });
+            // SAFETY: видеокарта простаивает (условие функции).
+            unsafe { destroy_retired(device, &self.swapchain_loader, r) };
+        }
     }
 
     /// # Safety
@@ -520,7 +700,10 @@ impl Drop for WindowRenderer {
         // Пустые (null) дескрипторы Vulkan разрешает передавать в destroy-функции.
         unsafe {
             let _ = self.ctx.device.device_wait_idle();
+            self.destroy_all_retired();
+            self.present_fences.destroy(&self.ctx.device);
             self.destroy_swapchain_objects();
+            self.transients.destroy(&self.ctx);
             let device = &self.ctx.device;
             if let Some(demo) = self.demo.take() {
                 demo.destroy(&self.ctx);
@@ -538,6 +721,23 @@ impl Drop for WindowRenderer {
             self.surface_loader.destroy_surface(self.surface, None);
         }
         // Дальше Rust сам уничтожит ctx (устройство и экземпляр), а затем отпустит окно.
+    }
+}
+
+/// Уничтожает объекты старого swapchain.
+///
+/// # Safety
+/// Ни видеокарта, ни показ кадров их больше не используют.
+unsafe fn destroy_retired(device: &ash::Device, loader: &khr::swapchain::Device, r: Retired) {
+    // SAFETY: условие функции.
+    unsafe {
+        for v in r.views {
+            device.destroy_image_view(v, None);
+        }
+        for s in r.semaphores {
+            device.destroy_semaphore(s, None);
+        }
+        loader.destroy_swapchain(r.swapchain, None);
     }
 }
 

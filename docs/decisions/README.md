@@ -9,3 +9,4 @@
 | [0003-performance-targets.md](0003-performance-targets.md) | Эталонный ПК и бюджеты времени кадра |
 | [0004-conventions.md](0004-conventions.md) | Координаты, цвет, время, видеокарта, логи, ресурсы |
 | [0005-license-and-scope.md](0005-license-and-scope.md) | Лицензия, языки, отношения с Forge и Motif |
+| [0006-render-graph.md](0006-render-graph.md) | Граф кадра, временные картинки, пересоздание swapchain без остановки видеокарты |

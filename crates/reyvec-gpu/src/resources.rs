@@ -368,13 +368,14 @@ impl GpuResources {
 
         let view = texture.view;
         let slot = self.textures.insert(texture);
-        if slot >= crate::bindless::MAX_TEXTURES {
+        // Ячейки в конце общего списка отданы временным картинкам графа кадра.
+        if slot >= crate::graph::FIRST_TRANSIENT_SLOT {
             let t = self.textures.take(slot).expect("только что вставлена");
             self.textures.release(slot);
             destroy_texture(ctx, t);
             return Err(GpuError::Memory(format!(
                 "текстур больше {}",
-                crate::bindless::MAX_TEXTURES
+                crate::graph::FIRST_TRANSIENT_SLOT
             )));
         }
         self.bindless.write_texture(ctx, slot, view);
