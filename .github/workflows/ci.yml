@@ -31,6 +31,8 @@ jobs:
         run: cargo test --workspace
       # Проверяем тот же путь, которым Роман обновляет локальную версию,
       # причём в Windows PowerShell 5.1, как при запуске update.bat.
+      # У машины CI нет видеокарты и Vulkan, поэтому окно здесь не открываем:
+      # окно проверяет задача lavapipe ниже и Роман на своём ПК.
       - name: Local update script (Windows PowerShell)
         shell: powershell
         run: |
@@ -38,8 +40,33 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\scripts\run.ps1 --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\scripts\run.ps1
+          .\scripts\run.ps1 --help
           exit $LASTEXITCODE
+
+  lavapipe:
+    name: Linux, software Vulkan (GPU tests, window with validation)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install software Vulkan, validation layers, shader compiler, virtual display
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools glslang-tools xvfb
+          vulkaninfo --summary | grep -E "deviceName|apiVersion"
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Precompiled SPIR-V matches GLSL sources
+        run: |
+          crates/reyvec-gpu/shaders/compile.sh
+          git diff --exit-code -- crates/reyvec-gpu/shaders
+      - name: GPU tests (headless triangle with validation)
+        run: cargo test -p reyvec-gpu -- --include-ignored
+      - name: Sandbox window, 120 frames, validation on
+        run: |
+          cargo build -p reyvec-sandbox
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --list-gpus
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --frames 120
 
   deny:
     name: Licenses and advisories (cargo-deny)

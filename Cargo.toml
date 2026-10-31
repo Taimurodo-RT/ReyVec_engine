@@ -12,8 +12,16 @@ publish = false
 
 [workspace.dependencies]
 reyvec-app = { path = "crates/reyvec-app" }
+reyvec-gpu = { path = "crates/reyvec-gpu" }
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+thiserror = "2"
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Без wayland-csd-adwaita: рамки окна на Wayland рисует система, а этот пакет тянет неподдерживаемый ttf-parser.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
