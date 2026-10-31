@@ -6,7 +6,9 @@ use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Core, GpuContext, GpuOptions};
-use crate::pipeline::{TrianglePipeline, TrianglePush, color_range, image_barrier};
+use crate::demo::Demo;
+use crate::pipeline::{color_range, image_barrier};
+use crate::resources::GpuResources;
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
 /// Сколько кадров видеокарта может готовить одновременно с процессором.
@@ -57,7 +59,10 @@ pub struct WindowRenderer {
     present_mode: vk::PresentModeKHR,
     vsync: bool,
     needs_recreate: bool,
-    pipeline: TrianglePipeline,
+    resources: Option<GpuResources>,
+    demo: Option<Demo>,
+    /// Сквозной номер кадра, нужен очереди отложенного удаления.
+    frame_number: u64,
     swapchain_loader: khr::swapchain::Device,
     surface_loader: khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -116,11 +121,9 @@ impl WindowRenderer {
             present_mode: vk::PresentModeKHR::FIFO,
             vsync: options.vsync,
             needs_recreate: true,
-            pipeline: TrianglePipeline {
-                layout: vk::PipelineLayout::null(),
-                pipeline: vk::Pipeline::null(),
-                format: vk::Format::UNDEFINED,
-            },
+            resources: None,
+            demo: None,
+            frame_number: 0,
             swapchain_loader,
             surface_loader,
             surface,
@@ -129,6 +132,7 @@ impl WindowRenderer {
         };
         // Дальше при любой ошибке Drop аккуратно уберёт всё созданное.
         renderer.create_frames()?;
+        renderer.resources = Some(GpuResources::new(&renderer.ctx)?);
         renderer.recreate_swapchain(size)?;
         tracing::info!(
             "Вывод в окно: {}×{}, формат {:?}, режим показа {:?}",
@@ -176,6 +180,14 @@ impl WindowRenderer {
         // SAFETY: забор принадлежит этому устройству.
         unsafe { device.wait_for_fences(&[frame.in_flight], true, u64::MAX) }
             .ctx("ожидание кадра")?;
+        // Забор этой ячейки дождались, значит кадр, что был в ней раньше, закончен.
+        let completed = self.frame_number.checked_sub(FRAMES_IN_FLIGHT as u64);
+        if let Some(res) = self.resources.as_mut() {
+            res.begin_frame(&self.ctx, self.frame_number, completed);
+            if let Some(demo) = self.demo.as_mut() {
+                demo.update(&self.ctx, res, time)?;
+            }
+        }
 
         // SAFETY: swapchain и семафор живы; семафор не ждёт ни одна отправка.
         let acquired = unsafe {
@@ -209,10 +221,6 @@ impl WindowRenderer {
         let view = self.views[image_index];
         let render_finished = self.render_finished[image_index];
         let extent = self.extent;
-        let push = TrianglePush {
-            time,
-            aspect: extent.width as f32 / extent.height as f32,
-        };
 
         // SAFETY: забор кадра дождались, значит его командный буфер свободен.
         // Все объекты принадлежат этому устройству и живы до конца кадра.
@@ -243,7 +251,17 @@ impl WindowRenderer {
                 &vk::DependencyInfo::default().image_memory_barriers(&to_color),
             );
 
-            self.pipeline.record(device, frame.cmd, view, extent, push);
+            if let (Some(demo), Some(res)) = (&self.demo, self.resources.as_mut()) {
+                demo.record(
+                    &self.ctx,
+                    res,
+                    frame.cmd,
+                    self.frame_index,
+                    view,
+                    extent,
+                    time,
+                );
+            }
 
             let to_present = [image_barrier(
                 image,
@@ -300,7 +318,8 @@ impl WindowRenderer {
             }
         }
 
-        self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
+        self.frame_number += 1;
+        self.frame_index = (self.frame_number % FRAMES_IN_FLIGHT as u64) as usize;
         Ok(FrameStatus::Presented)
     }
 
@@ -432,11 +451,14 @@ impl WindowRenderer {
             }
         }
 
-        if self.pipeline.format != format.format {
-            let new = TrianglePipeline::new(device, format.format)?;
-            let old = std::mem::replace(&mut self.pipeline, new);
-            // SAFETY: видеокарта простаивает, старый конвейер больше не нужен.
-            unsafe { old.destroy(device) };
+        if let Some(res) = self.resources.as_mut() {
+            match self.demo.as_mut() {
+                // Видеокарта простаивает (device_wait_idle выше), конвейеры можно менять.
+                Some(demo) => demo.set_format(&self.ctx, res, format.format)?,
+                None => {
+                    self.demo = Some(Demo::new(&self.ctx, res, format.format, FRAMES_IN_FLIGHT)?)
+                }
+            }
         }
 
         self.needs_recreate = false;
@@ -469,7 +491,12 @@ impl Drop for WindowRenderer {
             let _ = self.ctx.device.device_wait_idle();
             self.destroy_swapchain_objects();
             let device = &self.ctx.device;
-            self.pipeline.destroy(device);
+            if let Some(demo) = self.demo.take() {
+                demo.destroy(&self.ctx);
+            }
+            if let Some(res) = self.resources.take() {
+                res.destroy(&self.ctx);
+            }
             for frame in self.frames.drain(..) {
                 device.destroy_fence(frame.in_flight, None);
                 device.destroy_semaphore(frame.image_available, None);

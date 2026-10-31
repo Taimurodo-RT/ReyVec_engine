@@ -194,6 +194,8 @@ impl Core {
             probe.descriptor_indexing = f12.descriptor_indexing == vk::TRUE
                 && f12.runtime_descriptor_array == vk::TRUE
                 && f12.descriptor_binding_partially_bound == vk::TRUE
+                && f12.descriptor_binding_sampled_image_update_after_bind == vk::TRUE
+                && f12.descriptor_binding_update_unused_while_pending == vk::TRUE
                 && f12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE;
             probe.buffer_device_address = f12.buffer_device_address == vk::TRUE;
         }
@@ -309,6 +311,8 @@ unsafe extern "system" fn debug_callback(
 
 /// Видеокарта и логическое устройство с одной очередью графики.
 pub(crate) struct GpuContext {
+    /// Распределитель памяти видеокарты. Уничтожается раньше устройства (см. Drop).
+    pub allocator: std::mem::ManuallyDrop<std::sync::Mutex<gpu_allocator::vulkan::Allocator>>,
     pub device: ash::Device,
     pub queue: vk::Queue,
     pub queue_family: u32,
@@ -329,14 +333,35 @@ impl GpuContext {
         surface: Option<(&khr::surface::Instance, vk::SurfaceKHR)>,
     ) -> Result<Self, Box<(GpuError, Core)>> {
         match Self::create_device(&core, options, surface) {
-            Ok((device, queue, queue_family, physical, adapter)) => Ok(Self {
-                device,
-                queue,
-                queue_family,
-                physical,
-                adapter,
-                core,
-            }),
+            Ok((device, queue, queue_family, physical, adapter)) => {
+                let allocator = gpu_allocator::vulkan::Allocator::new(
+                    &gpu_allocator::vulkan::AllocatorCreateDesc {
+                        instance: core.instance.clone(),
+                        device: device.clone(),
+                        physical_device: physical,
+                        debug_settings: Default::default(),
+                        buffer_device_address: true,
+                        allocation_sizes: Default::default(),
+                    },
+                );
+                let allocator = match allocator {
+                    Ok(a) => a,
+                    Err(e) => {
+                        // SAFETY: устройство только что создано и ещё ничем не используется.
+                        unsafe { device.destroy_device(None) };
+                        return Err(Box::new((GpuError::Memory(e.to_string()), core)));
+                    }
+                };
+                Ok(Self {
+                    allocator: std::mem::ManuallyDrop::new(std::sync::Mutex::new(allocator)),
+                    device,
+                    queue,
+                    queue_family,
+                    physical,
+                    adapter,
+                    core,
+                })
+            }
             Err(e) => Err(Box::new((e, core))),
         }
     }
@@ -365,6 +390,8 @@ impl GpuContext {
             .descriptor_indexing(true)
             .runtime_descriptor_array(true)
             .descriptor_binding_partially_bound(true)
+            .descriptor_binding_sampled_image_update_after_bind(true)
+            .descriptor_binding_update_unused_while_pending(true)
             .shader_sampled_image_array_non_uniform_indexing(true)
             .buffer_device_address(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
@@ -411,6 +438,8 @@ impl Drop for GpuContext {
         // здесь остаётся только дождаться видеокарты и закрыть устройство.
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Распределитель освобождает свои блоки памяти, поэтому уходит до устройства.
+            std::mem::ManuallyDrop::drop(&mut self.allocator);
             self.device.destroy_device(None);
         }
     }

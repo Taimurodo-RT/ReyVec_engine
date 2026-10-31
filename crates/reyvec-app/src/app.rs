@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub vsync: bool,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
+    /// Закрыть окно через столько секунд (для автопроверок).
+    pub max_seconds: Option<f64>,
 }
 
 /// Итог работы окна.
@@ -150,6 +152,13 @@ impl App {
                 }
                 if self.config.max_frames.is_some_and(|max| self.frames >= max) {
                     tracing::info!("Нарисовано {} кадров, закрываю окно", self.frames);
+                    event_loop.exit();
+                } else if self
+                    .config
+                    .max_seconds
+                    .is_some_and(|max| self.start.elapsed().as_secs_f64() >= max)
+                {
+                    tracing::info!("Время вышло, закрываю окно");
                     event_loop.exit();
                 }
             }

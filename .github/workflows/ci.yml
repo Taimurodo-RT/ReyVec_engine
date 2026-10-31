@@ -62,11 +62,12 @@ jobs:
           git diff --exit-code -- crates/reyvec-gpu/shaders
       - name: GPU tests (headless triangle with validation)
         run: cargo test -p reyvec-gpu -- --include-ignored
-      - name: Sandbox window, 120 frames, validation on
+      # 7 секунд: за это время сцена несколько раз загружает новую текстуру и удаляет старую.
+      - name: Sandbox window, 7 seconds, validation on
         run: |
           cargo build -p reyvec-sandbox
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --list-gpus
-          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --frames 120
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --seconds 7
 
   deny:
     name: Licenses and advisories (cargo-deny)

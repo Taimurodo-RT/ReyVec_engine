@@ -4,6 +4,6 @@
 # From stage 2 shaders move to Slang and are compiled by the build.
 set -eu
 cd "$(dirname "$0")"
-for f in triangle.vert triangle.frag; do
+for f in triangle.vert triangle.frag sprite.vert sprite.frag; do
     glslangValidator -V --target-env vulkan1.3 -o "$f.spv" "$f" >/dev/null
 done
