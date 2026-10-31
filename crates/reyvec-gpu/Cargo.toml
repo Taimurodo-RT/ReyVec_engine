@@ -1,0 +1,19 @@
+[package]
+name = "reyvec-gpu"
+description = "ReyVec: безопасная обёртка над Vulkan. Весь unsafe-код Vulkan живёт только здесь."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ash.workspace = true
+ash-window.workspace = true
+raw-window-handle.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

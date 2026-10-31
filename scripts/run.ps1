@@ -17,4 +17,8 @@ if (Test-Path $versionFile) {
 }
 
 & $exe @args
-exit $LASTEXITCODE
+$code = $LASTEXITCODE
+if ($code -ne 0) {
+    Write-Host "Песочница завершилась с ошибкой (код $code). Пришли Claude файл dist\reyvec.log." -ForegroundColor Yellow
+}
+exit $code

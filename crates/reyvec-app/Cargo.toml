@@ -1,6 +1,6 @@
 [package]
 name = "reyvec-app"
-description = "ReyVec: окно, цикл кадра, время и ввод. Пока только общие сведения о движке и логи."
+description = "ReyVec: окно, цикл кадра, время и ввод."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+reyvec-gpu.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+winit.workspace = true
 
 [lints]
 workspace = true

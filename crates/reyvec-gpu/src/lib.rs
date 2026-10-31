@@ -1,0 +1,57 @@
+//! `reyvec-gpu`: безопасная обёртка над Vulkan для движка ReyVec.
+//!
+//! Правило проекта: весь `unsafe`-код Vulkan живёт только в этом крейте.
+//! Снаружи видны безопасные типы:
+//!
+//! - [`list_adapters`] перечисляет видеокарты и объясняет, почему какая-то не подходит;
+//! - [`WindowRenderer`] рисует кадры в окно (этап 1: вращающийся треугольник);
+//! - [`render_triangle_headless`] рисует тот же кадр без окна, для автотестов.
+//!
+//! Требования к видеокарте: Vulkan 1.3 с `dynamicRendering`, `synchronization2`,
+//! индексированием дескрипторов и адресами буферов (см. `docs/decisions/0001-stack.md`).
+
+mod adapter;
+mod context;
+mod headless;
+mod pipeline;
+mod window;
+
+pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
+pub use context::{GpuOptions, list_adapters, validation_error_count};
+pub use headless::{HeadlessImage, render_triangle_headless};
+pub use pipeline::CLEAR_COLOR;
+pub use window::{FrameStatus, RendererOptions, WindowRenderer, WindowTarget};
+
+use ash::vk;
+
+/// Ошибки GPU-слоя. Тексты написаны так, чтобы их можно было показать человеку.
+#[derive(Debug, thiserror::Error)]
+pub enum GpuError {
+    /// Не удалось загрузить Vulkan (нет драйвера или `vulkan-1.dll`).
+    #[error("не удалось загрузить Vulkan: {0}. Обновите драйвер видеокарты")]
+    Loading(String),
+    /// Вызов Vulkan вернул ошибку.
+    #[error("ошибка Vulkan при «{what}»: {result:?}")]
+    Vulkan {
+        /// Что делали.
+        what: &'static str,
+        /// Код ошибки.
+        result: vk::Result,
+    },
+    /// Нет видеокарты, которая подходит движку, или выбранная не подходит.
+    #[error("{0}")]
+    NoSuitableAdapter(String),
+    /// Окно не отдало свои дескрипторы.
+    #[error("окно недоступно для Vulkan: {0}")]
+    Window(String),
+}
+
+pub(crate) trait VkResultExt<T> {
+    fn ctx(self, what: &'static str) -> Result<T, GpuError>;
+}
+
+impl<T> VkResultExt<T> for Result<T, vk::Result> {
+    fn ctx(self, what: &'static str) -> Result<T, GpuError> {
+        self.map_err(|result| GpuError::Vulkan { what, result })
+    }
+}
