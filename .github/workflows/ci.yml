@@ -53,6 +53,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\scripts\run.ps1 --help
           exit $LASTEXITCODE
+      # Обновление поверх ручной правки: файл заменяется версией из репозитория,
+      # копия правки сохраняется в dist\local-changes.
+      - name: Update over a locally edited file (Windows PowerShell)
+        if: github.event_name == 'pull_request'
+        shell: powershell
+        env:
+          HEAD_BRANCH: ${{ github.head_ref }}
+        run: |
+          # git пишет ход работы в stderr; Windows PowerShell не должен считать это ошибкой.
+          $ErrorActionPreference = "Continue"
+          git fetch origin $env:HEAD_BRANCH
+          git checkout -B $env:HEAD_BRANCH origin/$env:HEAD_BRANCH
+          Add-Content -Path README.md -Value "local edit"
+          .\scripts\update.ps1 -Branch $env:HEAD_BRANCH
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --quiet HEAD -- README.md
+          if ($LASTEXITCODE -ne 0) { Write-Host "README.md was not restored"; exit 1 }
+          $patch = Get-ChildItem dist\local-changes\*.patch | Select-Object -First 1
+          if (-not $patch) { Write-Host "backup patch missing"; exit 1 }
+          if (-not (Select-String -Path $patch.FullName -Pattern "local edit" -Quiet)) { Write-Host "backup does not contain the edit"; exit 1 }
+          Write-Host "OK: edit replaced, backup at $($patch.FullName)"
 
   lavapipe:
     name: Linux, software Vulkan (GPU tests, window with validation)
