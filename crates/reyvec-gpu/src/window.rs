@@ -315,12 +315,12 @@ impl WindowRenderer {
     }
 
     /// Как рисуются залитые векторные фигуры.
-    pub fn fill(&self) -> crate::FillMethod {
+    pub fn fill(&self) -> crate::FillMode {
         self.demo.as_ref().map_or_else(Default::default, Demo::fill)
     }
 
     /// Способ рисования залитых векторных фигур со следующего кадра.
-    pub fn set_fill(&mut self, fill: crate::FillMethod) {
+    pub fn set_fill(&mut self, fill: crate::FillMode) {
         if let Some(demo) = self.demo.as_mut() {
             demo.set_fill(fill);
         }

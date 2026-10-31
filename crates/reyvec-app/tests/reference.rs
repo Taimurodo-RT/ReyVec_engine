@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use reyvec_app::snapshot::{compare, diff_image, load_png, save_png};
 use reyvec_app::{
-    DemoScene, FillMethod, GpuOptions, HeadlessScene, Msaa, render_headless, validation_error_count,
+    DemoScene, FillMode, GpuOptions, HeadlessScene, Msaa, render_headless, validation_error_count,
 };
 
 /// Насколько может отличаться канал пикселя (из 255): разные версии драйвера чуть
@@ -37,7 +37,7 @@ fn cases() -> Vec<Case> {
         scene,
         msaa: Msaa::Off,
         perceptual_edges: false,
-        fill: FillMethod::Triangles,
+        fill: FillMode::Triangles,
         zoom: false,
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
@@ -77,7 +77,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "vector-2s-stencil",
             scene: HeadlessScene {
-                fill: FillMethod::Stencil,
+                fill: FillMode::Stencil,
                 ..at(DemoScene::Vector, 2.0, false)
             },
         },
@@ -85,7 +85,7 @@ fn cases() -> Vec<Case> {
             name: "vector-2s-stencil-msaa4",
             scene: HeadlessScene {
                 msaa: Msaa::X4,
-                fill: FillMethod::Stencil,
+                fill: FillMode::Stencil,
                 ..at(DemoScene::Vector, 2.0, false)
             },
         },
@@ -101,9 +101,35 @@ fn cases() -> Vec<Case> {
             name: "vector-zoom-stencil-msaa4",
             scene: HeadlessScene {
                 msaa: Msaa::X4,
-                fill: FillMethod::Stencil,
+                fill: FillMode::Stencil,
                 zoom: true,
                 ..at(DemoScene::Vector, 2.0, false)
+            },
+        },
+        // Способ у каждой фигуры свой: сердце трафаретом, остальное треугольниками.
+        Case {
+            name: "vector-zoom-per-shape-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                fill: FillMode::PerShape,
+                zoom: true,
+                ..at(DemoScene::Vector, 2.0, false)
+            },
+        },
+        // Перетекание: в начале большая фигура круг, маленькие в разных формах.
+        Case {
+            name: "morph-0s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Morph, 0.0, false)
+            },
+        },
+        // Через 2.2 с большая фигура между звездой и сердцем.
+        Case {
+            name: "morph-2.2s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Morph, 2.2, false)
             },
         },
         Case {

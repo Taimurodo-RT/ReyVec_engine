@@ -1,4 +1,5 @@
-//! Векторный слой на видеокарте. Два способа рисовать заливки ([`FillMethod`]):
+//! Векторный слой на видеокарте. Два способа рисовать заливки ([`FillMethod`], выбирается
+//! для каждой фигуры, а для сравнения можно переключить на всю сцену: [`FillMode`]):
 //!
 //! 1. **Треугольники** (по умолчанию): фигуры заранее разбиты на треугольники (lyon).
 //!    Треугольники всех фигур [`ShapeLibrary`] лежат в двух общих буферах на видеокарте и
@@ -9,13 +10,15 @@
 //!    залитой фигуры два прохода. Первый считает в трафарете обороты контура (кривые
 //!    считаются точной формулой в шейдере), второй красит, где трафарет не ноль. Изгибы
 //!    гладкие при любом приближении, и процессору не нужно разбивать фигуру. Цена: две
-//!    команды на каждую залитую фигуру в кадре.
+//!    команды на каждую залитую фигуру в кадре. Так же рисуются перетекающие фигуры:
+//!    точки всех ключевых контуров лежат в буфере подряд, вершинный шейдер смешивает
+//!    два соседних по числу `morph` из экземпляра.
 //!
 //! Обводки в обоих способах рисуются треугольниками. Порядок экземпляров сохраняется:
 //! следующие рисуются поверх предыдущих.
 
 use ash::vk;
-use reyvec_vector::{Color, FillRule, Instance, ShapeLibrary, Style};
+use reyvec_vector::{Color, FillMethod, FillRule, Instance, ShapeLibrary, Style};
 
 use crate::GpuError;
 use crate::context::GpuContext;
@@ -28,36 +31,59 @@ use crate::shaders::ShaderLibrary;
 /// 3 рассчитан на 10 000); лишние не рисуются, а в лог пишется предупреждение.
 pub(crate) const MAX_INSTANCES: usize = 16 * 1024;
 /// Байт на экземпляр: раскладка `Instance` в `vector.slang` (std430).
-const INSTANCE_SIZE: usize = 48;
+const INSTANCE_SIZE: usize = 64;
 /// Байт на команду рисования (`VkDrawIndirectCommand`).
 const COMMAND_SIZE: usize = 16;
 /// Байт на точку веера и кривых: положение и координаты кривой.
 const CURVE_VERTEX_SIZE: usize = 16;
 
-/// Как рисовать залитые фигуры.
+/// Как рисовать залитые фигуры во всей сцене.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum FillMethod {
-    /// Заранее разбитые треугольники, одна команда на все фигуры.
+pub enum FillMode {
+    /// Каждая фигура своим способом ([`reyvec_vector::ShapeLibrary::add_with`]).
     #[default]
+    PerShape,
+    /// Все треугольниками (кроме перетекающих: они только трафаретом). Для сравнения.
     Triangles,
-    /// Трафарет: кривые точной формулой в шейдере, две команды на фигуру.
+    /// Все трафаретом. Для сравнения.
     Stencil,
 }
 
-impl FillMethod {
+impl FillMode {
     /// Название для панели и лога.
     pub fn label(self) -> &'static str {
         match self {
-            FillMethod::Triangles => "треугольники",
-            FillMethod::Stencil => "трафарет, кривые в шейдере",
+            FillMode::PerShape => "у каждой фигуры свой способ",
+            FillMode::Triangles => "все треугольниками",
+            FillMode::Stencil => "все трафаретом",
         }
     }
 
-    /// Следующий способ по кругу.
+    /// Следующий вариант по кругу.
     pub fn next(self) -> Self {
         match self {
-            FillMethod::Triangles => FillMethod::Stencil,
-            FillMethod::Stencil => FillMethod::Triangles,
+            FillMode::PerShape => FillMode::Triangles,
+            FillMode::Triangles => FillMode::Stencil,
+            FillMode::Stencil => FillMode::PerShape,
+        }
+    }
+
+    /// Вариант по имени из командной строки: `shape`, `triangles` или `stencil`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "shape" | "per-shape" => Some(FillMode::PerShape),
+            "triangles" => Some(FillMode::Triangles),
+            "stencil" => Some(FillMode::Stencil),
+            _ => None,
+        }
+    }
+
+    /// Рисовать ли трафаретом фигуру со способом `method`.
+    fn stencil(self, method: FillMethod) -> bool {
+        match self {
+            FillMode::PerShape => method == FillMethod::Stencil,
+            FillMode::Triangles => false,
+            FillMode::Stencil => true,
         }
     }
 }
@@ -72,6 +98,11 @@ struct MeshRange {
     curve_index_count: u32,
     even_odd: bool,
     color: Color,
+    method: FillMethod,
+    /// Перетекание: сколько точек между ключевыми контурами в буфере и номер последнего
+    /// ключевого контура (0 у обычных фигур).
+    morph_stride: u32,
+    morph_last: u32,
 }
 
 /// Треугольники всех фигур на видеокарте.
@@ -153,7 +184,7 @@ pub(crate) struct VectorRenderer {
     msaa: Msaa,
     /// Формат трафарета прохода сцены.
     stencil_format: vk::Format,
-    fill: FillMethod,
+    fill: FillMode,
     meshes: Option<Meshes>,
     frames: Vec<FrameBuffers>,
     /// Предупреждение о переполнении уже было в логе.
@@ -195,7 +226,7 @@ impl VectorRenderer {
             pipelines: build(ctx, res, shaders, Msaa::Off, stencil_format)?,
             msaa: Msaa::Off,
             stencil_format,
-            fill: FillMethod::default(),
+            fill: FillMode::default(),
             meshes: None,
             frames,
             warned_overflow: false,
@@ -203,12 +234,12 @@ impl VectorRenderer {
     }
 
     /// Как рисуются заливки.
-    pub fn fill(&self) -> FillMethod {
+    pub fn fill(&self) -> FillMode {
         self.fill
     }
 
     /// Способ рисования заливок со следующего кадра.
-    pub fn set_fill(&mut self, fill: FillMethod) {
+    pub fn set_fill(&mut self, fill: FillMode) {
         self.fill = fill;
     }
 
@@ -291,16 +322,23 @@ impl VectorRenderer {
             }
             let curves = library.curves(id);
             let curve_first = curve_index_count;
+            let keyframes = library.morph_keyframes(id);
+            let mut morph_stride = 0;
             if let Some(c) = curves {
-                for (p, uv) in c.vertices.iter().zip(&c.uv) {
-                    for f in [p[0], p[1], uv[0], uv[1]] {
-                        curve_vertices.extend_from_slice(&f.to_ne_bytes());
+                // Точки первого ключевого контура, за ними остальных: номер точки в
+                // контуре k = номер в первом + k · stride.
+                for positions in std::iter::once(&c.vertices).chain(keyframes) {
+                    for (p, uv) in positions.iter().zip(&c.uv) {
+                        for f in [p[0], p[1], uv[0], uv[1]] {
+                            curve_vertices.extend_from_slice(&f.to_ne_bytes());
+                        }
                     }
                 }
                 for &i in &c.indices {
                     curve_indices.extend_from_slice(&(i + curve_vertex_count).to_ne_bytes());
                 }
-                curve_vertex_count += c.vertices.len() as u32;
+                morph_stride = c.vertices.len() as u32;
+                curve_vertex_count += morph_stride * (1 + keyframes.len() as u32);
                 curve_index_count += c.indices.len() as u32;
             }
             ranges.push(MeshRange {
@@ -310,6 +348,9 @@ impl VectorRenderer {
                 curve_index_count: curves.map_or(0, |c| c.indices.len() as u32),
                 even_odd: matches!(shape.style, Style::Fill(FillRule::EvenOdd)),
                 color: shape.color,
+                method: library.method(id).unwrap_or_default(),
+                morph_stride,
+                morph_last: keyframes.len() as u32,
             });
             vertex_count += mesh.vertices.len() as u32;
             index_count += mesh.indices.len() as u32;
@@ -500,8 +541,9 @@ struct Packed {
 /// Раскладывает экземпляры в байты для видеокарты: экземпляры (std430), команды
 /// рисования треугольников и порядок рисования. Подряд идущие экземпляры одной фигуры,
 /// которые рисуются треугольниками, становятся одной командой. Экземпляры неизвестных и
-/// пустых фигур пропускаются.
-fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMethod) -> Packed {
+/// пустых фигур пропускаются. Фигуры без треугольников (перетекающие) рисуются трафаретом
+/// при любом `fill`.
+fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMode) -> Packed {
     let mut out = Vec::with_capacity(instances.len() * INSTANCE_SIZE);
     let mut commands: Vec<[u32; 4]> = Vec::new();
     let mut ops: Vec<Op> = Vec::new();
@@ -511,7 +553,8 @@ fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMethod) -> Packe
         let Some(range) = ranges.get(inst.shape.0 as usize) else {
             continue;
         };
-        let stencil = fill == FillMethod::Stencil && range.curve_index_count > 0;
+        let stencil =
+            range.curve_index_count > 0 && (range.index_count == 0 || fill.stencil(range.method));
         if range.index_count == 0 && !stencil {
             continue;
         }
@@ -525,6 +568,10 @@ fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMethod) -> Packe
         for v in color {
             out.extend_from_slice(&v.to_ne_bytes());
         }
+        out.extend_from_slice(&range.morph_stride.to_ne_bytes());
+        out.extend_from_slice(&range.morph_last.to_ne_bytes());
+        out.extend_from_slice(&inst.morph.to_ne_bytes());
+        out.extend_from_slice(&0u32.to_ne_bytes());
         if stencil {
             ops.push(Op::Stencil {
                 instance: written,
@@ -630,6 +677,18 @@ mod tests {
     use super::*;
     use reyvec_vector::{Affine, ShapeId};
 
+    const PLAIN: MeshRange = MeshRange {
+        first_index: 0,
+        index_count: 0,
+        curve_first_index: 0,
+        curve_index_count: 0,
+        even_odd: false,
+        color: Color::WHITE,
+        method: FillMethod::Triangles,
+        morph_stride: 0,
+        morph_last: 0,
+    };
+
     fn words(bytes: &[u8]) -> Vec<u32> {
         bytes
             .chunks_exact(4)
@@ -648,6 +707,7 @@ mod tests {
                 curve_index_count: 0,
                 even_odd: false,
                 color: red,
+                ..PLAIN
             },
             MeshRange {
                 first_index: 6,
@@ -656,6 +716,7 @@ mod tests {
                 curve_index_count: 0,
                 even_odd: false,
                 color: Color::WHITE,
+                ..PLAIN
             },
             MeshRange {
                 first_index: 9,
@@ -664,6 +725,7 @@ mod tests {
                 curve_index_count: 0,
                 even_odd: false,
                 color: Color::WHITE,
+                ..PLAIN
             },
         ];
         let at = |shape: u32, x: f64| Instance::new(ShapeId(shape), Affine::translate((x, 2.0)));
@@ -680,7 +742,7 @@ mod tests {
             instances: inst,
             commands: cmds,
             ops,
-        } = pack(&ranges, &instances, FillMethod::Triangles);
+        } = pack(&ranges, &instances, FillMode::Triangles);
         assert_eq!(inst.len(), 5 * INSTANCE_SIZE);
         assert_eq!(ops, [Op::Triangles { first: 0, count: 3 }]);
         assert_eq!(
@@ -695,6 +757,60 @@ mod tests {
         assert_eq!([f(4), f(5)], [5.0, 2.0]);
         assert_eq!(words(&last[24..32]), [0, 0]);
         assert_eq!([f(8), f(9), f(10), f(11)], [0.5, 0.0, 0.0, 0.25]);
+        assert_eq!(words(&last[48..64]), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn per_shape_methods_and_morphs() {
+        let ranges = [
+            // 0: заливка треугольниками, 1: заливка трафаретом, 2: перетекающая (нет
+            // треугольников, три ключевых контура по 12 точек).
+            MeshRange {
+                index_count: 3,
+                curve_index_count: 6,
+                ..PLAIN
+            },
+            MeshRange {
+                index_count: 3,
+                curve_index_count: 6,
+                method: FillMethod::Stencil,
+                ..PLAIN
+            },
+            MeshRange {
+                curve_index_count: 12,
+                method: FillMethod::Stencil,
+                morph_stride: 12,
+                morph_last: 2,
+                ..PLAIN
+            },
+        ];
+        let at = |shape: u32| Instance::new(ShapeId(shape), Affine::IDENTITY);
+        let instances = [at(0), at(1), at(2).with_morph(1.5)];
+        let stencil = |instance, index_count| Op::Stencil {
+            instance,
+            index_count,
+            even_odd: false,
+        };
+        let per_shape = pack(&ranges, &instances, FillMode::PerShape);
+        assert_eq!(
+            per_shape.ops,
+            [
+                Op::Triangles { first: 0, count: 1 },
+                stencil(1, 6),
+                stencil(2, 12)
+            ]
+        );
+        let morph = &per_shape.instances[2 * INSTANCE_SIZE + 48..3 * INSTANCE_SIZE];
+        assert_eq!(words(&morph[..8]), [12, 2]);
+        assert_eq!(f32::from_ne_bytes(morph[8..12].try_into().unwrap()), 1.5);
+        // «Все треугольниками»: перетекающая всё равно трафаретом.
+        let triangles = pack(&ranges, &instances, FillMode::Triangles);
+        assert_eq!(
+            triangles.ops,
+            [Op::Triangles { first: 0, count: 2 }, stencil(2, 12)]
+        );
+        let all = pack(&ranges, &instances, FillMode::Stencil);
+        assert_eq!(all.ops, [stencil(0, 6), stencil(1, 6), stencil(2, 12)]);
     }
 
     #[test]
@@ -705,13 +821,14 @@ mod tests {
             curve_first_index: 30,
             curve_index_count,
             even_odd,
-            color: Color::WHITE,
+            method: FillMethod::Triangles,
+            ..PLAIN
         };
         // 0: заливка, 1: обводка (у обводок нет веера), 2: заливка EvenOdd.
         let ranges = [range(0, 12, false), range(3, 0, false), range(6, 9, true)];
         let at = |shape: u32| Instance::new(ShapeId(shape), Affine::IDENTITY);
         let instances = [at(1), at(1), at(0), at(1), at(2), at(2)];
-        let packed = pack(&ranges, &instances, FillMethod::Stencil);
+        let packed = pack(&ranges, &instances, FillMode::Stencil);
         assert_eq!(
             packed.ops,
             [
@@ -738,7 +855,7 @@ mod tests {
         // Номер первого треугольника веера лежит в экземпляре рядом с номером способа 1.
         assert_eq!(words(&packed.instances[24..32]), [3, 30]);
         // Тот же кадр треугольниками: все шесть экземпляров в командах.
-        let triangles = pack(&ranges, &instances, FillMethod::Triangles);
+        let triangles = pack(&ranges, &instances, FillMode::Triangles);
         assert_eq!(triangles.ops, [Op::Triangles { first: 0, count: 4 }]);
     }
 }

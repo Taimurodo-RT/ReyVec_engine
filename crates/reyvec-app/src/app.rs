@@ -32,7 +32,7 @@ pub struct AppConfig {
     pub hot_reload: bool,
     /// Включить замеры для Tracy: программа Tracy сможет подключиться к движку.
     pub tracy: bool,
-    /// С какой сцены песочницы начать (клавиши 1 и 2 переключают).
+    /// С какой сцены песочницы начать (клавиши 1, 2 и 3 переключают).
     pub scene: DemoScene,
     /// Сглаживание сцены (клавиша M переключает).
     pub msaa: Msaa,
@@ -40,7 +40,7 @@ pub struct AppConfig {
     /// `docs/decisions/0009-vector-layer.md`.
     pub perceptual_edges: bool,
     /// Как рисовать залитые векторные фигуры (клавиша F переключает).
-    pub fill: reyvec_gpu::FillMethod,
+    pub fill: reyvec_gpu::FillMode,
     /// Лупа векторной сцены (клавиша Z переключает).
     pub zoom: bool,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
@@ -299,6 +299,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
     match code {
         KeyCode::Digit1 | KeyCode::Numpad1 => Some(DemoScene::Gpu),
         KeyCode::Digit2 | KeyCode::Numpad2 => Some(DemoScene::Vector),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some(DemoScene::Morph),
         _ => None,
     }
 }
@@ -372,6 +373,7 @@ impl ApplicationHandler for App {
             } if scene_for_key(code).is_some() => {
                 if let (Some(r), Some(scene)) = (self.renderer.as_mut(), scene_for_key(code)) {
                     r.set_scene(scene);
+                    tracing::info!("Сцена: {}", scene.title());
                 }
             }
             WindowEvent::KeyboardInput {

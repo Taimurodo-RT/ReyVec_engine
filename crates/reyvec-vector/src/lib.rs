@@ -7,7 +7,10 @@
 //! - [`tessellate`]: разбиение фигуры на треугольники (библиотека `lyon`). Делается один
 //!   раз, когда фигура появляется, а не каждый кадр;
 //! - [`ShapeLibrary`]: набор фигур с готовыми треугольниками;
-//! - [`Instance`]: фигура на сцене в этом кадре (где стоит, как повёрнута, оттенок).
+//! - [`Instance`]: фигура на сцене в этом кадре (где стоит, как повёрнута, оттенок,
+//!   форма перетекающей фигуры);
+//! - [`morph_mesh`]: перетекание между контурами. Контуры сводятся друг к другу один раз,
+//!   смешивает их каждый кадр видеокарта.
 //!
 //! Каждый кадр процессор только составляет список [`Instance`]. Двигать, вращать и
 //! рисовать фигуры будет видеокарта (`reyvec-gpu`). Как именно она их рисует, этот крейт
@@ -17,6 +20,7 @@
 mod color;
 mod curves;
 mod library;
+mod morph;
 mod shape;
 mod tessellate;
 
@@ -26,5 +30,6 @@ pub use curves::{CurveMesh, curve_mesh};
 pub use kurbo;
 pub use kurbo::{Affine, BezPath, Circle, PathEl, Point, Rect, Vec2};
 pub use library::{Instance, ShapeId, ShapeLibrary};
-pub use shape::{FillRule, LineCap, LineJoin, Shape, Stroke, Style};
+pub use morph::{MorphError, MorphMesh, morph_mesh};
+pub use shape::{FillMethod, FillRule, LineCap, LineJoin, Shape, Stroke, Style};
 pub use tessellate::{EdgeData, Mesh, TessellationError, tessellate, tessellate_smooth};

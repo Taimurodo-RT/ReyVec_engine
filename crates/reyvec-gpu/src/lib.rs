@@ -56,7 +56,7 @@ pub use pipeline::CLEAR_COLOR;
 pub use resources::{BufferId, BufferMemory, TextureId};
 pub use timing::{GpuFrameTimings, GpuTimingAverage, PassTiming};
 pub use ui::UiFrame;
-pub use vector::FillMethod;
+pub use vector::FillMode;
 pub use window::{FrameStatus, RendererOptions, WindowRenderer, WindowTarget};
 
 use ash::vk;

@@ -15,6 +15,10 @@ struct Instance
     uint first_index;
     uint curve_first_index;
     float4 color;
+    uint morph_stride; // перетекание: точек между ключевыми контурами в буфере
+    uint morph_last;   // номер последнего ключевого контура (0 у обычных фигур)
+    float morph;       // форма: 0 первый контур, 1 второй, 1.5 между вторым и третьим
+    uint pad;
 };
 
 struct Push
@@ -33,14 +37,29 @@ struct VertexOut
     nointerpolation float4 color : COLOR;
 };
 
+// Положение точки у перетекающей фигуры: смесь двух соседних ключевых контуров. Точки
+// контура k лежат в буфере через k · morph_stride после точек первого.
+float2 morphed(Instance inst, uint index, float2 first)
+{
+    if (inst.morph_last == 0)
+        return first;
+    float m = clamp(inst.morph, 0.0, float(inst.morph_last));
+    uint k = min(uint(m), inst.morph_last - 1);
+    float2 a = pc.vertices[index + k * inst.morph_stride].position;
+    float2 b = pc.vertices[index + (k + 1) * inst.morph_stride].position;
+    return lerp(a, b, m - float(k));
+}
+
 [shader("vertex")]
 VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInstanceID)
 {
     Instance inst = pc.instances[instance];
-    CurveVertex v = pc.vertices[pc.indices[inst.curve_first_index + vertex]];
+    uint index = pc.indices[inst.curve_first_index + vertex];
+    CurveVertex v = pc.vertices[index];
+    float2 shape = morphed(inst, index, v.position);
     float2 p = float2(
-        inst.linear.x * v.position.x + inst.linear.z * v.position.y,
-        inst.linear.y * v.position.x + inst.linear.w * v.position.y) + inst.offset;
+        inst.linear.x * shape.x + inst.linear.z * shape.y,
+        inst.linear.y * shape.x + inst.linear.w * shape.y) + inst.offset;
     p.x /= pc.aspect;
     VertexOut o;
     o.position = float4(p.x, -p.y, 0.0, 1.0);

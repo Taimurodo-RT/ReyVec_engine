@@ -1,7 +1,7 @@
 //! Песочница ReyVec: программа, которую запускают для проверки каждого этапа.
 //!
-//! Окно с тестовыми сценами (клавиши 1 и 2): треугольник и спрайты с текстурами
-//! (этап 2) и векторные фигуры (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
+//! Окно с тестовыми сценами (клавиши 1, 2 и 3): треугольник и спрайты с текстурами
+//! (этап 2), векторные фигуры и перетекание (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
 //! Шейдеры можно править на ходу: после сохранения файла картинка обновится.
 //!
 //! Флаги:
@@ -10,10 +10,11 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
-//! - `--scene gpu|vector`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene gpu|vector|morph`: с какой сцены начать (по умолчанию `vector`);
 //! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
-//! - `--fill triangles|stencil`: как рисовать заливки векторных фигур;
+//! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
+//!   у каждой фигуры свой способ, остальные варианты для сравнения);
 //! - `--zoom`: лупа векторной сцены (увеличение в 8 раз у края сердца);
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
@@ -36,10 +37,12 @@ const HELP: &str = "\
   --no-vsync             без вертикальной синхронизации
   --no-hot-reload        не перезагружать шейдеры после сохранения файлов
   --no-tracy             не включать замеры для программы Tracy
-  --scene <gpu|vector>   с какой сцены начать: gpu (этап 2) или vector (векторы, по умолчанию)
+  --scene <gpu|vector|morph>  с какой сцены начать: gpu (этап 2), vector (векторы, по умолчанию)
+                         или morph (перетекание)
   --msaa <off|4|8>       сглаживание краёв (по умолчанию 4)
   --editor-edges         края «как в редакторах» (дороже, особенно на встроенной видеокарте)
-  --fill <triangles|stencil>  заливки векторов: треугольники (по умолчанию) или трафарет
+  --fill <shape|triangles|stencil>  заливки векторов: у каждой фигуры свой способ (по умолчанию),
+                         все треугольниками или все трафаретом
   --zoom                 лупа векторной сцены: увеличение в 8 раз у края сердца
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
@@ -50,7 +53,7 @@ const HELP: &str = "\
   --version, -V          версия
   --help, -h             эта справка
 
-В окне: Esc закрывает окно, 1 и 2 переключают сцену, M переключает сглаживание, G вид краёв, F1 прячет и показывает панель счётчиков,
+В окне: Esc закрывает окно, 1, 2 и 3 переключают сцену, M переключает сглаживание, G вид краёв, F1 прячет и показывает панель счётчиков,
 F12 сохраняет снимок кадра в папку snapshots рядом с программой.";
 
 #[derive(Debug, Default, PartialEq)]
@@ -71,7 +74,7 @@ struct Args {
     scene: Option<reyvec_app::DemoScene>,
     msaa: Option<reyvec_app::Msaa>,
     editor_edges: bool,
-    fill: Option<reyvec_app::FillMethod>,
+    fill: Option<reyvec_app::FillMode>,
     zoom: bool,
 }
 
@@ -105,10 +108,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 );
             }
             "--scene" => {
-                let n = it.next().ok_or("после --scene нужно gpu или vector")?;
+                let n = it
+                    .next()
+                    .ok_or("после --scene нужно gpu, vector или morph")?;
                 out.scene = Some(
                     reyvec_app::DemoScene::from_name(&n)
-                        .ok_or_else(|| format!("--scene: «{n}», а нужно gpu или vector"))?,
+                        .ok_or_else(|| format!("--scene: «{n}», а нужно gpu, vector или morph"))?,
                 );
             }
             "--msaa" => {
@@ -121,12 +126,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--fill" => {
                 let n = it
                     .next()
-                    .ok_or("после --fill нужно triangles или stencil")?;
-                out.fill = Some(match n.as_str() {
-                    "triangles" => reyvec_app::FillMethod::Triangles,
-                    "stencil" => reyvec_app::FillMethod::Stencil,
-                    _ => return Err(format!("--fill: «{n}», а нужно triangles или stencil")),
-                });
+                    .ok_or("после --fill нужно shape, triangles или stencil")?;
+                out.fill = Some(reyvec_app::FillMode::from_name(&n).ok_or_else(|| {
+                    format!("--fill: «{n}», а нужно shape, triangles или stencil")
+                })?);
             }
             "--zoom" => out.zoom = true,
             "--snapshot" => {
@@ -357,6 +360,15 @@ mod tests {
             parse("--scene vector").unwrap().scene,
             Some(reyvec_app::DemoScene::Vector)
         );
+        assert_eq!(
+            parse("--scene morph").unwrap().scene,
+            Some(reyvec_app::DemoScene::Morph)
+        );
+        assert_eq!(
+            parse("--fill shape").unwrap().fill,
+            Some(reyvec_app::FillMode::PerShape)
+        );
+        assert!(parse("--fill quads").is_err());
         assert!(parse("--scene 3d").is_err());
         assert_eq!(parse("--msaa 8").unwrap().msaa, Some(reyvec_app::Msaa::X8));
         assert_eq!(

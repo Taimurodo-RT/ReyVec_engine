@@ -16,6 +16,30 @@ pub enum FillRule {
     EvenOdd,
 }
 
+/// Как видеокарта рисует залитую фигуру. Выбирается для каждой фигуры отдельно при
+/// добавлении в [`crate::ShapeLibrary`]; у обводок не важен (они всегда треугольниками).
+/// Почему по умолчанию треугольники: `docs/decisions/0009-vector-layer.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FillMethod {
+    /// Заранее разбитые треугольники: все такие фигуры рисуются одной общей командой.
+    /// Дёшево на любой видеокарте, но изгибы при сильном приближении становятся ломаными.
+    #[default]
+    Triangles,
+    /// Трафарет, кривые точной формулой в шейдере: гладко при любом приближении, но две
+    /// команды на каждую фигуру в кадре. Перетекающие фигуры рисуются только так.
+    Stencil,
+}
+
+impl FillMethod {
+    /// Название для панели и лога.
+    pub fn label(self) -> &'static str {
+        match self {
+            FillMethod::Triangles => "треугольники",
+            FillMethod::Stencil => "трафарет",
+        }
+    }
+}
+
 /// Как соединяются отрезки обводки в углах.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LineJoin {

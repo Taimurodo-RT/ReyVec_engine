@@ -1,7 +1,8 @@
-//! Сцены песочницы. Их две, переключаются клавишами 1 и 2 ([`DemoScene`]):
+//! Сцены песочницы. Их три, переключаются клавишами 1, 2 и 3 ([`DemoScene`]):
 //!
 //! - «GPU-фундамент» (этап 2): треугольник этапа 1 плюс спрайты с текстурами;
-//! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`.
+//! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`;
+//! - «Перетекание» (этап 3): фигуры, которые плавно меняют форму, там же.
 //!
 //! Про сцену этапа 2.
 //!
@@ -23,7 +24,7 @@ use crate::pipeline::{
 };
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
-use crate::vector::{FillMethod, VectorData, VectorRenderer};
+use crate::vector::{FillMode, VectorData, VectorRenderer};
 
 /// Какую сцену песочницы рисовать.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,6 +34,8 @@ pub enum DemoScene {
     /// Этап 3: векторные фигуры.
     #[default]
     Vector,
+    /// Этап 3: перетекающие фигуры (большая в центре и сетка маленьких).
+    Morph,
 }
 
 impl DemoScene {
@@ -41,14 +44,16 @@ impl DemoScene {
         match self {
             Self::Gpu => "GPU-фундамент",
             Self::Vector => "векторы",
+            Self::Morph => "перетекание",
         }
     }
 
-    /// Сцена по имени из командной строки: `gpu` или `vector`.
+    /// Сцена по имени из командной строки: `gpu`, `vector` или `morph`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
             "vector" => Some(Self::Vector),
+            "morph" => Some(Self::Morph),
             _ => None,
         }
     }
@@ -311,12 +316,12 @@ impl Demo {
     }
 
     /// Как рисуются залитые векторные фигуры.
-    pub fn fill(&self) -> FillMethod {
+    pub fn fill(&self) -> FillMode {
         self.vector.fill()
     }
 
     /// Способ рисования залитых фигур со следующего кадра.
-    pub fn set_fill(&mut self, fill: FillMethod) {
+    pub fn set_fill(&mut self, fill: FillMode) {
         self.vector.set_fill(fill);
     }
 
@@ -556,9 +561,13 @@ impl Demo {
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let vector = match scene {
-            DemoScene::Vector => {
+            DemoScene::Vector | DemoScene::Morph => {
                 let _zone = crate::cpu_zone!("векторные фигуры");
-                let mut instances = self.vector_demo.instances(time);
+                let mut instances = if scene == DemoScene::Morph {
+                    self.vector_demo.morph_instances(time)
+                } else {
+                    self.vector_demo.instances(time)
+                };
                 if self.zoom {
                     let lens = reyvec_vector::Affine::scale(ZOOM)
                         * reyvec_vector::Affine::translate((-ZOOM_CENTER.0, -ZOOM_CENTER.1));

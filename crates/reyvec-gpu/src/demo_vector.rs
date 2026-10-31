@@ -1,14 +1,18 @@
-//! Сцена песочницы этапа 3: векторные фигуры.
+//! Сцены песочницы этапа 3: векторные фигуры и перетекание.
 //!
-//! Все фигуры разбиваются на треугольники один раз, при создании сцены. Каждый кадр
-//! меняются только их положения, повороты, масштабы и оттенки ([`Instance`]), так что
+//! Все фигуры готовятся один раз, при создании сцены. Каждый кадр меняются только их
+//! положения, повороты, масштабы, оттенки и форма перетекания ([`Instance`]), так что
 //! процессор не пересчитывает ни одной кривой.
+//!
+//! Способы заливки выбраны для каждой фигуры: всё треугольниками, кроме сердца. Его
+//! показывает лупа (клавиша Z), а при сильном приближении треугольники видны ломаной,
+//! поэтому сердце рисуется трафаретом. Перетекающие фигуры всегда рисуются трафаретом.
 
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use reyvec_vector::{
-    Affine, BezPath, Circle, Color, FillRule, Instance, LineCap, LineJoin, Shape, ShapeId,
-    ShapeLibrary, Stroke,
+    Affine, BezPath, Circle, Color, FillMethod, FillRule, Instance, LineCap, LineJoin, Shape,
+    ShapeId, ShapeLibrary, Stroke,
 };
 
 /// Допуск разбиения кривых в единицах сцены (высота кадра = 2 единицы). В окне высотой
@@ -16,6 +20,8 @@ use reyvec_vector::{
 const TOLERANCE: f64 = 0.0005;
 /// Лепестков у цветка в центре: одна фигура, показанная 12 раз.
 const PETALS: usize = 12;
+/// Сетка маленьких перетекающих фигур в сцене «перетекание»: столбцов и строк.
+const MORPH_GRID: (usize, usize) = (17, 9);
 
 pub(crate) struct VectorDemo {
     pub library: ShapeLibrary,
@@ -27,6 +33,8 @@ pub(crate) struct VectorDemo {
     core: ShapeId,
     joins: [ShapeId; 3],
     wave: ShapeId,
+    /// Круг → звезда → сердце → кольцо.
+    morph: ShapeId,
 }
 
 impl VectorDemo {
@@ -44,7 +52,6 @@ impl VectorDemo {
             FillRule::EvenOdd,
             Color::from_srgb8(78, 205, 196),
         ));
-        let heart = add(Shape::fill(heart(0.3), Color::from_srgb8(232, 74, 95)));
         let mut ring_path = circle(0.28);
         ring_path.extend(circle(0.16));
         let ring = add(Shape::fill_with(
@@ -67,6 +74,19 @@ impl VectorDemo {
             Stroke::new(0.035).with_cap(LineCap::Round),
             Color::from_srgb8(245, 163, 199),
         ));
+        // Сердце трафаретом: его показывает лупа.
+        let heart_shape = Shape::fill(heart(0.3), Color::from_srgb8(232, 74, 95));
+        let morph_keyframes = [circle(0.4), star(5, 0.45, 0.2), heart(0.4), {
+            let mut ring = circle(0.4);
+            ring.extend(circle(0.22).reverse_subpaths());
+            ring
+        }];
+        let heart = library
+            .add_with(heart_shape, FillMethod::Stencil)
+            .expect("сердце корректно (проверено тестом)");
+        let morph = library
+            .add_morph(&morph_keyframes, FillRule::NonZero, Color::WHITE)
+            .expect("контуры перетекания корректны (проверено тестом)");
         Self {
             library,
             star_nonzero,
@@ -77,7 +97,38 @@ impl VectorDemo {
             core,
             joins,
             wave,
+            morph,
         }
+    }
+
+    /// Сцена «перетекание» в момент `time`: сетка маленьких фигур, у каждой свой темп, и
+    /// большая фигура в центре поверх них. Каждый кадр меняется только число `morph` в
+    /// экземплярах: смешивает контуры видеокарта.
+    pub fn morph_instances(&self, time: f32) -> Vec<Instance> {
+        let (cols, rows) = MORPH_GRID;
+        let last = 3.0; // номер последнего ключевого контура
+        // Туда и обратно: 0 → 3 → 0, плавно замедляясь у краёв.
+        let swing = |phase: f32| last * (0.5 - 0.5 * (time * 0.7 + phase).cos());
+        let mut out = Vec::with_capacity(cols * rows + 1);
+        for r in 0..rows {
+            for c in 0..cols {
+                let x = (c as f64 - (cols - 1) as f64 / 2.0) * 0.2;
+                let y = (r as f64 - (rows - 1) as f64 / 2.0) * 0.2;
+                let k = (c + r) as f32 / (cols + rows) as f32;
+                let [red, green, blue] = soft_hue(k);
+                out.push(
+                    Instance::new(self.morph, Affine::translate((x, y)) * Affine::scale(0.2))
+                        .with_tint(Color::linear(red, green, blue, 0.55))
+                        .with_morph(swing(k * TAU as f32)),
+                );
+            }
+        }
+        out.push(
+            Instance::new(self.morph, Affine::scale(1.4))
+                .with_tint(Color::from_srgb8(242, 193, 78))
+                .with_morph(swing(0.0)),
+        );
+        out
     }
 
     /// Фигуры на сцене в момент `time` (секунды), в порядке рисования.
@@ -178,6 +229,23 @@ fn petal() -> BezPath {
     path
 }
 
+/// Звезда с `points` лучами: радиус лучей `outer`, впадин `inner`.
+fn star(points: usize, outer: f64, inner: f64) -> BezPath {
+    let mut path = BezPath::new();
+    for i in 0..points * 2 {
+        let r = if i % 2 == 0 { outer } else { inner };
+        let a = FRAC_PI_2 + i as f64 * TAU / (points * 2) as f64;
+        let p = (r * a.cos(), r * a.sin());
+        if i == 0 {
+            path.move_to(p);
+        } else {
+            path.line_to(p);
+        }
+    }
+    path.close_path();
+    path
+}
+
 /// Ломаная из трёх отрезков с острыми углами: на ней видна разница соединений обводки.
 fn zigzag() -> BezPath {
     let mut path = BezPath::new();
@@ -215,7 +283,17 @@ mod tests {
     #[test]
     fn scene_builds_and_reuses_petal_mesh() {
         let demo = VectorDemo::new();
-        assert!(demo.library.iter().all(|(_, _, m)| m.triangle_count() > 0));
+        // У всех фигур есть треугольники, кроме перетекающей: она только трафаретом.
+        assert!(
+            demo.library
+                .iter()
+                .all(|(id, _, m)| (m.triangle_count() > 0) != (id == demo.morph))
+        );
+        assert_eq!(demo.library.method(demo.heart), Some(FillMethod::Stencil));
+        assert_eq!(demo.library.morph_keyframes(demo.morph).len(), 3);
+        let morphs = demo.morph_instances(1.0);
+        assert_eq!(morphs.len(), MORPH_GRID.0 * MORPH_GRID.1 + 1);
+        assert!(morphs.iter().all(|i| (0.0..=3.0).contains(&i.morph)));
         let instances = demo.instances(1.0);
         let petals = instances.iter().filter(|i| i.shape == demo.petal).count();
         assert_eq!(petals, PETALS);
