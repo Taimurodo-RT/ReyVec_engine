@@ -9,6 +9,7 @@ use crate::graph::{Access, ImageState, RenderGraph, TransientPool};
 use crate::pipeline::color_range;
 use crate::resources::GpuResources;
 use crate::shaders::ShaderLibrary;
+use crate::timing::{GpuFrameTimings, GpuTimer};
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -23,6 +24,8 @@ pub struct HeadlessImage {
     pub rgba: Vec<u8>,
     /// На какой видеокарте нарисовано.
     pub adapter: AdapterInfo,
+    /// Сколько видеокарта потратила на кадр (нет, если видеокарта не умеет замерять).
+    pub gpu_timings: Option<GpuFrameTimings>,
 }
 
 impl HeadlessImage {
@@ -51,6 +54,7 @@ struct Resources<'a> {
     gpu: Option<GpuResources>,
     demo: Option<Demo>,
     transients: TransientPool,
+    timer: Option<GpuTimer>,
 }
 
 impl Drop for Resources<'_> {
@@ -63,6 +67,9 @@ impl Drop for Resources<'_> {
                 demo.destroy(self.ctx);
             }
             self.transients.destroy(self.ctx);
+            if let Some(mut timer) = self.timer.take() {
+                timer.destroy(self.ctx);
+            }
             if let Some(gpu) = self.gpu.take() {
                 gpu.destroy(self.ctx);
             }
@@ -85,16 +92,21 @@ pub fn render_triangle_headless(
 ) -> Result<HeadlessImage, GpuError> {
     let core = Core::new(options.validation, None)?;
     let ctx = GpuContext::new(core, options, None).map_err(|failed| failed.0)?;
-    let rgba = render(&ctx, width, height)?;
+    let (rgba, gpu_timings) = render(&ctx, width, height)?;
     Ok(HeadlessImage {
         width,
         height,
         rgba,
         adapter: ctx.adapter.clone(),
+        gpu_timings,
     })
 }
 
-fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError> {
+fn render(
+    ctx: &GpuContext,
+    width: u32,
+    height: u32,
+) -> Result<(Vec<u8>, Option<GpuFrameTimings>), GpuError> {
     let d = &ctx.device;
     let mut r = Resources {
         ctx,
@@ -108,6 +120,7 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
         gpu: None,
         demo: None,
         transients: TransientPool::new(),
+        timer: None,
     };
     let extent = vk::Extent2D { width, height };
     let size = u64::from(width) * u64::from(height) * 4;
@@ -199,6 +212,7 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
             FORMAT,
             1,
         )?);
+        r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
             .create_command_pool(
                 &vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family),
@@ -275,7 +289,17 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
                 &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
             );
         });
-        graph.execute(ctx, cmd, &mut r.transients, &gpu.bindless, 0)?;
+        if let Some(timer) = r.timer.as_mut() {
+            timer.begin_frame(ctx, 0)?;
+        }
+        graph.execute(
+            ctx,
+            cmd,
+            &mut r.transients,
+            &gpu.bindless,
+            0,
+            r.timer.as_mut(),
+        )?;
         d.end_command_buffer(cmd).ctx("конец записи команд")?;
 
         let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
@@ -290,7 +314,15 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
             .ctx("чтение памяти")?;
         let pixels = std::slice::from_raw_parts(ptr.cast::<u8>(), size as usize).to_vec();
         d.unmap_memory(r.buffer_memory);
-        Ok(pixels)
+        // Кадр закончен: begin_frame той же ячейки читает его замеры.
+        let timings = match r.timer.as_mut() {
+            Some(timer) => {
+                timer.begin_frame(ctx, 0)?;
+                timer.last().cloned()
+            }
+            None => None,
+        };
+        Ok((pixels, timings))
     }
 }
 
@@ -348,6 +380,19 @@ mod tests {
         assert!(
             disk[0] > 220 && disk[1] > 150 && disk[2] < 100,
             "круг {disk:?}"
+        );
+
+        // Замеры проходов: на lavapipe метки времени есть, проходы графа по порядку.
+        let t = img.gpu_timings.as_ref().expect("замеры видеокарты");
+        eprintln!("Видеокарта на кадр: {}", t.describe());
+        let names: Vec<_> = t.passes.iter().map(|p| p.name).collect();
+        assert_eq!(names.last(), Some(&"чтение"), "проходы {names:?}");
+        assert!(t.passes.iter().all(|p| p.ms >= 0.0));
+        let sum: f64 = t.passes.iter().map(|p| p.ms).sum();
+        assert!(
+            (sum - t.total_ms).abs() < 1e-6,
+            "сумма {sum} и всего {}",
+            t.total_ms
         );
 
         assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");

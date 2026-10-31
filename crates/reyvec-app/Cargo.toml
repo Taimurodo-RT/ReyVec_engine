@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 reyvec-gpu.workspace = true
 thiserror.workspace = true
+tracy-client.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
