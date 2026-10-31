@@ -142,14 +142,17 @@ fn snapshot_headless(path: &str, args: &Args, validation: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = reyvec_app::snapshot::save_png(std::path::Path::new(path), &image.image) {
+    // Относительный путь считается от текущей папки; в логе пишем полный, чтобы файл было легко найти.
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.into());
+    if let Err(e) = reyvec_app::snapshot::save_png(&path, &image.image) {
         tracing::error!("Снимок не сохранён: {e}");
         return ExitCode::FAILURE;
     }
     tracing::info!(
-        "Кадр {width}×{height} (момент {:.2} с) нарисован без окна на «{}» и сохранён: {path}",
+        "Кадр {width}×{height} (момент {:.2} с) нарисован без окна на «{}» и сохранён: {}",
         scene.time,
-        image.adapter.name
+        image.adapter.name,
+        path.display()
     );
     if let Some(t) = &image.gpu_timings {
         tracing::info!("Видеокарта на кадр: {}", t.describe());
