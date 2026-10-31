@@ -66,6 +66,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         frames: 0,
         stats: FrameStats::new(Instant::now()),
         minimized: false,
+        closing: false,
+        closed_at: None,
     };
     event_loop
         .run_app(&mut app)
@@ -73,7 +75,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
     if let Some(e) = app.error.take() {
         return Err(e);
     }
-    let seconds = app.start.elapsed().as_secs_f64();
+    let end = app.closed_at.unwrap_or_else(Instant::now);
+    let seconds = end.duration_since(app.start).as_secs_f64();
     Ok(RunSummary {
         frames: app.frames,
         adapter: app.stats.adapter.clone(),
@@ -95,12 +98,26 @@ struct App {
     frames: u64,
     stats: FrameStats,
     minimized: bool,
+    /// Окно уже попросили закрыть. На Windows цикл событий завершается не сразу (например,
+    /// пока край окна держат мышкой), поэтому после этого кадры больше не рисуем.
+    closing: bool,
+    /// Когда окно попросили закрыть: до этого момента считаем средний FPS.
+    closed_at: Option<Instant>,
 }
 
 impl App {
     fn fail(&mut self, event_loop: &ActiveEventLoop, error: AppError) {
         // Сообщение выведет тот, кто вызвал run(), здесь только запоминаем ошибку.
         self.error = Some(error);
+        self.close(event_loop);
+    }
+
+    /// Просит закрыть окно. Повторные вызовы ничего не делают.
+    fn close(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.closing {
+            self.closed_at = Some(Instant::now());
+        }
+        self.closing = true;
         event_loop.exit();
     }
 
@@ -144,6 +161,9 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if self.closing {
+            return;
+        }
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
             return;
         };
@@ -162,14 +182,14 @@ impl App {
                 }
                 if self.config.max_frames.is_some_and(|max| self.frames >= max) {
                     tracing::info!("Нарисовано {} кадров, закрываю окно", self.frames);
-                    event_loop.exit();
+                    return self.close(event_loop);
                 } else if self
                     .config
                     .max_seconds
                     .is_some_and(|max| self.start.elapsed().as_secs_f64() >= max)
                 {
                     tracing::info!("Время вышло, закрываю окно");
-                    event_loop.exit();
+                    return self.close(event_loop);
                 }
             }
             Ok(FrameStatus::Skipped) => {}
@@ -195,7 +215,7 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -204,7 +224,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => event_loop.exit(),
+            } => self.close(event_loop),
             WindowEvent::Resized(size) => {
                 self.minimized = size.width == 0 || size.height == 0;
                 if let Some(r) = &mut self.renderer {
@@ -220,8 +240,8 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Свёрнутое окно не рисуем и не крутим цикл впустую: ждём событий.
-        if self.minimized {
+        // Свёрнутое или закрываемое окно не рисуем и не крутим цикл впустую: ждём событий.
+        if self.minimized || self.closing {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
