@@ -14,6 +14,8 @@ use crate::{GpuError, VkResultExt};
 
 /// Больше проходов в кадре не замеряется (остальные войдут в последний замеренный).
 pub(crate) const MAX_TIMED_PASSES: usize = 32;
+/// Имя «функции» у зон видеокарты в Tracy.
+const TRACY_FUNCTION: &str = "граф кадра";
 const QUERIES_PER_FRAME: u32 = MAX_TIMED_PASSES as u32 + 1;
 
 /// Время одного прохода на видеокарте.
@@ -109,6 +111,8 @@ struct Slot {
     /// Имена замеренных проходов; меток записано на одну больше (метка начала кадра).
     passes: Vec<&'static str>,
     started: bool,
+    /// Зоны этого кадра отправляются в Tracy (он был подключён, когда кадр записывался).
+    tracy: bool,
     tracy_frame: Option<tracy_client::GpuSpan>,
     /// Зоны Tracy по проходам (`None`, если Tracy не дал зону).
     tracy_passes: Vec<Option<tracy_client::GpuSpan>>,
@@ -327,8 +331,14 @@ impl GpuTimer {
         s.started = true;
         s.passes.clear();
         s.tracy_passes.clear();
-        if let Some(t) = &self.tracy {
-            s.tracy_frame = t.span_alloc("кадр", "", file!(), line!()).ok();
+        // Пока Tracy не подключён, он выбрасывает начала зон. Если отправить ему метки кадра,
+        // начатого до подключения, он получит время зон, о которых не знает, и упадёт.
+        // Поэтому зоны заводим только для кадров, начатых при подключённом Tracy.
+        s.tracy = self.tracy.is_some() && tracy_client::Client::is_connected();
+        if s.tracy
+            && let Some(t) = &self.tracy
+        {
+            s.tracy_frame = t.span_alloc("кадр", TRACY_FUNCTION, file!(), line!()).ok();
         }
     }
 
@@ -338,9 +348,11 @@ impl GpuTimer {
         if s.passes.len() >= MAX_TIMED_PASSES {
             return;
         }
-        if let Some(t) = &self.tracy {
+        if s.tracy
+            && let Some(t) = &self.tracy
+        {
             s.tracy_passes
-                .push(t.span_alloc(name, "", file!(), line!()).ok());
+                .push(t.span_alloc(name, TRACY_FUNCTION, file!(), line!()).ok());
         }
     }
 
