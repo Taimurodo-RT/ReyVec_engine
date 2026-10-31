@@ -1,7 +1,8 @@
 #version 450
-// Stage 1 test triangle. Vertices are built into the shader, no buffers yet.
+// Stage 1 test triangle. Vertices are built into the shader, no buffers.
 // Engine convention: Y points up, so we flip Y for Vulkan clip space.
 
+// Push constants are shared by all engine pipelines (128 bytes, all stages).
 layout(push_constant) uniform Push {
     float time;   // seconds since start
     float aspect; // width / height, keeps the triangle from stretching

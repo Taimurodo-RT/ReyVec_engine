@@ -8,6 +8,7 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
+//! - `--seconds <S>`: закрыть окно через S секунд;
 //! - `--version`: показать версию.
 
 use std::process::ExitCode;
@@ -24,6 +25,7 @@ const HELP: &str = "\
   --no-vsync             без вертикальной синхронизации
   --validation           слои валидации Vulkan (нужен Vulkan SDK)
   --frames <N>           закрыть окно после N кадров
+  --seconds <S>          закрыть окно через S секунд
   --version, -V          версия
   --help, -h             эта справка
 
@@ -38,6 +40,7 @@ struct Args {
     no_vsync: bool,
     validation: bool,
     frames: Option<u64>,
+    seconds: Option<f64>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -56,6 +59,15 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--frames" => {
                 let n = it.next().ok_or("после --frames нужно число")?;
                 out.frames = Some(n.parse().map_err(|_| format!("--frames: «{n}» не число"))?);
+            }
+            "--seconds" => {
+                let n = it.next().ok_or("после --seconds нужно число")?;
+                out.seconds = Some(
+                    n.parse()
+                        .ok()
+                        .filter(|s: &f64| s.is_finite() && *s >= 0.0)
+                        .ok_or_else(|| format!("--seconds: «{n}» не число"))?,
+                );
             }
             other => return Err(format!("неизвестный флаг «{other}». Справка: --help")),
         }
@@ -115,6 +127,7 @@ fn main() -> ExitCode {
         },
         vsync: !args.no_vsync,
         max_frames: args.frames,
+        max_seconds: args.seconds,
     };
 
     let result = reyvec_app::run(config);
@@ -158,7 +171,8 @@ mod tests {
 
     #[test]
     fn all_flags() {
-        let a = parse("--gpu radeon --no-vsync --validation --frames 120").unwrap();
+        let a = parse("--gpu radeon --no-vsync --validation --frames 120 --seconds 2.5").unwrap();
+        assert_eq!(a.seconds, Some(2.5));
         assert_eq!(a.gpu.as_deref(), Some("radeon"));
         assert!(a.no_vsync && a.validation);
         assert_eq!(a.frames, Some(120));
@@ -168,6 +182,7 @@ mod tests {
     fn bad_args() {
         assert!(parse("--gpu").is_err());
         assert!(parse("--frames ten").is_err());
+        assert!(parse("--seconds -1").is_err());
         assert!(parse("--fullscreen").is_err());
     }
 }

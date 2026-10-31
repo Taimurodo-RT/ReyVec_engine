@@ -11,15 +11,20 @@
 //! индексированием дескрипторов и адресами буферов (см. `docs/decisions/0001-stack.md`).
 
 mod adapter;
+mod bindless;
 mod context;
+mod demo;
 mod headless;
 mod pipeline;
+mod resources;
 mod window;
 
 pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
+pub use bindless::{MAX_TEXTURES, SamplerKind};
 pub use context::{GpuOptions, list_adapters, validation_error_count};
 pub use headless::{HeadlessImage, render_triangle_headless};
 pub use pipeline::CLEAR_COLOR;
+pub use resources::{BufferId, BufferMemory, TextureId};
 pub use window::{FrameStatus, RendererOptions, WindowRenderer, WindowTarget};
 
 use ash::vk;
@@ -41,6 +46,9 @@ pub enum GpuError {
     /// Нет видеокарты, которая подходит движку, или выбранная не подходит.
     #[error("{0}")]
     NoSuitableAdapter(String),
+    /// Не хватило памяти видеокарты или распределитель вернул ошибку.
+    #[error("память видеокарты: {0}")]
+    Memory(String),
     /// Окно не отдало свои дескрипторы.
     #[error("окно недоступно для Vulkan: {0}")]
     Window(String),

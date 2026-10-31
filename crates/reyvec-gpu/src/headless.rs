@@ -4,7 +4,9 @@
 use ash::vk;
 
 use crate::context::{Core, GpuContext, GpuOptions};
-use crate::pipeline::{TrianglePipeline, TrianglePush, color_range, image_barrier};
+use crate::demo::Demo;
+use crate::pipeline::{color_range, image_barrier};
+use crate::resources::GpuResources;
 use crate::{AdapterInfo, GpuError, VkResultExt};
 
 const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
@@ -44,7 +46,8 @@ struct Resources<'a> {
     buffer_memory: vk::DeviceMemory,
     pool: vk::CommandPool,
     fence: vk::Fence,
-    pipeline: Option<TrianglePipeline>,
+    gpu: Option<GpuResources>,
+    demo: Option<Demo>,
 }
 
 impl Drop for Resources<'_> {
@@ -53,8 +56,11 @@ impl Drop for Resources<'_> {
         // SAFETY: ждём видеокарту, затем уничтожаем; null-дескрипторы допустимы.
         unsafe {
             let _ = d.device_wait_idle();
-            if let Some(p) = self.pipeline.take() {
-                p.destroy(d);
+            if let Some(demo) = self.demo.take() {
+                demo.destroy(self.ctx);
+            }
+            if let Some(gpu) = self.gpu.take() {
+                gpu.destroy(self.ctx);
             }
             d.destroy_fence(self.fence, None);
             d.destroy_command_pool(self.pool, None);
@@ -67,7 +73,7 @@ impl Drop for Resources<'_> {
     }
 }
 
-/// Рисует кадр этапа 1 (треугольник в момент `time = 0`) в картинку `width × height`.
+/// Рисует кадр песочницы (треугольник и спрайты в момент `time = 0`) в картинку `width × height`.
 pub fn render_triangle_headless(
     options: &GpuOptions,
     width: u32,
@@ -95,7 +101,8 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
         buffer_memory: vk::DeviceMemory::null(),
         pool: vk::CommandPool::null(),
         fence: vk::Fence::null(),
-        pipeline: None,
+        gpu: None,
+        demo: None,
     };
     let extent = vk::Extent2D { width, height };
     let size = u64::from(width) * u64::from(height) * 4;
@@ -179,7 +186,13 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
         d.bind_buffer_memory(r.buffer, r.buffer_memory, 0)
             .ctx("привязка памяти буфера")?;
 
-        r.pipeline = Some(TrianglePipeline::new(d, FORMAT)?);
+        r.gpu = Some(GpuResources::new(ctx)?);
+        r.demo = Some(Demo::new(
+            ctx,
+            r.gpu.as_mut().expect("создано выше"),
+            FORMAT,
+            1,
+        )?);
         r.pool = d
             .create_command_pool(
                 &vk::CommandPoolCreateInfo::default().queue_family_index(ctx.queue_family),
@@ -217,15 +230,14 @@ fn render(ctx: &GpuContext, width: u32, height: u32) -> Result<Vec<u8>, GpuError
             cmd,
             &vk::DependencyInfo::default().image_memory_barriers(&to_color),
         );
-        r.pipeline.as_ref().expect("конвейер создан выше").record(
-            d,
+        r.demo.as_ref().expect("сцена создана выше").record(
+            ctx,
+            r.gpu.as_mut().expect("ресурсы созданы выше"),
             cmd,
+            0,
             r.view,
             extent,
-            TrianglePush {
-                time: 0.0,
-                aspect: width as f32 / height as f32,
-            },
+            0.0,
         );
         let to_transfer = [image_barrier(
             r.image,
@@ -303,7 +315,7 @@ mod tests {
             validation: true,
             gpu: None,
         };
-        let img = render_triangle_headless(&options, 64, 64).expect("рисование без окна");
+        let img = render_triangle_headless(&options, 128, 64).expect("рисование без окна");
         eprintln!("Нарисовано на: {}", img.adapter);
 
         // Угол: фон. UNORM-картинка хранит линейный цвет как есть.
@@ -317,7 +329,7 @@ mod tests {
         }
 
         // Центр: внутри треугольника, смесь трёх цветов, заметно ярче фона.
-        let center = img.pixel(32, 32);
+        let center = img.pixel(64, 32);
         assert!(
             center[0] > 60 && center[1] > 60 && center[2] > 60,
             "центр {center:?}"
@@ -325,10 +337,24 @@ mod tests {
 
         // Верхняя вершина красная: точка чуть ниже неё заметно краснее остальных каналов.
         // Y вверх: вершина (0, 0.6) в NDC оказывается в верхней части картинки.
-        let near_top = img.pixel(32, 17);
+        let near_top = img.pixel(64, 17);
         assert!(
             near_top[0] > near_top[1] && near_top[0] > near_top[2],
             "у верхней вершины {near_top:?}"
+        );
+
+        // Слева: шахматка из текстуры (центр приходится на светлую клетку).
+        // Её цвет хранится в sRGB, видеокарта переводит его в линейный при чтении.
+        let checker = img.pixel(27, 32);
+        assert!(
+            checker[0] > 180 && checker[1] > 170 && checker[2] > 200,
+            "шахматка {checker:?}"
+        );
+        // Справа: круг с оранжевым оттенком.
+        let disk = img.pixel(101, 32);
+        assert!(
+            disk[0] > 220 && disk[1] > 150 && disk[2] < 100,
+            "круг {disk:?}"
         );
 
         assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
