@@ -11,7 +11,7 @@ pub mod snapshot;
 pub use app::{AppConfig, AppError, RunSummary, run};
 pub use logging::{LogGuard, init_logging};
 pub use reyvec_gpu::{
-    AdapterInfo, FrameImage, GpuOptions, HeadlessImage, HeadlessScene, list_adapters,
+    AdapterInfo, DemoScene, FrameImage, GpuOptions, HeadlessImage, HeadlessScene, list_adapters,
     render_headless, validation_error_count,
 };
 

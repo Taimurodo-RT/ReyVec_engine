@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use reyvec_app::snapshot::{compare, diff_image, load_png, save_png};
-use reyvec_app::{GpuOptions, HeadlessScene, render_headless, validation_error_count};
+use reyvec_app::{DemoScene, GpuOptions, HeadlessScene, render_headless, validation_error_count};
 
 /// Насколько может отличаться канал пикселя (из 255): разные версии драйвера чуть
 /// по-разному сглаживают текстуры.
@@ -27,12 +27,14 @@ struct Case {
 }
 
 fn cases() -> Vec<Case> {
-    let scene = |time, shader_error| HeadlessScene {
+    let at = |scene, time, shader_error| HeadlessScene {
         width: 640,
         height: 360,
         time,
         shader_error,
+        scene,
     };
+    let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
         Case {
             name: "scene-0s",
@@ -46,6 +48,17 @@ fn cases() -> Vec<Case> {
         Case {
             name: "shader-error",
             scene: scene(1.0, true),
+        },
+        // Векторы этапа 3: звёзды с разными правилами заливки, сердце, кольцо, цветок из
+        // одного лепестка, углы обводки, волна.
+        Case {
+            name: "vector-0s",
+            scene: at(DemoScene::Vector, 0.0, false),
+        },
+        // Через 2 с всё повёрнуто и сдвинуто, сердце увеличено, кольцо сплющено.
+        Case {
+            name: "vector-2s",
+            scene: at(DemoScene::Vector, 2.0, false),
         },
     ]
 }

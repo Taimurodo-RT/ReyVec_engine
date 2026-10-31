@@ -4,7 +4,7 @@
 use ash::vk;
 
 use crate::context::{Core, GpuContext, GpuOptions};
-use crate::demo::Demo;
+use crate::demo::{Demo, DemoScene};
 use crate::graph::{Access, ImageState, RenderGraph, TransientPool};
 use crate::pipeline::color_range;
 use crate::resources::GpuResources;
@@ -49,6 +49,8 @@ pub struct HeadlessScene {
     pub time: f32,
     /// Нарисовать красную рамку ошибки шейдера.
     pub shader_error: bool,
+    /// Какая сцена песочницы.
+    pub scene: DemoScene,
 }
 
 /// Кадр, нарисованный без окна.
@@ -111,7 +113,7 @@ impl Drop for Resources<'_> {
     }
 }
 
-/// Рисует кадр песочницы (треугольник и спрайты в момент `time = 0`) в картинку `width × height`.
+/// Рисует кадр сцены этапа 2 (треугольник и спрайты в момент `time = 0`) в картинку `width × height`.
 pub fn render_triangle_headless(
     options: &GpuOptions,
     width: u32,
@@ -124,6 +126,7 @@ pub fn render_triangle_headless(
             height,
             time: 0.0,
             shader_error: false,
+            scene: DemoScene::Gpu,
         },
     )
 }
@@ -287,8 +290,9 @@ fn render(
         )
         .ctx("запись команд")?;
         let gpu = r.gpu.as_mut().expect("ресурсы созданы выше");
-        let demo = r.demo.as_ref().expect("сцена создана выше");
-        let data = demo.prepare(gpu, 0, extent, scene.time, scene.shader_error);
+        let demo = r.demo.as_mut().expect("сцена создана выше");
+        let data = demo.prepare(gpu, 0, extent, scene.time, scene.shader_error, scene.scene);
+        let demo = &*demo;
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();
         let target = graph.import(

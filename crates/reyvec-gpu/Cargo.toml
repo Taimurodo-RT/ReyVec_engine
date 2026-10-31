@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 egui.workspace = true
+reyvec-vector.workspace = true
 ash.workspace = true
 ash-window.workspace = true
 gpu-allocator.workspace = true

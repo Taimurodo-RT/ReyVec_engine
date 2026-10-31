@@ -6,7 +6,7 @@ use ash::{khr, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Core, GpuContext, GpuOptions};
-use crate::demo::Demo;
+use crate::demo::{Demo, DemoScene};
 use crate::graph::{Access, GraphReport, ImageHandle, ImageState, RenderGraph, TransientPool};
 use crate::headless::FrameImage;
 use crate::pipeline::color_range;
@@ -149,6 +149,8 @@ pub struct WindowRenderer {
     needs_recreate: bool,
     resources: Option<GpuResources>,
     demo: Option<Demo>,
+    /// Какую сцену песочницы рисовать.
+    scene: DemoScene,
     ui: Option<UiRenderer>,
     /// Изменения текстур панели, ещё не попавшие на видеокарту. Копятся, пока кадры
     /// пропускаются (окно свёрнуто): иначе, например, атлас шрифта потерялся бы.
@@ -229,6 +231,7 @@ impl WindowRenderer {
             needs_recreate: true,
             resources: None,
             demo: None,
+            scene: DemoScene::default(),
             ui: None,
             ui_textures: egui::TexturesDelta::default(),
             shaders: ShaderLibrary::new(options.hot_reload),
@@ -275,6 +278,19 @@ impl WindowRenderer {
     /// Видеокарта, на которой идёт рисование.
     pub fn adapter(&self) -> &AdapterInfo {
         &self.ctx.adapter
+    }
+
+    /// Какая сцена песочницы рисуется.
+    pub fn scene(&self) -> DemoScene {
+        self.scene
+    }
+
+    /// Переключает сцену песочницы со следующего кадра.
+    pub fn set_scene(&mut self, scene: DemoScene) {
+        if scene != self.scene {
+            tracing::info!("Сцена: {}", scene.title());
+        }
+        self.scene = scene;
     }
 
     /// Режим показа кадров словами: с вертикальной синхронизацией или без.
@@ -468,8 +484,16 @@ impl WindowRenderer {
                 .begin_command_buffer(frame.cmd, &begin)
                 .ctx("запись команд")?;
 
-            if let (Some(demo), Some(res)) = (&self.demo, self.resources.as_mut()) {
-                let data = demo.prepare(res, self.frame_index, extent, time, shader_error);
+            if let (Some(demo), Some(res)) = (self.demo.as_mut(), self.resources.as_mut()) {
+                let data = demo.prepare(
+                    res,
+                    self.frame_index,
+                    extent,
+                    time,
+                    shader_error,
+                    self.scene,
+                );
+                let demo = &*demo;
                 let ui_data = match (ui, self.ui.as_mut()) {
                     (Some(frame), Some(renderer)) => {
                         let mut textures = std::mem::take(&mut self.ui_textures);
