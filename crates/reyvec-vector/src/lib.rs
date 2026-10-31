@@ -25,4 +25,4 @@ pub use kurbo;
 pub use kurbo::{Affine, BezPath, Circle, PathEl, Point, Rect, Vec2};
 pub use library::{Instance, ShapeId, ShapeLibrary};
 pub use shape::{FillRule, LineCap, LineJoin, Shape, Stroke, Style};
-pub use tessellate::{Mesh, TessellationError, tessellate};
+pub use tessellate::{EdgeData, Mesh, TessellationError, tessellate, tessellate_smooth};

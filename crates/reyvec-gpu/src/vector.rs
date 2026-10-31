@@ -167,9 +167,8 @@ impl VectorRenderer {
         let mut vertex_count = 0u32;
         let mut index_count = 0u32;
         for (_, shape, mesh) in library.iter() {
-            for v in &mesh.vertices {
-                vertices.extend_from_slice(&v[0].to_ne_bytes());
-                vertices.extend_from_slice(&v[1].to_ne_bytes());
+            for (v, e) in mesh.vertices.iter().zip(&mesh.edges) {
+                pack_vertex(&mut vertices, *v, e);
             }
             // Номера точек сразу общие для всех фигур: шейдеру не нужно знать, где
             // начинаются точки фигуры.
@@ -361,6 +360,28 @@ fn build(
         Blend::Alpha,
         msaa.samples(),
     )
+}
+
+/// Размер точки на видеокарте: положение, смещение от контура, данные края (см. `vector.slang`).
+const VERTEX_SIZE: usize = 32;
+
+/// Пишет точку фигуры в формате шейдера: `float2 position; float2 offset; float4 edge`
+/// (поперёк, полутолщина, вид края, 0).
+fn pack_vertex(out: &mut Vec<u8>, position: [f32; 2], edge: &reyvec_vector::EdgeData) {
+    let start = out.len();
+    for f in [
+        position[0],
+        position[1],
+        edge.offset[0],
+        edge.offset[1],
+        edge.across,
+        edge.half_width,
+        edge.round,
+        0.0,
+    ] {
+        out.extend_from_slice(&f.to_ne_bytes());
+    }
+    debug_assert_eq!(out.len() - start, VERTEX_SIZE);
 }
 
 #[cfg(test)]
