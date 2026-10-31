@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+egui.workspace = true
 ash.workspace = true
 ash-window.workspace = true
 gpu-allocator.workspace = true

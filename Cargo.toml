@@ -16,6 +16,9 @@ reyvec-gpu = { path = "crates/reyvec-gpu" }
 ash = "0.38"
 ash-window = "0.13"
 notify = "8"
+# Панель отладки. Без буфера обмена и ссылок: панели они не нужны, а тянут много зависимостей.
+egui = { version = "0.37", default-features = false }
+egui-winit = { version = "0.37", default-features = false, features = ["x11", "wayland"] }
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 raw-window-handle = "0.6"
 thiserror = "2"

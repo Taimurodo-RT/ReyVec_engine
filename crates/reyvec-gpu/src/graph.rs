@@ -261,13 +261,17 @@ pub(crate) struct RenderGraph<'a> {
 
 /// Что получилось в кадре: для лога и счётчиков.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct GraphReport {
+pub struct GraphReport {
+    /// Проходы в порядке выполнения.
     pub passes: Vec<&'static str>,
+    /// Сколько барьеров поставил граф.
     pub barriers: usize,
+    /// Сколько временных картинок взято из пула.
     pub transient_images: usize,
 }
 
 impl GraphReport {
+    /// Строка вида «проходы: сцена → вывод; временных картинок: 1, барьеров: 4».
     pub fn describe(&self) -> String {
         format!(
             "проходы: {}; временных картинок: {}, барьеров: {}",

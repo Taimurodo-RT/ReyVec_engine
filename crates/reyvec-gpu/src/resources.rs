@@ -44,7 +44,6 @@ pub(crate) struct Texture {
     pub image: vk::Image,
     pub view: vk::ImageView,
     pub allocation: Option<Allocation>,
-    pub extent: vk::Extent2D,
 }
 
 enum Garbage {
@@ -276,6 +275,7 @@ impl GpuResources {
 
     /// Создаёт текстуру RGBA8 и загружает в неё пиксели. `srgb`: цвета в пространстве
     /// экрана (обычные картинки), иначе линейные данные (маски, нормали).
+    /// Ждёт окончания загрузки, поэтому подходит для загрузки при старте, а не каждый кадр.
     pub fn create_texture_rgba8(
         &mut self,
         ctx: &GpuContext,
@@ -290,6 +290,39 @@ impl GpuResources {
             (width * height * 4) as usize,
             "размер пикселей"
         );
+        let id = self.create_texture_empty(ctx, width, height, srgb, name)?;
+        let image = self.texture_image(id).expect("текстура только что создана");
+        let extent = vk::Extent2D { width, height };
+        let staging = match self.staging(ctx, pixels) {
+            Ok(s) => s,
+            Err(e) => {
+                self.destroy_texture(id);
+                return Err(e);
+            }
+        };
+        let result = self.immediate(ctx, |d, cmd| {
+            // SAFETY: картинка и временный буфер живы до конца немедленной отправки.
+            unsafe { record_texture_upload(d, cmd, image, staging.raw, [0, 0], extent, true) };
+        });
+        destroy_buffer(ctx, staging);
+        if let Err(e) = result {
+            self.destroy_texture(id);
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// Создаёт текстуру RGBA8 без содержимого (раскладка UNDEFINED) и сразу кладёт её в
+    /// общий список текстур. Содержимое загружается командами кадра
+    /// ([`record_texture_upload`]).
+    pub fn create_texture_empty(
+        &mut self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        srgb: bool,
+        name: &str,
+    ) -> Result<TextureId, GpuError> {
         let format = if srgb {
             vk::Format::R8G8B8A8_SRGB
         } else {
@@ -302,70 +335,6 @@ impl GpuResources {
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
             name,
         )?;
-        let staging = match self.staging(ctx, pixels) {
-            Ok(s) => s,
-            Err(e) => {
-                destroy_texture(ctx, texture);
-                return Err(e);
-            }
-        };
-        let image = texture.image;
-        let extent = texture.extent;
-        let result = self.immediate(ctx, |d, cmd| {
-            let to_dst = [image_barrier(
-                image,
-                vk::ImageLayout::UNDEFINED,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::PipelineStageFlags2::NONE,
-                vk::AccessFlags2::NONE,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-            )];
-            let region = [vk::BufferImageCopy::default()
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_extent(vk::Extent3D {
-                    width: extent.width,
-                    height: extent.height,
-                    depth: 1,
-                })];
-            let to_read = [image_barrier(
-                image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                vk::PipelineStageFlags2::COPY,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                vk::AccessFlags2::SHADER_SAMPLED_READ,
-            )];
-            // SAFETY: картинка и временный буфер живы до конца немедленной отправки.
-            unsafe {
-                d.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
-                );
-                d.cmd_copy_buffer_to_image(
-                    cmd,
-                    staging.raw,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &region,
-                );
-                d.cmd_pipeline_barrier2(
-                    cmd,
-                    &vk::DependencyInfo::default().image_memory_barriers(&to_read),
-                );
-            }
-        });
-        destroy_buffer(ctx, staging);
-        if let Err(e) = result {
-            destroy_texture(ctx, texture);
-            return Err(e);
-        }
-
         let view = texture.view;
         let slot = self.textures.insert(texture);
         // Ячейки в конце общего списка отданы временным картинкам графа кадра.
@@ -380,6 +349,16 @@ impl GpuResources {
         }
         self.bindless.write_texture(ctx, slot, view);
         Ok(TextureId(slot))
+    }
+
+    /// Картинка Vulkan текстуры `id` (для записи команд загрузки).
+    pub fn texture_image(&self, id: TextureId) -> Option<vk::Image> {
+        self.textures.get(id.0).map(|t| t.image)
+    }
+
+    /// Буфер Vulkan с номером `id` (для команд копирования).
+    pub fn buffer_raw(&self, id: BufferId) -> Option<vk::Buffer> {
+        self.buffers.get(id.0).map(|b| b.raw)
     }
 
     /// Убирает текстуру. Настоящее удаление случится, когда видеокарта закончит текущий кадр.
@@ -620,7 +599,6 @@ pub(crate) fn create_texture(
         image,
         view: vk::ImageView::null(),
         allocation: Some(allocation),
-        extent,
     };
     let a = texture.allocation.as_ref().expect("только что выделена");
     // SAFETY: память выделена под требования этой картинки.
@@ -648,6 +626,85 @@ pub(crate) fn create_texture(
         }
     }
     Ok(texture)
+}
+
+/// Записывает загрузку пикселей из `src` (плотные строки RGBA8) в область текстуры
+/// `image`, начиная с `offset`. После команд текстура готова к чтению шейдером.
+/// `first`: текстура ещё ни разу не заполнялась (раскладка UNDEFINED), иначе она в
+/// раскладке чтения и её могли читать прошлые команды.
+///
+/// # Safety
+/// `cmd` в состоянии записи, `image` и `src` живы, пока видеокарта выполняет команды.
+pub(crate) unsafe fn record_texture_upload(
+    d: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    src: vk::Buffer,
+    offset: [u32; 2],
+    extent: vk::Extent2D,
+    first: bool,
+) {
+    let (old_layout, src_stage) = if first {
+        (vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::NONE)
+    } else {
+        // Прошлые кадры могли читать текстуру в пиксельном шейдере: ждём их чтения.
+        (
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        )
+    };
+    let to_dst = [image_barrier(
+        image,
+        old_layout,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        src_stage,
+        vk::AccessFlags2::NONE,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    )];
+    let region = [vk::BufferImageCopy::default()
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D {
+            x: offset[0] as i32,
+            y: offset[1] as i32,
+            z: 0,
+        })
+        .image_extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        })];
+    let to_read = [image_barrier(
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    )];
+    // SAFETY: условие функции.
+    unsafe {
+        d.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
+        );
+        d.cmd_copy_buffer_to_image(
+            cmd,
+            src,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &region,
+        );
+        d.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_read),
+        );
+    }
 }
 
 pub(crate) fn destroy_texture(ctx: &GpuContext, t: Texture) {

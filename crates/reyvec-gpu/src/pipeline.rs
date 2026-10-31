@@ -17,6 +17,8 @@ pub(crate) enum Blend {
     Opaque,
     /// Обычная прозрачность по альфе.
     Alpha,
+    /// Прозрачность для цвета, уже умноженного на альфу (так рисует egui).
+    Premultiplied,
 }
 
 /// Собирает графический конвейер: вершинный и пиксельный шейдер, вывод в одну картинку `format`.
@@ -67,6 +69,16 @@ pub(crate) fn graphics_pipeline(
         attachment = attachment
             .blend_enable(true)
             .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD);
+    }
+    if blend == Blend::Premultiplied {
+        attachment = attachment
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
             .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .color_blend_op(vk::BlendOp::ADD)
             .src_alpha_blend_factor(vk::BlendFactor::ONE)

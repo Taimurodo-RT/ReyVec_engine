@@ -14,6 +14,8 @@ use crate::{GpuError, VkResultExt};
 
 /// Больше проходов в кадре не замеряется (остальные войдут в последний замеренный).
 pub(crate) const MAX_TIMED_PASSES: usize = 32;
+/// Имя «функции» у зон видеокарты в Tracy.
+const TRACY_FUNCTION: &str = "граф кадра";
 const QUERIES_PER_FRAME: u32 = MAX_TIMED_PASSES as u32 + 1;
 
 /// Время одного прохода на видеокарте.
@@ -51,8 +53,8 @@ impl GpuFrameTimings {
 pub struct GpuTimingAverage {
     frames: u32,
     total_ms: f64,
-    /// Имя прохода → (сумма мс, сколько раз встретился). Порядок проходов отдельно.
-    sums: HashMap<&'static str, (f64, u32)>,
+    /// Имя прохода → сумма мс. Порядок проходов отдельно.
+    sums: HashMap<&'static str, f64>,
     order: Vec<&'static str>,
 }
 
@@ -62,12 +64,10 @@ impl GpuTimingAverage {
         self.frames += 1;
         self.total_ms += t.total_ms;
         for p in &t.passes {
-            let e = self.sums.entry(p.name).or_insert_with(|| {
+            *self.sums.entry(p.name).or_insert_with(|| {
                 self.order.push(p.name);
-                (0.0, 0)
-            });
-            e.0 += p.ms;
-            e.1 += 1;
+                0.0
+            }) += p.ms;
         }
     }
 
@@ -76,7 +76,9 @@ impl GpuTimingAverage {
         self.frames
     }
 
-    /// Среднее за накопленные кадры. `None`, если замеров не было.
+    /// Среднее за накопленные кадры. `None`, если замеров не было. Проход, которого не было
+    /// в части кадров (например, панель спрятали), считается в них за 0 мс: так сумма
+    /// проходов равна среднему времени кадра.
     pub fn average(&self) -> Option<GpuFrameTimings> {
         if self.frames == 0 {
             return None;
@@ -86,12 +88,9 @@ impl GpuTimingAverage {
             passes: self
                 .order
                 .iter()
-                .map(|&name| {
-                    let (sum, n) = self.sums[name];
-                    PassTiming {
-                        name,
-                        ms: sum / n as f64,
-                    }
+                .map(|&name| PassTiming {
+                    name,
+                    ms: self.sums[name] / self.frames as f64,
                 })
                 .collect(),
         })
@@ -109,6 +108,8 @@ struct Slot {
     /// Имена замеренных проходов; меток записано на одну больше (метка начала кадра).
     passes: Vec<&'static str>,
     started: bool,
+    /// Зоны этого кадра отправляются в Tracy (он был подключён, когда кадр записывался).
+    tracy: bool,
     tracy_frame: Option<tracy_client::GpuSpan>,
     /// Зоны Tracy по проходам (`None`, если Tracy не дал зону).
     tracy_passes: Vec<Option<tracy_client::GpuSpan>>,
@@ -327,8 +328,14 @@ impl GpuTimer {
         s.started = true;
         s.passes.clear();
         s.tracy_passes.clear();
-        if let Some(t) = &self.tracy {
-            s.tracy_frame = t.span_alloc("кадр", "", file!(), line!()).ok();
+        // Пока Tracy не подключён, он выбрасывает начала зон. Если отправить ему метки кадра,
+        // начатого до подключения, он получит время зон, о которых не знает, и упадёт.
+        // Поэтому зоны заводим только для кадров, начатых при подключённом Tracy.
+        s.tracy = self.tracy.is_some() && tracy_client::Client::is_connected();
+        if s.tracy
+            && let Some(t) = &self.tracy
+        {
+            s.tracy_frame = t.span_alloc("кадр", TRACY_FUNCTION, file!(), line!()).ok();
         }
     }
 
@@ -338,9 +345,11 @@ impl GpuTimer {
         if s.passes.len() >= MAX_TIMED_PASSES {
             return;
         }
-        if let Some(t) = &self.tracy {
+        if s.tracy
+            && let Some(t) = &self.tracy
+        {
             s.tracy_passes
-                .push(t.span_alloc(name, "", file!(), line!()).ok());
+                .push(t.span_alloc(name, TRACY_FUNCTION, file!(), line!()).ok());
         }
     }
 
@@ -428,6 +437,17 @@ mod tests {
         assert_eq!(a.passes[0].name, "сцена");
         assert!((a.passes[0].ms - 2.0).abs() < 1e-9);
         assert_eq!(a.passes[1].name, "вывод");
+        // Проход только в одном из трёх кадров: вклад делится на все кадры.
+        avg.add(&GpuFrameTimings {
+            total_ms: 1.0,
+            passes: vec![PassTiming {
+                name: "сцена",
+                ms: 1.0,
+            }],
+        });
+        let a = avg.average().unwrap();
+        let sum: f64 = a.passes.iter().map(|p| p.ms).sum();
+        assert!((sum - a.total_ms).abs() < 1e-9);
         avg.clear();
         assert_eq!(avg.frames(), 0);
     }
