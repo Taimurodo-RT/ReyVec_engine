@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Taimurodo-RT/ReyVec_engine"
+publish = false
+
+[workspace.dependencies]
+reyvec-app = { path = "crates/reyvec-app" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.dev.package."*"]
+# Зависимости собираем с оптимизацией даже в отладке: так движок не тормозит при разработке.
+opt-level = 2
+
+[profile.release]
+debug = "line-tables-only"

@@ -1,0 +1,20 @@
+[package]
+name = "reyvec-sandbox"
+description = "Песочница ReyVec: программа, которую запускают для проверки каждого этапа."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "reyvec-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+reyvec-app.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
