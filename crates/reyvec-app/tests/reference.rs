@@ -36,7 +36,7 @@ fn cases() -> Vec<Case> {
         shader_error,
         scene,
         msaa: Msaa::Off,
-        perceptual_edges: true,
+        perceptual_edges: false,
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
@@ -69,6 +69,14 @@ fn cases() -> Vec<Case> {
             name: "vector-2s-msaa4",
             scene: HeadlessScene {
                 msaa: Msaa::X4,
+                ..at(DemoScene::Vector, 2.0, false)
+            },
+        },
+        Case {
+            name: "vector-2s-msaa4-editor",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                perceptual_edges: true,
                 ..at(DemoScene::Vector, 2.0, false)
             },
         },

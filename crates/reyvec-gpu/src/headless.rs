@@ -132,7 +132,7 @@ pub fn render_triangle_headless(
             shader_error: false,
             scene: DemoScene::Gpu,
             msaa: Msaa::Off,
-            perceptual_edges: true,
+            perceptual_edges: false,
         },
     )
 }
