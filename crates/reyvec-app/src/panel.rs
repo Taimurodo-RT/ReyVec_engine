@@ -135,8 +135,11 @@ impl Panel {
     }
 
     /// Отдаёт событие окна egui (мышь, клавиатура, масштаб). `true`: событие для панели.
+    /// Спрятанная панель событий не забирает: egui помнит, где панели были в последнем
+    /// показанном кадре, и иначе мышь там не двигала бы камеру.
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
-        self.state.on_window_event(window, event).consumed
+        let consumed = self.state.on_window_event(window, event).consumed;
+        consumed && self.visible
     }
 
     /// Что нажали мышкой на панели с прошлого вызова.
