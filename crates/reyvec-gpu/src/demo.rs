@@ -1500,10 +1500,11 @@ fn build(
     stencil: Option<vk::Format>,
 ) -> Result<vk::Pipeline, GpuError> {
     let pair = shaders.get(name);
-    let blend = if name == "sprite" {
-        Blend::Alpha
-    } else {
-        Blend::Opaque
+    let blend = match name {
+        "sprite" => Blend::Alpha,
+        // Силуэты слоёв объединяются с маской: a + b − a·b.
+        "light_mask_layer" => Blend::Screen,
+        _ => Blend::Opaque,
     };
     graphics_pipeline_stencil(
         &ctx.device,
