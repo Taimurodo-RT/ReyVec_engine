@@ -505,7 +505,7 @@ pub(crate) fn objects(t: f32) -> Vec<SdfObject> {
     out.push(SdfObject {
         blobs,
         k: 0.04,
-        color: [1.0, 0.42, 0.1, 1.0],
+        color: [1.0, 0.36, 0.05, 1.0],
         flags: OBJECT_EMISSIVE,
     });
 
@@ -575,18 +575,18 @@ pub(crate) fn objects(t: f32) -> Vec<SdfObject> {
     let mut blobs = vec![Blob::circle(SPOTS.orb, ORB_R + 0.006 * (t * 4.0).sin())];
     for i in 0..5 {
         let a = t * 1.6 + i as f32 * TAU / 5.0;
-        let r = 0.16 + 0.05 * (t * 1.1 + i as f32 * 1.7).sin();
+        let r = 0.19 + 0.04 * (t * 1.1 + i as f32 * 1.7).sin();
         blobs.push(Blob::circle(
             [
                 SPOTS.orb[0] + r * a.cos(),
                 SPOTS.orb[1] + 0.02 + r * a.sin() * 0.55,
             ],
-            0.022,
+            0.016,
         ));
     }
     out.push(SdfObject {
         blobs,
-        k: 0.09,
+        k: 0.045,
         color: glow([0.75, 0.35, 1.0], pulse),
         flags: OBJECT_EMISSIVE,
     });
@@ -654,13 +654,13 @@ pub(crate) fn lights(t: f32) -> Vec<Light> {
     let half = f(SHELF_W / 2.0) - 0.08;
     let x = f(CAULDRON_X);
     vec![
-        Light::point(SIGIL, [1.2 * neon, 0.22 * neon, 0.85 * neon], 1.6, 0.2),
+        Light::point(SIGIL, [0.6 * neon, 0.1 * neon, 0.42 * neon], 1.2, 0.2),
         Light::tube(
             [f(SHELF_X) - half, STRIP_Y - 0.005],
             [f(SHELF_X) + half, STRIP_Y - 0.005],
-            [0.2, 0.85, 1.25],
-            0.8,
-            0.05,
+            [0.12, 0.5, 0.75],
+            0.7,
+            0.1,
         ),
         Light::point(SPOTS.bulb, [0.3, 1.15, 0.4], 0.75, 0.05),
         Light::point(SPOTS.beaker, [1.3, 0.55, 0.12], 0.7, 0.04),
@@ -680,9 +680,9 @@ pub(crate) fn lights(t: f32) -> Vec<Light> {
         Light::tube(
             [x - 0.14, SPOTS.brew_y + 0.05],
             [x + 0.14, SPOTS.brew_y + 0.05],
-            [0.6 * brew, 1.35 * brew, 0.2 * brew],
-            1.1,
-            0.08,
+            [0.35 * brew, 0.8 * brew, 0.12 * brew],
+            0.85,
+            0.1,
         ),
     ]
 }

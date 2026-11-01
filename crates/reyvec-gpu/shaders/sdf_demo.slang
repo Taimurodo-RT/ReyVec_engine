@@ -83,7 +83,7 @@ float3 lab_backdrop(float2 p, float pixel)
     float seam = min(min(local.x, STONE.x - local.x), min(local.y, STONE.y - local.y));
     float r = cell_random(float2(col, row));
     // Камни немного разные по цвету: серые с тёплым или холодным отливом.
-    float3 stone = lerp(float3(0.17, 0.16, 0.17), float3(0.2, 0.17, 0.14), r) * (0.8 + 0.3 * r);
+    float3 stone = lerp(float3(0.12, 0.115, 0.125), float3(0.15, 0.125, 0.1), r) * (0.8 + 0.3 * r);
     // Камень чуть выпуклый: к краям темнее.
     stone *= 0.75 + 0.25 * saturate(seam / 0.03);
     float3 mortar = float3(0.05, 0.045, 0.045);
