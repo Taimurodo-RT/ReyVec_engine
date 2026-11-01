@@ -61,6 +61,8 @@ pub struct HeadlessScene {
     pub zoom: bool,
     /// Свои файлы для сцен «SVG» и «Motif»; без них там примеры.
     pub files: crate::UserFiles,
+    /// Опыт 4.6: свет каскадами лучей вместо лучей к источникам.
+    pub cascades: bool,
 }
 
 /// Кадр, нарисованный без окна.
@@ -142,6 +144,7 @@ pub fn render_triangle_headless(
             fill: crate::FillMode::PerShape,
             zoom: false,
             files: crate::UserFiles::default(),
+            cascades: false,
         },
     )
 }
@@ -286,6 +289,7 @@ fn render(
             // Шум против полос случайно сдвигает пиксели на ступень: эталоны сравниваются без
             // него.
             demo.set_dither(false);
+            demo.set_cascades(scene.cascades);
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;

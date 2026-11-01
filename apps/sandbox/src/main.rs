@@ -211,6 +211,7 @@ fn snapshot_headless(
         fill: args.fill.unwrap_or_default(),
         zoom: args.zoom,
         files,
+        cascades: false,
     };
     let options = reyvec_app::GpuOptions {
         validation,
