@@ -501,6 +501,8 @@ pub(crate) struct VectorRenderer {
     frames: Vec<FrameBuffers>,
     /// Предупреждение о переполнении уже было в логе.
     warned_overflow: bool,
+    /// Сколько фигур и блоков текста попало в последний кадр после отсечения.
+    drawn: u32,
 }
 
 /// Шейдеры векторного слоя: при их перезагрузке конвейеры пересобираются.
@@ -553,6 +555,7 @@ impl VectorRenderer {
             text: None,
             frames,
             warned_overflow: false,
+            drawn: 0,
         })
     }
 
@@ -820,6 +823,12 @@ impl VectorRenderer {
         }
     }
 
+    /// Сколько фигур и блоков текста нарисовано в последнем кадре: остальные целиком за
+    /// краем экрана и отсечены.
+    pub fn drawn(&self) -> u32 {
+        self.drawn
+    }
+
     /// Сколько фигур уже на видеокарте.
     pub fn uploaded_shapes(&self) -> usize {
         self.meshes.as_ref().map_or(0, |m| m.ranges.len())
@@ -956,7 +965,15 @@ impl VectorRenderer {
     ) -> Option<VectorData> {
         let meshes = self.meshes.as_ref()?;
         let texts = self.text.as_ref().map_or(&[][..], |t| &t.ranges[..]);
-        let packed = pack_frame(&meshes.ranges, texts, items, self.fill, view);
+        let packed = pack_frame(
+            &meshes.ranges,
+            texts,
+            items,
+            self.fill,
+            view,
+            visible_area(aspect),
+        );
+        self.drawn = packed.drawn;
         if packed.overflow && !self.warned_overflow {
             tracing::warn!(
                 "Векторных фигур в кадре больше, чем помещается ({MAX_INSTANCES}): лишние не рисуются"
@@ -1206,6 +1223,8 @@ struct Packed {
     bounds: Vec<Bounds>,
     /// Экземпляров больше [`MAX_INSTANCES`], лишние пропущены.
     overflow: bool,
+    /// Сколько фигур и блоков текста попало в кадр (после отсечения).
+    drawn: u32,
 }
 
 /// Номер конвейера наложения слоя.
@@ -1225,7 +1244,37 @@ fn blend_index(blend: BlendMode) -> usize {
 /// без треугольников (перетекающие) рисуются трафаретом при любом `fill`.
 #[cfg(test)]
 fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
-    pack_frame(ranges, &[], items, fill, reyvec_vector::Affine::IDENTITY)
+    pack_frame(
+        ranges,
+        &[],
+        items,
+        fill,
+        reyvec_vector::Affine::IDENTITY,
+        EVERYWHERE,
+    )
+}
+
+/// Видимая область без отсечения (для тестов).
+#[cfg(test)]
+const EVERYWHERE: Bounds = [f32::MIN, f32::MIN, f32::MAX, f32::MAX];
+
+/// Запас вокруг экрана при отсечении, в единицах экрана (высота кадра = 2): около 10
+/// пикселей при высоте окна 1080. Покрывает сглаживание краёв и округления.
+const CULL_MARGIN: f32 = 0.02;
+
+/// Видимая область экрана с запасом: x от `-aspect` до `aspect`, y от -1 до 1.
+fn visible_area(aspect: f32) -> Bounds {
+    [
+        -aspect - CULL_MARGIN,
+        -1.0 - CULL_MARGIN,
+        aspect + CULL_MARGIN,
+        1.0 + CULL_MARGIN,
+    ]
+}
+
+/// Прямоугольники пересекаются (касание считается).
+fn overlaps(a: Bounds, b: Bounds) -> bool {
+    a[0] <= b[2] && a[2] >= b[0] && a[1] <= b[3] && a[3] >= b[1]
 }
 
 /// Пишет вид камеры в константы конвейера (`view_linear`, `view_offset` в шейдерах).
@@ -1237,13 +1286,15 @@ fn write_view(push: &mut [u8; PUSH_SIZE], view: [f32; 6]) {
 }
 
 /// Как [`pack`], и ещё блоки текста `texts` (по номерам [`reyvec_vector::TextId`]) и вид
-/// камеры `view`: прямоугольники слоёв считаются уже на экране.
+/// камеры `view`: прямоугольники слоёв считаются уже на экране. Фигуры и блоки текста,
+/// чья рамка на экране не задевает `visible`, не пишутся вовсе (отсечение).
 fn pack_frame(
     ranges: &[MeshRange],
     texts: &[TextRange],
     items: &[SceneItem],
     fill: FillMode,
     view: reyvec_vector::Affine,
+    visible: Bounds,
 ) -> Packed {
     let mut out = Vec::new();
     let mut commands: Vec<[u32; 4]> = Vec::new();
@@ -1346,6 +1397,10 @@ fn pack_frame(
                 if range.glyph_count == 0 {
                     continue;
                 }
+                let on_screen = transform_bounds(&(view * t.transform), range.bounds);
+                if !overlaps(on_screen, visible) {
+                    continue;
+                }
                 if written as usize >= MAX_INSTANCES {
                     overflow = true;
                     continue;
@@ -1362,10 +1417,7 @@ fn pack_frame(
                 out.extend_from_slice(&[0u8; 12]);
                 out.extend_from_slice(&NO_PAINT.to_ne_bytes());
                 if target != 0 {
-                    bounds[target] = union(
-                        bounds[target],
-                        transform_bounds(&(view * t.transform), range.bounds),
-                    );
+                    bounds[target] = union(bounds[target], on_screen);
                 }
                 targets[target].push(Op::Text {
                     instance: written,
@@ -1383,6 +1435,10 @@ fn pack_frame(
         let stencil =
             range.curve_index_count > 0 && (range.index_count == 0 || fill.stencil(range.method));
         if range.index_count == 0 && !stencil {
+            continue;
+        }
+        let on_screen = transform_bounds(&(view * inst.transform), range.bounds);
+        if !overlaps(on_screen, visible) {
             continue;
         }
         if written as usize >= MAX_INSTANCES {
@@ -1404,10 +1460,7 @@ fn pack_frame(
         out.extend_from_slice(&inst.morph.to_ne_bytes());
         out.extend_from_slice(&range.paint.to_ne_bytes());
         if target != 0 {
-            bounds[target] = union(
-                bounds[target],
-                transform_bounds(&(view * inst.transform), range.bounds),
-            );
+            bounds[target] = union(bounds[target], on_screen);
         }
         let ops = &mut targets[target];
         if stencil {
@@ -1477,6 +1530,7 @@ fn pack_frame(
         layer_order,
         bounds,
         overflow,
+        drawn: written,
     }
 }
 
@@ -2165,6 +2219,7 @@ mod tests {
             &items,
             FillMode::PerShape,
             reyvec_vector::Affine::IDENTITY,
+            EVERYWHERE,
         );
         assert_eq!(
             packed.targets[0],
@@ -2246,7 +2301,7 @@ mod tests {
         // Камера с центром (1, 0) и приближением 4: фигура 1..1.1 × 0..0.2 на экране
         // 0..0.4 × 0..0.8 (слой рисуется в прямоугольнике там, где фигура видна).
         let view = reyvec_vector::Camera2D::new((1.0, 0.0), 4.0).view();
-        let packed = pack_frame(&ranges, &[], &items, FillMode::PerShape, view);
+        let packed = pack_frame(&ranges, &[], &items, FillMode::PerShape, view, EVERYWHERE);
         let near = |a: Bounds, b: Bounds| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
         assert!(
             near(packed.bounds[1], [0.0, 0.0, 0.4, 0.8]),
@@ -2256,6 +2311,40 @@ mod tests {
         // Сами экземпляры не меняются: камеру применяет видеокарта.
         let plain = pack(&ranges, &items, FillMode::PerShape);
         assert_eq!(packed.instances, plain.instances);
+    }
+
+    #[test]
+    fn shapes_off_screen_are_culled() {
+        let ranges = [MeshRange {
+            index_count: 3,
+            bounds: [0.0, 0.0, 0.1, 0.1],
+            ..PLAIN
+        }];
+        let at = |x: f64| SceneItem::from(Instance::new(ShapeId(0), Affine::translate((x, 0.0))));
+        // Экран 16:9: x от −1.78 до 1.78. Вторая фигура далеко справа, третья только
+        // краем заходит в кадр.
+        let items = [at(0.0), at(5.0), at(1.75), at(0.2)];
+        let visible = visible_area(16.0 / 9.0);
+        let packed = pack_frame(
+            &ranges,
+            &[],
+            &items,
+            FillMode::PerShape,
+            Affine::IDENTITY,
+            visible,
+        );
+        assert_eq!(packed.drawn, 3);
+        assert_eq!(packed.instances.len(), 3 * INSTANCE_SIZE);
+        // Оставшиеся три подряд — одна команда на три экземпляра.
+        assert_eq!(words(&packed.commands), [3, 3, 0, 0]);
+        // С камерой, приближенной к дальней фигуре, видна только она.
+        let view = reyvec_vector::Camera2D::new((5.05, 0.05), 8.0).view();
+        let packed = pack_frame(&ranges, &[], &items, FillMode::PerShape, view, visible);
+        assert_eq!(packed.drawn, 1);
+        assert_eq!(
+            f32::from_ne_bytes(packed.instances[16..20].try_into().unwrap()),
+            5.0
+        );
     }
 
     #[test]
