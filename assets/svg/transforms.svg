@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="-10 -10 120 120" preserveAspectRatio="xMidYMid meet">
+  <defs>
+    <path id="arrow" d="M 0 -6 L 14 0 L 0 6 Z" fill="#e9c46a"/>
+  </defs>
+  <rect x="-10" y="-10" width="120" height="120" fill="#22223b"/>
+  <g transform="translate(25 25) rotate(30)">
+    <rect x="-15" y="-10" width="30" height="20" fill="#4a4e69" stroke="#f2e9e4" stroke-width="2"/>
+  </g>
+  <g transform="translate(75 25) skewX(25)">
+    <rect x="-12" y="-12" width="24" height="24" fill="#9a8c98"/>
+  </g>
+  <!-- Неравномерное растяжение: толщина обводки меняется вдоль окружности, как в SVG. -->
+  <g transform="translate(25 75) scale(2 0.6)">
+    <circle cx="0" cy="0" r="9" fill="none" stroke="#f2e9e4" stroke-width="3"/>
+  </g>
+  <g transform="translate(75 75)">
+    <use href="#arrow" transform="rotate(0)"/>
+    <use href="#arrow" transform="rotate(90)"/>
+    <use href="#arrow" transform="rotate(180)"/>
+    <use href="#arrow" transform="rotate(270) scale(1.5)"/>
+  </g>
+  <text x="5" y="105" fill="#ffffff" font-size="8">текст пока не показывается</text>
+</svg>

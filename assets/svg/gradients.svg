@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d3557"/>
+      <stop offset="0.6" stop-color="#457b9d"/>
+      <stop offset="1" stop-color="#f1faee"/>
+    </linearGradient>
+    <radialGradient id="ball" cx="0.5" cy="0.5" r="0.5" fx="0.3" fy="0.3">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="0.3" stop-color="#ffb4a2"/>
+      <stop offset="1" stop-color="#9d0208"/>
+    </radialGradient>
+    <linearGradient id="reflect" x1="0" y1="0" x2="20" y2="0" gradientUnits="userSpaceOnUse" spreadMethod="reflect">
+      <stop offset="0" stop-color="#f6c445"/>
+      <stop offset="1" stop-color="#e94f37"/>
+    </linearGradient>
+    <linearGradient id="repeat" x1="0" y1="0" x2="0" y2="15" gradientUnits="userSpaceOnUse" spreadMethod="repeat" gradientTransform="rotate(30)">
+      <stop offset="0" stop-color="#44bba4"/>
+      <stop offset="1" stop-color="#9b5de5"/>
+    </linearGradient>
+    <radialGradient id="glow" gradientUnits="userSpaceOnUse" cx="150" cy="150" r="40" gradientTransform="translate(150 150) scale(1 0.5) translate(-150 -150)">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="1"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#44bba4"/>
+      <stop offset="1" stop-color="#f6c445"/>
+    </linearGradient>
+  </defs>
+  <rect x="5" y="5" width="190" height="90" fill="url(#sky)"/>
+  <circle cx="60" cy="50" r="38" fill="url(#ball)"/>
+  <rect x="110" y="15" width="80" height="70" fill="url(#reflect)"/>
+  <rect x="5" y="105" width="90" height="90" fill="url(#repeat)"/>
+  <rect x="105" y="105" width="90" height="90" fill="#22223b"/>
+  <rect x="105" y="105" width="90" height="90" fill="url(#glow)"/>
+  <path d="M 115 185 Q 150 120 185 185" fill="none" stroke="url(#line)" stroke-width="8" stroke-linecap="round"/>
+</svg>

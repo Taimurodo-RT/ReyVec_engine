@@ -1,10 +1,11 @@
-//! Сцены песочницы. Их пять, переключаются клавишами 1–5 ([`DemoScene`]):
+//! Сцены песочницы. Их шесть, переключаются клавишами 1–6 ([`DemoScene`]):
 //!
 //! - «GPU-фундамент» (этап 2): треугольник этапа 1 плюс спрайты с текстурами;
 //! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`;
 //! - «Перетекание» (этап 3): фигуры, которые плавно меняют форму, там же;
 //! - «Слои» (этап 3): прозрачность группы фигур и режимы смешивания, там же;
-//! - «Маски» (этап 3): обрезка по силуэту, маска по яркости и обратная, там же.
+//! - «Маски» (этап 3): обрезка по силуэту, маска по яркости и обратная, там же;
+//! - «SVG» (этап 3): тестовые рисунки SVG или свой файл (`--svg`), там же.
 //!
 //! Про сцену этапа 2.
 //!
@@ -42,6 +43,8 @@ pub enum DemoScene {
     Layers,
     /// Этап 3: маски и обрезка.
     Masks,
+    /// Этап 3: рисунки SVG (тестовые или свой файл).
+    Svg,
 }
 
 impl DemoScene {
@@ -53,10 +56,11 @@ impl DemoScene {
             Self::Morph => "перетекание",
             Self::Layers => "слои",
             Self::Masks => "маски",
+            Self::Svg => "SVG",
         }
     }
 
-    /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers` или `masks`.
+    /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks` или `svg`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -64,6 +68,7 @@ impl DemoScene {
             "morph" => Some(Self::Morph),
             "layers" => Some(Self::Layers),
             "masks" => Some(Self::Masks),
+            "svg" => Some(Self::Svg),
             _ => None,
         }
     }
@@ -232,6 +237,7 @@ impl Demo {
         shaders: &ShaderLibrary,
         format: vk::Format,
         frames_in_flight: usize,
+        svg: Option<&[u8]>,
     ) -> Result<Self, GpuError> {
         let checker = res.create_texture_rgba8(
             ctx,
@@ -253,7 +259,7 @@ impl Demo {
                 &format!("спрайты кадра {i}"),
             )?);
         }
-        let vector_demo = VectorDemo::new();
+        let vector_demo = VectorDemo::new(svg);
         let stencil_format = pick_stencil_format(ctx)?;
         let mut vector = VectorRenderer::new(ctx, res, shaders, frames_in_flight, stencil_format)?;
         // SAFETY: physical получен из этого экземпляра.
@@ -571,7 +577,8 @@ impl Demo {
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let vector = match scene {
-            DemoScene::Vector | DemoScene::Morph | DemoScene::Layers | DemoScene::Masks => {
+            DemoScene::Gpu => None,
+            _ => {
                 let _zone = crate::cpu_zone!("векторные фигуры");
                 let mut items: Vec<reyvec_vector::SceneItem> = match scene {
                     DemoScene::Morph => self
@@ -582,6 +589,7 @@ impl Demo {
                         .collect(),
                     DemoScene::Layers => self.vector_demo.layer_items(time),
                     DemoScene::Masks => self.vector_demo.mask_items(time),
+                    DemoScene::Svg => self.vector_demo.svg_items(aspect),
                     _ => self
                         .vector_demo
                         .instances(time)
@@ -600,7 +608,6 @@ impl Demo {
                 }
                 self.vector.prepare(res, slot, &items, aspect)
             }
-            DemoScene::Gpu => None,
         };
         let sprites = self.sprites_at(scene, time, aspect, shader_error);
         let count = sprites.len().min(MAX_SPRITES);
