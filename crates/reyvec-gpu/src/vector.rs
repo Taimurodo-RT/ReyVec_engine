@@ -1334,9 +1334,8 @@ struct StencilRun {
     cell: f32,
     /// Рамка, слой и следующая рамка той же корзины у каждой фигуры, разложенной по сетке.
     placed: Vec<(Bounds, u32, u32)>,
-    /// Самая большая рамка группы и сколько клеток вокруг центра она может задеть.
-    max_size: f32,
-    reach: i64,
+    /// Самые большие полуширина и полувысота рамок группы.
+    max_half: [f32; 2],
     /// Сетка: клетка (x, y) попадает в корзину (см. [`bucket_of`]), у корзины цепочка
     /// рамок через `placed`. Совпадение корзин у далёких клеток только добавляет лишнюю
     /// проверку рамок. Без выделения памяти на каждую фигуру.
@@ -1374,9 +1373,8 @@ impl StencilRun {
             self.shape = Some(shape);
             self.index_count = range.curve_index_count;
             self.even_odd = range.even_odd;
-            // Клетка в полтора раза больше первой рамки: повёрнутые и чуть большие копии
-            // той же фигуры (рамка повёрнутой до √2 больше) всё ещё смотрят только 3×3
-            // клетки вокруг своей.
+            // Клетка в полтора раза больше первой рамки: в клетке в среднем одна-две
+            // фигуры, а поиск соседей задевает 2×2–3×3 клетки.
             self.cell = if usable {
                 1.5 * (b[2] - b[0]).max(b[3] - b[1]).max(1e-4)
             } else {
@@ -1393,33 +1391,35 @@ impl StencilRun {
         &mut self.data
     }
 
-    /// Слой для рамки `b`, и рамка запоминается. Рамка кладётся в клетку своего центра;
-    /// задевающие её рамки могут лежать только в клетках не дальше `reach` (размер самой
-    /// большой рамки в клетках), их и проверяем.
+    /// Слой для рамки `b`, и рамка запоминается. Рамка кладётся в клетку своего центра.
+    /// Центр задевающей рамки отстоит от нашего не больше чем на сумму полуширин (и
+    /// полувысот), поэтому смотрим только клетки, куда такой центр может попасть: при
+    /// клетке в полтора размера фигуры это обычно 2×2 или 2×3 клетки, а не 3×3.
     fn place(&mut self, b: Bounds, usable: bool) -> u32 {
-        let size = (b[2] - b[0]).max(b[3] - b[1]);
-        if !usable || size > Self::MAX_REACH as f32 * self.cell {
+        let (hw, hh) = ((b[2] - b[0]) * 0.5, (b[3] - b[1]) * 0.5);
+        if !usable || 2.0 * hw.max(hh) > Self::MAX_REACH as f32 * self.cell {
             // Выше всех, и все следующие тоже выше неё.
             let level = self.levels;
             self.floor = level + 1;
             return level;
         }
-        if size > self.max_size {
-            self.max_size = size;
-            self.reach = ((size / self.cell).ceil() as i64).max(1);
-        }
+        self.max_half = [self.max_half[0].max(hw), self.max_half[1].max(hh)];
         if self.heads.is_empty() {
             self.heads.resize(Self::MIN_BUCKETS, (0, NONE));
         } else if self.placed.len() > 2 * self.heads.len() {
             self.grow();
         }
-        let (cx, cy) = self.center_cell(b);
+        let (mx, my) = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5);
+        // Небольшой запас: округление не должно увести край поиска за клетку соседа.
+        let slack = self.cell * 1e-3;
+        let (rx, ry) = (hw + self.max_half[0] + slack, hh + self.max_half[1] + slack);
+        let (x0, x1) = (self.cell_of(mx - rx), self.cell_of(mx + rx));
+        let (y0, y1) = (self.cell_of(my - ry), self.cell_of(my + ry));
         let mask = self.heads.len() - 1;
-        let r = self.reach;
         let mut level = self.floor;
         // Полуоткрытые диапазоны: `..=` в горячем цикле заметно дороже.
-        for y in cy - r..cy + r + 1 {
-            for x in cx - r..cx + r + 1 {
+        for y in y0..y1 + 1 {
+            for x in x0..x1 + 1 {
                 let (generation, head) = self.heads[bucket_of(x, y, mask)];
                 let mut e = if generation == self.generation {
                     head
@@ -1437,19 +1437,24 @@ impl StencilRun {
         }
         let idx = self.placed.len() as u32;
         self.placed.push((b, level, NONE));
-        self.insert(idx, cx, cy);
+        self.insert(idx, self.cell_of(mx), self.cell_of(my));
         level
+    }
+
+    /// Номер клетки для координаты `v`.
+    fn cell_of(&self, v: f32) -> i64 {
+        // Округление вниз без вызова floorf (он не встраивается и заметно дорог здесь).
+        let x = v / self.cell;
+        let t = x as i64;
+        if (t as f32) > x { t - 1 } else { t }
     }
 
     /// Клетка центра рамки `b`.
     fn center_cell(&self, b: Bounds) -> (i64, i64) {
-        // Округление вниз без вызова floorf (он не встраивается и заметно дорог здесь).
-        let cell = |v: f32| {
-            let x = v / self.cell;
-            let t = x as i64;
-            if (t as f32) > x { t - 1 } else { t }
-        };
-        (cell((b[0] + b[2]) * 0.5), cell((b[1] + b[3]) * 0.5))
+        (
+            self.cell_of((b[0] + b[2]) * 0.5),
+            self.cell_of((b[1] + b[3]) * 0.5),
+        )
     }
 
     fn insert(&mut self, idx: u32, x: i64, y: i64) {
@@ -1492,8 +1497,7 @@ impl StencilRun {
         self.per_level.clear();
         self.next_generation();
         self.placed.clear();
-        self.max_size = 0.0;
-        self.reach = 1;
+        self.max_half = [0.0; 2];
         self.levels = 0;
         self.floor = 0;
         self.shape = None;
@@ -1541,8 +1545,7 @@ impl StencilRun {
             self.next_generation();
         }
         self.placed.clear();
-        self.max_size = 0.0;
-        self.reach = 1;
+        self.max_half = [0.0; 2];
         self.levels = 0;
         self.floor = 0;
         self.shape = None;
@@ -2632,6 +2635,44 @@ mod tests {
         // Сами экземпляры не меняются: камеру применяет видеокарта.
         let plain = pack(&ranges, &items, FillMode::PerShape);
         assert_eq!(packed.instances, plain.instances);
+    }
+
+    #[test]
+    fn stencil_levels_match_brute_force() {
+        // Случайные рамки разного размера: слой по сетке должен совпасть со слоем,
+        // посчитанным сравнением каждой рамки со всеми предыдущими.
+        let mut seed = 12345u32;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        let range = MeshRange {
+            curve_index_count: 3,
+            method: FillMethod::Stencil,
+            ..PLAIN
+        };
+        let mut run = StencilRun::default();
+        for round in 0..3 {
+            run.clear();
+            let boxes: Vec<Bounds> = (0..2000)
+                .map(|_| {
+                    let (x, y) = (rnd() * 4.0 - 2.0, rnd() * 2.0 - 1.0);
+                    let (w, h) = (0.02 + rnd() * 0.06, 0.02 + rnd() * 0.06);
+                    [x, y, x + w, y + h]
+                })
+                .collect();
+            for b in &boxes {
+                run.add(0, ShapeId(0), &range, *b);
+            }
+            for (i, b) in boxes.iter().enumerate() {
+                let expected = (0..i)
+                    .filter(|&j| overlaps(boxes[j], *b))
+                    .map(|j| run.levels_of[j] + 1)
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(run.levels_of[i], expected, "round {round}, box {i}");
+            }
+        }
     }
 
     #[test]
