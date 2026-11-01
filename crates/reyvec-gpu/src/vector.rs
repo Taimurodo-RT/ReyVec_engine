@@ -635,8 +635,10 @@ impl VectorRenderer {
     /// Записывает рисование цели `target` (0 — кадр сцены, иначе слой из
     /// [`Self::layer_order`]) в открытый проход рисования. `layers[k]` — готовая
     /// картинка слоя `k` (для слоёв, которые здесь накладываются): номер в общем списке
-    /// текстур и прямоугольник, где она нарисована. `area` — область рисования прохода:
-    /// после наложения слоя ножницы возвращаются на неё.
+    /// текстур и прямоугольник кадра, где она нарисована (с угла этого прямоугольника
+    /// начинается картинка). `area` — область рисования прохода в пикселях кадра: после
+    /// наложения слоя ножницы возвращаются на неё. `origin` — пиксель кадра, с которого
+    /// начинается картинка цели (у кадра сцены ноль).
     ///
     /// # Safety
     /// `cmd` записывается внутри `vkCmdBeginRendering` с картинкой формата
@@ -653,7 +655,9 @@ impl VectorRenderer {
         target: usize,
         layers: &[Option<LayerTexture>],
         area: vk::Rect2D,
+        origin: vk::Offset2D,
     ) {
+        let area_here = shift(area, origin);
         let push = |indices: vk::DeviceAddress, vertices: vk::DeviceAddress| {
             let mut push = [0u8; PUSH_SIZE];
             push[..8].copy_from_slice(&indices.to_ne_bytes());
@@ -720,21 +724,34 @@ impl VectorRenderer {
                     else {
                         continue;
                     };
-                    let (mask_texture, mask_mode) = match mask {
-                        None => (u32::MAX, 0),
+                    let (mask_texture, mask_mode, mask_origin) = match mask {
+                        None => (u32::MAX, 0, rect.offset),
                         Some(m) => match layers.get(m.target as usize) {
-                            Some(Some(t)) => (t.texture, m.shader_mode()),
+                            Some(Some(t)) => (t.texture, m.shader_mode(), t.rect.offset),
                             _ => continue,
                         },
                     };
                     let Some(scissor) = intersect(rect, area) else {
                         continue;
                     };
-                    let mut push = [0u8; 16];
+                    // Пиксель цели + сдвиг = пиксель картинки слоя (и маски).
+                    let mut push = [0u8; 32];
                     push[..4].copy_from_slice(&texture.to_ne_bytes());
                     push[4..8].copy_from_slice(&opacity.to_ne_bytes());
                     push[8..12].copy_from_slice(&mask_texture.to_ne_bytes());
-                    push[12..].copy_from_slice(&mask_mode.to_ne_bytes());
+                    push[12..16].copy_from_slice(&mask_mode.to_ne_bytes());
+                    for (i, v) in [
+                        origin.x - rect.offset.x,
+                        origin.y - rect.offset.y,
+                        origin.x - mask_origin.x,
+                        origin.y - mask_origin.y,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        push[16 + 4 * i..20 + 4 * i].copy_from_slice(&v.to_ne_bytes());
+                    }
+                    let scissor = shift(scissor, origin);
                     let pipeline = p.composite[blend_index(blend)];
                     // SAFETY: условия функции; картинка слоя готова к чтению.
                     unsafe {
@@ -743,7 +760,7 @@ impl VectorRenderer {
                         // Только прямоугольник слоя: остальное в картинке слоя не рисовалось.
                         device.cmd_set_scissor(cmd, 0, &[scissor]);
                         device.cmd_draw(cmd, 3, 1, 0, 0);
-                        device.cmd_set_scissor(cmd, 0, &[area]);
+                        device.cmd_set_scissor(cmd, 0, &[area_here]);
                     }
                 }
             }
@@ -1085,6 +1102,17 @@ pub(crate) struct LayerTexture {
 }
 
 /// Общая часть двух прямоугольников пикселей или `None`, если её нет.
+/// Прямоугольник кадра `r` в пикселях картинки, которая начинается в пикселе кадра `origin`.
+fn shift(r: vk::Rect2D, origin: vk::Offset2D) -> vk::Rect2D {
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: r.offset.x - origin.x,
+            y: r.offset.y - origin.y,
+        },
+        extent: r.extent,
+    }
+}
+
 fn intersect(a: vk::Rect2D, b: vk::Rect2D) -> Option<vk::Rect2D> {
     let x0 = a.offset.x.max(b.offset.x);
     let y0 = a.offset.y.max(b.offset.y);

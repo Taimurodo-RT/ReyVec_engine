@@ -252,7 +252,9 @@ pub(crate) unsafe fn begin_color_pass(
 /// в конце прохода точки MSAA усредняются в него, а `color_view` не сохраняется. Если задан
 /// `stencil_view`, трафарет очищается нулём и после прохода не нужен. Все картинки в
 /// раскладках целей рисования. Очистка, рисование (ножницы) и сведение MSAA только в
-/// `area` (по умолчанию вся картинка), область вывода на всю картинку `extent`.
+/// `area` (в пикселях картинки, по умолчанию `extent` от угла). Область вывода — кадр
+/// размером `extent`; если картинка — кусочек кадра, начинающийся в пикселе `origin`, кадр
+/// сдвигается на `-origin`.
 ///
 /// # Safety
 /// `cmd` в состоянии записи, картинки живы до конца выполнения команд.
@@ -264,6 +266,7 @@ pub(crate) unsafe fn begin_scene_pass(
     resolve_view: Option<vk::ImageView>,
     stencil_view: Option<vk::ImageView>,
     extent: vk::Extent2D,
+    origin: vk::Offset2D,
     area: Option<vk::Rect2D>,
     clear: [f32; 4],
 ) {
@@ -304,7 +307,11 @@ pub(crate) unsafe fn begin_scene_pass(
     if let Some(s) = stencil.as_ref() {
         rendering = rendering.stencil_attachment(s);
     }
+    // Картинка может быть кусочком кадра, начинающимся в пикселе кадра `origin`:
+    // область вывода сдвигается так, чтобы фигуры легли в неё на свои места.
     let viewport = vk::Viewport::default()
+        .x(-origin.x as f32)
+        .y(-origin.y as f32)
         .width(extent.width as f32)
         .height(extent.height as f32)
         .max_depth(1.0);
