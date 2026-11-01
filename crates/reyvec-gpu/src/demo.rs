@@ -1,9 +1,10 @@
-//! Сцены песочницы. Их четыре, переключаются клавишами 1–4 ([`DemoScene`]):
+//! Сцены песочницы. Их пять, переключаются клавишами 1–5 ([`DemoScene`]):
 //!
 //! - «GPU-фундамент» (этап 2): треугольник этапа 1 плюс спрайты с текстурами;
 //! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`;
 //! - «Перетекание» (этап 3): фигуры, которые плавно меняют форму, там же;
-//! - «Слои» (этап 3): прозрачность группы фигур и режимы смешивания, там же.
+//! - «Слои» (этап 3): прозрачность группы фигур и режимы смешивания, там же;
+//! - «Маски» (этап 3): обрезка по силуэту, маска по яркости и обратная, там же.
 //!
 //! Про сцену этапа 2.
 //!
@@ -39,6 +40,8 @@ pub enum DemoScene {
     Morph,
     /// Этап 3: слои с общей прозрачностью и режимами смешивания.
     Layers,
+    /// Этап 3: маски и обрезка.
+    Masks,
 }
 
 impl DemoScene {
@@ -49,16 +52,18 @@ impl DemoScene {
             Self::Vector => "векторы",
             Self::Morph => "перетекание",
             Self::Layers => "слои",
+            Self::Masks => "маски",
         }
     }
 
-    /// Сцена по имени из командной строки: `gpu`, `vector`, `morph` или `layers`.
+    /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers` или `masks`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
             "vector" => Some(Self::Vector),
             "morph" => Some(Self::Morph),
             "layers" => Some(Self::Layers),
+            "masks" => Some(Self::Masks),
             _ => None,
         }
     }
@@ -566,7 +571,7 @@ impl Demo {
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let vector = match scene {
-            DemoScene::Vector | DemoScene::Morph | DemoScene::Layers => {
+            DemoScene::Vector | DemoScene::Morph | DemoScene::Layers | DemoScene::Masks => {
                 let _zone = crate::cpu_zone!("векторные фигуры");
                 let mut items: Vec<reyvec_vector::SceneItem> = match scene {
                     DemoScene::Morph => self
@@ -576,6 +581,7 @@ impl Demo {
                         .map(Into::into)
                         .collect(),
                     DemoScene::Layers => self.vector_demo.layer_items(time),
+                    DemoScene::Masks => self.vector_demo.mask_items(time),
                     _ => self
                         .vector_demo
                         .instances(time)

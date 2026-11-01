@@ -147,6 +147,21 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Layers, 1.0, false)
             },
         },
+        // Маски: обрезка по звезде, маска по яркости, обратная маска (дырка).
+        Case {
+            name: "masks-1s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Masks, 1.0, false)
+            },
+        },
+        Case {
+            name: "masks-1s-msaa-off",
+            scene: HeadlessScene {
+                msaa: Msaa::Off,
+                ..at(DemoScene::Masks, 1.0, false)
+            },
+        },
         Case {
             name: "vector-2s-msaa4-editor",
             scene: HeadlessScene {

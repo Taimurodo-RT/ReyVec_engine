@@ -1,4 +1,4 @@
-//! Сцены песочницы этапа 3: векторные фигуры, перетекание и слои.
+//! Сцены песочницы этапа 3: векторные фигуры, перетекание, слои и маски.
 //!
 //! Все фигуры готовятся один раз, при создании сцены. Каждый кадр меняются только их
 //! положения, повороты, масштабы, оттенки и форма перетекания ([`Instance`]), так что
@@ -15,7 +15,7 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 
 use reyvec_vector::{
     Affine, BezPath, BlendMode, Circle, Color, FillMethod, FillRule, Gradient, Instance, LineCap,
-    LineJoin, Rect, SceneItem, Shape, ShapeId, ShapeLibrary, Spread, Stroke,
+    LineJoin, MaskMode, Rect, SceneItem, Shape, ShapeId, ShapeLibrary, Spread, Stroke,
 };
 
 /// Допуск разбиения кривых в единицах сцены (высота кадра = 2 единицы). В окне высотой
@@ -27,6 +27,8 @@ const PETALS: usize = 12;
 const MORPH_GRID: (usize, usize) = (17, 9);
 /// Фон режимов смешивания в сцене «слои»: центр x, y, ширина, высота.
 const BACKDROP: (f64, f64, f64, f64) = (0.95, 0.0, 1.6, 1.7);
+/// Размер панели в сцене «маски»: ширина, высота.
+const PANEL: (f64, f64) = (1.0, 1.4);
 
 pub(crate) struct VectorDemo {
     pub library: ShapeLibrary,
@@ -46,6 +48,10 @@ pub(crate) struct VectorDemo {
     square: ShapeId,
     backdrop: ShapeId,
     pill: ShapeId,
+    /// Сцена «маски»: белая звезда (силуэт обрезки) и прямоугольник панели с градиентом
+    /// от белого к чёрному (маска по яркости).
+    mask_star: ShapeId,
+    fade: ShapeId,
 }
 
 impl VectorDemo {
@@ -124,6 +130,13 @@ impl VectorDemo {
             },
             Color::from_srgb8(255, 140, 40),
         ));
+        let mask_star = add(Shape::fill(star(5, 0.5, 0.22), Color::WHITE));
+        let fade = add(Shape::fill(
+            rect(PANEL.0, PANEL.1),
+            Gradient::linear((-PANEL.0 / 2.0, 0.0), (PANEL.0 / 2.0, 0.0))
+                .stop(0.0, Color::WHITE)
+                .stop(1.0, Color::from_srgb8(0, 0, 0)),
+        ));
         let heart = library
             .add_with(heart_shape, FillMethod::Stencil)
             .expect("сердце корректно (проверено тестом)");
@@ -145,7 +158,121 @@ impl VectorDemo {
             square,
             backdrop,
             pill,
+            mask_star,
+            fade,
         }
+    }
+
+    /// Сцена «маски» в момент `time`: три панели.
+    ///
+    /// - Слева обрезка: косые цветные полосы видны только внутри вращающейся звезды
+    ///   (маска по прозрачности).
+    /// - В середине маска по яркости: сетка цветных кругов плавно гаснет слева направо
+    ///   под градиентом от белого к чёрному.
+    /// - Справа обратная маска: в бирюзовой панели со звездой движется круглая дырка,
+    ///   сквозь неё видны полосы позади панели.
+    pub fn mask_items(&self, time: f32) -> Vec<SceneItem> {
+        let t = f64::from(time);
+        let mut out = Vec::with_capacity(96);
+        let shape = |id, transform| SceneItem::from(Instance::new(id, transform));
+        let tinted =
+            |id, transform, c: Color| SceneItem::from(Instance::new(id, transform).with_tint(c));
+        let (w, h) = PANEL;
+        let centers = [-1.15, 0.0, 1.15];
+        // Тёмные подложки панелей, чтобы были видны их границы.
+        for x in centers {
+            out.push(tinted(
+                self.square,
+                Affine::translate((x, 0.0)) * Affine::scale_non_uniform(w, h),
+                Color::from_srgb8(32, 36, 58),
+            ));
+        }
+
+        // Слева: обрезка по звезде.
+        let x = centers[0];
+        out.push(SceneItem::layer(1.0));
+        out.push(SceneItem::clip());
+        out.push(shape(
+            self.mask_star,
+            Affine::translate((x, 0.0)) * Affine::rotate(t * 0.3),
+        ));
+        out.push(SceneItem::EndMask);
+        let step = 0.12;
+        let shift = (t * 0.1).rem_euclid(step);
+        for i in 0..16 {
+            let k = f64::from(i);
+            let [r, g, b] = soft_hue(i as f32 / 16.0);
+            out.push(tinted(
+                self.square,
+                Affine::translate((x - 0.9 + k * step + shift, 0.0))
+                    * Affine::rotate(0.5)
+                    * Affine::scale_non_uniform(0.07, 2.2),
+                Color::linear(r, g, b, 1.0),
+            ));
+        }
+        out.push(SceneItem::EndLayer);
+
+        // В середине: маска по яркости.
+        let x = centers[1];
+        out.push(SceneItem::layer(1.0));
+        out.push(SceneItem::mask(MaskMode::Luminance, false));
+        out.push(shape(self.fade, Affine::translate((x, 0.0))));
+        out.push(SceneItem::EndMask);
+        let (cols, rows) = (5, 7);
+        for row in 0..rows {
+            for col in 0..cols {
+                let k = (row * cols + col) as f32 / (rows * cols) as f32;
+                let [r, g, b] = soft_hue(k);
+                let pulse = 1.0 + 0.15 * (t * 2.0 + f64::from(row + col)).sin();
+                out.push(tinted(
+                    self.disk,
+                    Affine::translate((
+                        x + (f64::from(col) - 2.0) * 0.19,
+                        (f64::from(row) - 3.0) * 0.19,
+                    )) * Affine::scale(0.075 * pulse),
+                    Color::linear(r, g, b, 1.0),
+                ));
+            }
+        }
+        out.push(SceneItem::EndLayer);
+
+        // Справа: полосы позади панели и панель с обратной маской (дыркой).
+        let x = centers[2];
+        let stripes = 7;
+        let sw = w / f64::from(stripes);
+        for i in 0..stripes {
+            let c = if i % 2 == 0 {
+                Color::from_srgb8(200, 60, 80)
+            } else {
+                Color::from_srgb8(240, 220, 120)
+            };
+            out.push(tinted(
+                self.square,
+                Affine::translate((x - w / 2.0 + sw * (f64::from(i) + 0.5), 0.0))
+                    * Affine::scale_non_uniform(sw, h),
+                c,
+            ));
+        }
+        out.push(SceneItem::layer(1.0));
+        out.push(SceneItem::mask(MaskMode::Alpha, true));
+        let a = t * 0.8;
+        out.push(shape(
+            self.disk,
+            Affine::translate((x + 0.25 * a.cos(), 0.3 * a.sin())) * Affine::scale(0.22),
+        ));
+        out.push(SceneItem::EndMask);
+        out.push(tinted(
+            self.square,
+            Affine::translate((x, 0.0)) * Affine::scale_non_uniform(w, h),
+            Color::from_srgb8(40, 150, 150),
+        ));
+        out.push(tinted(
+            self.mask_star,
+            Affine::translate((x, 0.0)) * Affine::scale(0.7),
+            Color::from_srgb8(242, 193, 78),
+        ));
+        out.push(SceneItem::EndLayer);
+        out
     }
 
     /// Сцена «слои» в момент `time`.
@@ -479,11 +606,24 @@ mod tests {
             match item {
                 SceneItem::BeginLayer { .. } => depth += 1,
                 SceneItem::EndLayer => depth -= 1,
-                SceneItem::Shape(_) => {}
+                _ => {}
             }
             assert!(depth >= 0);
             deepest = deepest.max(depth);
         }
         assert_eq!((depth, deepest), (0, 2));
+        // Сцена «маски»: три слоя, у каждого одна маска прямо внутри.
+        let items = demo.mask_items(1.0);
+        let masks = items
+            .iter()
+            .filter(|i| matches!(i, SceneItem::BeginMask { .. }))
+            .count();
+        let ends = items
+            .iter()
+            .filter(|i| matches!(i, SceneItem::EndMask))
+            .count();
+        assert_eq!((masks, ends), (3, 3));
+        let _ = demo.mask_items(2.0);
+        assert_eq!(demo.library.revision(), rev);
     }
 }
