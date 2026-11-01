@@ -2419,6 +2419,7 @@ dependencies = [
  "png",
  "resvg",
  "reyvec-gpu",
+ "reyvec-sdf",
  "reyvec-vector",
  "thiserror 2.0.21",
  "tracing",
@@ -2466,6 +2467,10 @@ dependencies = [
  "reyvec-app",
  "tracing",
 ]
+
+[[package]]
+name = "reyvec-sdf"
+version = "0.1.0"
 
 [[package]]
 name = "reyvec-svg"

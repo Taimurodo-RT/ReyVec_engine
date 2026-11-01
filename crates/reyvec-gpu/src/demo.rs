@@ -76,6 +76,8 @@ pub enum DemoScene {
     Stress,
     /// Этап 3: 10 000 перетекающих фигур, все меняют форму каждый кадр.
     StressMorph,
+    /// Этап 4: свет на полях расстояний (SDF). Пока фигуры библиотеки SDF и их поле.
+    Light,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -102,11 +104,12 @@ impl DemoScene {
             Self::Text => "текст",
             Self::Stress => "стресс: движение",
             Self::StressMorph => "стресс: перетекание",
+            Self::Light => "свет (SDF)",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg`, `motif`, `stream`, `text`, `stress` или `stress-morph`.
+    /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph` или `light`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -120,6 +123,7 @@ impl DemoScene {
             "text" => Some(Self::Text),
             "stress" => Some(Self::Stress),
             "stress-morph" => Some(Self::StressMorph),
+            "light" => Some(Self::Light),
             _ => None,
         }
     }
@@ -278,6 +282,8 @@ pub(crate) struct FrameData {
 
 pub(crate) struct Demo {
     triangle: vk::Pipeline,
+    /// Сцена «свет»: SDF-фигуры одним треугольником на весь экран (`sdf_demo.slang`).
+    sdf: vk::Pipeline,
     sprites: vk::Pipeline,
     /// Копирует кадр сцены в окно; зависит от формата окна.
     present: vk::Pipeline,
@@ -390,6 +396,7 @@ impl Demo {
         }
         let mut demo = Self {
             triangle: vk::Pipeline::null(),
+            sdf: vk::Pipeline::null(),
             sprites: vk::Pipeline::null(),
             present: vk::Pipeline::null(),
             resolve: vk::Pipeline::null(),
@@ -429,6 +436,15 @@ impl Demo {
                 res,
                 shaders,
                 "sprite",
+                scene_format,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.sdf = build(
+                ctx,
+                res,
+                shaders,
+                "sdf_demo",
                 scene_format,
                 Msaa::Off,
                 Some(stencil_format),
@@ -586,6 +602,7 @@ impl Demo {
                 ("triangle", msaa, stencil),
                 ("sprite", msaa, stencil),
                 ("resolve", Msaa::Off, None),
+                ("sdf_demo", msaa, stencil),
             ] {
                 made.push(build(ctx, res, shaders, name, format, samples, stencil)?);
             }
@@ -603,10 +620,12 @@ impl Demo {
             ctx.device.destroy_pipeline(self.triangle, None);
             ctx.device.destroy_pipeline(self.sprites, None);
             ctx.device.destroy_pipeline(self.resolve, None);
+            ctx.device.destroy_pipeline(self.sdf, None);
         }
         self.triangle = made[0];
         self.sprites = made[1];
         self.resolve = made[2];
+        self.sdf = made[3];
         self.msaa = msaa;
         self.scene_format = format;
         Ok(())
@@ -655,6 +674,7 @@ impl Demo {
                 "sprite" => (&mut self.sprites, self.scene_format, self.msaa, stencil),
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
+                "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
                 _ => continue,
             };
             match build(ctx, res, shaders, name, format, msaa, stencil) {
@@ -837,7 +857,7 @@ impl Demo {
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let vector = match scene {
-            DemoScene::Gpu => {
+            DemoScene::Gpu | DemoScene::Light => {
                 self.vector_items = 0;
                 None
             }
@@ -1052,6 +1072,12 @@ impl Demo {
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &triangle_push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
+                if frame.scene == DemoScene::Light {
+                    let push = sdf_push(frame.time, frame.extent, self.camera);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sdf);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                }
                 if let Some(vector) = frame.vector {
                     let full = vk::Rect2D::default().extent(p.extent(scene));
                     self.vector.record(
@@ -1123,8 +1149,10 @@ impl Demo {
             ctx.device.destroy_pipeline(self.sprites, None);
             ctx.device.destroy_pipeline(self.present, None);
             ctx.device.destroy_pipeline(self.resolve, None);
+            ctx.device.destroy_pipeline(self.sdf, None);
         }
         self.triangle = vk::Pipeline::null();
+        self.sdf = vk::Pipeline::null();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
         self.resolve = vk::Pipeline::null();
@@ -1181,6 +1209,25 @@ fn layer_textures(p: &PassContext, layers: &[LayerImage]) -> Vec<Option<LayerTex
         });
     }
     out
+}
+
+/// Постоянные сцены «свет» в раскладке `Push` из `sdf_demo.slang`: время, отношение сторон,
+/// центр и приближение камеры, высота кадра в пикселях.
+fn sdf_push(time: f32, extent: vk::Extent2D, camera: reyvec_vector::Camera2D) -> [u8; 24] {
+    let aspect = extent.width as f32 / extent.height.max(1) as f32;
+    let values = [
+        time,
+        aspect,
+        camera.center.x as f32,
+        camera.center.y as f32,
+        camera.zoom as f32,
+        extent.height.max(1) as f32,
+    ];
+    let mut push = [0u8; 24];
+    for (i, v) in values.into_iter().enumerate() {
+        push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+    push
 }
 
 fn build(
