@@ -284,6 +284,10 @@ pub(crate) struct Demo {
     triangle: vk::Pipeline,
     /// Сцена «свет»: SDF-фигуры одним треугольником на весь экран (`sdf_demo.slang`).
     sdf: vk::Pipeline,
+    /// Поле расстояний сцены «свет» (4.2): маска теней и проходы jump flooding.
+    field: FieldPipelines,
+    /// Линии фона сцены «свет» по полю из картинки (jump flooding), а не точному.
+    light_field: bool,
     sprites: vk::Pipeline,
     /// Копирует кадр сцены в окно; зависит от формата окна.
     present: vk::Pipeline,
@@ -397,6 +401,8 @@ impl Demo {
         let mut demo = Self {
             triangle: vk::Pipeline::null(),
             sdf: vk::Pipeline::null(),
+            field: FieldPipelines::default(),
+            light_field: false,
             sprites: vk::Pipeline::null(),
             present: vk::Pipeline::null(),
             resolve: vk::Pipeline::null(),
@@ -450,6 +456,10 @@ impl Demo {
                 Some(stencil_format),
             )?;
             demo.resolve = build(ctx, res, shaders, "resolve", scene_format, Msaa::Off, None)?;
+            for name in FIELD_SHADERS {
+                *demo.field.slot(name) =
+                    build(ctx, res, shaders, name, field_format(name), Msaa::Off, None)?;
+            }
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -489,6 +499,16 @@ impl Demo {
         } else {
             reyvec_vector::Camera2D::default()
         };
+    }
+
+    /// Линии фона сцены «свет» по полю из картинки (jump flooding), а не точному.
+    pub fn light_field(&self) -> bool {
+        self.light_field
+    }
+
+    /// Включает линии фона сцены «свет» по полю из картинки.
+    pub fn set_light_field(&mut self, on: bool) {
+        self.light_field = on;
     }
 
     /// Камера векторных сцен.
@@ -675,6 +695,9 @@ impl Demo {
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
+                n if FIELD_SHADERS.contains(&n) => {
+                    (self.field.slot(n), field_format(n), Msaa::Off, None)
+                }
                 _ => continue,
             };
             match build(ctx, res, shaders, name, format, msaa, stencil) {
@@ -1034,10 +1057,16 @@ impl Demo {
             None => Vec::new(),
         };
 
+        let field = (frame.scene == DemoScene::Light)
+            .then(|| self.add_field_passes(graph, bindless, frame));
+
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
             (stencil, Access::StencilAttachment),
         ];
+        if let Some(f) = field {
+            uses.push((f, Access::Sampled));
+        }
         if hardware_resolve.is_some() {
             uses.push((scene, Access::ColorAttachment));
         }
@@ -1073,7 +1102,8 @@ impl Demo {
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
                 if frame.scene == DemoScene::Light {
-                    let push = sdf_push(frame.time, frame.extent, self.camera);
+                    let field_texture = field.filter(|_| self.light_field).map(|f| p.texture(f));
+                    let push = sdf_push(frame.time, frame.extent, self.camera, field_texture);
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sdf);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
@@ -1142,6 +1172,86 @@ impl Demo {
         );
     }
 
+    /// Проходы поля расстояний сцены «свет» (4.2): «маска» рисует фигуры, отбрасывающие
+    /// тень, в половинном разрешении; «поле» строит из неё расстояния jump flooding.
+    /// Возвращает картинку поля (расстояние со знаком в единицах сцены).
+    fn add_field_passes<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        bindless: &'a Bindless,
+        frame: FrameData,
+    ) -> ImageHandle {
+        let layout = bindless.pipeline_layout;
+        let size = field_size(frame.extent);
+        let mask = graph.create("маска теней", size, field_format("light_mask"));
+        let seeds = [
+            graph.create("семена поля", size, field_format("jfa_seed")),
+            graph.create("семена поля", size, field_format("jfa_seed")),
+        ];
+        let field = graph.create("поле расстояний", size, field_format("jfa_field"));
+        let camera = self.camera;
+        // Одна команда рисования на весь экран: треугольник, без буферов.
+        let draw =
+            move |p: &PassContext, target: ImageHandle, pipeline: vk::Pipeline, push: &[u8]| {
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл цель в раскладку рисования, а прочитанные картинки — в
+                // чтение; конвейер жив, пока кадр рисуется.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(target), size);
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            };
+        graph.add_pass("маска", &[(mask, Access::ColorAttachment)], move |p| {
+            let push = sdf_push(frame.time, frame.extent, camera, None);
+            draw(p, mask, self.field.mask, &push[..24]);
+        });
+        graph.add_pass(
+            "поле",
+            &[(mask, Access::Sampled), (seeds[0], Access::ColorAttachment)],
+            move |p| {
+                draw(p, seeds[0], self.field.seed, &p.texture(mask).to_ne_bytes());
+            },
+        );
+        let mut current = 0;
+        for step in jfa_steps(size) {
+            let (src, dst) = (seeds[current], seeds[1 - current]);
+            graph.add_pass(
+                "поле",
+                &[(src, Access::Sampled), (dst, Access::ColorAttachment)],
+                move |p| {
+                    let mut push = [0u8; 8];
+                    push[..4].copy_from_slice(&p.texture(src).to_ne_bytes());
+                    push[4..].copy_from_slice(&step.to_ne_bytes());
+                    draw(p, dst, self.field.step, &push);
+                },
+            );
+            current = 1 - current;
+        }
+        let last = seeds[current];
+        // Сколько единиц сцены в пикселе поля: высота экрана — 2 единицы при приближении 1.
+        let scene_per_pixel = 2.0 / (size.height as f32 * camera.zoom as f32);
+        graph.add_pass(
+            "поле",
+            &[
+                (last, Access::Sampled),
+                (mask, Access::Sampled),
+                (field, Access::ColorAttachment),
+            ],
+            move |p| {
+                let mut push = [0u8; 12];
+                push[..4].copy_from_slice(&p.texture(last).to_ne_bytes());
+                push[4..8].copy_from_slice(&p.texture(mask).to_ne_bytes());
+                push[8..].copy_from_slice(&scene_per_pixel.to_ne_bytes());
+                draw(p, field, self.field.field, &push);
+            },
+        );
+        field
+    }
+
     fn destroy_pipelines(&mut self, ctx: &GpuContext) {
         // SAFETY: вызывается, когда видеокарта не использует конвейеры; null допустим.
         unsafe {
@@ -1150,9 +1260,13 @@ impl Demo {
             ctx.device.destroy_pipeline(self.present, None);
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
+            for name in FIELD_SHADERS {
+                ctx.device.destroy_pipeline(*self.field.slot(name), None);
+            }
         }
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
+        self.field = FieldPipelines::default();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
         self.resolve = vk::Pipeline::null();
@@ -1211,9 +1325,15 @@ fn layer_textures(p: &PassContext, layers: &[LayerImage]) -> Vec<Option<LayerTex
     out
 }
 
-/// Постоянные сцены «свет» в раскладке `Push` из `sdf_demo.slang`: время, отношение сторон,
-/// центр и приближение камеры, высота кадра в пикселях.
-fn sdf_push(time: f32, extent: vk::Extent2D, camera: reyvec_vector::Camera2D) -> [u8; 24] {
+/// Постоянные сцены «свет» в раскладке `Push` из `sdf_demo.slang` (первые 24 байта такие же
+/// у `light_mask.slang`): время, отношение сторон, центр и приближение камеры, высота кадра
+/// в пикселях, затем картинка поля расстояний (если линии фона берутся из неё).
+fn sdf_push(
+    time: f32,
+    extent: vk::Extent2D,
+    camera: reyvec_vector::Camera2D,
+    field: Option<u32>,
+) -> [u8; 32] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let values = [
         time,
@@ -1223,11 +1343,71 @@ fn sdf_push(time: f32, extent: vk::Extent2D, camera: reyvec_vector::Camera2D) ->
         camera.zoom as f32,
         extent.height.max(1) as f32,
     ];
-    let mut push = [0u8; 24];
+    let mut push = [0u8; 32];
     for (i, v) in values.into_iter().enumerate() {
         push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
     }
+    push[24..28].copy_from_slice(&field.unwrap_or(0).to_ne_bytes());
+    push[28..32].copy_from_slice(&u32::from(field.is_some()).to_ne_bytes());
     push
+}
+
+/// Шейдеры поля расстояний (4.2) по порядку проходов.
+const FIELD_SHADERS: [&str; 4] = ["light_mask", "jfa_seed", "jfa_step", "jfa_field"];
+
+/// Во сколько раз поле расстояний меньше кадра по каждой стороне.
+const FIELD_DOWNSCALE: u32 = 2;
+
+/// Формат картинки, в которую рисует шейдер поля `name`: маска — 8 бит, семена — две
+/// координаты пикселя (половинные числа точны до 2048, а поле не шире), поле — одно
+/// число со знаком.
+fn field_format(name: &str) -> vk::Format {
+    match name {
+        "light_mask" => vk::Format::R8_UNORM,
+        "jfa_seed" | "jfa_step" => vk::Format::R16G16_SFLOAT,
+        _ => vk::Format::R16_SFLOAT,
+    }
+}
+
+/// Размер поля расстояний для кадра `frame`.
+fn field_size(frame: vk::Extent2D) -> vk::Extent2D {
+    vk::Extent2D {
+        width: frame.width.div_ceil(FIELD_DOWNSCALE).max(1),
+        height: frame.height.div_ceil(FIELD_DOWNSCALE).max(1),
+    }
+}
+
+/// Шаги jump flooding для картинки `size`: от половины большей стороны (степень двойки)
+/// до 1, и ещё раз 1 (как `reyvec_sdf::jump_flood`).
+fn jfa_steps(size: vk::Extent2D) -> Vec<i32> {
+    let mut steps = Vec::new();
+    let mut step = size.width.max(size.height).next_power_of_two() / 2;
+    while step >= 1 {
+        steps.push(step as i32);
+        step /= 2;
+    }
+    steps.push(1);
+    steps
+}
+
+/// Конвейеры поля расстояний.
+#[derive(Default)]
+struct FieldPipelines {
+    mask: vk::Pipeline,
+    seed: vk::Pipeline,
+    step: vk::Pipeline,
+    field: vk::Pipeline,
+}
+
+impl FieldPipelines {
+    fn slot(&mut self, name: &str) -> &mut vk::Pipeline {
+        match name {
+            "light_mask" => &mut self.mask,
+            "jfa_seed" => &mut self.seed,
+            "jfa_step" => &mut self.step,
+            _ => &mut self.field,
+        }
+    }
 }
 
 fn build(
@@ -1389,6 +1569,22 @@ fn hue_to_rgb(h: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_is_half_size_and_steps_reach_one() {
+        let size = field_size(vk::Extent2D {
+            width: 1920,
+            height: 1009,
+        });
+        assert_eq!((size.width, size.height), (960, 505));
+        assert_eq!(jfa_steps(size), [512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1]);
+        let tiny = field_size(vk::Extent2D {
+            width: 1,
+            height: 1,
+        });
+        assert_eq!((tiny.width, tiny.height), (1, 1));
+        assert_eq!(jfa_steps(tiny), [1]);
+    }
 
     #[test]
     fn msaa_defaults_and_cycle() {

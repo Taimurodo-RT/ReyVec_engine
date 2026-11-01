@@ -269,6 +269,17 @@ impl App {
                 r.set_zoom(on);
                 tracing::info!("Лупа векторной сцены: {}", if on { "×8" } else { "выкл" });
             }
+            PanelAction::LightField(on) => {
+                r.set_light_field(on);
+                tracing::info!(
+                    "Свет: линии фона по {}",
+                    if on {
+                        "полю из картинки (jump flooding)"
+                    } else {
+                        "точному полю"
+                    }
+                );
+            }
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
                 tracing::info!("Камера в начале");
@@ -334,6 +345,7 @@ impl App {
                 msaa_options: &msaa_options,
                 compact_supported: renderer.compact_scene_supported(),
                 fill_mode: renderer.fill(),
+                light_field: renderer.light_field(),
             };
             panel.frame(window, &info)
         });
