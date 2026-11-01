@@ -15,6 +15,8 @@ struct Vertex
     float4 edge;     // поперёк линии, полутолщина (0 у заливок), вид края, 0
 };
 
+#include "include/paint.slang"
+
 struct Instance
 {
     float4 linear;    // матрица 2×2 (a, b, c, d): x' = a·x + c·y, y' = b·x + d·y
@@ -25,7 +27,7 @@ struct Instance
     uint morph_stride; // перетекание: точек между ключевыми контурами в буфере
     uint morph_last;   // номер последнего ключевого контура (0 у обычных фигур)
     float morph;       // форма: 0 первый контур, 1 второй, 1.5 между вторым и третьим
-    uint pad;
+    uint paint;        // градиент из списка закрасок (NO_PAINT у фигур одного цвета)
 };
 
 struct Push
@@ -34,6 +36,9 @@ struct Push
     Vertex* vertices;   // точки всех фигур в их собственных координатах
     Instance* instances;
     float aspect;
+    uint samples;       // здесь не нужно (поле общее с трафаретом)
+    Paint* paints;      // градиенты фигур
+    GradientStop* stops;
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -41,6 +46,8 @@ struct VertexOut
 {
     float4 position : SV_Position;
     float4 color : COLOR;
+    float2 local : LOCAL;
+    nointerpolation uint paint : PAINT;
     float2 offset : OFFSET;
     float4 edge : EDGE;
 };
@@ -62,6 +69,8 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
     VertexOut o;
     o.position = float4(p.x, -p.y, 0.0, 1.0);
     o.color = inst.color;
+    o.local = local;
+    o.paint = inst.paint;
     o.offset = v.offset;
     o.edge = v.edge;
     return o;
@@ -92,5 +101,8 @@ float4 fs_main(VertexOut input) : SV_Target
     {
         coverage = 1.0;
     }
-    return float4(input.color.rgb, input.color.a * coverage);
+    float4 color = input.color;
+    if (input.paint != NO_PAINT)
+        color *= paint_color(pc.paints, pc.stops, input.paint, input.local);
+    return float4(color.rgb, color.a * coverage);
 }

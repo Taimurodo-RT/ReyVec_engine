@@ -2,7 +2,7 @@
 
 use kurbo::BezPath;
 
-use crate::Color;
+use crate::Paint;
 
 /// Какие точки считать внутри контура, если он пересекает сам себя или в нём есть дырки.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,34 +113,35 @@ pub enum Style {
 pub struct Shape {
     pub path: BezPath,
     pub style: Style,
-    pub color: Color,
+    /// Цвет или градиент.
+    pub paint: Paint,
 }
 
 impl Shape {
     /// Залитая фигура (правило [`FillRule::NonZero`]).
-    pub fn fill(path: BezPath, color: Color) -> Self {
+    pub fn fill(path: BezPath, paint: impl Into<Paint>) -> Self {
         Self {
             path,
             style: Style::Fill(FillRule::NonZero),
-            color,
+            paint: paint.into(),
         }
     }
 
     /// Залитая фигура с заданным правилом заливки.
-    pub fn fill_with(path: BezPath, rule: FillRule, color: Color) -> Self {
+    pub fn fill_with(path: BezPath, rule: FillRule, paint: impl Into<Paint>) -> Self {
         Self {
             path,
             style: Style::Fill(rule),
-            color,
+            paint: paint.into(),
         }
     }
 
     /// Обводка контура.
-    pub fn stroke(path: BezPath, stroke: Stroke, color: Color) -> Self {
+    pub fn stroke(path: BezPath, stroke: Stroke, paint: impl Into<Paint>) -> Self {
         Self {
             path,
             style: Style::Stroke(stroke),
-            color,
+            paint: paint.into(),
         }
     }
 }

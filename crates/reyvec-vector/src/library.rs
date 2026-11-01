@@ -3,7 +3,7 @@
 use kurbo::Affine;
 
 use crate::{
-    Color, CurveMesh, FillMethod, FillRule, Mesh, MorphError, MorphMesh, Shape, Style,
+    Color, CurveMesh, FillMethod, FillRule, Mesh, MorphError, MorphMesh, Paint, Shape, Style,
     TessellationError, curve_mesh, morph_mesh, tessellate_smooth,
 };
 
@@ -73,14 +73,14 @@ impl ShapeLibrary {
         &mut self,
         keyframes: &[kurbo::BezPath],
         rule: FillRule,
-        color: Color,
+        paint: impl Into<Paint>,
     ) -> Result<ShapeId, MorphError> {
         let MorphMesh {
             mesh,
             keyframes: other,
         } = morph_mesh(keyframes, self.tolerance)?;
         Ok(self.push(Entry {
-            shape: Shape::fill_with(keyframes[0].clone(), rule, color),
+            shape: Shape::fill_with(keyframes[0].clone(), rule, paint),
             mesh: Mesh::default(),
             curves: Some(mesh),
             morph: other,

@@ -4,6 +4,9 @@
 //! положения, повороты, масштабы, оттенки и форма перетекания ([`Instance`]), так что
 //! процессор не пересчитывает ни одной кривой.
 //!
+//! Сердце, кольцо и волна закрашены градиентами (радиальный с бликом, линейный и
+//! повторяющийся вдоль обводки), остальные фигуры одним цветом.
+//!
 //! Способы заливки выбраны для каждой фигуры: всё треугольниками, кроме сердца. Его
 //! показывает лупа (клавиша Z), а при сильном приближении треугольники видны ломаной,
 //! поэтому сердце рисуется трафаретом. Перетекающие фигуры всегда рисуются трафаретом.
@@ -11,8 +14,8 @@
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use reyvec_vector::{
-    Affine, BezPath, Circle, Color, FillMethod, FillRule, Instance, LineCap, LineJoin, Shape,
-    ShapeId, ShapeLibrary, Stroke,
+    Affine, BezPath, Circle, Color, FillMethod, FillRule, Gradient, Instance, LineCap, LineJoin,
+    Shape, ShapeId, ShapeLibrary, Spread, Stroke,
 };
 
 /// Допуск разбиения кривых в единицах сцены (высота кадра = 2 единицы). В окне высотой
@@ -54,10 +57,13 @@ impl VectorDemo {
         ));
         let mut ring_path = circle(0.28);
         ring_path.extend(circle(0.16));
+        // Кольцо: линейный градиент сверху вниз.
         let ring = add(Shape::fill_with(
             ring_path,
             FillRule::EvenOdd,
-            Color::from_srgb8(123, 108, 246),
+            Gradient::linear((0.0, 0.28), (0.0, -0.28))
+                .stop(0.0, Color::from_srgb8(160, 140, 255))
+                .stop(1.0, Color::from_srgb8(60, 40, 170)),
         ));
         let petal = add(Shape::fill(petal(), Color::WHITE));
         let core = add(Shape::fill(circle(0.07), Color::from_srgb8(255, 233, 168)));
@@ -69,13 +75,25 @@ impl VectorDemo {
                 blue,
             ))
         });
+        // Волна: обводка с повторяющимся градиентом вдоль.
         let wave = add(Shape::stroke(
             wave(),
             Stroke::new(0.035).with_cap(LineCap::Round),
-            Color::from_srgb8(245, 163, 199),
+            Gradient::linear((-0.7, 0.0), (-0.35, 0.0))
+                .with_spread(Spread::Reflect)
+                .stop(0.0, Color::from_srgb8(245, 163, 199))
+                .stop(1.0, Color::from_srgb8(120, 200, 255)),
         ));
         // Сердце трафаретом: его показывает лупа.
-        let heart_shape = Shape::fill(heart(0.3), Color::from_srgb8(232, 74, 95));
+        // Сердце: радиальный градиент с бликом слева сверху.
+        let heart_shape = Shape::fill(
+            heart(0.3),
+            Gradient::radial((0.0, 0.05), 0.42)
+                .with_focus((-0.12, 0.15))
+                .stop(0.0, Color::from_srgb8(255, 170, 180))
+                .stop(0.45, Color::from_srgb8(232, 74, 95))
+                .stop(1.0, Color::from_srgb8(120, 20, 45)),
+        );
         let morph_keyframes = [circle(0.4), star(5, 0.45, 0.2), heart(0.4), {
             let mut ring = circle(0.4);
             ring.extend(circle(0.22).reverse_subpaths());

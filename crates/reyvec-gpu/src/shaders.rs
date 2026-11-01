@@ -95,7 +95,13 @@ impl ShaderLibrary {
         };
         let mut changed = BTreeSet::new();
         while let Ok(path) = hot.events.try_recv() {
-            if let Some(name) = shader_name(&path) {
+            if path.parent() != Some(hot.dir.as_path()) {
+                // Общий кусок из shaders/include: его подключают многие шейдеры, поэтому
+                // пересобираем все.
+                if path.extension().is_some_and(|e| e == "slang") {
+                    changed.extend(self.shaders.keys().cloned());
+                }
+            } else if let Some(name) = shader_name(&path) {
                 changed.insert(name);
             }
         }
@@ -166,7 +172,7 @@ fn start_watching(dir: &Path) -> Option<HotReload> {
             return None;
         }
     };
-    if let Err(e) = watcher.watch(dir, notify::RecursiveMode::NonRecursive) {
+    if let Err(e) = watcher.watch(dir, notify::RecursiveMode::Recursive) {
         tracing::warn!("Не удалось следить за папкой {}: {e}", dir.display());
         return None;
     }
