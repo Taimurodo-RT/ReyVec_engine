@@ -24,6 +24,8 @@ pub(crate) enum PanelAction {
     Fill(FillMode),
     Zoom(bool),
     LightField(bool),
+    Glow(bool),
+    Dither(bool),
     ResetCamera,
     Snapshot,
 }
@@ -98,6 +100,10 @@ pub(crate) struct PanelInfo<'a> {
     pub fill_mode: FillMode,
     /// Линии фона сцены «свет» по полю из картинки (jump flooding).
     pub light_field: bool,
+    /// Свечение и мягкий переход к белому в сцене «лампы и тени».
+    pub glow: bool,
+    /// Шум против полос при выводе.
+    pub dither: bool,
 }
 
 pub(crate) struct Panel {
@@ -379,6 +385,30 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::LightField(field));
         }
     }
+    if info.scene_id == DemoScene::Lamps {
+        let mut glow = info.glow;
+        if ui
+            .checkbox(&mut glow, "Свечение и мягкие пересветы (B)")
+            .on_hover_text(
+                "Яркие места мягко светятся вокруг, а свет ярче белого плавно переходит \
+                 в белый, а не обрезается пятнами",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::Glow(glow));
+        }
+    }
+    let mut dither = info.dither;
+    if ui
+        .checkbox(&mut dither, "Шум против полос (D)")
+        .on_hover_text(
+            "Незаметный шум в одну ступень яркости: плавные тёмные переходы \
+             не распадаются на полосы",
+        )
+        .changed()
+    {
+        actions.push(PanelAction::Dither(dither));
+    }
     ui.horizontal(|ui| {
         if ui.button("Камера в начало (R)").clicked() {
             actions.push(PanelAction::ResetCamera);
@@ -529,6 +559,8 @@ mod tests {
             compact_supported: true,
             fill_mode: FillMode::PerShape,
             light_field: false,
+            glow: true,
+            dither: true,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {
