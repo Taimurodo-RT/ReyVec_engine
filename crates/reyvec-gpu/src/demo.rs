@@ -28,7 +28,8 @@ use crate::graph::{Access, ImageHandle, PassContext, RenderGraph};
 use crate::lights::{LIGHT_SIZE, MAX_LIGHTS};
 use crate::pipeline::Blend;
 use crate::pipeline::{
-    CLEAR_COLOR, Stencil, StencilUse, begin_color_pass, begin_scene_pass, graphics_pipeline_stencil,
+    CLEAR_COLOR, Stencil, StencilUse, begin_color_pass, begin_color_pass_with, begin_scene_pass,
+    graphics_pipeline_stencil,
 };
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
@@ -1441,7 +1442,11 @@ impl Demo {
             // SAFETY: граф перевёл маску в раскладку рисования, а картинки слоёв (уже
             // нарисованные) в чтение; конвейеры живы, пока кадр рисуется.
             unsafe {
-                begin_color_pass(d, cmd, p.view(mask), size);
+                // Очистка нулём: «ничего не закрыто». Цвет фона кадра (не ноль) сделал бы
+                // каждую точку маски чуть закрытой, то есть краем, и поле стало бы почти
+                // нулевым везде (так было в сцене «слизь и магия», где маску не
+                // перекрывают SDF-фигуры сцены «свет»).
+                begin_color_pass_with(d, cmd, p.view(mask), size, [0.0; 4]);
                 bindless.bind(d, cmd);
                 // Сначала SDF-фигуры сцены на всю маску (в сцене «слизь и магия» их нет,
                 // маска просто очищена), потом SDF-объекты и силуэты слоёв поверх.

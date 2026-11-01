@@ -99,18 +99,27 @@ float4 fs_main(VertexOut input) : SV_Target
     float cover = sdf_coverage(d, pixel);
     if (pc.mode == 1)
         return float4(cover, 0.0, 0.0, 1.0);
+    // Снаружи объекта (большая часть прямоугольника) больше ничего не считаем.
+    if (cover <= 0.0)
+        return float4(0.0, 0.0, 0.0, 0.0);
 
-    // Наклон поля: куда расстояние растёт быстрее всего (наружу от поверхности).
-    float e = pixel;
-    float2 grad = float2(object_field(o, p + float2(e, 0.0)) - object_field(o, p - float2(e, 0.0)),
-                         object_field(o, p + float2(0.0, e)) - object_field(o, p - float2(0.0, e)));
-    float2 outward = grad / max(length(grad), 1e-6);
     // Толщина: у края 0, глубже BEVEL — 1. Поверхность как у капли: у края почти
     // вертикальная, к середине горизонтальная.
     const float BEVEL = 0.07;
     float depth = saturate(-d / BEVEL);
     float flat_part = 1.0 - (1.0 - depth) * (1.0 - depth);
-    float3 normal = normalize(float3(outward * (1.0 - flat_part), flat_part + 0.05));
+    float3 normal = float3(0.0, 0.0, 1.0);
+    if (depth < 1.0)
+    {
+        // Наклон поля: куда расстояние растёт быстрее всего (наружу от поверхности).
+        // Нужен только у края, где поверхность наклонена; в середине она плоская.
+        float e = pixel;
+        float2 grad = float2(
+            object_field(o, p + float2(e, 0.0)) - object_field(o, p - float2(e, 0.0)),
+            object_field(o, p + float2(0.0, e)) - object_field(o, p - float2(0.0, e)));
+        float2 outward = grad / max(length(grad), 1e-6);
+        normal = normalize(float3(outward * (1.0 - flat_part), flat_part + 0.05));
+    }
     float3 to_light = normalize(SHAPE_LIGHT);
 
     float3 color;

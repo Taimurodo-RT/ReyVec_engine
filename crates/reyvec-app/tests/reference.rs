@@ -591,4 +591,12 @@ fn blobs_scene_draws_slime_and_glowing_orb() {
     eprintln!("шар {orb:?}, угол {corner:?}");
     let sum = |c: [u32; 3]| c.iter().sum::<u32>();
     assert!(sum(orb) > sum(corner) * 3, "шар {orb:?}, угол {corner:?}");
+    // Пол у тёплой лампы (сверху слева) освещён, а не в тени: однажды маска теней
+    // очищалась цветом фона, каждая её точка считалась краем, и тень была везде.
+    let floor = pixel(-1.1, 0.45);
+    eprintln!("пол у лампы {floor:?}");
+    assert!(
+        sum(floor) > sum(corner) * 2,
+        "пол у лампы {floor:?}, угол {corner:?}"
+    );
 }
