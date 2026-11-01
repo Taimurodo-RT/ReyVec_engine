@@ -197,7 +197,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
     )));
     ui.label(
         RichText::new(
-            "1–4 сцена, M сглаживание, G края, F заливка, Z лупа, F1 прячет панель, F12 снимок",
+            "1–5 сцена, M сглаживание, G края, F заливка, Z лупа, F1 прячет панель, F12 снимок",
         )
         .weak(),
     );

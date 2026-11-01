@@ -19,8 +19,8 @@
 
 use ash::vk;
 use reyvec_vector::{
-    BlendMode, Color, FillMethod, FillRule, Gradient, GradientKind, Paint, SceneItem, ShapeId,
-    ShapeLibrary, Spread, Style,
+    BlendMode, Color, FillMethod, FillRule, Gradient, GradientKind, MaskMode, Paint, SceneItem,
+    ShapeId, ShapeLibrary, Spread, Style,
 };
 
 use crate::GpuError;
@@ -128,6 +128,20 @@ const EMPTY_BOUNDS: Bounds = [
     f32::NEG_INFINITY,
 ];
 
+fn intersect_bounds(a: Bounds, b: Bounds) -> Bounds {
+    let r = [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ];
+    if r[0] > r[2] || r[1] > r[3] {
+        EMPTY_BOUNDS
+    } else {
+        r
+    }
+}
+
 fn union(a: Bounds, b: Bounds) -> Bounds {
     [
         a[0].min(b[0]),
@@ -178,12 +192,33 @@ enum Op {
         index_count: u32,
         even_odd: bool,
     },
-    /// Наложить готовый слой `layer` (номер цели рисования) с прозрачностью и режимом.
+    /// Наложить готовый слой `layer` (номер цели рисования) с прозрачностью, режимом и,
+    /// если есть, маской.
     Composite {
         layer: u32,
         opacity: f32,
         blend: BlendMode,
+        mask: Option<LayerMask>,
     },
+}
+
+/// Маска слоя: готовая картинка цели `target`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LayerMask {
+    target: u32,
+    mode: MaskMode,
+    inverted: bool,
+}
+
+impl LayerMask {
+    /// Режим для шейдера `vector_layer.slang`: 1 по прозрачности, 2 по яркости, +4 обратная.
+    fn shader_mode(self) -> u32 {
+        let mode = match self.mode {
+            MaskMode::Alpha => 1,
+            MaskMode::Luminance => 2,
+        };
+        mode | if self.inverted { 4 } else { 0 }
+    }
 }
 
 /// Буферы одного кадра в работе: пока видеокарта читает одни, процессор пишет в другие.
@@ -579,8 +614,8 @@ impl VectorRenderer {
         pixel_rect(b, data.aspect, extent)
     }
 
-    /// Слои, которые накладываются прямо в цель `target`: их картинки проход этой цели
-    /// читает.
+    /// Слои и их маски, которые накладываются прямо в цель `target`: их картинки проход
+    /// этой цели читает.
     pub fn layer_children(&self, data: &VectorData, target: usize) -> Vec<u32> {
         self.frames[data.slot]
             .targets
@@ -588,9 +623,12 @@ impl VectorRenderer {
             .into_iter()
             .flatten()
             .filter_map(|op| match *op {
-                Op::Composite { layer, .. } => Some(layer),
+                Op::Composite { layer, mask, .. } => {
+                    Some(std::iter::once(layer).chain(mask.map(|m| m.target)))
+                }
                 _ => None,
             })
+            .flatten()
             .collect()
     }
 
@@ -676,17 +714,27 @@ impl VectorRenderer {
                     layer,
                     opacity,
                     blend,
+                    mask,
                 } => {
                     let Some(&Some(LayerTexture { texture, rect })) = layers.get(layer as usize)
                     else {
                         continue;
                     };
+                    let (mask_texture, mask_mode) = match mask {
+                        None => (u32::MAX, 0),
+                        Some(m) => match layers.get(m.target as usize) {
+                            Some(Some(t)) => (t.texture, m.shader_mode()),
+                            _ => continue,
+                        },
+                    };
                     let Some(scissor) = intersect(rect, area) else {
                         continue;
                     };
-                    let mut push = [0u8; 8];
+                    let mut push = [0u8; 16];
                     push[..4].copy_from_slice(&texture.to_ne_bytes());
-                    push[4..].copy_from_slice(&opacity.to_ne_bytes());
+                    push[4..8].copy_from_slice(&opacity.to_ne_bytes());
+                    push[8..12].copy_from_slice(&mask_texture.to_ne_bytes());
+                    push[12..].copy_from_slice(&mask_mode.to_ne_bytes());
                     let pipeline = p.composite[blend_index(blend)];
                     // SAFETY: условия функции; картинка слоя готова к чтению.
                     unsafe {
@@ -746,34 +794,20 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
     let mut targets: Vec<Vec<Op>> = vec![Vec::new()];
     let mut bounds: Vec<Bounds> = vec![EMPTY_BOUNDS];
     let mut layer_order = Vec::new();
-    // Открытые слои: номер цели, прозрачность, режим.
-    let mut stack: Vec<(usize, f32, BlendMode)> = Vec::new();
+    let mut stack: Vec<Open> = Vec::new();
     let mut last: Option<(usize, ShapeId)> = None;
     let mut written = 0u32;
     let mut overflow = false;
 
-    let close = |layer: (usize, f32, BlendMode),
-                 stack: &[(usize, f32, BlendMode)],
-                 targets: &mut Vec<Vec<Op>>,
-                 bounds: &mut Vec<Bounds>,
-                 layer_order: &mut Vec<u32>| {
-        let (idx, opacity, blend) = layer;
-        if targets[idx].is_empty() {
-            return;
-        }
-        layer_order.push(idx as u32);
-        let parent = stack.last().map_or(0, |l| l.0);
-        bounds[parent] = union(bounds[parent], bounds[idx]);
-        targets[parent].push(Op::Composite {
-            layer: idx as u32,
-            opacity,
-            blend,
-        });
-    };
-
     for item in items {
+        let skipping = matches!(stack.last(), Some(Open::Skip { .. }));
         let inst = match *item {
             SceneItem::BeginLayer { opacity, blend } => {
+                last = None;
+                if skipping {
+                    stack.push(Open::Skip { mask: false });
+                    continue;
+                }
                 targets.push(Vec::new());
                 bounds.push(EMPTY_BOUNDS);
                 let opacity = if opacity.is_nan() {
@@ -781,20 +815,75 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
                 } else {
                     opacity.clamp(0.0, 1.0)
                 };
-                stack.push((targets.len() - 1, opacity, blend));
+                stack.push(Open::Layer {
+                    idx: targets.len() - 1,
+                    opacity,
+                    blend,
+                    mask: None,
+                    hidden: false,
+                });
+                continue;
+            }
+            SceneItem::BeginMask { mode, inverted } => {
                 last = None;
+                // Маска только прямо внутри слоя, иначе она и её фигуры пропускаются.
+                if !matches!(stack.last(), Some(Open::Layer { .. })) {
+                    stack.push(Open::Skip { mask: true });
+                    continue;
+                }
+                targets.push(Vec::new());
+                bounds.push(EMPTY_BOUNDS);
+                stack.push(Open::Mask {
+                    idx: targets.len() - 1,
+                    mode,
+                    inverted,
+                });
                 continue;
             }
             SceneItem::EndLayer => {
-                if let Some(layer) = stack.pop() {
-                    close(layer, &stack, &mut targets, &mut bounds, &mut layer_order);
-                }
                 last = None;
+                match stack.last() {
+                    Some(Open::Layer { .. } | Open::Skip { mask: false }) => {}
+                    _ => continue, // лишний или не тот конец
+                }
+                if let Some(Open::Layer {
+                    idx,
+                    opacity,
+                    blend,
+                    mask,
+                    hidden,
+                }) = stack.pop()
+                {
+                    close_layer(
+                        (idx, opacity, blend, mask, hidden),
+                        &stack,
+                        &mut targets,
+                        &mut bounds,
+                        &mut layer_order,
+                    );
+                }
                 continue;
             }
+            SceneItem::EndMask => {
+                last = None;
+                match stack.last() {
+                    Some(Open::Mask { .. } | Open::Skip { mask: true }) => {}
+                    _ => continue,
+                }
+                if let Some(Open::Mask {
+                    idx,
+                    mode,
+                    inverted,
+                }) = stack.pop()
+                {
+                    close_mask(idx, mode, inverted, &mut stack, &targets, &mut layer_order);
+                }
+                continue;
+            }
+            SceneItem::Shape(_) if skipping => continue,
             SceneItem::Shape(inst) => inst,
         };
-        let target = stack.last().map_or(0, |l| l.0);
+        let target = stack.last().map_or(0, Open::target);
         let Some(range) = ranges.get(inst.shape.0 as usize) else {
             continue;
         };
@@ -860,8 +949,29 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         }
         written += 1;
     }
-    while let Some(layer) = stack.pop() {
-        close(layer, &stack, &mut targets, &mut bounds, &mut layer_order);
+    // Незакрытые слои и маски закрываются в конце кадра.
+    while let Some(open) = stack.pop() {
+        match open {
+            Open::Layer {
+                idx,
+                opacity,
+                blend,
+                mask,
+                hidden,
+            } => close_layer(
+                (idx, opacity, blend, mask, hidden),
+                &stack,
+                &mut targets,
+                &mut bounds,
+                &mut layer_order,
+            ),
+            Open::Mask {
+                idx,
+                mode,
+                inverted,
+            } => close_mask(idx, mode, inverted, &mut stack, &targets, &mut layer_order),
+            Open::Skip { .. } => {}
+        }
     }
     Packed {
         instances: out,
@@ -875,6 +985,94 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         bounds,
         overflow,
     }
+}
+
+/// Открытая скобка при раскладке кадра.
+enum Open {
+    Layer {
+        idx: usize,
+        opacity: f32,
+        blend: BlendMode,
+        mask: Option<LayerMask>,
+        /// Маска пустая и не обратная: слой нигде не виден.
+        hidden: bool,
+    },
+    Mask {
+        idx: usize,
+        mode: MaskMode,
+        inverted: bool,
+    },
+    /// Пропускаемая скобка (маска вне слоя и всё внутри неё). `mask`: чем закрывается.
+    Skip { mask: bool },
+}
+
+impl Open {
+    /// Цель, куда рисуются фигуры внутри скобки.
+    fn target(&self) -> usize {
+        match *self {
+            Open::Layer { idx, .. } | Open::Mask { idx, .. } => idx,
+            Open::Skip { .. } => 0,
+        }
+    }
+}
+
+/// Закрывает слой: если в нём что-то есть и он не скрыт пустой маской, он попадает в
+/// порядок рисования и накладывается в родителя. С маской (не обратной) слой виден
+/// только в пересечении своего прямоугольника и прямоугольника маски; маска рисуется
+/// в том же прямоугольнике, что и слой.
+fn close_layer(
+    (idx, opacity, blend, mask, hidden): (usize, f32, BlendMode, Option<LayerMask>, bool),
+    stack: &[Open],
+    targets: &mut [Vec<Op>],
+    bounds: &mut [Bounds],
+    layer_order: &mut Vec<u32>,
+) {
+    if targets[idx].is_empty() || hidden {
+        return;
+    }
+    if let Some(m) = mask {
+        let t = m.target as usize;
+        if !m.inverted {
+            bounds[idx] = intersect_bounds(bounds[idx], bounds[t]);
+        }
+        bounds[t] = bounds[idx];
+    }
+    layer_order.push(idx as u32);
+    let parent = stack.last().map_or(0, Open::target);
+    bounds[parent] = union(bounds[parent], bounds[idx]);
+    targets[parent].push(Op::Composite {
+        layer: idx as u32,
+        opacity,
+        blend,
+        mask,
+    });
+}
+
+/// Закрывает маску и отдаёт её слою, в котором она стоит.
+fn close_mask(
+    idx: usize,
+    mode: MaskMode,
+    inverted: bool,
+    stack: &mut [Open],
+    targets: &[Vec<Op>],
+    layer_order: &mut Vec<u32>,
+) {
+    let Some(Open::Layer { mask, hidden, .. }) = stack.last_mut() else {
+        return;
+    };
+    if targets[idx].is_empty() {
+        // Пустая маска: обычная прячет слой целиком, обратная ничего не прячет.
+        *hidden = !inverted;
+        *mask = None;
+        return;
+    }
+    *hidden = false;
+    *mask = Some(LayerMask {
+        target: idx as u32,
+        mode,
+        inverted,
+    });
+    layer_order.push(idx as u32);
 }
 
 /// Готовая картинка слоя для наложения.
@@ -1308,13 +1506,15 @@ mod tests {
                 Op::Composite {
                     layer: 1,
                     opacity: 0.5,
-                    blend: BlendMode::Normal
+                    blend: BlendMode::Normal,
+                    mask: None
                 },
                 tri(4),
                 Op::Composite {
                     layer: 4,
                     opacity: 0.25,
-                    blend: BlendMode::Add
+                    blend: BlendMode::Add,
+                    mask: None
                 },
             ]
         );
@@ -1325,7 +1525,8 @@ mod tests {
                 Op::Composite {
                     layer: 2,
                     opacity: 1.0,
-                    blend: BlendMode::Multiply
+                    blend: BlendMode::Multiply,
+                    mask: None
                 },
                 tri(3),
             ]
@@ -1415,5 +1616,109 @@ mod tests {
         assert!(intersect(r, full).is_some());
         let a = pixel_rect([0.0, 0.0, 1.0, 0.5], 2.0, extent);
         assert_eq!(intersect(a, full).map(|r| r.extent.width), Some(54));
+    }
+
+    #[test]
+    fn masks_belong_to_their_layer_and_clip_its_bounds() {
+        let ranges = [MeshRange {
+            index_count: 3,
+            bounds: [0.0, 0.0, 1.0, 1.0],
+            ..PLAIN
+        }];
+        let at = |x: f64| SceneItem::from(Instance::new(ShapeId(0), Affine::translate((x, 0.0))));
+        let comp = |layer, mask| Op::Composite {
+            layer,
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            mask,
+        };
+        let items = [
+            // 1: слой с маской 2 по яркости; маска сдвинута, слой виден в пересечении.
+            SceneItem::layer(1.0),
+            at(0.0),
+            SceneItem::mask(MaskMode::Luminance, false),
+            at(0.5),
+            SceneItem::EndMask,
+            SceneItem::EndLayer,
+            // 3: обратная маска 4 не обрезает прямоугольник слоя.
+            SceneItem::layer(1.0),
+            SceneItem::mask(MaskMode::Alpha, true),
+            at(3.5),
+            SceneItem::EndMask,
+            at(3.0),
+            SceneItem::EndLayer,
+            // 5: пустая обычная маска 6 прячет слой.
+            SceneItem::layer(1.0),
+            SceneItem::clip(),
+            SceneItem::EndMask,
+            at(5.0),
+            SceneItem::EndLayer,
+            // Маска вне слоя пропускается вместе с фигурами и вложенными слоями.
+            SceneItem::clip(),
+            at(9.0),
+            SceneItem::layer(1.0),
+            at(9.0),
+            SceneItem::EndLayer,
+            SceneItem::EndMask,
+            SceneItem::EndMask, // лишний конец
+            // 7: пустая обратная маска 8 ничего не прячет.
+            SceneItem::layer(1.0),
+            SceneItem::mask(MaskMode::Alpha, true),
+            SceneItem::EndMask,
+            at(7.0),
+            SceneItem::EndLayer,
+        ];
+        let packed = pack(&ranges, &items, FillMode::PerShape);
+        let mask = |target, mode, inverted| {
+            Some(LayerMask {
+                target,
+                mode,
+                inverted,
+            })
+        };
+        let ops: Vec<_> = packed.targets[0]
+            .iter()
+            .filter(|op| matches!(op, Op::Composite { .. }))
+            .copied()
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                comp(1, mask(2, MaskMode::Luminance, false)),
+                comp(3, mask(4, MaskMode::Alpha, true)),
+                comp(7, None),
+            ]
+        );
+        assert_eq!(
+            packed.targets.len(),
+            9,
+            "пропущенная маска не заводит целей"
+        );
+        assert_eq!(
+            packed.layer_order,
+            [2, 1, 4, 3, 7],
+            "маска раньше своего слоя"
+        );
+        assert_eq!(
+            packed.bounds[1],
+            [0.5, 0.0, 1.0, 1.0],
+            "пересечение со маской"
+        );
+        assert_eq!(
+            packed.bounds[2], packed.bounds[1],
+            "маска рисуется там же, где слой"
+        );
+        assert_eq!(packed.bounds[3], [3.0, 0.0, 4.0, 1.0]);
+        assert_eq!(packed.bounds[4], packed.bounds[3]);
+        assert_eq!(packed.instances.len(), 6 * INSTANCE_SIZE);
+        assert_eq!(
+            LayerMask {
+                target: 0,
+                mode: MaskMode::Luminance,
+                inverted: true
+            }
+            .shader_mode(),
+            6
+        );
     }
 }

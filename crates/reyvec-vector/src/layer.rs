@@ -7,6 +7,11 @@
 //!
 //! Кадр описывается плоским списком [`SceneItem`]: фигуры и скобки «начало слоя» и
 //! «конец слоя». Слои можно вкладывать друг в друга.
+//!
+//! У слоя может быть маска: фигуры между [`SceneItem::BeginMask`] и
+//! [`SceneItem::EndMask`] внутри слоя сами не видны, а решают, где слой виден. Маска
+//! по прозрачности (обрезка по силуэту, как clip-path в SVG, или мягкий край градиентом)
+//! или по яркости (белое видно, чёрное нет, как `mask` в SVG), можно обратную.
 
 use crate::Instance;
 
@@ -37,6 +42,27 @@ impl BlendMode {
     }
 }
 
+/// Что в маске решает, где слой виден.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MaskMode {
+    /// По прозрачности фигур маски: где они непрозрачны, слой виден. Обычная обрезка по
+    /// силуэту (clip-path) и мягкие края.
+    #[default]
+    Alpha,
+    /// По яркости фигур маски: белое видно, чёрное нет, прозрачное нет (как `mask` в SVG).
+    Luminance,
+}
+
+impl MaskMode {
+    /// Название для документов и лога.
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskMode::Alpha => "по прозрачности",
+            MaskMode::Luminance => "по яркости",
+        }
+    }
+}
+
 /// Элемент кадра векторного слоя по порядку рисования.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SceneItem {
@@ -46,6 +72,13 @@ pub enum SceneItem {
     BeginLayer { opacity: f32, blend: BlendMode },
     /// Конец слоя. Лишний конец пропускается, незакрытые слои закрываются в конце кадра.
     EndLayer,
+    /// Начало маски слоя, в котором она стоит: фигуры до [`SceneItem::EndMask`] рисуются
+    /// в маску, а не на экран. `inverted`: слой виден там, где маски нет (дырка).
+    /// Маска вне слоя пропускается вместе с её фигурами. У слоя одна маска: если их
+    /// несколько, действует последняя.
+    BeginMask { mode: MaskMode, inverted: bool },
+    /// Конец маски.
+    EndMask,
 }
 
 impl From<Instance> for SceneItem {
@@ -61,6 +94,19 @@ impl SceneItem {
             opacity,
             blend: BlendMode::Normal,
         }
+    }
+
+    /// Начало маски по прозрачности: обрезка слоя по силуэту фигур маски.
+    pub fn clip() -> Self {
+        Self::BeginMask {
+            mode: MaskMode::Alpha,
+            inverted: false,
+        }
+    }
+
+    /// Начало маски с режимом `mode`.
+    pub fn mask(mode: MaskMode, inverted: bool) -> Self {
+        Self::BeginMask { mode, inverted }
     }
 
     /// Начало слоя с режимом смешивания `blend`.
