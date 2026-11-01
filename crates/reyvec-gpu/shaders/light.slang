@@ -58,17 +58,26 @@ float field_at(float2 p)
 
 // Мягкая тень: доля источника, видная из p по направлению dir на расстоянии до dist.
 // Шагаем по полю; h / t — насколько близко луч прошёл к фигуре относительно пройденного
-// пути, softness задаёт размер источника (приём Иниго Килеса «soft shadows» для SDF).
+// пути, softness задаёт размер источника (приём Иниго Килеса «soft shadows» для SDF,
+// улучшенный вариант: между двумя шагами ищется самая близкая к фигуре точка луча, так
+// край полутени не идёт полосами). Шагов до SHADOW_STEPS: длинным теням вдоль фигур
+// нужно много мелких шагов, иначе луч не доходит до конца и тень обрывается ступенькой.
+static const int SHADOW_STEPS = 64;
+
 float soft_shadow(float2 p, float2 dir, float dist, float softness, float step_min)
 {
     float lit = 1.0;
     float t = step_min;
-    for (int i = 0; i < 32 && t < dist; i++)
+    float prev = 1e10;
+    for (int i = 0; i < SHADOW_STEPS && t < dist; i++)
     {
         float h = field_at(p + dir * t);
         if (h < 0.0)
             return 0.0;
-        lit = min(lit, h / (softness * t));
+        float y = h * h / (2.0 * prev);
+        float d = sqrt(max(h * h - y * y, 0.0));
+        lit = min(lit, d / (softness * max(t - y, 1e-6)));
+        prev = h;
         t += max(h, step_min);
     }
     lit = saturate(lit);
