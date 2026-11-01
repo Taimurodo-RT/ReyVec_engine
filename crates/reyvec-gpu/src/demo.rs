@@ -48,6 +48,8 @@ pub enum DemoScene {
     Svg,
     /// Этап 3: перетекающие фигуры из файла Motif (пример или свой файл).
     Motif,
+    /// Этап 3: текст (кириллица и латиница, переносы, выравнивание, слои и маски).
+    Text,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -70,11 +72,12 @@ impl DemoScene {
             Self::Masks => "маски",
             Self::Svg => "SVG",
             Self::Motif => "Motif",
+            Self::Text => "текст",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg` или `motif`.
+    /// `svg`, `motif` или `text`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -84,6 +87,7 @@ impl DemoScene {
             "masks" => Some(Self::Masks),
             "svg" => Some(Self::Svg),
             "motif" => Some(Self::Motif),
+            "text" => Some(Self::Text),
             _ => None,
         }
     }
@@ -283,7 +287,10 @@ impl Demo {
                 .get_physical_device_properties(ctx.physical)
                 .limits
         };
-        if let Err(e) = vector.upload(ctx, res, &vector_demo.library) {
+        if let Err(e) = vector
+            .upload(ctx, res, &vector_demo.library)
+            .and_then(|()| vector.upload_text(ctx, res, &vector_demo.text))
+        {
             vector.destroy(ctx);
             return Err(e);
         }
@@ -606,6 +613,7 @@ impl Demo {
                     DemoScene::Masks => self.vector_demo.mask_items(time),
                     DemoScene::Svg => self.vector_demo.svg_items(aspect),
                     DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
+                    DemoScene::Text => self.vector_demo.text_items(time, aspect),
                     _ => self
                         .vector_demo
                         .instances(time)
@@ -617,9 +625,7 @@ impl Demo {
                     let lens = reyvec_vector::Affine::scale(ZOOM)
                         * reyvec_vector::Affine::translate((-ZOOM_CENTER.0, -ZOOM_CENTER.1));
                     for item in &mut items {
-                        if let reyvec_vector::SceneItem::Shape(i) = item {
-                            i.transform = lens * i.transform;
-                        }
+                        *item = item.placed(lens);
                     }
                 }
                 self.vector.prepare(res, slot, &items, aspect)

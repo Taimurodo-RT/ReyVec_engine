@@ -62,13 +62,7 @@ impl SvgDrawing {
     /// Элементы кадра для рисунка, поставленного преобразованием `place` (из координат
     /// рисунка в координаты сцены).
     pub fn placed(&self, place: Affine) -> impl Iterator<Item = SceneItem> + '_ {
-        self.items.iter().map(move |item| match *item {
-            SceneItem::Shape(mut inst) => {
-                inst.transform = place * inst.transform;
-                SceneItem::Shape(inst)
-            }
-            other => other,
-        })
+        self.items.iter().map(move |item| item.placed(place))
     }
 }
 
@@ -492,6 +486,7 @@ mod tests {
             .iter()
             .map(|i| match i {
                 SceneItem::Shape(_) => "S",
+                SceneItem::Text(_) => "T",
                 SceneItem::BeginLayer { .. } => "L(",
                 SceneItem::EndLayer => ")",
                 SceneItem::BeginMask { .. } => "M[",
