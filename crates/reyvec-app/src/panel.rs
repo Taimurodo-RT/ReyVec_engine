@@ -50,7 +50,11 @@ const SCENES: &[(&str, &[(DemoScene, &str)])] = &[
     ),
     (
         "Этап 4: свет",
-        &[(DemoScene::Light, "L"), (DemoScene::Lamps, "K")],
+        &[
+            (DemoScene::Light, "L"),
+            (DemoScene::Lamps, "K"),
+            (DemoScene::Blobs, "J"),
+        ],
     ),
 ];
 
@@ -385,7 +389,7 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::LightField(field));
         }
     }
-    if info.scene_id == DemoScene::Lamps {
+    if info.scene_id.uses_lights() {
         let mut glow = info.glow;
         if ui
             .checkbox(&mut glow, "Свечение и мягкие пересветы (B)")

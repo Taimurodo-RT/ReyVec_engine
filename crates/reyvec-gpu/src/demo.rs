@@ -21,6 +21,7 @@ use ash::vk;
 use crate::GpuError;
 use crate::adapter::AdapterKind;
 use crate::bindless::{Bindless, SamplerKind};
+use crate::blobs::{BLOB_SIZE, MAX_BLOBS, MAX_OBJECTS, OBJECT_SIZE};
 use crate::context::GpuContext;
 use crate::demo_vector::VectorDemo;
 use crate::graph::{Access, ImageHandle, PassContext, RenderGraph};
@@ -81,6 +82,9 @@ pub enum DemoScene {
     Light,
     /// Этап 4: те же фигуры, освещённые лампами, с мягкими тенями по полю (4.3).
     Lamps,
+    /// Этап 4: объекты целиком из SDF (слизь, капли, магический шар) рядом с векторными,
+    /// со светом и тенями (4.5).
+    Blobs,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -109,11 +113,13 @@ impl DemoScene {
             Self::StressMorph => "стресс: перетекание",
             Self::Light => "свет (SDF)",
             Self::Lamps => "лампы и тени",
+            Self::Blobs => "слизь и магия",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph`, `light` или `lamps`.
+    /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph`, `light`, `lamps` или
+    /// `blobs`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -129,13 +135,19 @@ impl DemoScene {
             "stress-morph" => Some(Self::StressMorph),
             "light" => Some(Self::Light),
             "lamps" => Some(Self::Lamps),
+            "blobs" => Some(Self::Blobs),
             _ => None,
         }
     }
 
     /// Сцены этапа 4 с SDF-фигурами и полем расстояний.
     pub fn uses_field(self) -> bool {
-        matches!(self, Self::Light | Self::Lamps)
+        matches!(self, Self::Light | Self::Lamps | Self::Blobs)
+    }
+
+    /// Сцены этапа 4, освещённые лампами (свет, тени, свечение).
+    pub fn uses_lights(self) -> bool {
+        matches!(self, Self::Lamps | Self::Blobs)
     }
 
     /// Другой вариант стресс-теста (движение ↔ перетекание). У остальных сцен `None`.
@@ -288,6 +300,10 @@ pub(crate) struct FrameData {
     /// Источники света сцены «лампы и тени» в буфере кадра (адрес и сколько их).
     lights_address: vk::DeviceAddress,
     light_count: u32,
+    /// Объекты из SDF (4.5): записи объектов и их частей.
+    objects_address: vk::DeviceAddress,
+    blobs_address: vk::DeviceAddress,
+    object_count: u32,
     time: f32,
     aspect: f32,
     extent: vk::Extent2D,
@@ -306,6 +322,11 @@ pub(crate) struct Demo {
     /// Свет сцены «лампы и тени» (4.3): проход «свет» и источники каждого кадра.
     light: vk::Pipeline,
     light_buffers: Vec<BufferId>,
+    /// Объекты из SDF (4.5): в кадр сцены и в маску теней; буферы объектов и частей.
+    object: vk::Pipeline,
+    object_mask: vk::Pipeline,
+    object_buffers: Vec<BufferId>,
+    blob_buffers: Vec<BufferId>,
     /// Свечение ярких мест (4.4): шаги вниз и вверх по цепочке уменьшенных картинок.
     bloom_down: vk::Pipeline,
     bloom_up: vk::Pipeline,
@@ -404,6 +425,24 @@ impl Demo {
                 &format!("свет кадра {i}"),
             )?);
         }
+        let mut object_buffers = Vec::new();
+        let mut blob_buffers = Vec::new();
+        for i in 0..frames_in_flight {
+            object_buffers.push(res.create_buffer(
+                ctx,
+                (MAX_OBJECTS * OBJECT_SIZE) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferMemory::CpuToGpu,
+                &format!("SDF-объекты кадра {i}"),
+            )?);
+            blob_buffers.push(res.create_buffer(
+                ctx,
+                (MAX_BLOBS * BLOB_SIZE) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferMemory::CpuToGpu,
+                &format!("части SDF-объектов кадра {i}"),
+            )?);
+        }
         let vector_demo = VectorDemo::new(files);
         let stencil_format = pick_stencil_format(ctx)?;
         // SAFETY: physical получен из этого экземпляра.
@@ -445,6 +484,10 @@ impl Demo {
             field_downscale: field_downscale_for(ctx.adapter.kind),
             light: vk::Pipeline::null(),
             light_buffers,
+            object: vk::Pipeline::null(),
+            object_mask: vk::Pipeline::null(),
+            object_buffers,
+            blob_buffers,
             bloom_down: vk::Pipeline::null(),
             bloom_up: vk::Pipeline::null(),
             glow: true,
@@ -507,6 +550,16 @@ impl Demo {
                     build(ctx, res, shaders, name, field_format(name), Msaa::Off, None)?;
             }
             demo.light = build(ctx, res, shaders, "light", LIGHT_FORMAT, Msaa::Off, None)?;
+            demo.object = build(
+                ctx,
+                res,
+                shaders,
+                "sdf_object",
+                scene_format,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.object_mask = build_object_mask(ctx, res, shaders)?;
             demo.bloom_down = build(
                 ctx,
                 res,
@@ -700,6 +753,7 @@ impl Demo {
                 ("sprite", msaa, stencil),
                 ("resolve", Msaa::Off, None),
                 ("sdf_demo", msaa, stencil),
+                ("sdf_object", msaa, stencil),
             ] {
                 made.push(build(ctx, res, shaders, name, format, samples, stencil)?);
             }
@@ -718,11 +772,13 @@ impl Demo {
             ctx.device.destroy_pipeline(self.sprites, None);
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
+            ctx.device.destroy_pipeline(self.object, None);
         }
         self.triangle = made[0];
         self.sprites = made[1];
         self.resolve = made[2];
         self.sdf = made[3];
+        self.object = made[4];
         self.msaa = msaa;
         self.scene_format = format;
         Ok(())
@@ -773,6 +829,17 @@ impl Demo {
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
                 "light" => (&mut self.light, LIGHT_FORMAT, Msaa::Off, None),
+                "sdf_object" => {
+                    match build_object_mask(ctx, res, shaders) {
+                        Ok(new) => {
+                            let old = std::mem::replace(&mut self.object_mask, new);
+                            // SAFETY: видеокарта простаивает (условие функции).
+                            unsafe { ctx.device.destroy_pipeline(old, None) };
+                        }
+                        Err(e) => shaders.set_error(name, e.to_string()),
+                    }
+                    (&mut self.object, self.scene_format, self.msaa, stencil)
+                }
                 "bloom_down" => (&mut self.bloom_down, BLOOM_FORMAT, Msaa::Off, None),
                 "bloom_up" => (&mut self.bloom_up, BLOOM_FORMAT, Msaa::Off, None),
                 n if FIELD_SHADERS.contains(&n) => {
@@ -888,7 +955,9 @@ impl Demo {
             DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
             DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
             DemoScene::Text => self.vector_demo.text_items(time, aspect),
-            DemoScene::Light | DemoScene::Lamps => self.vector_demo.light_items(time),
+            DemoScene::Light | DemoScene::Lamps | DemoScene::Blobs => {
+                self.vector_demo.light_items(time)
+            }
             DemoScene::Stress | DemoScene::StressMorph => self
                 .vector_demo
                 .stress_instances(time, aspect, scene == DemoScene::StressMorph)
@@ -1016,10 +1085,10 @@ impl Demo {
         let bytes: Vec<u8> = sprites[..count].iter().flat_map(|s| s.to_bytes()).collect();
         let buffer = self.instance_buffers[slot];
         res.write_buffer(buffer, 0, &bytes);
-        let lights = if scene == DemoScene::Lamps {
-            crate::lights::demo_lights(time)
-        } else {
-            Vec::new()
+        let lights = match scene {
+            DemoScene::Lamps => crate::lights::demo_lights(time),
+            DemoScene::Blobs => crate::blobs::demo_lights(time),
+            _ => Vec::new(),
         };
         let light_count = lights.len().min(MAX_LIGHTS);
         let light_bytes: Vec<u8> = lights[..light_count]
@@ -1028,6 +1097,15 @@ impl Demo {
             .collect();
         let light_buffer = self.light_buffers[slot];
         res.write_buffer(light_buffer, 0, &light_bytes);
+        let objects = if scene == DemoScene::Blobs {
+            crate::blobs::demo_objects(time)
+        } else {
+            Vec::new()
+        };
+        let (object_bytes, blob_bytes, object_count) = crate::blobs::pack(&objects);
+        let (object_buffer, blob_buffer) = (self.object_buffers[slot], self.blob_buffers[slot]);
+        res.write_buffer(object_buffer, 0, &object_bytes);
+        res.write_buffer(blob_buffer, 0, &blob_bytes);
         FrameData {
             scene,
             msaa: self.msaa,
@@ -1037,6 +1115,9 @@ impl Demo {
             sprite_count: count as u32,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
+            objects_address: res.buffer_address(object_buffer),
+            blobs_address: res.buffer_address(blob_buffer),
+            object_count,
             time,
             aspect,
             extent,
@@ -1162,7 +1243,7 @@ impl Demo {
             .uses_field()
             .then(|| self.add_field_passes(graph, bindless, frame, shadow_images));
         let light = field
-            .filter(|_| frame.scene == DemoScene::Lamps)
+            .filter(|_| frame.scene.uses_lights())
             .map(|f| self.add_light_pass(graph, bindless, frame, f));
 
         let mut uses = vec![
@@ -1213,11 +1294,18 @@ impl Demo {
                         frame.extent,
                         self.camera,
                         field_texture,
-                        frame.scene == DemoScene::Lamps,
+                        frame.scene.uses_lights(),
+                        frame.scene == DemoScene::Blobs,
                     );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sdf);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
+                }
+                if frame.object_count > 0 {
+                    let push = object_push(frame, self.camera, 0);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.object);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 6, frame.object_count, 0, 0);
                 }
                 if let Some(vector) = frame.vector {
                     let full = vk::Rect2D::default().extent(p.extent(scene));
@@ -1348,17 +1436,26 @@ impl Demo {
         let mut uses = vec![(mask, Access::ColorAttachment)];
         uses.extend(shadows.iter().map(|l| (l.image, Access::Sampled)));
         graph.add_pass("маска", &uses, move |p| {
-            let push = sdf_push(frame.time, frame.extent, camera, None, false);
+            let push = sdf_push(frame.time, frame.extent, camera, None, false, false);
             let (d, cmd) = (p.device, p.cmd);
             // SAFETY: граф перевёл маску в раскладку рисования, а картинки слоёв (уже
             // нарисованные) в чтение; конвейеры живы, пока кадр рисуется.
             unsafe {
                 begin_color_pass(d, cmd, p.view(mask), size);
                 bindless.bind(d, cmd);
-                // Сначала SDF-фигуры сцены на всю маску, потом силуэты слоёв поверх.
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.field.mask);
-                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push[..24]);
-                d.cmd_draw(cmd, 3, 1, 0, 0);
+                // Сначала SDF-фигуры сцены на всю маску (в сцене «слизь и магия» их нет,
+                // маска просто очищена), потом SDF-объекты и силуэты слоёв поверх.
+                if frame.scene != DemoScene::Blobs {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.field.mask);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push[..24]);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                }
+                if frame.object_count > 0 {
+                    let push = object_push(frame, camera, 1);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.object_mask);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 6, frame.object_count, 0, 0);
+                }
                 if !shadows.is_empty() {
                     d.cmd_bind_pipeline(
                         cmd,
@@ -1573,6 +1670,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.light, None);
+            ctx.device.destroy_pipeline(self.object, None);
+            ctx.device.destroy_pipeline(self.object_mask, None);
             ctx.device.destroy_pipeline(self.bloom_down, None);
             ctx.device.destroy_pipeline(self.bloom_up, None);
             for name in FIELD_SHADERS {
@@ -1582,6 +1681,8 @@ impl Demo {
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
+        self.object = vk::Pipeline::null();
+        self.object_mask = vk::Pipeline::null();
         self.bloom_down = vk::Pipeline::null();
         self.bloom_up = vk::Pipeline::null();
         self.field = FieldPipelines::default();
@@ -1652,6 +1753,7 @@ fn sdf_push(
     camera: reyvec_vector::Camera2D,
     field: Option<u32>,
     lit: bool,
+    no_shapes: bool,
 ) -> [u8; 32] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let values = [
@@ -1667,9 +1769,48 @@ fn sdf_push(
         push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
     }
     push[24..28].copy_from_slice(&field.unwrap_or(0).to_ne_bytes());
-    let flags = u32::from(field.is_some()) | (u32::from(lit) << 1);
+    let flags = u32::from(field.is_some()) | (u32::from(lit) << 1) | (u32::from(no_shapes) << 2);
     push[28..32].copy_from_slice(&flags.to_ne_bytes());
     push
+}
+
+/// Константы для `sdf_object.slang` (4.5): записи объектов, камера и режим (0 — цвет
+/// в кадр сцены, 1 — доля закрытой точки в маску теней).
+fn object_push(frame: FrameData, camera: reyvec_vector::Camera2D, mode: u32) -> [u8; 40] {
+    let mut push = [0u8; 40];
+    push[..8].copy_from_slice(&frame.objects_address.to_ne_bytes());
+    push[8..16].copy_from_slice(&frame.blobs_address.to_ne_bytes());
+    let values = [
+        camera.center.x as f32,
+        camera.center.y as f32,
+        frame.aspect,
+        camera.zoom as f32,
+    ];
+    for (i, v) in values.into_iter().enumerate() {
+        push[16 + 4 * i..20 + 4 * i].copy_from_slice(&v.to_ne_bytes());
+    }
+    push[32..36].copy_from_slice(&mode.to_ne_bytes());
+    push
+}
+
+/// Конвейер SDF-объектов для маски теней: доля закрытой точки объединяется с маской,
+/// как силуэты слоёв (`a + b − a·b`).
+fn build_object_mask(
+    ctx: &GpuContext,
+    res: &GpuResources,
+    shaders: &ShaderLibrary,
+) -> Result<vk::Pipeline, GpuError> {
+    let pair = shaders.get("sdf_object");
+    graphics_pipeline_stencil(
+        &ctx.device,
+        res.bindless.pipeline_layout,
+        &pair.vs,
+        &pair.fs,
+        field_format("light_mask"),
+        Blend::Screen,
+        vk::SampleCountFlags::TYPE_1,
+        None,
+    )
 }
 
 /// Формат картинки света (4.3): свет может быть ярче 1, поэтому с плавающей точкой.
@@ -1810,6 +1951,8 @@ fn build(
         "sprite" => Blend::Alpha,
         // Силуэты слоёв объединяются с маской: a + b − a·b.
         "light_mask_layer" => Blend::Screen,
+        // SDF-объекты с мягким краем поверх фона.
+        "sdf_object" => Blend::Alpha,
         _ => Blend::Opaque,
     };
     graphics_pipeline_stencil(
