@@ -39,6 +39,10 @@ pub(crate) struct PanelInfo<'a> {
     pub fill: &'a str,
     /// Лупа векторной сцены включена.
     pub zoom: bool,
+    /// Приближение камеры векторных сцен.
+    pub camera_zoom: f64,
+    /// Время процессора на подготовку векторного кадра (мс) и число фигур в кадре.
+    pub vector_cpu: Option<(f64, usize)>,
 }
 
 pub(crate) struct Panel {
@@ -193,14 +197,37 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
     ui.label(mono(format!(
         "Заливка: {}{}",
         info.fill,
-        if info.zoom { ", лупа ×8" } else { "" }
+        if info.zoom {
+            ", лупа ×8".to_string()
+        } else if (info.camera_zoom - 1.0).abs() > 1e-9 {
+            format!(", камера ×{}", zoom_text(info.camera_zoom))
+        } else {
+            String::new()
+        }
     )));
+    if let Some((ms, shapes)) = info.vector_cpu {
+        ui.label(mono(format!(
+            "Процессор, векторы: {ms:.3} мс ({shapes} фигур)"
+        )));
+    }
     ui.label(
         RichText::new(
-            "1–9 сцена, M сглаживание, G края, F заливка, Z лупа, F1 прячет панель, F12 снимок",
+            "0–9 сцена, T вариант стресса, M сглаживание, G края, F заливка, Z лупа, \
+             колесо и мышь камера, R сброс, F1 прячет панель, F12 снимок",
         )
         .weak(),
     );
+}
+
+/// Приближение для панели: «2.5», «0.25», «128».
+fn zoom_text(zoom: f64) -> String {
+    if zoom >= 10.0 {
+        format!("{zoom:.0}")
+    } else if zoom >= 1.0 {
+        format!("{zoom:.1}")
+    } else {
+        format!("{zoom:.2}")
+    }
 }
 
 /// Зелёный, пока видеокарта укладывается в бюджет с запасом, жёлтый у края, красный сверх.
@@ -317,6 +344,8 @@ mod tests {
             perceptual_edges: true,
             fill: "у каждой фигуры свой способ",
             zoom: false,
+            camera_zoom: 1.0,
+            vector_cpu: Some((0.25, 10_000)),
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {

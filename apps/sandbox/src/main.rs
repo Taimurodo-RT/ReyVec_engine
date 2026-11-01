@@ -1,7 +1,9 @@
 //! Песочница ReyVec: программа, которую запускают для проверки каждого этапа.
 //!
-//! Окно с тестовыми сценами (клавиши 1–9): треугольник и спрайты с текстурами
-//! (этап 2), векторные фигуры, перетекание, слои, маски, SVG, фигуры Motif, поток новых фигур и текст (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
+//! Окно с тестовыми сценами (клавиши 0–9): треугольник и спрайты с текстурами
+//! (этап 2), векторные фигуры, перетекание, слои, маски, SVG, фигуры Motif, поток новых фигур,
+//! текст и стресс-тест на 10 000 фигур (этап 3). Камера векторных сцен: колесо мыши
+//! приближает, перетаскивание левой кнопкой двигает, R возвращает. FPS в заголовке, панель счётчиков (F1 прячет).
 //! Шейдеры можно править на ходу: после сохранения файла картинка обновится.
 //!
 //! Флаги:
@@ -10,7 +12,7 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
-//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph`: с какой сцены начать (по умолчанию `vector`);
 //! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
@@ -42,7 +44,8 @@ const HELP: &str = "\
   --scene <имя>          с какой сцены начать: gpu (этап 2), vector (векторы, по умолчанию),
                          morph (перетекание), layers (слои), masks (маски), svg (рисунки SVG)
                          motif (перетекающие фигуры из Motif), stream (новые фигуры
-                         во время работы) или text (текст)
+                         во время работы), text (текст), stress (10 000 движущихся
+                         фигур) или stress-morph (10 000 перетекающих фигур)
   --svg <файл.svg>       показать свой рисунок SVG в сцене «SVG» (клавиша 6, с неё и начнёт)
   --motif <файл.reyvec.json>  показать свои перетекающие фигуры от Motif в сцене «Motif»
                          (клавиша 7, с неё и начнёт)
@@ -118,11 +121,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--scene" => {
                 let n = it.next().ok_or(
-                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream или text",
+                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress или stress-morph",
                 )?;
                 out.scene = Some(reyvec_app::DemoScene::from_name(&n).ok_or_else(|| {
                     format!(
-                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream или text"
+                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress или stress-morph"
                     )
                 })?);
             }
@@ -436,6 +439,10 @@ mod tests {
         assert_eq!(
             parse("--scene text").unwrap().scene,
             Some(reyvec_app::DemoScene::Text)
+        );
+        assert_eq!(
+            parse("--scene stress-morph").unwrap().scene,
+            Some(reyvec_app::DemoScene::StressMorph)
         );
         assert_eq!(
             parse("--motif a.reyvec.json").unwrap().motif.as_deref(),

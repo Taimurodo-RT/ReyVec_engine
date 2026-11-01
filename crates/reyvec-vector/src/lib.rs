@@ -17,6 +17,7 @@
 //! не знает: описание фигуры не зависит от способа рисования, поэтому способы можно
 //! добавлять и менять (см. `docs/decisions/0009-vector-layer.md`).
 
+mod camera;
 mod color;
 mod curves;
 mod layer;
@@ -26,6 +27,7 @@ mod paint;
 mod shape;
 mod tessellate;
 
+pub use camera::{Camera2D, MAX_ZOOM, MIN_ZOOM};
 pub use color::Color;
 pub use curves::{CurveMesh, curve_mesh};
 /// Библиотека кривых целиком: прямоугольники, круги, эллипсы и прочее (`kurbo::Shape::to_path`).

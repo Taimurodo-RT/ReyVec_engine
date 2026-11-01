@@ -39,6 +39,8 @@ struct Push
     uint samples;       // здесь не нужно (поле общее с трафаретом)
     Paint* paints;      // градиенты фигур
     GradientStop* stops;
+    float4 view_linear; // вид камеры (Camera2D в reyvec-vector): матрица 2×2 (a, b, c, d)
+    float2 view_offset; // и сдвиг: сцена → экран, одинаково для всех фигур кадра
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -64,6 +66,9 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
         inst.linear.x * local.x + inst.linear.z * local.y,
         inst.linear.y * local.x + inst.linear.w * local.y) + inst.offset;
     // Сцена: y вверх от -1 до 1, x от -aspect до aspect (как у спрайтов).
+    p = float2(
+        pc.view_linear.x * p.x + pc.view_linear.z * p.y,
+        pc.view_linear.y * p.x + pc.view_linear.w * p.y) + pc.view_offset;
     p.x /= pc.aspect;
 
     VertexOut o;

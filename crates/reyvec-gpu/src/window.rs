@@ -336,6 +336,27 @@ impl WindowRenderer {
         self.demo.as_ref().is_some_and(Demo::zoom)
     }
 
+    /// Камера векторных сцен (сдвиг и приближение).
+    pub fn camera(&self) -> reyvec_vector::Camera2D {
+        self.demo.as_ref().map(Demo::camera).unwrap_or_default()
+    }
+
+    /// Ставит камеру векторных сцен со следующего кадра.
+    pub fn set_camera(&mut self, camera: reyvec_vector::Camera2D) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_camera(camera);
+        }
+    }
+
+    /// Время процессора на подготовку векторного кадра, мс (сглаженное), и число фигур
+    /// в кадре. `None` у сцены без векторов.
+    pub fn vector_cpu(&self) -> Option<(f64, usize)> {
+        self.demo
+            .as_ref()
+            .map(Demo::vector_cpu)
+            .filter(|&(_, n)| n > 0)
+    }
+
     /// Лупа векторной сцены (увеличение в 8 раз у края сердца) со следующего кадра.
     pub fn set_zoom(&mut self, on: bool) {
         if let Some(demo) = self.demo.as_mut() {
