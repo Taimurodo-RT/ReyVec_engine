@@ -343,6 +343,8 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::Digit8 | KeyCode::Numpad8 => Some(DemoScene::Stream),
         KeyCode::Digit9 | KeyCode::Numpad9 => Some(DemoScene::Text),
         KeyCode::Digit0 | KeyCode::Numpad0 => Some(DemoScene::Stress),
+        // Сцены этапа 4 и дальше — буквами: цифры заняты сценами этапов 2–3.
+        KeyCode::KeyL => Some(DemoScene::Light),
         _ => None,
     }
 }

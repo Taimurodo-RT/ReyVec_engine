@@ -214,6 +214,16 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::StressMorph, 2.0, false)
             },
         },
+        // Свет (этап 4), пока библиотека SDF: круг, скруглённый прямоугольник, кривая
+        // Безье; капли сливаются, вырезание и пересечение с плавным переходом; фон
+        // показывает поле расстояний линиями.
+        Case {
+            name: "light-1s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Light, 1.0, false)
+            },
+        },
         Case {
             name: "vector-2s-msaa4-editor",
             scene: HeadlessScene {
@@ -257,9 +267,15 @@ fn frames_match_references() {
         let expected = match load_png(&reference) {
             Ok(img) => img,
             Err(e) => {
+                // Получившийся кадр кладём к упавшим: в CI его можно взять из артефакта
+                // и, проверив глазами, сделать эталоном.
+                let actual = failures_dir().join(format!("{}-actual.png", case.name));
+                save_png(&actual, &frame.image).expect("запись кадра");
                 problems.push(format!(
-                    "{}: нет эталона ({e}). Снимите его с REYVEC_UPDATE_REFERENCES=1",
-                    case.name
+                    "{}: нет эталона ({e}). Снимите его с REYVEC_UPDATE_REFERENCES=1 \
+                     или возьмите {}",
+                    case.name,
+                    actual.display()
                 ));
                 continue;
             }
