@@ -31,6 +31,21 @@ use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
 use crate::vector::{FillMode, LayerTexture, Uploads, VectorData, VectorRenderer};
 
+/// Время процессора на векторный кадр (сглаженное по кадрам), раздельно: сколько
+/// заняла сама сцена песочницы (расчёт движения фигур — то, что в игре делает её
+/// логика) и сколько движок (раскладка фигур, отсечение, пачки, запись для видеокарты).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VectorCpu {
+    /// Сцена песочницы: построить список фигур кадра, мс.
+    pub scene_ms: f64,
+    /// Движок: подготовить векторный кадр из списка фигур, мс.
+    pub engine_ms: f64,
+    /// Фигур в кадре.
+    pub shapes: usize,
+    /// Из них нарисовано после отсечения.
+    pub drawn: usize,
+}
+
 /// Какую сцену песочницы рисовать.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DemoScene {
@@ -267,7 +282,7 @@ pub(crate) struct Demo {
     /// Камера векторных сцен (сдвиг и приближение). Лупа — одно её положение.
     camera: reyvec_vector::Camera2D,
     /// Время процессора на подготовку векторного кадра, мс (сглаженное).
-    vector_cpu_ms: f64,
+    vector_cpu: VectorCpu,
     /// Векторных фигур и блоков текста в последнем кадре и сколько из них нарисовано
     /// (остальные за краем экрана).
     vector_items: usize,
@@ -351,7 +366,7 @@ impl Demo {
             perceptual_edges: false,
             stencil_format,
             camera: reyvec_vector::Camera2D::default(),
-            vector_cpu_ms: 0.0,
+            vector_cpu: VectorCpu::default(),
             vector_items: 0,
             vector_drawn: 0,
         };
@@ -430,8 +445,12 @@ impl Demo {
     /// Сколько процессор тратит на подготовку векторного кадра (раскладка фигур, запись
     /// экземпляров и команд), мс, сглажено за последние кадры, сколько в кадре фигур и
     /// сколько из них нарисовано (остальные целиком за краем экрана).
-    pub fn vector_cpu(&self) -> (f64, usize, usize) {
-        (self.vector_cpu_ms, self.vector_items, self.vector_drawn)
+    pub fn vector_cpu(&self) -> VectorCpu {
+        VectorCpu {
+            shapes: self.vector_items,
+            drawn: self.vector_drawn,
+            ..self.vector_cpu
+        }
     }
 
     /// Края сводятся «как в редакторах» (`true`) или физически точно.
@@ -695,6 +714,7 @@ impl Demo {
                         .map(Into::into)
                         .collect(),
                 };
+                let built = std::time::Instant::now();
                 // Фигуры, добавленные с прошлого кадра, едут на видеокарту в этом же
                 // кадре (копирование в начале кадра, без ожидания).
                 self.uploads = match self
@@ -718,13 +738,18 @@ impl Demo {
                 let data = self
                     .vector
                     .prepare(res, slot, &items, aspect, self.camera.view());
-                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                let scene_ms = (built - started).as_secs_f64() * 1000.0;
+                let engine_ms = built.elapsed().as_secs_f64() * 1000.0;
                 // Сглаживание: число на панели не прыгает от кадра к кадру.
-                self.vector_cpu_ms = if self.vector_items == 0 {
-                    ms
-                } else {
-                    self.vector_cpu_ms * 0.9 + ms * 0.1
+                let smooth = |old: f64, new: f64| {
+                    if self.vector_items == 0 {
+                        new
+                    } else {
+                        old * 0.9 + new * 0.1
+                    }
                 };
+                self.vector_cpu.scene_ms = smooth(self.vector_cpu.scene_ms, scene_ms);
+                self.vector_cpu.engine_ms = smooth(self.vector_cpu.engine_ms, engine_ms);
                 self.vector_items = items.len();
                 self.vector_drawn = self.vector.drawn() as usize;
                 data

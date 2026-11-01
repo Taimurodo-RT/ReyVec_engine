@@ -43,7 +43,7 @@ pub(crate) struct PanelInfo<'a> {
     pub camera_zoom: f64,
     /// Время процессора на подготовку векторного кадра (мс), число фигур в кадре и
     /// сколько из них нарисовано (остальные за краем экрана).
-    pub vector_cpu: Option<(f64, usize, usize)>,
+    pub vector_cpu: Option<reyvec_gpu::VectorCpu>,
 }
 
 pub(crate) struct Panel {
@@ -206,9 +206,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             String::new()
         }
     )));
-    if let Some((ms, shapes, drawn)) = info.vector_cpu {
+    if let Some(cpu) = info.vector_cpu {
         ui.label(mono(format!(
-            "Процессор, векторы: {ms:.3} мс ({shapes} фигур, на экране {drawn})"
+            "Процессор, движок: {:.3} мс ({} фигур, на экране {})",
+            cpu.engine_ms, cpu.shapes, cpu.drawn
+        )));
+        ui.label(mono(format!(
+            "Процессор, сцена песочницы: {:.3} мс",
+            cpu.scene_ms
         )));
     }
     ui.label(
@@ -346,7 +351,12 @@ mod tests {
             fill: "у каждой фигуры свой способ",
             zoom: false,
             camera_zoom: 1.0,
-            vector_cpu: Some((0.25, 10_000, 312)),
+            vector_cpu: Some(reyvec_gpu::VectorCpu {
+                scene_ms: 0.4,
+                engine_ms: 0.25,
+                shapes: 10_000,
+                drawn: 312,
+            }),
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {
