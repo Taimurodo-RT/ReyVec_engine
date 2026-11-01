@@ -31,7 +31,7 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID)
 }
 
 [shader("fragment")]
-float4 fs_main(VertexOut input) : SV_Target
+float4 fs_main(VertexOut input, out uint coverage : SV_Coverage) : SV_Target
 {
     // Середина точки маски в пикселях кадра, затем в пикселях картинки слоя. Сэмплер
     // смешивает соседние пиксели слоя: край фигуры не дрожит от точки к точке.
@@ -40,7 +40,8 @@ float4 fs_main(VertexOut input) : SV_Target
     textures[pc.texture].GetDimensions(w, h);
     float2 uv = (frame_pixel - float2(pc.offset)) / float2(w, h);
     float alpha = textures[pc.texture].SampleLevel(samplers[0], uv, 0.0).a;
-    if (alpha < 0.5)
-        discard;
+    // Пустое место не пишется: маска покрытия 0 (без discard, которому нужна
+    // отдельная возможность видеокарты, как в vector_stencil.slang).
+    coverage = alpha < 0.5 ? 0u : 1u;
     return float4(1.0, 0.0, 0.0, 1.0);
 }
