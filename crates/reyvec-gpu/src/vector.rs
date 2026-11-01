@@ -16,8 +16,13 @@
 //!
 //! Обводки в обоих способах рисуются треугольниками. Порядок экземпляров сохраняется:
 //! следующие рисуются поверх предыдущих.
+//!
+//! Текст (`reyvec-text`) рисуется в том же списке: буквы всех блоков лежат в общем буфере
+//! прямоугольниками, формы букв — в атласе MSDF. Блок текста в кадре — один экземпляр и
+//! один вызов рисования, сколько бы букв в нём ни было (шейдер `vector_text.slang`).
 
 use ash::vk;
+use reyvec_text::TextLibrary;
 use reyvec_vector::{
     BlendMode, Color, FillMethod, FillRule, Gradient, GradientKind, MaskMode, Paint, SceneItem,
     ShapeId, ShapeLibrary, Spread, Style,
@@ -27,7 +32,7 @@ use crate::GpuError;
 use crate::context::GpuContext;
 use crate::demo::{Msaa, SCENE_FORMAT};
 use crate::pipeline::{Blend, Stencil, StencilUse, graphics_pipeline_stencil};
-use crate::resources::{BufferId, BufferMemory, GpuResources};
+use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
 
 /// Сколько экземпляров фигур помещается в кадр. Больше пока не нужно (стресс-тест этапа
@@ -55,6 +60,8 @@ fn arena_capacity(used: u64) -> u64 {
 }
 /// Байт констант векторных конвейеров.
 const PUSH_SIZE: usize = 48;
+/// Байт на букву текста: прямоугольник и его место в атласе (`Glyph` в `vector_text.slang`).
+const GLYPH_SIZE: usize = 32;
 
 /// Как рисовать залитые фигуры во всей сцене.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -188,6 +195,27 @@ struct Arena {
     id: BufferId,
     capacity: u64,
     used: u64,
+}
+
+/// Где в общем буфере букв лежит блок текста.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TextRange {
+    first_glyph: u32,
+    glyph_count: u32,
+    color: Color,
+    /// Рамка блока в его координатах (с запасом поля вокруг букв).
+    bounds: Bounds,
+}
+
+/// Буквы всех блоков текста и атлас на видеокарте.
+struct TextMeshes {
+    glyphs: BufferId,
+    atlas: TextureId,
+    atlas_size: [f32; 2],
+    /// Сколько разных букв было в атласе при загрузке.
+    atlas_glyphs: usize,
+    ranges: Vec<TextRange>,
+    revision: u64,
 }
 
 /// Треугольники всех фигур на видеокарте: шесть буферов-копилок и где в них какая фигура.
@@ -354,6 +382,8 @@ enum Op {
         index_count: u32,
         even_odd: bool,
     },
+    /// Блок текста: экземпляр и число букв (по шесть вершин на букву).
+    Text { instance: u32, glyph_count: u32 },
     /// Наложить готовый слой `layer` (номер цели рисования) с прозрачностью, режимом и,
     /// если есть, маской.
     Composite {
@@ -409,6 +439,10 @@ pub(crate) struct VectorData {
     stops: vk::DeviceAddress,
     instances: vk::DeviceAddress,
     commands: vk::Buffer,
+    /// Буквы текста и атлас (нули, если текста нет).
+    glyphs: vk::DeviceAddress,
+    atlas: u32,
+    atlas_size: [f32; 2],
     slot: usize,
     aspect: f32,
 }
@@ -420,6 +454,7 @@ struct Pipelines {
     count_nonzero: vk::Pipeline,
     count_even_odd: vk::Pipeline,
     cover: vk::Pipeline,
+    text: vk::Pipeline,
     /// Наложение слоя по режимам: обычное, умножение, экран, сложение.
     composite: [vk::Pipeline; 4],
 }
@@ -430,6 +465,7 @@ impl Pipelines {
         count_nonzero: vk::Pipeline::null(),
         count_even_odd: vk::Pipeline::null(),
         cover: vk::Pipeline::null(),
+        text: vk::Pipeline::null(),
         composite: [vk::Pipeline::null(); 4],
     };
 
@@ -439,6 +475,7 @@ impl Pipelines {
             self.count_nonzero,
             self.count_even_odd,
             self.cover,
+            self.text,
         ]
         .into_iter()
         .chain(self.composite)
@@ -457,13 +494,20 @@ pub(crate) struct VectorRenderer {
     stencil_format: vk::Format,
     fill: FillMode,
     meshes: Option<Meshes>,
+    text: Option<TextMeshes>,
     frames: Vec<FrameBuffers>,
     /// Предупреждение о переполнении уже было в логе.
     warned_overflow: bool,
 }
 
 /// Шейдеры векторного слоя: при их перезагрузке конвейеры пересобираются.
-const SHADERS: [&str; 4] = ["vector", "vector_stencil", "vector_cover", "vector_layer"];
+const SHADERS: [&str; 5] = [
+    "vector",
+    "vector_stencil",
+    "vector_cover",
+    "vector_layer",
+    "vector_text",
+];
 
 impl VectorRenderer {
     pub fn new(
@@ -503,6 +547,7 @@ impl VectorRenderer {
             stencil_format,
             fill: FillMode::default(),
             meshes: None,
+            text: None,
             frames,
             warned_overflow: false,
         })
@@ -777,6 +822,125 @@ impl VectorRenderer {
         self.meshes.as_ref().map_or(0, |m| m.ranges.len())
     }
 
+    /// Загружает буквы всех блоков текста на видеокарту, если текст изменился с прошлой
+    /// загрузки, и атлас букв, если в нём появились новые буквы. Ждёт окончания загрузки,
+    /// как [`Self::upload`]: вызывать, когда текст меняется, а не каждый кадр.
+    pub fn upload_text(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        text: &TextLibrary,
+    ) -> Result<(), GpuError> {
+        if self
+            .text
+            .as_ref()
+            .is_some_and(|t| t.revision == text.revision())
+        {
+            return Ok(());
+        }
+        let (aw, ah) = text.atlas().size();
+        let mut glyphs: Vec<u8> = Vec::new();
+        let mut ranges = Vec::with_capacity(text.len());
+        let mut count = 0u32;
+        for (_, laid) in text.iter() {
+            let mut bounds = EMPTY_BOUNDS;
+            for g in &laid.glyphs {
+                let [l, t, r, b] = g.rect;
+                bounds = union(bounds, [l, b, r, t]);
+                let [u0, v0, u1, v1] = g.uv;
+                for f in [
+                    l,
+                    t,
+                    r,
+                    b,
+                    u0 / aw as f32,
+                    v0 / ah as f32,
+                    u1 / aw as f32,
+                    v1 / ah as f32,
+                ] {
+                    glyphs.extend_from_slice(&f.to_ne_bytes());
+                }
+            }
+            let n = laid.glyphs.len() as u32;
+            ranges.push(TextRange {
+                first_glyph: count,
+                glyph_count: n,
+                color: laid.color,
+                bounds,
+            });
+            count += n;
+        }
+        debug_assert_eq!(glyphs.len(), count as usize * GLYPH_SIZE);
+        if glyphs.is_empty() {
+            glyphs.resize(GLYPH_SIZE, 0);
+        }
+        let buffer = res.create_buffer(
+            ctx,
+            glyphs.len() as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::GpuOnly,
+            "буквы текста",
+        )?;
+        if let Err(e) = res.upload_buffer(ctx, buffer, &glyphs) {
+            res.destroy_buffer(buffer);
+            return Err(e);
+        }
+        // Атлас только растёт: если букв столько же и размер тот же, он не изменился.
+        let atlas_glyphs = text.atlas().len();
+        let size = [aw as f32, ah as f32];
+        let old = self.text.take();
+        let atlas = match &old {
+            Some(o) if o.atlas_glyphs == atlas_glyphs && o.atlas_size == size => o.atlas,
+            _ => {
+                match res.create_texture_rgba8(
+                    ctx,
+                    aw,
+                    ah,
+                    text.atlas().pixels(),
+                    false,
+                    "атлас букв",
+                ) {
+                    Ok(t) => {
+                        if let Some(o) = &old {
+                            res.destroy_texture(o.atlas);
+                        }
+                        t
+                    }
+                    Err(e) => {
+                        res.destroy_buffer(buffer);
+                        self.text = old;
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        // Старый буфер может ещё читать кадр в работе: он уходит в очередь отложенного удаления.
+        if let Some(o) = old {
+            res.destroy_buffer(o.glyphs);
+        }
+        tracing::info!(
+            "Текст на видеокарте: {} блоков, {} букв, атлас {aw}×{ah} ({} разных букв)",
+            ranges.len(),
+            count,
+            atlas_glyphs
+        );
+        if text.atlas().overflow() > 0 {
+            tracing::warn!(
+                "В атлас букв не поместилось {} букв: они не рисуются",
+                text.atlas().overflow()
+            );
+        }
+        self.text = Some(TextMeshes {
+            glyphs: buffer,
+            atlas,
+            atlas_size: size,
+            atlas_glyphs,
+            ranges,
+            revision: text.revision(),
+        });
+        Ok(())
+    }
+
     /// Пишет экземпляры и команды рисования кадра в буферы ячейки `slot`. Видеокарта не
     /// должна в этот момент читать буферы `slot`. `None`, если рисовать нечего.
     pub fn prepare(
@@ -787,7 +951,8 @@ impl VectorRenderer {
         aspect: f32,
     ) -> Option<VectorData> {
         let meshes = self.meshes.as_ref()?;
-        let packed = pack(&meshes.ranges, items, self.fill);
+        let texts = self.text.as_ref().map_or(&[][..], |t| &t.ranges[..]);
+        let packed = pack_frame(&meshes.ranges, texts, items, self.fill);
         if packed.overflow && !self.warned_overflow {
             tracing::warn!(
                 "Векторных фигур в кадре больше, чем помещается ({MAX_INSTANCES}): лишние не рисуются"
@@ -812,6 +977,12 @@ impl VectorRenderer {
             stops: res.buffer_address(meshes.arenas[5].id),
             instances: res.buffer_address(frame.instances),
             commands: res.buffer_raw(frame.commands)?,
+            glyphs: self
+                .text
+                .as_ref()
+                .map_or(0, |t| res.buffer_address(t.glyphs)),
+            atlas: self.text.as_ref().map_or(0, |t| t.atlas.0),
+            atlas_size: self.text.as_ref().map_or([1.0; 2], |t| t.atlas_size),
             slot,
             aspect,
         })
@@ -935,6 +1106,25 @@ impl VectorRenderer {
                     // SAFETY: условия функции.
                     unsafe { device.cmd_draw(cmd, index_count, 1, 0, instance) };
                 }
+                Op::Text {
+                    instance,
+                    glyph_count,
+                } => {
+                    let mut push = [0u8; 40];
+                    push[..8].copy_from_slice(&data.glyphs.to_ne_bytes());
+                    push[8..16].copy_from_slice(&data.instances.to_ne_bytes());
+                    push[16..20].copy_from_slice(&data.aspect.to_ne_bytes());
+                    push[20..24].copy_from_slice(&data.atlas.to_ne_bytes());
+                    push[24..28].copy_from_slice(&data.atlas_size[0].to_ne_bytes());
+                    push[28..32].copy_from_slice(&data.atlas_size[1].to_ne_bytes());
+                    push[32..36].copy_from_slice(&reyvec_text::RANGE.to_ne_bytes());
+                    // SAFETY: условия функции; буквы блока лежат в буфере букв.
+                    unsafe {
+                        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, p.text);
+                        device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        device.cmd_draw(cmd, glyph_count * 6, 1, 0, instance);
+                    }
+                }
                 Op::Composite {
                     layer,
                     opacity,
@@ -1026,7 +1216,18 @@ fn blend_index(blend: BlendMode) -> usize {
 /// экземпляры одной фигуры в одной цели, которые рисуются треугольниками, становятся одной
 /// командой. Экземпляры неизвестных и пустых фигур пропускаются, пустые слои тоже. Фигуры
 /// без треугольников (перетекающие) рисуются трафаретом при любом `fill`.
+#[cfg(test)]
 fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
+    pack_frame(ranges, &[], items, fill)
+}
+
+/// Как [`pack`], и ещё блоки текста `texts` (по номерам [`reyvec_vector::TextId`]).
+fn pack_frame(
+    ranges: &[MeshRange],
+    texts: &[TextRange],
+    items: &[SceneItem],
+    fill: FillMode,
+) -> Packed {
     let mut out = Vec::new();
     let mut commands: Vec<[u32; 4]> = Vec::new();
     let mut targets: Vec<Vec<Op>> = vec![Vec::new()];
@@ -1118,7 +1319,42 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
                 }
                 continue;
             }
-            SceneItem::Shape(_) if skipping => continue,
+            SceneItem::Shape(_) | SceneItem::Text(_) if skipping => continue,
+            SceneItem::Text(t) => {
+                last = None;
+                let target = stack.last().map_or(0, Open::target);
+                let Some(range) = texts.get(t.text.0 as usize) else {
+                    continue;
+                };
+                if range.glyph_count == 0 {
+                    continue;
+                }
+                if written as usize >= MAX_INSTANCES {
+                    overflow = true;
+                    continue;
+                }
+                let [a, b, c, d, e, f] = t.transform.as_coeffs().map(|v| v as f32);
+                for v in [a, b, c, d, e, f] {
+                    out.extend_from_slice(&v.to_ne_bytes());
+                }
+                out.extend_from_slice(&range.first_glyph.to_ne_bytes());
+                out.extend_from_slice(&range.glyph_count.to_ne_bytes());
+                for v in range.color.multiply(t.tint).to_array() {
+                    out.extend_from_slice(&v.to_ne_bytes());
+                }
+                out.extend_from_slice(&[0u8; 12]);
+                out.extend_from_slice(&NO_PAINT.to_ne_bytes());
+                if target != 0 {
+                    bounds[target] =
+                        union(bounds[target], transform_bounds(&t.transform, range.bounds));
+                }
+                targets[target].push(Op::Text {
+                    instance: written,
+                    glyph_count: range.glyph_count,
+                });
+                written += 1;
+                continue;
+            }
             SceneItem::Shape(inst) => inst,
         };
         let target = stack.last().map_or(0, Open::target);
@@ -1401,6 +1637,7 @@ fn build(
         made.count_nonzero = one("vector_stencil", Blend::Opaque, StencilUse::CountNonZero)?;
         made.count_even_odd = one("vector_stencil", Blend::Opaque, StencilUse::CountEvenOdd)?;
         made.cover = one("vector_cover", Blend::Alpha, StencilUse::Cover)?;
+        made.text = one("vector_text", Blend::Alpha, StencilUse::Ignore)?;
         for (i, blend) in [
             Blend::Premultiplied,
             Blend::Multiply,
@@ -1861,6 +2098,81 @@ mod tests {
         assert!(packed.overflow);
         assert_eq!(packed.instances.len(), MAX_INSTANCES * INSTANCE_SIZE);
         assert_eq!(words(&packed.commands)[1], MAX_INSTANCES as u32);
+    }
+
+    #[test]
+    fn text_blocks_are_one_instance_each_and_split_shape_runs() {
+        let ranges = [MeshRange {
+            index_count: 3,
+            ..PLAIN
+        }];
+        let gold = Color::linear(1.0, 0.8, 0.2, 1.0);
+        let texts = [
+            TextRange {
+                first_glyph: 0,
+                glyph_count: 5,
+                color: gold,
+                bounds: [0.0, -0.1, 0.5, 0.0],
+            },
+            TextRange {
+                first_glyph: 5,
+                glyph_count: 0,
+                color: Color::WHITE,
+                bounds: EMPTY_BOUNDS,
+            },
+        ];
+        let shape = SceneItem::from(Instance::new(ShapeId(0), Affine::IDENTITY));
+        let text = |id, x| {
+            SceneItem::from(reyvec_vector::TextInstance::at(
+                reyvec_vector::TextId(id),
+                x,
+                0.0,
+            ))
+        };
+        let items = [
+            shape,
+            text(0, 0.0),
+            shape,
+            // Пустой блок и неизвестный номер пропускаются.
+            text(1, 0.0),
+            text(7, 0.0),
+            SceneItem::layer(1.0),
+            text(0, 1.0),
+            SceneItem::EndLayer,
+        ];
+        let packed = pack_frame(&ranges, &texts, &items, FillMode::PerShape);
+        assert_eq!(
+            packed.targets[0],
+            vec![
+                Op::Triangles { first: 0, count: 1 },
+                Op::Text {
+                    instance: 1,
+                    glyph_count: 5
+                },
+                Op::Triangles { first: 1, count: 1 },
+                Op::Composite {
+                    layer: 1,
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                    mask: None
+                },
+            ]
+        );
+        assert_eq!(
+            packed.targets[1],
+            vec![Op::Text {
+                instance: 3,
+                glyph_count: 5
+            }]
+        );
+        assert_eq!(packed.bounds[1], [1.0, -0.1, 1.5, 0.0]);
+        // Экземпляр блока: сдвиг, первая буква и число букв, цвет блока.
+        let w = words(&packed.instances[INSTANCE_SIZE..2 * INSTANCE_SIZE]);
+        assert_eq!(&w[6..8], &[0, 5]);
+        assert_eq!(f32::from_bits(w[8]), 1.0);
+        assert_eq!(f32::from_bits(w[9]), 0.8);
+        assert_eq!(w[15], NO_PAINT);
+        assert_eq!(packed.instances.len(), 4 * INSTANCE_SIZE);
     }
 
     #[test]

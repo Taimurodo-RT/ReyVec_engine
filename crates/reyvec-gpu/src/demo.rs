@@ -51,6 +51,8 @@ pub enum DemoScene {
     Motif,
     /// Этап 3: новые фигуры появляются во время работы и загружаются внутри кадра.
     Stream,
+    /// Этап 3: текст (кириллица и латиница, переносы, выравнивание, слои и маски).
+    Text,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -74,11 +76,12 @@ impl DemoScene {
             Self::Svg => "SVG",
             Self::Motif => "Motif",
             Self::Stream => "поток",
+            Self::Text => "текст",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg`, `motif` или `stream`.
+    /// `svg`, `motif`, `stream` или `text`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -89,6 +92,7 @@ impl DemoScene {
             "svg" => Some(Self::Svg),
             "motif" => Some(Self::Motif),
             "stream" => Some(Self::Stream),
+            "text" => Some(Self::Text),
             _ => None,
         }
     }
@@ -290,7 +294,10 @@ impl Demo {
                 .get_physical_device_properties(ctx.physical)
                 .limits
         };
-        if let Err(e) = vector.upload(ctx, res, &vector_demo.library) {
+        if let Err(e) = vector
+            .upload(ctx, res, &vector_demo.library)
+            .and_then(|()| vector.upload_text(ctx, res, &vector_demo.text))
+        {
             vector.destroy(ctx);
             return Err(e);
         }
@@ -617,6 +624,7 @@ impl Demo {
                     DemoScene::Svg => self.vector_demo.svg_items(aspect),
                     DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
                     DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
+                    DemoScene::Text => self.vector_demo.text_items(time, aspect),
                     _ => self
                         .vector_demo
                         .instances(time)
@@ -628,9 +636,7 @@ impl Demo {
                     let lens = reyvec_vector::Affine::scale(ZOOM)
                         * reyvec_vector::Affine::translate((-ZOOM_CENTER.0, -ZOOM_CENTER.1));
                     for item in &mut items {
-                        if let reyvec_vector::SceneItem::Shape(i) = item {
-                            i.transform = lens * i.transform;
-                        }
+                        *item = item.placed(lens);
                     }
                 }
                 // Фигуры, добавленные с прошлого кадра, едут на видеокарту в этом же

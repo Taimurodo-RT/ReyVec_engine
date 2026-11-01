@@ -1,0 +1,20 @@
+[package]
+name = "reyvec-text"
+description = "ReyVec: текст для векторного слоя — раскладка строк (parley) и атлас букв MSDF (fdsm)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+reyvec-vector.workspace = true
+parley.workspace = true
+skrifa.workspace = true
+fdsm.workspace = true
+image.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

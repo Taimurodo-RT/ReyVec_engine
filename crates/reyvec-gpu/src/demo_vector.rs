@@ -1,4 +1,4 @@
-//! Сцены песочницы этапа 3: векторные фигуры, перетекание, слои, маски и SVG.
+//! Сцены песочницы этапа 3: векторные фигуры, перетекание, слои, маски, SVG, Motif и текст.
 //!
 //! Все фигуры готовятся один раз, при создании сцены. Каждый кадр меняются только их
 //! положения, повороты, масштабы, оттенки и форма перетекания ([`Instance`]), так что
@@ -15,9 +15,11 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 
 use reyvec_motif::{MorphShape, load_morph_file};
 use reyvec_svg::{SvgDrawing, SvgOptions, load_svg};
+use reyvec_text::{Align, TextBlock, TextLibrary};
 use reyvec_vector::{
     Affine, BezPath, BlendMode, Circle, Color, FillMethod, FillRule, Gradient, Instance, LineCap,
-    LineJoin, MaskMode, Rect, SceneItem, Shape, ShapeId, ShapeLibrary, Spread, Stroke,
+    LineJoin, MaskMode, Rect, SceneItem, Shape, ShapeId, ShapeLibrary, Spread, Stroke, TextId,
+    TextInstance,
 };
 
 /// Допуск разбиения кривых в единицах сцены (высота кадра = 2 единицы). В окне высотой
@@ -54,6 +56,9 @@ pub(crate) struct VectorDemo {
     /// от белого к чёрному (маска по яркости).
     mask_star: ShapeId,
     fade: ShapeId,
+    /// Сцена «текст»: квадрат 1×1, белый слева, чёрный справа, с переходом посередине
+    /// (маска по яркости, в которой тают буквы).
+    text_fade: ShapeId,
     /// Сцена «SVG»: рисунки, загруженные один раз. `user`: показан свой файл.
     svgs: Vec<SvgDrawing>,
     user_svg: bool,
@@ -62,6 +67,10 @@ pub(crate) struct VectorDemo {
     /// Сцена «поток»: фигуры, добавленные во время работы (по одной каждые
     /// 1 / [`STREAM_RATE`] секунды), и когда каждая появилась.
     stream: Vec<(ShapeId, f32)>,
+    /// Блоки текста всех сцен и атлас их букв.
+    pub text: TextLibrary,
+    /// Сцена «текст».
+    text_scene: TextScene,
 }
 
 /// Сколько новых фигур в секунду добавляет сцена «поток».
@@ -71,6 +80,32 @@ const STREAM_GRID: (usize, usize) = (20, 10);
 /// Радиус фигуры потока в единицах сцены (примерно её размер в кадре 16:9): под него
 /// подобран допуск разбиения кривых.
 const STREAM_SIZE: f64 = 0.08;
+
+/// Блоки сцены «текст».
+struct TextScene {
+    title: TextId,
+    /// Подписи колонок и сами колонки: по левому краю, по центру, по правому, по ширине.
+    labels: [TextId; 4],
+    columns: [TextId; 4],
+    /// Строки разного размера в пикселях (при высоте окна 1080).
+    sizes: Vec<TextId>,
+    /// Текст в слое с маской по яркости.
+    masked: TextId,
+    /// Крупное слово, которое вращается и меняет размер.
+    spin: TextId,
+}
+
+/// Сцена «текст» рассчитана на область шириной `TEXT_AREA.0` и высотой `TEXT_AREA.1`
+/// (единицы сцены) и уменьшается целиком, если окно уже.
+const TEXT_AREA: (f64, f64) = (3.4, 2.0);
+/// Ширина колонки и расстояние между колонками.
+const TEXT_COLUMN: (f32, f32) = (0.74, 0.11);
+/// Текст колонок: кириллица и латиница, длинные слова, цифры и знаки.
+const TEXT_PARAGRAPH: &str = "Съешь же ещё этих мягких французских булок, да выпей чаю. \
+Широкая электрификация южных губерний даст мощный толчок подъёму сельского хозяйства. \
+The quick brown fox jumps over the lazy dog — 0123456789, «кавычки» и (скобки)!";
+/// Размер строк в пикселях при высоте окна 1080.
+const TEXT_SIZES: [f32; 6] = [10.0, 12.0, 14.0, 18.0, 24.0, 32.0];
 
 /// Пример файла от Motif: круг → звезда → сердце, «плей» → «пауза», рот.
 const MOTIF_EXAMPLE: &[u8] = include_bytes!("../../../assets/motif/morph.reyvec.json");
@@ -187,12 +222,19 @@ impl VectorDemo {
                 .stop(0.0, Color::WHITE)
                 .stop(1.0, Color::from_srgb8(0, 0, 0)),
         ));
+        let text_fade = add(Shape::fill(
+            rect(1.0, 1.0),
+            Gradient::linear((-0.5, 0.0), (0.5, 0.0))
+                .stop(0.4, Color::WHITE)
+                .stop(0.6, Color::from_srgb8(0, 0, 0)),
+        ));
         let heart = library
             .add_with(heart_shape, FillMethod::Stencil)
             .expect("сердце корректно (проверено тестом)");
         let morph = library
             .add_morph(&morph_keyframes, FillRule::NonZero, Color::WHITE)
             .expect("контуры перетекания корректны (проверено тестом)");
+        let (text, text_scene) = text_scene();
         Self {
             library,
             star_nonzero,
@@ -210,10 +252,13 @@ impl VectorDemo {
             pill,
             mask_star,
             fade,
+            text_fade,
             svgs: Vec::new(),
             user_svg: false,
             motif: Vec::new(),
             stream: Vec::new(),
+            text,
+            text_scene,
         }
         .with_svgs(files.svg.as_deref())
         .with_motif(files.motif.as_deref())
@@ -316,6 +361,79 @@ impl VectorDemo {
                 )
             })
             .collect()
+    }
+
+    /// Сцена «текст» в момент `time`: заголовок, четыре колонки с разным выравниванием,
+    /// строки от 10 до 32 пикселей, текст в слое с маской и вращающееся слово. Текст
+    /// разложен один раз при создании сцены: каждый кадр здесь только места блоков.
+    pub fn text_items(&self, time: f32, aspect: f32) -> Vec<SceneItem> {
+        let t = f64::from(time);
+        let s = &self.text_scene;
+        // Вся сцена уменьшается, если окно уже 3.4 × 2.
+        let fit = (2.0 * f64::from(aspect) / TEXT_AREA.0)
+            .min(2.0 / TEXT_AREA.1)
+            .min(1.0);
+        let place = Affine::scale(fit);
+        let left = -TEXT_AREA.0 / 2.0 + 0.05;
+        let mut out = Vec::with_capacity(32);
+        let mut put =
+            |id: TextId, x: f64, y: f64| out.push(SceneItem::from(TextInstance::at(id, x, y)));
+
+        // Заголовок по центру сверху.
+        let (w, _) = self.text_size(s.title);
+        put(s.title, -w / 2.0, 0.97);
+        // Колонки.
+        let step = f64::from(TEXT_COLUMN.0 + TEXT_COLUMN.1);
+        let columns_width = 4.0 * step - f64::from(TEXT_COLUMN.1);
+        for i in 0..4 {
+            let x = -columns_width / 2.0 + step * i as f64;
+            put(s.labels[i], x, 0.72);
+            put(s.columns[i], x, 0.64);
+        }
+        // Строки разного размера слева внизу.
+        let mut y = -0.05;
+        for &id in &s.sizes {
+            put(id, left, y);
+            y -= self.text_size(id).1 + 0.02;
+        }
+
+        // В середине внизу: текст в слое с маской по яркости (белое видно, чёрное нет):
+        // слева буквы видны, справа нет, а граница ходит туда-сюда.
+        let (mw, mh) = self.text_size(s.masked);
+        let (mx, my) = (-0.25, -0.12);
+        out.push(SceneItem::layer(1.0));
+        out.push(SceneItem::mask(MaskMode::Luminance, false));
+        let sway = 0.45 * (t * 0.8).sin();
+        out.push(SceneItem::from(Instance::new(
+            self.text_fade,
+            Affine::translate((mx + mw / 2.0 + sway * mw, my - mh / 2.0))
+                * Affine::scale_non_uniform(2.0 * mw, mh * 1.2),
+        )));
+        out.push(SceneItem::EndMask);
+        out.push(SceneItem::from(TextInstance::at(s.masked, mx, my)));
+        out.push(SceneItem::EndLayer);
+
+        // Справа внизу: слово вращается и меняет размер (буквы остаются чёткими).
+        let (sw, sh) = self.text_size(s.spin);
+        let k = 1.0 + 0.35 * (t * 0.7).sin();
+        let mut spin = TextInstance::at(s.spin, 0.0, 0.0);
+        spin.transform = Affine::translate((1.15, -0.55))
+            * Affine::rotate(t * 0.4)
+            * Affine::scale(k)
+            * Affine::translate((-sw / 2.0, sh / 2.0));
+        let hue = soft_hue((time * 0.05).rem_euclid(1.0));
+        spin.tint = Color::linear(hue[0], hue[1], hue[2], 1.0);
+        out.push(spin.into());
+
+        out.into_iter().map(|i| i.placed(place)).collect()
+    }
+
+    /// Ширина и высота блока текста в единицах сцены.
+    fn text_size(&self, id: TextId) -> (f64, f64) {
+        self.text.get(id).map_or((0.0, 0.0), |l| {
+            let (w, h) = l.size();
+            (f64::from(w), f64::from(h))
+        })
     }
 
     /// Загружает рисунки сцены «SVG»: свой файл или тестовые. Ошибки пишутся в лог.
@@ -748,6 +866,71 @@ fn hsv(h: f64, s: f64, v: f64) -> Color {
 }
 
 /// Прямоугольник `w`×`h` с центром в нуле.
+/// Готовит блоки сцены «текст»: раскладка и атлас букв один раз.
+fn text_scene() -> (TextLibrary, TextScene) {
+    let _zone = crate::cpu_zone!("раскладка текста");
+    let started = std::time::Instant::now();
+    let mut lib = TextLibrary::new();
+    let white = Color::from_srgb8(236, 238, 245);
+    let grey = Color::from_srgb8(150, 156, 180);
+    let gold = Color::from_srgb8(242, 193, 78);
+    let title = lib.add(TextBlock::new("ReyVec: текст на векторном слое", 0.11).color(white));
+    let aligns = [Align::Left, Align::Center, Align::Right, Align::Justify];
+    let labels = aligns.map(|a| {
+        lib.add(
+            TextBlock::new(a.label(), 0.04)
+                .width(TEXT_COLUMN.0)
+                .align(a)
+                .color(gold),
+        )
+    });
+    let columns = aligns.map(|a| {
+        lib.add(
+            TextBlock::new(TEXT_PARAGRAPH, 0.042)
+                .width(TEXT_COLUMN.0)
+                .align(a)
+                .line_height(1.3)
+                .color(white),
+        )
+    });
+    // 1 пиксель при высоте окна 1080 = 2 / 1080 единиц сцены.
+    let sizes = TEXT_SIZES
+        .iter()
+        .map(|&px| {
+            lib.add(
+                TextBlock::new(
+                    format!("{px} px: Мелкий текст интерфейса — Small UI text 123"),
+                    px * 2.0 / 1080.0,
+                )
+                .color(grey),
+            )
+        })
+        .collect();
+    let masked = lib.add(
+        TextBlock::new("Текст в слое с маской: буквы гаснут и появляются", 0.075)
+            .width(1.2)
+            .color(Color::from_srgb8(120, 200, 255)),
+    );
+    let spin = lib.add(TextBlock::new("Чёткость", 0.12).color(Color::WHITE));
+    tracing::info!(
+        "Текст: {} блоков, {} разных букв в атласе за {:.1} мс",
+        lib.len(),
+        lib.atlas().len(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    (
+        lib,
+        TextScene {
+            title,
+            labels,
+            columns,
+            sizes,
+            masked,
+            spin,
+        },
+    )
+}
+
 fn rect(w: f64, h: f64) -> BezPath {
     use reyvec_vector::kurbo::Shape as _;
     Rect::new(-w / 2.0, -h / 2.0, w / 2.0, h / 2.0).to_path(1e-6)

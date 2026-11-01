@@ -308,6 +308,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::Digit6 | KeyCode::Numpad6 => Some(DemoScene::Svg),
         KeyCode::Digit7 | KeyCode::Numpad7 => Some(DemoScene::Motif),
         KeyCode::Digit8 | KeyCode::Numpad8 => Some(DemoScene::Stream),
+        KeyCode::Digit9 | KeyCode::Numpad9 => Some(DemoScene::Text),
         _ => None,
     }
 }
