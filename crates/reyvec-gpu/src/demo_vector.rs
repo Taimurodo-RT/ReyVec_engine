@@ -13,6 +13,7 @@
 
 use std::f64::consts::{FRAC_PI_2, TAU};
 
+use reyvec_motif::{MorphShape, load_morph_file};
 use reyvec_svg::{SvgDrawing, SvgOptions, load_svg};
 use reyvec_vector::{
     Affine, BezPath, BlendMode, Circle, Color, FillMethod, FillRule, Gradient, Instance, LineCap,
@@ -56,7 +57,14 @@ pub(crate) struct VectorDemo {
     /// Сцена «SVG»: рисунки, загруженные один раз. `user`: показан свой файл.
     svgs: Vec<SvgDrawing>,
     user_svg: bool,
+    /// Сцена «Motif»: перетекающие фигуры из файла (пример или свой).
+    motif: Vec<MorphShape>,
 }
+
+/// Пример файла от Motif: круг → звезда → сердце, «плей» → «пауза», рот.
+const MOTIF_EXAMPLE: &[u8] = include_bytes!("../../../assets/motif/morph.reyvec.json");
+/// Доля клетки, которую занимает фигура Motif.
+const MOTIF_FIT: f64 = 0.8;
 
 /// Тестовые рисунки SVG сцены «SVG». Те же файлы сверяются с `resvg` в тестах.
 pub(crate) const TEST_SVGS: [(&str, &[u8]); 6] = [
@@ -85,8 +93,8 @@ const SVG_GRID: (usize, usize) = (3, 2);
 const SVG_FIT: f64 = 0.95;
 
 impl VectorDemo {
-    /// `svg`: свой рисунок для сцены «SVG» (содержимое файла).
-    pub fn new(svg: Option<&[u8]>) -> Self {
+    /// `files`: свой рисунок для сцены «SVG» и свои фигуры для сцены «Motif».
+    pub fn new(files: &crate::UserFiles) -> Self {
         let mut library = ShapeLibrary::new(TOLERANCE);
         let mut add = |shape| {
             library
@@ -193,8 +201,70 @@ impl VectorDemo {
             fade,
             svgs: Vec::new(),
             user_svg: false,
+            motif: Vec::new(),
         }
-        .with_svgs(svg)
+        .with_svgs(files.svg.as_deref())
+        .with_motif(files.motif.as_deref())
+    }
+
+    /// Загружает фигуры сцены «Motif»: свой файл, а если его нет или он не читается,
+    /// пример. Ошибки и предупреждения пишутся в лог.
+    fn with_motif(mut self, user: Option<&[u8]>) -> Self {
+        let mut load = |name: &str, data: &[u8]| {
+            let _zone = crate::cpu_zone!("загрузка файла Motif");
+            let started = std::time::Instant::now();
+            match load_morph_file(data, &mut self.library) {
+                Ok(f) => {
+                    tracing::info!(
+                        "Motif «{name}»: {} перетекающих фигур за {:.1} мс",
+                        f.shapes.len(),
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                    for w in &f.warnings {
+                        tracing::warn!("Motif «{name}»: {w}");
+                    }
+                    Some(f.shapes)
+                }
+                Err(e) => {
+                    tracing::error!("Motif «{name}»: {e}");
+                    None
+                }
+            }
+        };
+        self.motif = user
+            .and_then(|data| load("свой файл", data))
+            .or_else(|| load("пример", MOTIF_EXAMPLE))
+            .unwrap_or_default();
+        self
+    }
+
+    /// Сцена «Motif» в момент `time`: фигуры в ряд (до четырёх в ряду), каждая по
+    /// первой своей анимации из Motif (без анимации стоит на своём значении `morph`).
+    /// Каждый кадр процессор только берёт значение анимации, формы смешивает видеокарта.
+    pub fn motif_items(&self, time: f32, aspect: f32) -> Vec<SceneItem> {
+        let n = self.motif.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let aspect = f64::from(aspect);
+        let cols = n.min(4);
+        let rows = n.div_ceil(cols);
+        let (cw, ch) = (2.0 * aspect / cols as f64, 2.0 / rows as f64);
+        self.motif
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let (c, r) = (i % cols, i / cols);
+                let center = (-aspect + cw * (c as f64 + 0.5), 1.0 - ch * (r as f64 + 0.5));
+                let (w, h) = m.size;
+                let k = (ch * MOTIF_FIT / h.max(1e-6)).min(cw * MOTIF_FIT / w.max(1e-6));
+                let morph = m.animations.first().map_or(m.morph, |a| a.sample(time));
+                SceneItem::Shape(
+                    Instance::new(m.shape, Affine::translate(center) * Affine::scale(k))
+                        .with_morph(morph),
+                )
+            })
+            .collect()
     }
 
     /// Загружает рисунки сцены «SVG»: свой файл или тестовые. Ошибки пишутся в лог.
@@ -673,13 +743,18 @@ mod tests {
 
     #[test]
     fn scene_builds_and_reuses_petal_mesh() {
-        let demo = VectorDemo::new(None);
-        // У всех фигур есть треугольники, кроме перетекающей: она только трафаретом.
+        let demo = VectorDemo::new(&crate::UserFiles::default());
+        // У всех фигур есть треугольники, кроме перетекающих (своя и из примера Motif):
+        // они только трафаретом.
         assert!(
             demo.library
                 .iter()
-                .all(|(id, _, m)| (m.triangle_count() > 0) != (id == demo.morph))
+                .all(|(id, _, m)| (m.triangle_count() > 0)
+                    != !demo.library.morph_keyframes(id).is_empty())
         );
+        assert_eq!(demo.motif.len(), 3);
+        let motif = demo.motif_items(1.0, 16.0 / 9.0);
+        assert_eq!(motif.len(), 3);
         assert_eq!(demo.library.method(demo.heart), Some(FillMethod::Stencil));
         assert_eq!(demo.library.morph_keyframes(demo.morph).len(), 3);
         let morphs = demo.morph_instances(1.0);

@@ -1,7 +1,7 @@
 //! Песочница ReyVec: программа, которую запускают для проверки каждого этапа.
 //!
-//! Окно с тестовыми сценами (клавиши 1–6): треугольник и спрайты с текстурами
-//! (этап 2), векторные фигуры, перетекание, слои, маски и SVG (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
+//! Окно с тестовыми сценами (клавиши 1–7): треугольник и спрайты с текстурами
+//! (этап 2), векторные фигуры, перетекание, слои, маски, SVG и фигуры Motif (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
 //! Шейдеры можно править на ходу: после сохранения файла картинка обновится.
 //!
 //! Флаги:
@@ -10,12 +10,13 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
-//! - `--scene gpu|vector|morph|layers|masks|svg`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene gpu|vector|morph|layers|masks|svg|motif`: с какой сцены начать (по умолчанию `vector`);
 //! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
 //!   у каждой фигуры свой способ, остальные варианты для сравнения);
 //! - `--svg <файл>`: свой рисунок SVG в сцене «SVG»;
+//! - `--motif <файл>`: свои перетекающие фигуры от Motif (`*.reyvec.json`) в сцене «Motif»;
 //! - `--zoom`: лупа векторной сцены (увеличение в 8 раз у края сердца);
 //! - `--validation`: включить слои валидации Vulkan (нужен Vulkan SDK);
 //! - `--frames <N>`: закрыть окно после N кадров;
@@ -38,10 +39,12 @@ const HELP: &str = "\
   --no-vsync             без вертикальной синхронизации
   --no-hot-reload        не перезагружать шейдеры после сохранения файлов
   --no-tracy             не включать замеры для программы Tracy
-  --scene <gpu|vector|morph|layers|masks|svg>  с какой сцены начать: gpu (этап 2), vector
-                         (векторы, по умолчанию), morph (перетекание), layers (слои),
-                         masks (маски) или svg (рисунки SVG)
+  --scene <имя>          с какой сцены начать: gpu (этап 2), vector (векторы, по умолчанию),
+                         morph (перетекание), layers (слои), masks (маски), svg (рисунки SVG)
+                         или motif (перетекающие фигуры из Motif)
   --svg <файл.svg>       показать свой рисунок SVG в сцене «SVG» (клавиша 6, с неё и начнёт)
+  --motif <файл.reyvec.json>  показать свои перетекающие фигуры от Motif в сцене «Motif»
+                         (клавиша 7, с неё и начнёт)
   --msaa <off|4|8>       сглаживание краёв (по умолчанию 4)
   --editor-edges         края «как в редакторах» (дороже, особенно на встроенной видеокарте)
   --fill <shape|triangles|stencil>  заливки векторов: у каждой фигуры свой способ (по умолчанию),
@@ -56,7 +59,7 @@ const HELP: &str = "\
   --version, -V          версия
   --help, -h             эта справка
 
-В окне: Esc закрывает окно, 1–6 переключают сцену, M переключает сглаживание, G вид краёв, F1 прячет и показывает панель счётчиков,
+В окне: Esc закрывает окно, 1–7 переключают сцену, M переключает сглаживание, G вид краёв, F1 прячет и показывает панель счётчиков,
 F12 сохраняет снимок кадра в папку snapshots рядом с программой.";
 
 #[derive(Debug, Default, PartialEq)]
@@ -80,6 +83,7 @@ struct Args {
     fill: Option<reyvec_app::FillMode>,
     zoom: bool,
     svg: Option<String>,
+    motif: Option<String>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -112,11 +116,13 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 );
             }
             "--scene" => {
-                let n = it
-                    .next()
-                    .ok_or("после --scene нужно gpu, vector, morph, layers, masks или svg")?;
+                let n = it.next().ok_or(
+                    "после --scene нужно gpu, vector, morph, layers, masks, svg или motif",
+                )?;
                 out.scene = Some(reyvec_app::DemoScene::from_name(&n).ok_or_else(|| {
-                    format!("--scene: «{n}», а нужно gpu, vector, morph, layers, masks или svg")
+                    format!(
+                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg или motif"
+                    )
                 })?);
             }
             "--msaa" => {
@@ -137,6 +143,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--zoom" => out.zoom = true,
             "--svg" => {
                 out.svg = Some(it.next().ok_or("после --svg нужен путь к файлу SVG")?);
+            }
+            "--motif" => {
+                out.motif = Some(
+                    it.next()
+                        .ok_or("после --motif нужен путь к файлу *.reyvec.json")?,
+                );
             }
             "--snapshot" => {
                 out.snapshot = Some(it.next().ok_or("после --snapshot нужно имя файла")?);
@@ -177,7 +189,7 @@ fn snapshot_headless(
     path: &str,
     args: &Args,
     validation: bool,
-    svg: Option<std::sync::Arc<[u8]>>,
+    files: reyvec_app::UserFiles,
 ) -> ExitCode {
     let (width, height) = args.size.unwrap_or((1280, 720));
     let scene = reyvec_app::HeadlessScene {
@@ -190,7 +202,7 @@ fn snapshot_headless(
         perceptual_edges: args.editor_edges,
         fill: args.fill.unwrap_or_default(),
         zoom: args.zoom,
-        svg,
+        files,
     };
     let options = reyvec_app::GpuOptions {
         validation,
@@ -273,25 +285,33 @@ fn main() -> ExitCode {
 
     // В отладочной сборке валидация включена всегда: так ошибки ловятся сразу.
     let validation = args.validation || cfg!(debug_assertions);
-    let svg = match &args.svg {
-        None => None,
+    let read = |what: &str, path: &Option<String>| match path {
+        None => Ok(None),
         Some(path) => match std::fs::read(path) {
             Ok(data) => {
-                tracing::info!("Свой SVG: {path}");
-                Some(std::sync::Arc::<[u8]>::from(data))
+                tracing::info!("Свой {what}: {path}");
+                Ok(Some(std::sync::Arc::<[u8]>::from(data)))
             }
             Err(e) => {
-                tracing::error!("Не прочитать SVG «{path}»: {e}");
-                return ExitCode::FAILURE;
+                tracing::error!("Не прочитать {what} «{path}»: {e}");
+                Err(ExitCode::FAILURE)
             }
         },
     };
-    // Со своим SVG песочница начинает со сцены «SVG».
-    if svg.is_some() && args.scene.is_none() {
-        args.scene = Some(reyvec_app::DemoScene::Svg);
+    let files = match (read("SVG", &args.svg), read("файл Motif", &args.motif)) {
+        (Ok(svg), Ok(motif)) => reyvec_app::UserFiles { svg, motif },
+        (Err(code), _) | (_, Err(code)) => return code,
+    };
+    // Со своим файлом песочница начинает с его сцены.
+    if args.scene.is_none() {
+        if files.motif.is_some() {
+            args.scene = Some(reyvec_app::DemoScene::Motif);
+        } else if files.svg.is_some() {
+            args.scene = Some(reyvec_app::DemoScene::Svg);
+        }
     }
     if let Some(path) = &args.snapshot {
-        return snapshot_headless(path, &args, validation, svg);
+        return snapshot_headless(path, &args, validation, files);
     }
     let config = reyvec_app::AppConfig {
         title: reyvec_app::engine_title(),
@@ -307,7 +327,7 @@ fn main() -> ExitCode {
         perceptual_edges: args.editor_edges,
         fill: args.fill.unwrap_or_default(),
         zoom: args.zoom,
-        svg,
+        files,
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
@@ -408,6 +428,15 @@ mod tests {
         );
         assert_eq!(parse("--svg a.svg").unwrap().svg.as_deref(), Some("a.svg"));
         assert!(parse("--svg").is_err());
+        assert_eq!(
+            parse("--scene motif").unwrap().scene,
+            Some(reyvec_app::DemoScene::Motif)
+        );
+        assert_eq!(
+            parse("--motif a.reyvec.json").unwrap().motif.as_deref(),
+            Some("a.reyvec.json")
+        );
+        assert!(parse("--motif").is_err());
         assert_eq!(
             parse("--fill shape").unwrap().fill,
             Some(reyvec_app::FillMode::PerShape)

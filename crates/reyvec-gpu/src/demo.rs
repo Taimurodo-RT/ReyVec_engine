@@ -1,11 +1,12 @@
-//! Сцены песочницы. Их шесть, переключаются клавишами 1–6 ([`DemoScene`]):
+//! Сцены песочницы. Их семь, переключаются клавишами 1–7 ([`DemoScene`]):
 //!
 //! - «GPU-фундамент» (этап 2): треугольник этапа 1 плюс спрайты с текстурами;
 //! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`;
 //! - «Перетекание» (этап 3): фигуры, которые плавно меняют форму, там же;
 //! - «Слои» (этап 3): прозрачность группы фигур и режимы смешивания, там же;
 //! - «Маски» (этап 3): обрезка по силуэту, маска по яркости и обратная, там же;
-//! - «SVG» (этап 3): тестовые рисунки SVG или свой файл (`--svg`), там же.
+//! - «SVG» (этап 3): тестовые рисунки SVG или свой файл (`--svg`), там же;
+//! - «Motif» (этап 3): перетекающие фигуры из файла Motif (`--motif`), там же.
 //!
 //! Про сцену этапа 2.
 //!
@@ -45,6 +46,17 @@ pub enum DemoScene {
     Masks,
     /// Этап 3: рисунки SVG (тестовые или свой файл).
     Svg,
+    /// Этап 3: перетекающие фигуры из файла Motif (пример или свой файл).
+    Motif,
+}
+
+/// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UserFiles {
+    /// Рисунок SVG для сцены «SVG».
+    pub svg: Option<std::sync::Arc<[u8]>>,
+    /// Перетекающие фигуры от Motif (`*.reyvec.json`) для сцены «Motif».
+    pub motif: Option<std::sync::Arc<[u8]>>,
 }
 
 impl DemoScene {
@@ -57,10 +69,12 @@ impl DemoScene {
             Self::Layers => "слои",
             Self::Masks => "маски",
             Self::Svg => "SVG",
+            Self::Motif => "Motif",
         }
     }
 
-    /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks` или `svg`.
+    /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
+    /// `svg` или `motif`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -69,6 +83,7 @@ impl DemoScene {
             "layers" => Some(Self::Layers),
             "masks" => Some(Self::Masks),
             "svg" => Some(Self::Svg),
+            "motif" => Some(Self::Motif),
             _ => None,
         }
     }
@@ -237,7 +252,7 @@ impl Demo {
         shaders: &ShaderLibrary,
         format: vk::Format,
         frames_in_flight: usize,
-        svg: Option<&[u8]>,
+        files: &UserFiles,
     ) -> Result<Self, GpuError> {
         let checker = res.create_texture_rgba8(
             ctx,
@@ -259,7 +274,7 @@ impl Demo {
                 &format!("спрайты кадра {i}"),
             )?);
         }
-        let vector_demo = VectorDemo::new(svg);
+        let vector_demo = VectorDemo::new(files);
         let stencil_format = pick_stencil_format(ctx)?;
         let mut vector = VectorRenderer::new(ctx, res, shaders, frames_in_flight, stencil_format)?;
         // SAFETY: physical получен из этого экземпляра.
@@ -590,6 +605,7 @@ impl Demo {
                     DemoScene::Layers => self.vector_demo.layer_items(time),
                     DemoScene::Masks => self.vector_demo.mask_items(time),
                     DemoScene::Svg => self.vector_demo.svg_items(aspect),
+                    DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
                     _ => self
                         .vector_demo
                         .instances(time)

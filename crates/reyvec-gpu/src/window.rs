@@ -32,8 +32,8 @@ pub struct RendererOptions {
     pub vsync: bool,
     /// Следить за файлами шейдеров и перезагружать их на лету.
     pub hot_reload: bool,
-    /// Свой SVG для сцены «SVG» (содержимое файла); без него там тестовые рисунки.
-    pub svg: Option<std::sync::Arc<[u8]>>,
+    /// Свои файлы для сцен «SVG» и «Motif»; без них там примеры.
+    pub files: crate::UserFiles,
 }
 
 /// Что произошло с кадром.
@@ -151,8 +151,8 @@ pub struct WindowRenderer {
     needs_recreate: bool,
     resources: Option<GpuResources>,
     demo: Option<Demo>,
-    /// Свой SVG для сцены «SVG».
-    svg: Option<std::sync::Arc<[u8]>>,
+    /// Свои файлы для сцен «SVG» и «Motif».
+    files: crate::UserFiles,
     /// Какую сцену песочницы рисовать.
     scene: DemoScene,
     /// Какое сглаживание просили (видеокарта может уметь меньше).
@@ -237,7 +237,7 @@ impl WindowRenderer {
             needs_recreate: true,
             resources: None,
             demo: None,
-            svg: options.svg.clone(),
+            files: options.files.clone(),
             scene: DemoScene::default(),
             msaa_wanted: Msaa::default(),
             ui: None,
@@ -875,7 +875,7 @@ impl WindowRenderer {
                         &self.shaders,
                         format.format,
                         FRAMES_IN_FLIGHT,
-                        self.svg.as_deref(),
+                        &self.files,
                     )?);
                     self.ui = Some(UiRenderer::new(
                         &self.ctx,

@@ -12,6 +12,7 @@ publish.workspace = true
 egui.workspace = true
 reyvec-vector.workspace = true
 reyvec-svg.workspace = true
+reyvec-motif.workspace = true
 ash.workspace = true
 ash-window.workspace = true
 gpu-allocator.workspace = true

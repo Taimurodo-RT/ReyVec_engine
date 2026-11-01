@@ -132,7 +132,10 @@ fn svg_matches_resvg() {
             perceptual_edges: false,
             fill: FillMode::PerShape,
             zoom: false,
-            svg: Some(data),
+            files: reyvec_app::UserFiles {
+                svg: Some(data),
+                motif: None,
+            },
         };
         let frame = render_headless(&options, &scene)
             .expect("кадр без окна")

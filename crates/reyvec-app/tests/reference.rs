@@ -39,7 +39,7 @@ fn cases() -> Vec<Case> {
         perceptual_edges: false,
         fill: FillMode::Triangles,
         zoom: false,
-        svg: None,
+        files: Default::default(),
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
@@ -170,6 +170,14 @@ fn cases() -> Vec<Case> {
             scene: HeadlessScene {
                 msaa: Msaa::X4,
                 ..at(DemoScene::Svg, 0.0, false)
+            },
+        },
+        // Фигуры из примера Motif на середине пути: звезда → сердце, «пауза», рот.
+        Case {
+            name: "motif-2.5s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Motif, 2.5, false)
             },
         },
         Case {
