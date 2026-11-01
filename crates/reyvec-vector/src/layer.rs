@@ -71,7 +71,14 @@ pub enum SceneItem {
     /// Готовый блок текста (см. крейт `reyvec-text`).
     Text(TextInstance),
     /// Начало слоя: всё до парного [`SceneItem::EndLayer`] рисуется в слой.
-    BeginLayer { opacity: f32, blend: BlendMode },
+    /// `casts_shadow`: фигуры слоя отбрасывают тень (этап 4): их силуэт попадает в поле
+    /// расстояний света. Силуэт берётся из картинки слоя, поэтому фигуры рисуются один раз;
+    /// маска слоя и его прозрачность на силуэт не влияют.
+    BeginLayer {
+        opacity: f32,
+        blend: BlendMode,
+        casts_shadow: bool,
+    },
     /// Конец слоя. Лишний конец пропускается, незакрытые слои закрываются в конце кадра.
     EndLayer,
     /// Начало маски слоя, в котором она стоит: фигуры до [`SceneItem::EndMask`] рисуются
@@ -148,6 +155,16 @@ impl SceneItem {
         Self::BeginLayer {
             opacity,
             blend: BlendMode::Normal,
+            casts_shadow: false,
+        }
+    }
+
+    /// Начало слоя, фигуры которого отбрасывают тень (непрозрачный, обычное наложение).
+    pub fn shadow_caster() -> Self {
+        Self::BeginLayer {
+            opacity: 1.0,
+            blend: BlendMode::Normal,
+            casts_shadow: true,
         }
     }
 
@@ -166,6 +183,10 @@ impl SceneItem {
 
     /// Начало слоя с режимом смешивания `blend`.
     pub fn blend(blend: BlendMode, opacity: f32) -> Self {
-        Self::BeginLayer { opacity, blend }
+        Self::BeginLayer {
+            opacity,
+            blend,
+            casts_shadow: false,
+        }
     }
 }

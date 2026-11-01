@@ -73,6 +73,11 @@ pub(crate) struct VectorDemo {
     text_scene: TextScene,
 }
 
+/// Векторные фигуры сцены «свет» стоят ниже этой высоты (единицы сцены при камере по
+/// умолчанию, низ экрана −1). Выше только SDF-фигуры: их сверяет с процессором тест
+/// `light_scene_matches_cpu`.
+pub const LIGHT_VECTOR_TOP: f32 = -0.74;
+
 /// Фигур в сцене «стресс» и их сетка: столбцов, строк.
 pub(crate) const STRESS_COUNT: usize = 10_000;
 const STRESS_GRID: (usize, usize) = (125, 80);
@@ -817,6 +822,42 @@ impl VectorDemo {
     }
 
     /// Фигуры на сцене в момент `time` (секунды), в порядке рисования.
+    /// Векторные фигуры сцены «свет» (задача 4.2б): ряд под SDF-фигурами, ниже
+    /// [`LIGHT_VECTOR_TOP`]. Звезда, сердце и кольцо стоят в слое «отбрасывает тень» и
+    /// попадают в поле расстояний, вторая звезда справа без отметки: поле её не видит.
+    pub fn light_items(&self, time: f32) -> Vec<SceneItem> {
+        let t = f64::from(time);
+        let y = -0.88;
+        let size = 0.3;
+        let beat = 1.0 + 0.08 * (t * 3.0).sin().max(0.0);
+        let squash = 0.2 * (t * 1.5).sin();
+        vec![
+            SceneItem::shadow_caster(),
+            Instance::new(
+                self.star_nonzero,
+                Affine::translate((-1.2, y)) * Affine::rotate(t * 0.4) * Affine::scale(size),
+            )
+            .into(),
+            Instance::new(
+                self.heart,
+                Affine::translate((-0.4, y)) * Affine::scale(size * beat),
+            )
+            .into(),
+            Instance::new(
+                self.ring,
+                Affine::translate((0.4, y))
+                    * Affine::scale_non_uniform(size * (1.0 + squash), size * (1.0 - squash)),
+            )
+            .into(),
+            SceneItem::EndLayer,
+            Instance::new(
+                self.star_nonzero,
+                Affine::translate((1.2, y)) * Affine::rotate(-t * 0.4) * Affine::scale(size),
+            )
+            .into(),
+        ]
+    }
+
     pub fn instances(&self, time: f32) -> Vec<Instance> {
         let t = f64::from(time);
         let mut out = Vec::with_capacity(10 + PETALS);

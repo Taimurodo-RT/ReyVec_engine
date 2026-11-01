@@ -142,7 +142,7 @@ impl Builder<'_> {
         };
         let start = self.items.len();
         let opacity = g.opacity().get();
-        self.items.push(SceneItem::BeginLayer { opacity, blend });
+        self.items.push(SceneItem::blend(blend, opacity));
         let mut open = 1;
         // Маска и её маски.
         let mut mask = g.mask();
@@ -571,10 +571,10 @@ mod tests {
             unreachable!()
         };
         assert_eq!(opacity, 0.5);
-        assert!(d.items.contains(&SceneItem::BeginLayer {
-            opacity: 1.0,
-            blend: BlendMode::Multiply
-        }));
+        assert!(
+            d.items
+                .contains(&SceneItem::blend(BlendMode::Multiply, 1.0))
+        );
         assert!(
             d.items
                 .contains(&SceneItem::mask(MaskMode::Luminance, false))

@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 
 use reyvec_app::snapshot::{compare, diff_image, load_png, save_png};
 use reyvec_app::{
-    DemoScene, FillMode, GpuOptions, HeadlessScene, Msaa, render_headless, validation_error_count,
+    DemoScene, FillMode, GpuOptions, HeadlessScene, LIGHT_VECTOR_TOP, Msaa, render_headless,
+    validation_error_count,
 };
 
 /// Насколько может отличаться канал пикселя (из 255): разные версии драйвера чуть
@@ -452,6 +453,13 @@ fn light_scene_matches_cpu() {
             let nx = (x as f32 + 0.5) / width as f32 * 2.0 - 1.0;
             let ny = (y as f32 + 0.5) / height as f32 * 2.0 - 1.0;
             let p = reyvec_sdf::V2::new(nx * aspect, -ny);
+            if p.y < LIGHT_VECTOR_TOP {
+                // Ряд векторных фигур (4.2б): их проверяют векторные тесты, здесь
+                // берётся то, что нарисовала видеокарта.
+                let i = ((y * width + x) * 4) as usize;
+                rgba.extend_from_slice(&frame.image.rgba[i..i + 4]);
+                continue;
+            }
             let c = light_scene_cpu(p, time, pixel);
             rgba.extend(c.iter().map(|v| linear_to_srgb8(*v)));
             rgba.push(255);

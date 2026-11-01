@@ -436,6 +436,8 @@ struct FrameBuffers {
     targets: Vec<Vec<Op>>,
     /// Слои в порядке рисования: вложенные раньше тех, в которые они вложены.
     layer_order: Vec<u32>,
+    /// Слои, фигуры которых отбрасывают тень.
+    shadow_layers: Vec<u32>,
     /// Прямоугольник каждой цели в координатах сцены (у цели 0 не используется).
     bounds: Vec<Bounds>,
 }
@@ -665,6 +667,7 @@ impl VectorRenderer {
                 staging_size: 0,
                 targets: Vec::new(),
                 layer_order: Vec::new(),
+                shadow_layers: Vec::new(),
                 bounds: Vec::new(),
             });
         }
@@ -1166,6 +1169,7 @@ impl VectorRenderer {
         res.write_buffer(frame.commands, 0, &packed.commands);
         frame.targets = packed.targets;
         frame.layer_order = packed.layer_order;
+        frame.shadow_layers = packed.shadow_layers;
         frame.bounds = packed.bounds;
         Some(VectorData {
             vertices: res.buffer_address(meshes.arenas[0].id),
@@ -1192,6 +1196,12 @@ impl VectorRenderer {
     /// Каждый рисуется своим проходом раньше прохода, в котором его накладывают.
     pub fn layer_order(&self, data: &VectorData) -> &[u32] {
         &self.frames[data.slot].layer_order
+    }
+
+    /// Нарисованные слои, фигуры которых отбрасывают тень (их картинки читает маска
+    /// теней света).
+    pub fn shadow_layers(&self, data: &VectorData) -> &[u32] {
+        &self.frames[data.slot].shadow_layers
     }
 
     /// Прямоугольник пикселей кадра размером `extent`, который занимают фигуры слоя
@@ -1401,6 +1411,8 @@ struct Packed {
     targets: Vec<Vec<Op>>,
     /// Непустые слои в порядке рисования: вложенные раньше внешних.
     layer_order: Vec<u32>,
+    /// Те из них, чьи фигуры отбрасывают тень.
+    shadow_layers: Vec<u32>,
     /// Прямоугольник каждой цели на экране (после камеры): всё, что в неё рисуется, включая
     /// вложенные слои.
     bounds: Vec<Bounds>,
@@ -1752,6 +1764,7 @@ fn pack_frame(
     let mut targets: Vec<Vec<Op>> = vec![Vec::new()];
     let mut bounds: Vec<Bounds> = vec![EMPTY_BOUNDS];
     let mut layer_order = Vec::new();
+    let mut shadow_layers = Vec::new();
     let mut stack: Vec<Open> = Vec::new();
     let mut last: Option<(usize, ShapeId)> = None;
     // Подряд идущие фигуры трафаретом копятся в `run` и пишутся слоями (см. `StencilRun`);
@@ -1768,7 +1781,11 @@ fn pack_frame(
             run.flush(&mut out, &mut targets, &mut written);
         }
         let inst = match *item {
-            SceneItem::BeginLayer { opacity, blend } => {
+            SceneItem::BeginLayer {
+                opacity,
+                blend,
+                casts_shadow,
+            } => {
                 last = None;
                 if skipping {
                     stack.push(Open::Skip { mask: false });
@@ -1787,6 +1804,7 @@ fn pack_frame(
                     blend,
                     mask: None,
                     hidden: false,
+                    casts_shadow,
                 });
                 continue;
             }
@@ -1818,15 +1836,18 @@ fn pack_frame(
                     blend,
                     mask,
                     hidden,
+                    casts_shadow,
                 }) = stack.pop()
-                {
-                    close_layer(
+                    && close_layer(
                         (idx, opacity, blend, mask, hidden),
                         &stack,
                         &mut targets,
                         &mut bounds,
                         &mut layer_order,
-                    );
+                    )
+                    && casts_shadow
+                {
+                    shadow_layers.push(idx as u32);
                 }
                 continue;
             }
@@ -1992,13 +2013,19 @@ fn pack_frame(
                 blend,
                 mask,
                 hidden,
-            } => close_layer(
-                (idx, opacity, blend, mask, hidden),
-                &stack,
-                &mut targets,
-                &mut bounds,
-                &mut layer_order,
-            ),
+                casts_shadow,
+            } => {
+                if close_layer(
+                    (idx, opacity, blend, mask, hidden),
+                    &stack,
+                    &mut targets,
+                    &mut bounds,
+                    &mut layer_order,
+                ) && casts_shadow
+                {
+                    shadow_layers.push(idx as u32);
+                }
+            }
             Open::Mask {
                 idx,
                 mode,
@@ -2016,6 +2043,7 @@ fn pack_frame(
             .collect(),
         targets,
         layer_order,
+        shadow_layers,
         bounds,
         overflow,
         drawn: written,
@@ -2031,6 +2059,8 @@ enum Open {
         mask: Option<LayerMask>,
         /// Маска пустая и не обратная: слой нигде не виден.
         hidden: bool,
+        /// Фигуры слоя отбрасывают тень.
+        casts_shadow: bool,
     },
     Mask {
         idx: usize,
@@ -2054,16 +2084,16 @@ impl Open {
 /// Закрывает слой: если в нём что-то есть и он не скрыт пустой маской, он попадает в
 /// порядок рисования и накладывается в родителя. С маской (не обратной) слой виден
 /// только в пересечении своего прямоугольника и прямоугольника маски; маска рисуется
-/// в том же прямоугольнике, что и слой.
+/// в том же прямоугольнике, что и слой. Возвращает, попал ли слой в порядок рисования.
 fn close_layer(
     (idx, opacity, blend, mask, hidden): (usize, f32, BlendMode, Option<LayerMask>, bool),
     stack: &[Open],
     targets: &mut [Vec<Op>],
     bounds: &mut [Bounds],
     layer_order: &mut Vec<u32>,
-) {
+) -> bool {
     if targets[idx].is_empty() || hidden {
-        return;
+        return false;
     }
     if let Some(m) = mask {
         let t = m.target as usize;
@@ -2081,6 +2111,7 @@ fn close_layer(
         blend,
         mask,
     });
+    true
 }
 
 /// Закрывает маску и отдаёт её слою, в котором она стоит.
@@ -2669,6 +2700,33 @@ mod tests {
         assert_eq!(packed.bounds[3], EMPTY_BOUNDS);
         assert_eq!(words(&packed.commands).len(), 6 * 4);
         assert!(!packed.overflow);
+    }
+
+    #[test]
+    fn shadow_layers_are_listed_when_drawn() {
+        let ranges = [MeshRange {
+            index_count: 3,
+            ..PLAIN
+        }];
+        let shape = || SceneItem::from(Instance::new(ShapeId(0), Affine::IDENTITY));
+        let items = [
+            SceneItem::shadow_caster(),
+            shape(),
+            SceneItem::layer(1.0), // вложенный обычный слой внутри тени
+            shape(),
+            SceneItem::EndLayer,
+            SceneItem::EndLayer,
+            SceneItem::shadow_caster(),
+            SceneItem::EndLayer, // пустой: не рисуется, тени нет
+            SceneItem::layer(1.0),
+            shape(),
+            SceneItem::EndLayer,
+            SceneItem::shadow_caster(),
+            shape(), // незакрытый: закрывается в конце кадра и тоже в списке
+        ];
+        let packed = pack(&ranges, &items, FillMode::PerShape);
+        assert_eq!(packed.layer_order, [2, 1, 4, 5]);
+        assert_eq!(packed.shadow_layers, [1, 5]);
     }
 
     #[test]
