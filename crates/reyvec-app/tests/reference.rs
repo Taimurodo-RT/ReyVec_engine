@@ -494,3 +494,51 @@ fn light_scene_matches_cpu() {
     }
     assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
 }
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn lamps_scene_lights_around_lamps() {
+    // Сцена «лампы и тени» (4.3): проходы поля и света без ошибок валидации, и у тёплой
+    // лампы светлее, чем в дальнем углу, где только лунный и общий свет.
+    let (width, height, time) = (640u32, 360u32, 1.0f32);
+    let scene = HeadlessScene {
+        width,
+        height,
+        time,
+        shader_error: false,
+        scene: DemoScene::Lamps,
+        msaa: Msaa::X4,
+        perceptual_edges: false,
+        fill: FillMode::Triangles,
+        zoom: false,
+        files: Default::default(),
+    };
+    let options = GpuOptions {
+        validation: true,
+        gpu: None,
+    };
+    let frame = render_headless(&options, &scene).expect("кадр без окна");
+    assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+    let brightness = |cx: u32, cy: u32| {
+        let mut sum = 0u32;
+        for y in cy - 2..=cy + 2 {
+            for x in cx - 2..=cx + 2 {
+                let i = ((y * width + x) * 4) as usize;
+                sum += frame.image.rgba[i..i + 3]
+                    .iter()
+                    .map(|&v| u32::from(v))
+                    .sum::<u32>();
+            }
+        }
+        sum
+    };
+    // Тёплая лампа при t = 1 (lights::demo_lights): x = cos 0,45, y = 0,05 + 0,55·sin 0,45.
+    let aspect = width as f32 / height as f32;
+    let (lx, ly) = (0.45f32.cos(), 0.05 + 0.55 * 0.45f32.sin());
+    let px = ((lx / aspect + 1.0) * 0.5 * width as f32) as u32;
+    let py = ((1.0 - ly) * 0.5 * height as f32) as u32;
+    let lamp = brightness(px, py);
+    let corner = brightness(4, 4);
+    eprintln!("яркость у лампы {lamp}, в углу {corner}");
+    assert!(lamp > corner * 2, "у лампы {lamp}, в углу {corner}");
+}

@@ -24,6 +24,7 @@ use crate::bindless::{Bindless, SamplerKind};
 use crate::context::GpuContext;
 use crate::demo_vector::VectorDemo;
 use crate::graph::{Access, ImageHandle, PassContext, RenderGraph};
+use crate::lights::{LIGHT_SIZE, MAX_LIGHTS};
 use crate::pipeline::Blend;
 use crate::pipeline::{
     CLEAR_COLOR, Stencil, StencilUse, begin_color_pass, begin_scene_pass, graphics_pipeline_stencil,
@@ -78,6 +79,8 @@ pub enum DemoScene {
     StressMorph,
     /// Этап 4: свет на полях расстояний (SDF). Пока фигуры библиотеки SDF и их поле.
     Light,
+    /// Этап 4: те же фигуры, освещённые лампами, с мягкими тенями по полю (4.3).
+    Lamps,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -105,11 +108,12 @@ impl DemoScene {
             Self::Stress => "стресс: движение",
             Self::StressMorph => "стресс: перетекание",
             Self::Light => "свет (SDF)",
+            Self::Lamps => "лампы и тени",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph` или `light`.
+    /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph`, `light` или `lamps`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -124,8 +128,14 @@ impl DemoScene {
             "stress" => Some(Self::Stress),
             "stress-morph" => Some(Self::StressMorph),
             "light" => Some(Self::Light),
+            "lamps" => Some(Self::Lamps),
             _ => None,
         }
+    }
+
+    /// Сцены этапа 4 с SDF-фигурами и полем расстояний.
+    pub fn uses_field(self) -> bool {
+        matches!(self, Self::Light | Self::Lamps)
     }
 
     /// Другой вариант стресс-теста (движение ↔ перетекание). У остальных сцен `None`.
@@ -275,6 +285,9 @@ pub(crate) struct FrameData {
     vector: Option<VectorData>,
     sprites_address: vk::DeviceAddress,
     sprite_count: u32,
+    /// Источники света сцены «лампы и тени» в буфере кадра (адрес и сколько их).
+    lights_address: vk::DeviceAddress,
+    light_count: u32,
     time: f32,
     aspect: f32,
     extent: vk::Extent2D,
@@ -290,6 +303,9 @@ pub(crate) struct Demo {
     light_field: bool,
     /// Во сколько раз поле расстояний меньше кадра по каждой стороне (по видеокарте).
     field_downscale: u32,
+    /// Свет сцены «лампы и тени» (4.3): проход «свет» и источники каждого кадра.
+    light: vk::Pipeline,
+    light_buffers: Vec<BufferId>,
     sprites: vk::Pipeline,
     /// Копирует кадр сцены в окно; зависит от формата окна.
     present: vk::Pipeline,
@@ -371,6 +387,16 @@ impl Demo {
                 &format!("спрайты кадра {i}"),
             )?);
         }
+        let mut light_buffers = Vec::new();
+        for i in 0..frames_in_flight {
+            light_buffers.push(res.create_buffer(
+                ctx,
+                (MAX_LIGHTS * LIGHT_SIZE) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferMemory::CpuToGpu,
+                &format!("свет кадра {i}"),
+            )?);
+        }
         let vector_demo = VectorDemo::new(files);
         let stencil_format = pick_stencil_format(ctx)?;
         // SAFETY: physical получен из этого экземпляра.
@@ -410,6 +436,8 @@ impl Demo {
             field: FieldPipelines::default(),
             light_field: false,
             field_downscale: field_downscale_for(ctx.adapter.kind),
+            light: vk::Pipeline::null(),
+            light_buffers,
             sprites: vk::Pipeline::null(),
             present: vk::Pipeline::null(),
             resolve: vk::Pipeline::null(),
@@ -467,6 +495,7 @@ impl Demo {
                 *demo.field.slot(name) =
                     build(ctx, res, shaders, name, field_format(name), Msaa::Off, None)?;
             }
+            demo.light = build(ctx, res, shaders, "light", LIGHT_FORMAT, Msaa::Off, None)?;
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -702,6 +731,7 @@ impl Demo {
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
+                "light" => (&mut self.light, LIGHT_FORMAT, Msaa::Off, None),
                 n if FIELD_SHADERS.contains(&n) => {
                     (self.field.slot(n), field_format(n), Msaa::Off, None)
                 }
@@ -815,7 +845,7 @@ impl Demo {
             DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
             DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
             DemoScene::Text => self.vector_demo.text_items(time, aspect),
-            DemoScene::Light => self.vector_demo.light_items(time),
+            DemoScene::Light | DemoScene::Lamps => self.vector_demo.light_items(time),
             DemoScene::Stress | DemoScene::StressMorph => self
                 .vector_demo
                 .stress_instances(time, aspect, scene == DemoScene::StressMorph)
@@ -943,6 +973,18 @@ impl Demo {
         let bytes: Vec<u8> = sprites[..count].iter().flat_map(|s| s.to_bytes()).collect();
         let buffer = self.instance_buffers[slot];
         res.write_buffer(buffer, 0, &bytes);
+        let lights = if scene == DemoScene::Lamps {
+            crate::lights::demo_lights(time)
+        } else {
+            Vec::new()
+        };
+        let light_count = lights.len().min(MAX_LIGHTS);
+        let light_bytes: Vec<u8> = lights[..light_count]
+            .iter()
+            .flat_map(|l| l.to_bytes())
+            .collect();
+        let light_buffer = self.light_buffers[slot];
+        res.write_buffer(light_buffer, 0, &light_bytes);
         FrameData {
             scene,
             msaa: self.msaa,
@@ -950,6 +992,8 @@ impl Demo {
             vector,
             sprites_address: res.buffer_address(buffer),
             sprite_count: count as u32,
+            lights_address: res.buffer_address(light_buffer),
+            light_count: light_count as u32,
             time,
             aspect,
             extent,
@@ -1070,8 +1114,13 @@ impl Demo {
             Some(vector) => layer_images(&layers, self.vector.shadow_layers(&vector)),
             None => Vec::new(),
         };
-        let field = (frame.scene == DemoScene::Light)
+        let field = frame
+            .scene
+            .uses_field()
             .then(|| self.add_field_passes(graph, bindless, frame, shadow_images));
+        let light = field
+            .filter(|_| frame.scene == DemoScene::Lamps)
+            .map(|f| self.add_light_pass(graph, bindless, frame, f));
 
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
@@ -1114,9 +1163,15 @@ impl Demo {
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &triangle_push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
-                if frame.scene == DemoScene::Light {
+                if frame.scene.uses_field() {
                     let field_texture = field.filter(|_| self.light_field).map(|f| p.texture(f));
-                    let push = sdf_push(frame.time, frame.extent, self.camera, field_texture);
+                    let push = sdf_push(
+                        frame.time,
+                        frame.extent,
+                        self.camera,
+                        field_texture,
+                        frame.scene == DemoScene::Lamps,
+                    );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sdf);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
@@ -1166,23 +1221,28 @@ impl Demo {
             );
         }
 
-        graph.add_pass(
-            "вывод",
-            &[(scene, Access::Sampled), (target, Access::ColorAttachment)],
-            move |p| {
-                let push = p.texture(scene).to_ne_bytes();
-                let (d, cmd) = (p.device, p.cmd);
-                // SAFETY: граф перевёл сцену в чтение, а цель в раскладку рисования.
-                unsafe {
-                    begin_color_pass(d, cmd, p.view(target), p.extent(target));
-                    bindless.bind(d, cmd);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.present);
-                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                    d.cmd_draw(cmd, 3, 1, 0, 0);
-                    d.cmd_end_rendering(cmd);
-                }
-            },
-        );
+        let mut uses = vec![(scene, Access::Sampled), (target, Access::ColorAttachment)];
+        if let Some(l) = light {
+            uses.push((l, Access::Sampled));
+        }
+        graph.add_pass("вывод", &uses, move |p| {
+            let mut push = [0u8; 12];
+            push[..4].copy_from_slice(&p.texture(scene).to_ne_bytes());
+            if let Some(l) = light {
+                push[4..8].copy_from_slice(&p.texture(l).to_ne_bytes());
+                push[8..].copy_from_slice(&1u32.to_ne_bytes());
+            }
+            let (d, cmd) = (p.device, p.cmd);
+            // SAFETY: граф перевёл сцену в чтение, а цель в раскладку рисования.
+            unsafe {
+                begin_color_pass(d, cmd, p.view(target), p.extent(target));
+                bindless.bind(d, cmd);
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.present);
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+                d.cmd_end_rendering(cmd);
+            }
+        });
     }
 
     /// Проходы поля расстояний сцены «свет» (4.2): «маска» рисует фигуры, отбрасывающие
@@ -1224,7 +1284,7 @@ impl Demo {
         let mut uses = vec![(mask, Access::ColorAttachment)];
         uses.extend(shadows.iter().map(|l| (l.image, Access::Sampled)));
         graph.add_pass("маска", &uses, move |p| {
-            let push = sdf_push(frame.time, frame.extent, camera, None);
+            let push = sdf_push(frame.time, frame.extent, camera, None, false);
             let (d, cmd) = (p.device, p.cmd);
             // SAFETY: граф перевёл маску в раскладку рисования, а картинки слоёв (уже
             // нарисованные) в чтение; конвейеры живы, пока кадр рисуется.
@@ -1300,6 +1360,56 @@ impl Demo {
         field
     }
 
+    /// Проход «свет» сцены «лампы и тени» (4.3): в разрешении поля для каждой точки
+    /// складывает свет всех источников с мягкими тенями по полю `field`. Возвращает
+    /// картинку света, на которую «вывод» умножает кадр.
+    fn add_light_pass<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        bindless: &'a Bindless,
+        frame: FrameData,
+        field: ImageHandle,
+    ) -> ImageHandle {
+        let layout = bindless.pipeline_layout;
+        let size = field_size(frame.extent, self.field_downscale);
+        let light = graph.create("свет", size, LIGHT_FORMAT);
+        let camera = self.camera;
+        graph.add_pass(
+            "свет",
+            &[(field, Access::Sampled), (light, Access::ColorAttachment)],
+            move |p| {
+                let mut push = [0u8; 48];
+                push[..8].copy_from_slice(&frame.lights_address.to_ne_bytes());
+                push[8..12].copy_from_slice(&frame.light_count.to_ne_bytes());
+                push[12..16].copy_from_slice(&p.texture(field).to_ne_bytes());
+                let values = [
+                    camera.center.x as f32,
+                    camera.center.y as f32,
+                    frame.aspect,
+                    camera.zoom as f32,
+                    crate::lights::AMBIENT[0],
+                    crate::lights::AMBIENT[1],
+                    crate::lights::AMBIENT[2],
+                ];
+                for (i, v) in values.into_iter().enumerate() {
+                    push[16 + 4 * i..20 + 4 * i].copy_from_slice(&v.to_ne_bytes());
+                }
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл поле в чтение, а картинку света в цель рисования;
+                // буфер источников этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(light), size);
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.light);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            },
+        );
+        light
+    }
+
     fn destroy_pipelines(&mut self, ctx: &GpuContext) {
         // SAFETY: вызывается, когда видеокарта не использует конвейеры; null допустим.
         unsafe {
@@ -1308,12 +1418,14 @@ impl Demo {
             ctx.device.destroy_pipeline(self.present, None);
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
+            ctx.device.destroy_pipeline(self.light, None);
             for name in FIELD_SHADERS {
                 ctx.device.destroy_pipeline(*self.field.slot(name), None);
             }
         }
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
+        self.light = vk::Pipeline::null();
         self.field = FieldPipelines::default();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
@@ -1381,6 +1493,7 @@ fn sdf_push(
     extent: vk::Extent2D,
     camera: reyvec_vector::Camera2D,
     field: Option<u32>,
+    lit: bool,
 ) -> [u8; 32] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let values = [
@@ -1396,9 +1509,13 @@ fn sdf_push(
         push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
     }
     push[24..28].copy_from_slice(&field.unwrap_or(0).to_ne_bytes());
-    push[28..32].copy_from_slice(&u32::from(field.is_some()).to_ne_bytes());
+    let flags = u32::from(field.is_some()) | (u32::from(lit) << 1);
+    push[28..32].copy_from_slice(&flags.to_ne_bytes());
     push
 }
+
+/// Формат картинки света (4.3): свет может быть ярче 1, поэтому с плавающей точкой.
+const LIGHT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// Шейдеры поля расстояний (4.2) по порядку проходов.
 const FIELD_SHADERS: [&str; 5] = [

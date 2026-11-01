@@ -46,7 +46,10 @@ const SCENES: &[(&str, &[(DemoScene, &str)])] = &[
             (DemoScene::StressMorph, "T"),
         ],
     ),
-    ("Этап 4: свет", &[(DemoScene::Light, "L")]),
+    (
+        "Этап 4: свет",
+        &[(DemoScene::Light, "L"), (DemoScene::Lamps, "K")],
+    ),
 ];
 
 /// Что показывает панель. Собирается окном каждый кадр.
@@ -362,7 +365,7 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
     if ui.checkbox(&mut zoom, "Лупа ×8 (Z)").changed() {
         actions.push(PanelAction::Zoom(zoom));
     }
-    if info.scene_id == DemoScene::Light {
+    if info.scene_id.uses_field() {
         let mut field = info.light_field;
         if ui
             .checkbox(&mut field, "Свет: линии по полю из картинки")
