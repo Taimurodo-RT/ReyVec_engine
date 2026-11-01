@@ -46,6 +46,9 @@ pub struct VectorCpu {
     pub drawn: usize,
 }
 
+/// Сколько времени кадра можно тратить на постройку недостающих уровней детализации, мс.
+const DETAIL_BUDGET_MS: f64 = 1.0;
+
 /// Какую сцену песочницы рисовать.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DemoScene {
@@ -666,6 +669,83 @@ impl Demo {
         }
     }
 
+    /// Список векторных фигур кадра сцены `scene` в момент `time`.
+    fn scene_items(
+        &mut self,
+        scene: DemoScene,
+        time: f32,
+        aspect: f32,
+    ) -> Vec<reyvec_vector::SceneItem> {
+        match scene {
+            DemoScene::Morph => self
+                .vector_demo
+                .morph_instances(time)
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            DemoScene::Layers => self.vector_demo.layer_items(time),
+            DemoScene::Masks => self.vector_demo.mask_items(time),
+            DemoScene::Svg => self.vector_demo.svg_items(aspect),
+            DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
+            DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
+            DemoScene::Text => self.vector_demo.text_items(time, aspect),
+            DemoScene::Stress | DemoScene::StressMorph => self
+                .vector_demo
+                .stress_instances(time, aspect, scene == DemoScene::StressMorph)
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            _ => self
+                .vector_demo
+                .instances(time)
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }
+    }
+
+    /// Строит уровни детализации, которых не хватило последнему кадру, пока не потрачено
+    /// `budget_ms` (хотя бы один). Построенные уровни загрузит следующий кадр; до тех пор
+    /// фигура рисуется ближайшим готовым уровнем.
+    fn build_details(&mut self, budget_ms: f64) {
+        let requests = self.vector.detail_requests().to_vec();
+        if requests.is_empty() {
+            return;
+        }
+        let _zone = crate::cpu_zone!("уровни детализации");
+        let started = std::time::Instant::now();
+        for (id, level) in requests {
+            if let Err(e) = self.vector_demo.library.build_detail(id, level) {
+                tracing::warn!("уровень детализации {level} фигуры {}: {e}", id.0);
+            }
+            if started.elapsed().as_secs_f64() * 1000.0 > budget_ms {
+                break;
+            }
+        }
+    }
+
+    /// Для картинок тестов: строит и загружает все уровни детализации, нужные кадру
+    /// сцены `scene` в момент `time`, до первого кадра (в окне они строятся по ходу).
+    pub fn settle_details(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        extent: vk::Extent2D,
+        time: f32,
+        scene: DemoScene,
+    ) -> Result<(), GpuError> {
+        let aspect = extent.width as f32 / extent.height.max(1) as f32;
+        let items = self.scene_items(scene, time, aspect);
+        self.vector.upload(ctx, res, &self.vector_demo.library)?;
+        let requests = self.vector.plan_details(&items, extent, self.camera.view());
+        for (id, level) in requests {
+            if let Err(e) = self.vector_demo.library.build_detail(id, level) {
+                tracing::warn!("уровень детализации {level} фигуры {}: {e}", id.0);
+            }
+        }
+        self.vector.upload(ctx, res, &self.vector_demo.library)
+    }
+
     /// Готовит данные кадра: пишет спрайты в буфер `slot` (номер кадра в работе).
     /// Буфер `slot` видеокарта в этот момент читать не должна.
     #[allow(clippy::too_many_arguments)]
@@ -688,32 +768,7 @@ impl Demo {
             _ => {
                 let _zone = crate::cpu_zone!("векторные фигуры");
                 let started = std::time::Instant::now();
-                let items: Vec<reyvec_vector::SceneItem> = match scene {
-                    DemoScene::Morph => self
-                        .vector_demo
-                        .morph_instances(time)
-                        .into_iter()
-                        .map(Into::into)
-                        .collect(),
-                    DemoScene::Layers => self.vector_demo.layer_items(time),
-                    DemoScene::Masks => self.vector_demo.mask_items(time),
-                    DemoScene::Svg => self.vector_demo.svg_items(aspect),
-                    DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
-                    DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
-                    DemoScene::Text => self.vector_demo.text_items(time, aspect),
-                    DemoScene::Stress | DemoScene::StressMorph => self
-                        .vector_demo
-                        .stress_instances(time, aspect, scene == DemoScene::StressMorph)
-                        .into_iter()
-                        .map(Into::into)
-                        .collect(),
-                    _ => self
-                        .vector_demo
-                        .instances(time)
-                        .into_iter()
-                        .map(Into::into)
-                        .collect(),
-                };
+                let items = self.scene_items(scene, time, aspect);
                 let built = std::time::Instant::now();
                 // Фигуры, добавленные с прошлого кадра, едут на видеокарту в этом же
                 // кадре (копирование в начале кадра, без ожидания).
@@ -737,7 +792,8 @@ impl Demo {
                 }
                 let data = self
                     .vector
-                    .prepare(res, slot, &items, aspect, self.camera.view());
+                    .prepare(res, slot, &items, extent, self.camera.view());
+                self.build_details(DETAIL_BUDGET_MS);
                 let scene_ms = (built - started).as_secs_f64() * 1000.0;
                 let engine_ms = built.elapsed().as_secs_f64() * 1000.0;
                 // Сглаживание: число на панели не прыгает от кадра к кадру.

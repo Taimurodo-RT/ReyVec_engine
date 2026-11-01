@@ -24,8 +24,8 @@
 use ash::vk;
 use reyvec_text::TextLibrary;
 use reyvec_vector::{
-    BlendMode, Color, FillMethod, FillRule, Gradient, GradientKind, MaskMode, Paint, SceneItem,
-    ShapeId, ShapeLibrary, Spread, Style,
+    BlendMode, Color, DETAIL_COARSEST, DETAIL_FINEST, DETAIL_LEVELS, FillMethod, FillRule,
+    Gradient, GradientKind, MaskMode, Paint, SceneItem, ShapeId, ShapeLibrary, Spread, Style,
 };
 
 use crate::GpuError;
@@ -516,6 +516,102 @@ pub(crate) struct VectorRenderer {
     drawn: u32,
     /// Память раскладки фигур трафаретом по слоям, общая для всех кадров.
     stencil_run: StencilRun,
+    /// Уровни детализации фигур (копия таблиц набора) и какие уровни просили построить.
+    details: Details,
+}
+
+/// Уровни детализации на стороне раскладки кадра: для каждой фигуры набора номера её
+/// готовых уровней ([`ShapeLibrary::detail_table`]), допуск набора и просьбы построить
+/// недостающие уровни, собранные за кадр.
+#[derive(Default)]
+struct Details {
+    table: Vec<[u32; DETAIL_LEVELS]>,
+    revision: Option<u64>,
+    tolerance: f32,
+    /// Ошибка уровня 0 в пикселях на единицу масштаба: допуск × пикселей на единицу экрана.
+    error_px: f32,
+    requests: Vec<(ShapeId, i32)>,
+    /// Биты уровней, уже попавших в `requests` в этом кадре (по фигурам).
+    requested: Vec<u16>,
+}
+
+/// Наибольшая ошибка ломаной на экране, в пикселях: уровень детализации выбирается так,
+/// чтобы ошибка была не больше неё (и не меньше её четверти).
+const DETAIL_ERROR_PX: f32 = 0.25;
+
+impl Details {
+    fn sync(&mut self, library: &ShapeLibrary) {
+        if self.revision == Some(library.revision()) {
+            return;
+        }
+        self.revision = Some(library.revision());
+        self.tolerance = library.tolerance() as f32;
+        self.table.clear();
+        self.table.extend((0..library.len() as u32).map(|i| {
+            *library
+                .detail_table(ShapeId(i))
+                .expect("номер в пределах набора")
+        }));
+        self.requested.resize(self.table.len(), 0);
+    }
+
+    /// Начало кадра: высота кадра в пикселях `height`, старые просьбы сбрасываются.
+    fn begin(&mut self, height: f32) {
+        self.error_px = self.tolerance * height * 0.5;
+        for &(id, _) in &self.requests {
+            self.requested[id.0 as usize] = 0;
+        }
+        self.requests.clear();
+    }
+
+    /// Какой фигурой рисовать экземпляр фигуры `id` с преобразованием на экран `m`:
+    /// уровень, у которого ошибка ломаной на экране не больше [`DETAIL_ERROR_PX`]. Если
+    /// нужного уровня ещё нет (или он не загружен: номер не меньше `uploaded`), он
+    /// попадает в просьбы, а пока берётся ближайший готовый уровень между нужным и
+    /// обычным. Стоит несколько умножений и сравнений: кривые не трогаются.
+    fn pick(&mut self, id: ShapeId, m: &reyvec_vector::Affine, uploaded: usize) -> ShapeId {
+        let Some(row) = self.table.get(id.0 as usize) else {
+            return id;
+        };
+        let [a, b, c, d, _, _] = m.as_coeffs();
+        let stretch = (a * a + b * b).max(c * c + d * d) as f32;
+        // Нужный уровень: ⌊log₄(допустимая ошибка / ошибка уровня 0)⌋; логарифм по
+        // показателю степени числа f32, без вызова log2.
+        let ratio = DETAIL_ERROR_PX * DETAIL_ERROR_PX / (self.error_px * self.error_px * stretch);
+        if !(ratio.is_normal()) {
+            return id;
+        }
+        let log2 = ((ratio.to_bits() >> 23) & 0xff) as i32 - 127;
+        // ratio — квадрат отношения, поэтому log₄ отношения = log₂(ratio) / 4.
+        let level = log2.div_euclid(4).clamp(DETAIL_FINEST, DETAIL_COARSEST);
+        if level == 0 {
+            return id;
+        }
+        let at = |l: i32| row[(l - DETAIL_FINEST) as usize];
+        let want = at(level);
+        if want != u32::MAX && (want as usize) < uploaded {
+            return ShapeId(want);
+        }
+        if want == u32::MAX {
+            let bit = 1u16 << (level - DETAIL_FINEST);
+            if let Some(mask) = self.requested.get_mut(id.0 as usize)
+                && *mask & bit == 0
+            {
+                *mask |= bit;
+                self.requests.push((id, level));
+            }
+        }
+        let step = -level.signum();
+        let mut l = level + step;
+        while l != 0 {
+            let d = at(l);
+            if d != u32::MAX && (d as usize) < uploaded {
+                return ShapeId(d);
+            }
+            l += step;
+        }
+        id
+    }
 }
 
 /// Шейдеры векторного слоя: при их перезагрузке конвейеры пересобираются.
@@ -570,6 +666,7 @@ impl VectorRenderer {
             warned_overflow: false,
             drawn: 0,
             stencil_run: StencilRun::default(),
+            details: Details::default(),
         })
     }
 
@@ -636,6 +733,7 @@ impl VectorRenderer {
         res: &mut GpuResources,
         library: &ShapeLibrary,
     ) -> Result<(), GpuError> {
+        self.details.sync(library);
         let done = self.meshes.as_ref().map_or(0, |m| m.ranges.len());
         if done == library.len() && self.meshes.is_some() {
             return Ok(());
@@ -722,6 +820,7 @@ impl VectorRenderer {
         slot: usize,
         library: &ShapeLibrary,
     ) -> Result<Uploads, GpuError> {
+        self.details.sync(library);
         let Some(meshes) = self.meshes.as_mut() else {
             return Ok(Uploads::default());
         };
@@ -835,6 +934,39 @@ impl VectorRenderer {
                 &vk::DependencyInfo::default().memory_barriers(&barrier),
             );
         }
+    }
+
+    /// Уровни детализации, которых не хватило в последнем кадре: фигура и уровень (см.
+    /// [`ShapeLibrary::build_detail`]). Построенные уровни загрузит следующий
+    /// [`Self::stream`].
+    pub fn detail_requests(&self) -> &[(ShapeId, i32)] {
+        &self.details.requests
+    }
+
+    /// Только раскладывает кадр (без записи для видеокарты), чтобы узнать, каких уровней
+    /// детализации ему не хватает. Для картинок тестов: уровни строятся до первого кадра.
+    pub fn plan_details(
+        &mut self,
+        items: &[SceneItem],
+        extent: vk::Extent2D,
+        view: reyvec_vector::Affine,
+    ) -> Vec<(ShapeId, i32)> {
+        let Some(meshes) = self.meshes.as_ref() else {
+            return Vec::new();
+        };
+        let aspect = extent.width as f32 / extent.height.max(1) as f32;
+        self.details.begin(extent.height as f32);
+        pack_frame(
+            &meshes.ranges,
+            &[],
+            items,
+            self.fill,
+            view,
+            visible_area(aspect),
+            &mut self.stencil_run,
+            &mut self.details,
+        );
+        self.details.requests.clone()
     }
 
     /// Сколько фигур и блоков текста нарисовано в последнем кадре: остальные целиком за
@@ -974,11 +1106,13 @@ impl VectorRenderer {
         res: &mut GpuResources,
         slot: usize,
         items: &[SceneItem],
-        aspect: f32,
+        extent: vk::Extent2D,
         view: reyvec_vector::Affine,
     ) -> Option<VectorData> {
+        let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let meshes = self.meshes.as_ref()?;
         let texts = self.text.as_ref().map_or(&[][..], |t| &t.ranges[..]);
+        self.details.begin(extent.height as f32);
         let packed = pack_frame(
             &meshes.ranges,
             texts,
@@ -987,6 +1121,7 @@ impl VectorRenderer {
             view,
             visible_area(aspect),
             &mut self.stencil_run,
+            &mut self.details,
         );
         self.drawn = packed.drawn;
         if packed.overflow && !self.warned_overflow {
@@ -1270,6 +1405,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         reyvec_vector::Affine::IDENTITY,
         EVERYWHERE,
         &mut StencilRun::default(),
+        &mut Details::default(),
     )
 }
 
@@ -1567,7 +1703,10 @@ fn write_view(push: &mut [u8; PUSH_SIZE], view: [f32; 6]) {
 
 /// Как [`pack`], и ещё блоки текста `texts` (по номерам [`reyvec_vector::TextId`]) и вид
 /// камеры `view`: прямоугольники слоёв считаются уже на экране. Фигуры и блоки текста,
-/// чья рамка на экране не задевает `visible`, не пишутся вовсе (отсечение).
+/// чья рамка на экране не задевает `visible`, не пишутся вовсе (отсечение). Фигура
+/// рисуется уровнем детализации под свой размер на экране (`details`).
+// Все аргументы — разные входы одной раскладки; `run` и `details` — память между кадрами.
+#[allow(clippy::too_many_arguments)]
 fn pack_frame(
     ranges: &[MeshRange],
     texts: &[TextRange],
@@ -1576,6 +1715,7 @@ fn pack_frame(
     view: reyvec_vector::Affine,
     visible: Bounds,
     run: &mut StencilRun,
+    details: &mut Details,
 ) -> Packed {
     let mut out = Vec::new();
     let mut commands: Vec<[u32; 4]> = Vec::new();
@@ -1727,19 +1867,30 @@ fn pack_frame(
             SceneItem::Shape(inst) => inst,
         };
         let target = stack.last().map_or(0, Open::target);
-        let Some(range) = ranges.get(inst.shape.0 as usize) else {
+        let to_screen = view * inst.transform;
+        let Some(base) = ranges.get(inst.shape.0 as usize) else {
             continue;
+        };
+        let mut on_screen = transform_bounds(&to_screen, base.bounds);
+        if !overlaps(on_screen, visible) {
+            continue;
+        }
+        // Уровень детализации под размер на экране (у уровня своя рамка: чуть другие
+        // точки и запас под мягкий край).
+        let shape = details.pick(inst.shape, &to_screen, ranges.len());
+        let range = if shape == inst.shape {
+            base
+        } else {
+            let r = &ranges[shape.0 as usize];
+            on_screen = transform_bounds(&to_screen, r.bounds);
+            r
         };
         let stencil =
             range.curve_index_count > 0 && (range.index_count == 0 || fill.stencil(range.method));
         if range.index_count == 0 && !stencil {
             continue;
         }
-        let on_screen = transform_bounds(&(view * inst.transform), range.bounds);
-        if !overlaps(on_screen, visible) {
-            continue;
-        }
-        if !(stencil && run.accepts(target, inst.shape)) {
+        if !(stencil && run.accepts(target, shape)) {
             run.flush(&mut out, &mut targets, &mut written);
         }
         if written as usize + run.len() >= MAX_INSTANCES {
@@ -1751,7 +1902,7 @@ fn pack_frame(
         }
         // Фигуры трафаретом пишутся в накопитель (потом по слоям), остальные сразу.
         let out = if stencil {
-            run.add(target, inst.shape, range, on_screen)
+            run.add(target, shape, range, on_screen)
         } else {
             &mut out
         };
@@ -1781,7 +1932,7 @@ fn pack_frame(
         }
         let ops = &mut targets[target];
         {
-            let same = last == Some((target, inst.shape));
+            let same = last == Some((target, shape));
             // `last` ставится только после команды треугольников этой цели и
             // сбрасывается на всём остальном, поэтому последняя команда и есть отрезок
             // этой фигуры.
@@ -1801,7 +1952,7 @@ fn pack_frame(
                     }
                 }
             }
-            last = Some((target, inst.shape));
+            last = Some((target, shape));
         }
         written += 1;
     }
@@ -2536,6 +2687,7 @@ mod tests {
             reyvec_vector::Affine::IDENTITY,
             EVERYWHERE,
             &mut StencilRun::default(),
+            &mut Details::default(),
         );
         assert_eq!(
             packed.targets[0],
@@ -2625,6 +2777,7 @@ mod tests {
             view,
             EVERYWHERE,
             &mut StencilRun::default(),
+            &mut Details::default(),
         );
         let near = |a: Bounds, b: Bounds| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
         assert!(
@@ -2635,6 +2788,50 @@ mod tests {
         // Сами экземпляры не меняются: камеру применяет видеокарта.
         let plain = pack(&ranges, &items, FillMode::PerShape);
         assert_eq!(packed.instances, plain.instances);
+    }
+
+    #[test]
+    fn detail_level_follows_size_on_screen() {
+        // Фигура 0 с готовыми уровнями −2 (номер 1) и 2 (номер 2); допуск 0.001, кадр
+        // высотой 1000 пикселей: ошибка уровня 0 при масштабе 1 — полпикселя.
+        let mut row = [u32::MAX; DETAIL_LEVELS];
+        row[(-DETAIL_FINEST) as usize] = 0;
+        row[(-2 - DETAIL_FINEST) as usize] = 1;
+        row[(2 - DETAIL_FINEST) as usize] = 2;
+        let mut details = Details {
+            table: vec![row, [u32::MAX; DETAIL_LEVELS], [u32::MAX; DETAIL_LEVELS]],
+            tolerance: 0.001,
+            requested: vec![0; 3],
+            ..Details::default()
+        };
+        details.begin(1000.0);
+        let at = |s: f64| reyvec_vector::Affine::scale(s);
+        // Масштаб 0.4: ошибка 0.2 пикселя, уровень 0.
+        assert_eq!(details.pick(ShapeId(0), &at(0.4), 3), ShapeId(0));
+        // Масштаб 1: ошибка 0.5 пикселя, нужен уровень −1; его нет, ближайший готовый
+        // между −1 и 0 — сама фигура, а −1 попадает в просьбы.
+        assert_eq!(details.pick(ShapeId(0), &at(1.0), 3), ShapeId(0));
+        // Масштаб 16: ошибка 8 пикселей, нужен −3 (8/64 ≤ ¼); есть −2 — он ближе.
+        assert_eq!(details.pick(ShapeId(0), &at(16.0), 3), ShapeId(1));
+        // Масштаб 4: ошибка 2 пикселя, уровень −2 готов.
+        assert_eq!(details.pick(ShapeId(0), &at(4.0), 3), ShapeId(1));
+        // Мелкая: масштаб 0.01, ошибка 0.005 пикселя — уровень 2 (×16 = 0.08 ≤ ¼).
+        assert_eq!(details.pick(ShapeId(0), &at(0.01), 3), ShapeId(2));
+        // Но если он ещё не загружен (загружено 2 фигуры), берётся сама фигура.
+        assert_eq!(details.pick(ShapeId(0), &at(0.01), 2), ShapeId(0));
+        // Поворот не меняет уровень, растяжение по одной оси учитывается.
+        let turned = reyvec_vector::Affine::rotate(0.7) * at(4.0);
+        assert_eq!(details.pick(ShapeId(0), &turned, 3), ShapeId(1));
+        let stretched = reyvec_vector::Affine::scale_non_uniform(0.4, 4.0);
+        assert_eq!(details.pick(ShapeId(0), &stretched, 3), ShapeId(1));
+        // Просьбы без повторов: −1 и −3, каждая один раз.
+        assert_eq!(details.requests, vec![(ShapeId(0), -1), (ShapeId(0), -3)]);
+        details.begin(1000.0);
+        assert!(details.requests.is_empty());
+        assert_eq!(details.pick(ShapeId(0), &at(1.0), 3), ShapeId(0));
+        assert_eq!(details.requests, vec![(ShapeId(0), -1)]);
+        // Неизвестная фигура рисуется как есть.
+        assert_eq!(details.pick(ShapeId(7), &at(1.0), 3), ShapeId(7));
     }
 
     #[test]
@@ -2751,9 +2948,17 @@ mod tests {
                 })
                 .collect();
             let mut run = StencilRun::default();
+            // Все уровни уже готовы (указывают на саму фигуру): обычный кадр без просьб.
+            let mut details = Details {
+                table: vec![[0; DETAIL_LEVELS], [1; DETAIL_LEVELS]],
+                tolerance: 0.0005,
+                requested: vec![0; 2],
+                ..Details::default()
+            };
             let started = std::time::Instant::now();
             let mut ops = 0;
             for _ in 0..100 {
+                details.begin(1009.0);
                 ops = pack_frame(
                     &ranges,
                     &[],
@@ -2762,6 +2967,7 @@ mod tests {
                     Affine::IDENTITY,
                     visible_area(1.9),
                     &mut run,
+                    &mut details,
                 )
                 .targets[0]
                     .len();
@@ -2793,6 +2999,7 @@ mod tests {
             Affine::IDENTITY,
             visible,
             &mut StencilRun::default(),
+            &mut Details::default(),
         );
         assert_eq!(packed.drawn, 3);
         assert_eq!(packed.instances.len(), 3 * INSTANCE_SIZE);
@@ -2808,6 +3015,7 @@ mod tests {
             view,
             visible,
             &mut StencilRun::default(),
+            &mut Details::default(),
         );
         assert_eq!(packed.drawn, 1);
         assert_eq!(

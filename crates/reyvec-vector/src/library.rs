@@ -7,6 +7,27 @@ use crate::{
     TessellationError, curve_mesh, morph_mesh, tessellate_smooth,
 };
 
+/// Самый подробный уровень детализации: допуск в 4⁶ = 4096 раз меньше обычного (под
+/// самое сильное приближение камеры).
+pub const DETAIL_FINEST: i32 = -6;
+/// Самый грубый уровень: допуск в 4³ = 64 раза больше обычного (мелкие фигуры вдали).
+pub const DETAIL_COARSEST: i32 = 3;
+/// Сколько уровней от [`DETAIL_FINEST`] до [`DETAIL_COARSEST`].
+pub const DETAIL_LEVELS: usize = (DETAIL_COARSEST - DETAIL_FINEST + 1) as usize;
+
+/// Почему не построить уровень детализации.
+#[derive(Debug, thiserror::Error)]
+pub enum DetailError {
+    #[error("нет фигуры №{0}")]
+    UnknownShape(u32),
+    #[error("уровень детализации {0} вне {DETAIL_FINEST}..={DETAIL_COARSEST}")]
+    BadLevel(i32),
+    #[error(transparent)]
+    Tessellation(#[from] TessellationError),
+    #[error(transparent)]
+    Morph(#[from] MorphError),
+}
+
 /// Номер фигуры в [`ShapeLibrary`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShapeId(pub u32);
@@ -18,8 +39,17 @@ struct Entry {
     curves: Option<CurveMesh>,
     /// Положения точек `curves` у остальных ключевых контуров (только у перетекающих).
     morph: Vec<Vec<[f32; 2]>>,
+    /// Ключевые контуры перетекающей фигуры (для уровней детализации).
+    keyframes: Vec<kurbo::BezPath>,
     method: FillMethod,
+    /// Уровни детализации этой фигуры: номер готовой фигуры-уровня или `u32::MAX`
+    /// (индекс = уровень − [`DETAIL_FINEST`]). У самих уровней все пустые.
+    details: [u32; DETAIL_LEVELS],
+    /// У уровня детализации: исходная фигура и номер уровня.
+    detail_of: Option<(ShapeId, i32)>,
 }
+
+const NO_DETAIL: u32 = u32::MAX;
 
 /// Фигуры, уже разбитые на треугольники. Разбиение делается один раз в [`Self::add`],
 /// поэтому показывать фигуру в каждом кадре процессору почти ничего не стоит.
@@ -61,7 +91,10 @@ impl ShapeLibrary {
             mesh,
             curves,
             morph: Vec::new(),
+            keyframes: Vec::new(),
             method,
+            details: [NO_DETAIL; DETAIL_LEVELS],
+            detail_of: None,
         }))
     }
 
@@ -84,14 +117,98 @@ impl ShapeLibrary {
             mesh: Mesh::default(),
             curves: Some(mesh),
             morph: other,
+            keyframes: keyframes.to_vec(),
             method: FillMethod::Stencil,
+            details: [NO_DETAIL; DETAIL_LEVELS],
+            detail_of: None,
         }))
     }
 
-    fn push(&mut self, entry: Entry) -> ShapeId {
+    /// Готовый уровень детализации `level` фигуры `id` (0 — сама фигура), если он уже
+    /// построен.
+    pub fn detail(&self, id: ShapeId, level: i32) -> Option<ShapeId> {
+        let k = usize::try_from(level - DETAIL_FINEST).ok()?;
+        let d = *self.entries.get(id.0 as usize)?.details.get(k)?;
+        (d != NO_DETAIL).then_some(ShapeId(d))
+    }
+
+    /// Все уровни детализации фигуры `id`: номер готовой фигуры-уровня или `u32::MAX`
+    /// (индекс = уровень − [`DETAIL_FINEST`]). Для таблицы на стороне видеокарты.
+    pub fn detail_table(&self, id: ShapeId) -> Option<&[u32; DETAIL_LEVELS]> {
+        self.entries.get(id.0 as usize).map(|e| &e.details)
+    }
+
+    /// Исходная фигура и уровень, если `id` — уровень детализации другой фигуры.
+    pub fn detail_of(&self, id: ShapeId) -> Option<(ShapeId, i32)> {
+        self.entries.get(id.0 as usize)?.detail_of
+    }
+
+    /// Строит уровень детализации `level` фигуры `id`: та же фигура, разбитая с допуском
+    /// `tolerance · 4^level` (меньше нуля — подробнее, под приближение камеры; больше —
+    /// грубее, для мелких фигур). Разовая работа процессора: уровень становится новой
+    /// фигурой набора и загружается на видеокарту как любая новая фигура. Если уровень уже
+    /// есть, просто возвращает его.
+    pub fn build_detail(&mut self, id: ShapeId, level: i32) -> Result<ShapeId, DetailError> {
+        if !(DETAIL_FINEST..=DETAIL_COARSEST).contains(&level) {
+            return Err(DetailError::BadLevel(level));
+        }
+        let base = self
+            .entries
+            .get(id.0 as usize)
+            .ok_or(DetailError::UnknownShape(id.0))?;
+        if let Some((original, _)) = base.detail_of {
+            return Err(DetailError::UnknownShape(original.0));
+        }
+        if let Some(done) = self.detail(id, level) {
+            return Ok(done);
+        }
+        let tolerance = self.tolerance * 4f64.powi(level);
+        let entry = if base.keyframes.is_empty() {
+            let mesh = tessellate_smooth(&base.shape, tolerance, tolerance * 4.0)?;
+            let curves = base
+                .curves
+                .is_some()
+                .then(|| curve_mesh(&base.shape.path, tolerance));
+            Entry {
+                shape: base.shape.clone(),
+                mesh,
+                curves,
+                morph: Vec::new(),
+                keyframes: Vec::new(),
+                method: base.method,
+                details: [NO_DETAIL; DETAIL_LEVELS],
+                detail_of: Some((id, level)),
+            }
+        } else {
+            let MorphMesh {
+                mesh,
+                keyframes: other,
+            } = morph_mesh(&base.keyframes, tolerance)?;
+            Entry {
+                shape: base.shape.clone(),
+                mesh: Mesh::default(),
+                curves: Some(mesh),
+                morph: other,
+                keyframes: Vec::new(),
+                method: FillMethod::Stencil,
+                details: [NO_DETAIL; DETAIL_LEVELS],
+                detail_of: Some((id, level)),
+            }
+        };
+        let new = self.push(entry);
+        self.entries[id.0 as usize].details[(level - DETAIL_FINEST) as usize] = new.0;
+        Ok(new)
+    }
+
+    fn push(&mut self, mut entry: Entry) -> ShapeId {
+        let id = self.entries.len() as u32;
+        if entry.detail_of.is_none() {
+            // Уровень 0 — сама фигура.
+            entry.details[(-DETAIL_FINEST) as usize] = id;
+        }
         self.entries.push(entry);
         self.revision += 1;
-        ShapeId(self.entries.len() as u32 - 1)
+        ShapeId(id)
     }
 
     /// Способ рисования заливки фигуры (у перетекающих всегда трафарет).
@@ -225,6 +342,43 @@ mod tests {
         assert_eq!(lib.iter().count(), 2);
         assert_eq!(lib.method(a), Some(FillMethod::Triangles));
         assert!(lib.morph_keyframes(a).is_empty());
+    }
+
+    #[test]
+    fn detail_levels_are_built_once_with_scaled_tolerance() {
+        let mut lib = ShapeLibrary::new(0.01);
+        let circle = kurbo::Circle::new((0.0, 0.0), 1.0).to_path(1e-3);
+        let id = lib.add(Shape::fill(circle.clone(), Color::WHITE)).unwrap();
+        assert_eq!(lib.detail(id, 0), Some(id));
+        assert_eq!(lib.detail(id, -2), None);
+        let fine = lib.build_detail(id, -2).unwrap();
+        let coarse = lib.build_detail(id, 2).unwrap();
+        assert_eq!(lib.build_detail(id, -2).unwrap(), fine);
+        assert_eq!(lib.detail(id, -2), Some(fine));
+        assert_eq!(lib.detail_of(fine), Some((id, -2)));
+        assert_eq!(lib.detail_of(id), None);
+        assert_eq!(lib.len(), 3);
+        let count = |s| lib.mesh(s).unwrap().triangle_count();
+        // Допуск в 16 раз меньше: кривая режется примерно в 4 раза мельче.
+        assert!(count(fine) > 3 * count(id), "{} {}", count(fine), count(id));
+        assert!(count(coarse) < count(id));
+        // Подробная заливка ближе к площади круга.
+        let err = |s| (lib.mesh(s).unwrap().area() - std::f64::consts::PI).abs();
+        assert!(err(fine) < err(id) && err(id) < err(coarse));
+        let table = lib.detail_table(id).unwrap();
+        assert_eq!(table[(-2 - DETAIL_FINEST) as usize], fine.0);
+        assert!(lib.build_detail(id, DETAIL_FINEST - 1).is_err());
+        assert!(lib.build_detail(fine, 1).is_err());
+        assert!(lib.build_detail(ShapeId(99), 1).is_err());
+        // Перетекающая фигура тоже: точек у уровня больше, ключевые контуры те же.
+        let square = Rect::new(-1.0, -1.0, 1.0, 1.0).to_path(0.1);
+        let m = lib
+            .add_morph(&[circle, square], FillRule::NonZero, Color::WHITE)
+            .unwrap();
+        let mf = lib.build_detail(m, -2).unwrap();
+        assert_eq!(lib.method(mf), Some(FillMethod::Stencil));
+        assert_eq!(lib.morph_keyframes(mf).len(), 1);
+        assert!(lib.curves(mf).unwrap().vertices.len() > lib.curves(m).unwrap().vertices.len());
     }
 
     #[test]
