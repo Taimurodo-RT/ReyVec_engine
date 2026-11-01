@@ -32,7 +32,7 @@ pub struct AppConfig {
     pub hot_reload: bool,
     /// Включить замеры для Tracy: программа Tracy сможет подключиться к движку.
     pub tracy: bool,
-    /// С какой сцены песочницы начать (клавиши 1–5 переключают).
+    /// С какой сцены песочницы начать (клавиши 1–6 переключают).
     pub scene: DemoScene,
     /// Сглаживание сцены (клавиша M переключает).
     pub msaa: Msaa,
@@ -43,6 +43,8 @@ pub struct AppConfig {
     pub fill: reyvec_gpu::FillMode,
     /// Лупа векторной сцены (клавиша Z переключает).
     pub zoom: bool,
+    /// Свой SVG для сцены «SVG» (содержимое файла).
+    pub svg: Option<std::sync::Arc<[u8]>>,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -182,6 +184,7 @@ impl App {
                 gpu: self.config.gpu.clone(),
                 vsync: self.config.vsync,
                 hot_reload: self.config.hot_reload,
+                svg: self.config.svg.clone(),
             },
         )?;
         self.stats.adapter = renderer.adapter().name.clone();
@@ -302,6 +305,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::Digit3 | KeyCode::Numpad3 => Some(DemoScene::Morph),
         KeyCode::Digit4 | KeyCode::Numpad4 => Some(DemoScene::Layers),
         KeyCode::Digit5 | KeyCode::Numpad5 => Some(DemoScene::Masks),
+        KeyCode::Digit6 | KeyCode::Numpad6 => Some(DemoScene::Svg),
         _ => None,
     }
 }

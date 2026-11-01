@@ -1,4 +1,4 @@
-//! Сцены песочницы этапа 3: векторные фигуры, перетекание, слои и маски.
+//! Сцены песочницы этапа 3: векторные фигуры, перетекание, слои, маски и SVG.
 //!
 //! Все фигуры готовятся один раз, при создании сцены. Каждый кадр меняются только их
 //! положения, повороты, масштабы, оттенки и форма перетекания ([`Instance`]), так что
@@ -13,6 +13,7 @@
 
 use std::f64::consts::{FRAC_PI_2, TAU};
 
+use reyvec_svg::{SvgDrawing, SvgOptions, load_svg};
 use reyvec_vector::{
     Affine, BezPath, BlendMode, Circle, Color, FillMethod, FillRule, Gradient, Instance, LineCap,
     LineJoin, MaskMode, Rect, SceneItem, Shape, ShapeId, ShapeLibrary, Spread, Stroke,
@@ -52,10 +53,40 @@ pub(crate) struct VectorDemo {
     /// от белого к чёрному (маска по яркости).
     mask_star: ShapeId,
     fade: ShapeId,
+    /// Сцена «SVG»: рисунки, загруженные один раз. `user`: показан свой файл.
+    svgs: Vec<SvgDrawing>,
+    user_svg: bool,
 }
 
+/// Тестовые рисунки SVG сцены «SVG». Те же файлы сверяются с `resvg` в тестах.
+pub(crate) const TEST_SVGS: [(&str, &[u8]); 6] = [
+    ("shapes", include_bytes!("../../../assets/svg/shapes.svg")),
+    (
+        "gradients",
+        include_bytes!("../../../assets/svg/gradients.svg"),
+    ),
+    ("groups", include_bytes!("../../../assets/svg/groups.svg")),
+    (
+        "clip-mask",
+        include_bytes!("../../../assets/svg/clip-mask.svg"),
+    ),
+    (
+        "transforms",
+        include_bytes!("../../../assets/svg/transforms.svg"),
+    ),
+    (
+        "illustration",
+        include_bytes!("../../../assets/svg/illustration.svg"),
+    ),
+];
+/// Сетка тестовых рисунков: столбцов, строк.
+const SVG_GRID: (usize, usize) = (3, 2);
+/// Доля клетки или кадра, которую занимает рисунок.
+const SVG_FIT: f64 = 0.95;
+
 impl VectorDemo {
-    pub fn new() -> Self {
+    /// `svg`: свой рисунок для сцены «SVG» (содержимое файла).
+    pub fn new(svg: Option<&[u8]>) -> Self {
         let mut library = ShapeLibrary::new(TOLERANCE);
         let mut add = |shape| {
             library
@@ -160,7 +191,71 @@ impl VectorDemo {
             pill,
             mask_star,
             fade,
+            svgs: Vec::new(),
+            user_svg: false,
         }
+        .with_svgs(svg)
+    }
+
+    /// Загружает рисунки сцены «SVG»: свой файл или тестовые. Ошибки пишутся в лог.
+    fn with_svgs(mut self, user: Option<&[u8]>) -> Self {
+        let mut load = |name: &str, data: &[u8], height: f64| {
+            let _zone = crate::cpu_zone!("загрузка SVG");
+            let started = std::time::Instant::now();
+            match load_svg(data, &mut self.library, SvgOptions { height }) {
+                Ok(d) => {
+                    tracing::info!(
+                        "SVG «{name}»: {} фигур за {:.1} мс",
+                        d.shape_count,
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                    for w in &d.warnings {
+                        tracing::warn!("SVG «{name}»: {w}");
+                    }
+                    Some(d)
+                }
+                Err(e) => {
+                    tracing::error!("SVG «{name}»: {e}");
+                    None
+                }
+            }
+        };
+        if let Some(d) = user.and_then(|data| load("свой файл", data, 2.0 * SVG_FIT)) {
+            self.svgs.push(d);
+            self.user_svg = true;
+            return self;
+        }
+        let cell = 2.0 / SVG_GRID.1 as f64 * SVG_FIT;
+        for (name, data) in TEST_SVGS {
+            if let Some(d) = load(name, data, cell) {
+                self.svgs.push(d);
+            }
+        }
+        self
+    }
+
+    /// Сцена «SVG» для кадра с соотношением сторон `aspect`: свой рисунок по центру во
+    /// весь кадр или тестовые рисунки сеткой. Рисунки не двигаются: каждый кадр только
+    /// копируется готовый список.
+    pub fn svg_items(&self, aspect: f32) -> Vec<SceneItem> {
+        let aspect = f64::from(aspect);
+        if self.user_svg {
+            let d = &self.svgs[0];
+            let (w, h) = d.size;
+            let k = (2.0 * SVG_FIT / h).min(2.0 * aspect * SVG_FIT / w);
+            return d.placed(Affine::scale(k)).collect();
+        }
+        let (cols, rows) = SVG_GRID;
+        let (cw, ch) = (2.0 * aspect / cols as f64, 2.0 / rows as f64);
+        let mut out = Vec::new();
+        for (i, d) in self.svgs.iter().enumerate() {
+            let (c, r) = (i % cols, i / cols);
+            let center = (-aspect + cw * (c as f64 + 0.5), 1.0 - ch * (r as f64 + 0.5));
+            let (w, h) = d.size;
+            let k = (ch * SVG_FIT / h).min(cw * SVG_FIT / w);
+            out.extend(d.placed(Affine::translate(center) * Affine::scale(k)));
+        }
+        out
     }
 
     /// Сцена «маски» в момент `time`: три панели.
@@ -578,7 +673,7 @@ mod tests {
 
     #[test]
     fn scene_builds_and_reuses_petal_mesh() {
-        let demo = VectorDemo::new();
+        let demo = VectorDemo::new(None);
         // У всех фигур есть треугольники, кроме перетекающей: она только трафаретом.
         assert!(
             demo.library

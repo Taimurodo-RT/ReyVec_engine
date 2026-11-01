@@ -108,6 +108,16 @@ jobs:
           name: reference-failures
           path: target/reference-failures
           if-no-files-found: ignore
+      # Рисунки SVG из assets/svg сравниваются с эталонным рисовальщиком resvg.
+      - name: SVG matches resvg
+        run: cargo test -p reyvec-app --test svg_reference -- --include-ignored
+      - name: Upload SVG comparison images
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: svg-reference
+          path: target/svg-reference
+          if-no-files-found: ignore
       # 7 секунд: за это время сцена несколько раз загружает новую текстуру и удаляет старую.
       - name: Sandbox window, 7 seconds, validation on
         run: |
@@ -118,6 +128,9 @@ jobs:
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --scene layers --seconds 3
           # Сцена «маски»: маски слоёв (обычная, по яркости, обратная).
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --scene masks --seconds 3
+          # Сцена «SVG»: тестовые рисунки сеткой и свой файл через --svg.
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --scene svg --seconds 3
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --svg assets/svg/illustration.svg --seconds 3
       # Снимки кадра: без окна (--snapshot) и из окна по F12.
       - name: Frame snapshots (headless and F12 in window)
         run: |

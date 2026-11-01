@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="180" viewBox="0 0 240 180">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffcdb2"/>
+      <stop offset="1" stop-color="#b5838d"/>
+    </linearGradient>
+    <radialGradient id="sun">
+      <stop offset="0" stop-color="#fff3b0"/>
+      <stop offset="0.7" stop-color="#ffd166"/>
+      <stop offset="1" stop-color="#ffd166" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="hill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6d9773"/>
+      <stop offset="1" stop-color="#0c3b2e"/>
+    </linearGradient>
+    <clipPath id="window"><rect x="152" y="104" width="16" height="16" rx="2"/></clipPath>
+  </defs>
+  <rect width="240" height="180" fill="url(#sky)"/>
+  <circle cx="180" cy="55" r="40" fill="url(#sun)"/>
+  <path d="M -10 130 C 40 90, 90 100, 130 125 S 210 110, 250 120 L 250 190 L -10 190 Z" fill="#8a9a5b" opacity="0.8"/>
+  <path d="M -10 150 C 50 120, 120 140, 160 150 S 220 140, 250 145 L 250 190 L -10 190 Z" fill="url(#hill)"/>
+  <!-- Домик. -->
+  <rect x="135" y="100" width="50" height="40" fill="#e5989b" stroke="#6d6875" stroke-width="2"/>
+  <polygon points="130,102 160,78 190,102" fill="#6d6875" stroke-linejoin="round" stroke="#6d6875" stroke-width="4"/>
+  <g clip-path="url(#window)">
+    <rect x="150" y="100" width="20" height="25" fill="#fff3b0"/>
+    <path d="M 160 100 V 125 M 150 112 H 170" stroke="#6d6875" stroke-width="2"/>
+  </g>
+  <!-- Дерево. -->
+  <rect x="58" y="110" width="8" height="35" fill="#6d4c41"/>
+  <g opacity="0.9">
+    <circle cx="62" cy="100" r="20" fill="#2d6a4f"/>
+    <circle cx="50" cy="112" r="14" fill="#40916c"/>
+    <circle cx="75" cy="110" r="15" fill="#40916c"/>
+  </g>
+  <!-- Облако с размытым краем через маску. -->
+  <mask id="cloudfade"><rect x="20" y="20" width="100" height="40" fill="url(#cloudgrad)"/></mask>
+  <linearGradient id="cloudgrad" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="black"/><stop offset="0.3" stop-color="white"/>
+    <stop offset="0.7" stop-color="white"/><stop offset="1" stop-color="black"/>
+  </linearGradient>
+  <g mask="url(#cloudfade)">
+    <ellipse cx="70" cy="42" rx="45" ry="12" fill="#ffffff"/>
+    <ellipse cx="60" cy="34" rx="20" ry="10" fill="#ffffff"/>
+  </g>
+  <path d="M 20 165 q 10 -8 20 0 t 20 0 t 20 0" fill="none" stroke="#fefae0" stroke-width="2" stroke-dasharray="4 3" stroke-linecap="round"/>
+</svg>

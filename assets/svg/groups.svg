@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <rect x="0" y="0" width="200" height="200" fill="#f1faee"/>
+  <rect x="0" y="100" width="200" height="100" fill="#1d3557"/>
+  <!-- Прозрачная группа: перекрытия не просвечивают. Рядом те же круги с прозрачностью по отдельности. -->
+  <g opacity="0.5">
+    <circle cx="40" cy="45" r="25" fill="#e63946"/>
+    <circle cx="65" cy="45" r="25" fill="#e63946"/>
+  </g>
+  <circle cx="125" cy="45" r="25" fill="#e63946" fill-opacity="0.5"/>
+  <circle cx="150" cy="45" r="25" fill="#e63946" fill-opacity="0.5"/>
+  <!-- Вложенные прозрачные группы. -->
+  <g opacity="0.8">
+    <rect x="15" y="80" width="40" height="40" fill="#457b9d"/>
+    <g opacity="0.5"><rect x="35" y="100" width="40" height="40" fill="#f4a261"/></g>
+  </g>
+  <!-- Режимы смешивания на светлом и тёмном. -->
+  <g style="mix-blend-mode:multiply"><rect x="100" y="80" width="25" height="100" fill="#f4a261"/></g>
+  <g style="mix-blend-mode:screen"><rect x="135" y="80" width="25" height="100" fill="#f4a261"/></g>
+  <rect x="170" y="80" width="25" height="100" fill="#f4a261" opacity="0.6"/>
+  <path d="M 20 150 h 60 v 40 h -60 z M 35 160 h 30 v 20 h -30 z" fill="#2a9d8f" fill-rule="evenodd" stroke="#e9c46a" stroke-width="4" stroke-opacity="0.7"/>
+</svg>

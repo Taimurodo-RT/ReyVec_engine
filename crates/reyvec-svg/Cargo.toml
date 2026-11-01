@@ -1,0 +1,21 @@
+[package]
+name = "reyvec-svg"
+description = "ReyVec: загрузка SVG в векторные фигуры, слои и маски движка."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+reyvec-vector.workspace = true
+kurbo.workspace = true
+thiserror.workspace = true
+usvg.workspace = true
+
+[dev-dependencies]
+resvg.workspace = true
+
+[lints]
+workspace = true

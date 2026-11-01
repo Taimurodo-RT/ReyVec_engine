@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200">
+  <!-- Заливки: прямоугольник, скруглённый, круг, эллипс, звезда EvenOdd и NonZero. -->
+  <rect x="10" y="10" width="50" height="35" fill="#e94f37"/>
+  <rect x="75" y="10" width="50" height="35" rx="12" fill="#f6c445"/>
+  <circle cx="165" cy="28" r="20" fill="#44bba4"/>
+  <ellipse cx="35" cy="80" rx="27" ry="16" fill="#3f88c5"/>
+  <polygon points="100,55 112,95 78,70 122,70 88,95" fill="#9b5de5" fill-rule="evenodd"/>
+  <polygon points="165,55 177,95 143,70 187,70 153,95" fill="#9b5de5"/>
+  <!-- Обводки: стыки острый, круглый, срезанный; концы плоский, круглый, квадратный. -->
+  <polyline points="12,140 30,112 48,140" fill="none" stroke="#ffffff" stroke-width="8" stroke-linejoin="miter"/>
+  <polyline points="76,140 94,112 112,140" fill="none" stroke="#ffffff" stroke-width="8" stroke-linejoin="round"/>
+  <polyline points="140,140 158,112 176,140" fill="none" stroke="#ffffff" stroke-width="8" stroke-linejoin="bevel"/>
+  <line x1="20" y1="158" x2="60" y2="158" stroke="#f6c445" stroke-width="10" stroke-linecap="butt"/>
+  <line x1="85" y1="158" x2="125" y2="158" stroke="#f6c445" stroke-width="10" stroke-linecap="round"/>
+  <line x1="150" y1="158" x2="185" y2="158" stroke="#f6c445" stroke-width="10" stroke-linecap="square"/>
+  <!-- Штрихи и заливка с обводкой. -->
+  <circle cx="40" cy="183" r="12" fill="none" stroke="#44bba4" stroke-width="3" stroke-dasharray="6 3"/>
+  <path d="M 80 190 C 100 165, 120 200, 140 175 S 170 170, 185 190" fill="#3f88c5" stroke="#e94f37" stroke-width="3"/>
+</svg>

@@ -11,8 +11,8 @@ pub mod snapshot;
 pub use app::{AppConfig, AppError, RunSummary, run};
 pub use logging::{LogGuard, init_logging};
 pub use reyvec_gpu::{
-    AdapterInfo, DemoScene, FillMode, FrameImage, GpuOptions, HeadlessImage, HeadlessScene, Msaa,
-    list_adapters, render_headless, validation_error_count,
+    AdapterInfo, CLEAR_COLOR, DemoScene, FillMode, FrameImage, GpuOptions, HeadlessImage,
+    HeadlessScene, Msaa, list_adapters, render_headless, validation_error_count,
 };
 
 /// Название движка.
