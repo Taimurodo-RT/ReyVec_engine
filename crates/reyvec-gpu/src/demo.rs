@@ -288,6 +288,8 @@ pub(crate) struct Demo {
     field: FieldPipelines,
     /// Линии фона сцены «свет» по полю из картинки (jump flooding), а не точному.
     light_field: bool,
+    /// Во сколько раз поле расстояний меньше кадра по каждой стороне (по видеокарте).
+    field_downscale: u32,
     sprites: vk::Pipeline,
     /// Копирует кадр сцены в окно; зависит от формата окна.
     present: vk::Pipeline,
@@ -383,6 +385,10 @@ impl Demo {
             & limits.framebuffer_stencil_sample_counts;
         let scene_format = pick_scene_format(ctx, msaa_counts);
         tracing::info!("Формат кадра сцены: {scene_format:?}");
+        tracing::info!(
+            "Поле расстояний света: в {} раза меньше кадра по каждой стороне",
+            field_downscale_for(ctx.adapter.kind)
+        );
         let mut vector = VectorRenderer::new(
             ctx,
             res,
@@ -403,6 +409,7 @@ impl Demo {
             sdf: vk::Pipeline::null(),
             field: FieldPipelines::default(),
             light_field: false,
+            field_downscale: field_downscale_for(ctx.adapter.kind),
             sprites: vk::Pipeline::null(),
             present: vk::Pipeline::null(),
             resolve: vk::Pipeline::null(),
@@ -1182,7 +1189,7 @@ impl Demo {
         frame: FrameData,
     ) -> ImageHandle {
         let layout = bindless.pipeline_layout;
-        let size = field_size(frame.extent);
+        let size = field_size(frame.extent, self.field_downscale);
         let mask = graph.create("маска теней", size, field_format("light_mask"));
         let seeds = [
             graph.create("семена поля", size, field_format("jfa_seed")),
@@ -1355,8 +1362,16 @@ fn sdf_push(
 /// Шейдеры поля расстояний (4.2) по порядку проходов.
 const FIELD_SHADERS: [&str; 4] = ["light_mask", "jfa_seed", "jfa_step", "jfa_field"];
 
-/// Во сколько раз поле расстояний меньше кадра по каждой стороне.
-const FIELD_DOWNSCALE: u32 = 2;
+/// Во сколько раз поле расстояний меньше кадра по каждой стороне на видеокарте этого
+/// типа. Jump flooding упирается в память: на встроенной Radeon поле в половину кадра
+/// стоило 4 мс (узкое место света 2), в четверть — вчетверо меньше точек. Мягким теням
+/// такой точности хватает; резкие края рисует векторный слой.
+pub(crate) fn field_downscale_for(kind: AdapterKind) -> u32 {
+    match kind {
+        AdapterKind::Integrated => 4,
+        _ => 2,
+    }
+}
 
 /// Формат картинки, в которую рисует шейдер поля `name`: маска — 8 бит, семена — две
 /// координаты пикселя (половинные числа точны до 2048, а поле не шире), поле — одно
@@ -1369,11 +1384,11 @@ fn field_format(name: &str) -> vk::Format {
     }
 }
 
-/// Размер поля расстояний для кадра `frame`.
-fn field_size(frame: vk::Extent2D) -> vk::Extent2D {
+/// Размер поля расстояний для кадра `frame`, если поле в `downscale` раз меньше.
+fn field_size(frame: vk::Extent2D, downscale: u32) -> vk::Extent2D {
     vk::Extent2D {
-        width: frame.width.div_ceil(FIELD_DOWNSCALE).max(1),
-        height: frame.height.div_ceil(FIELD_DOWNSCALE).max(1),
+        width: frame.width.div_ceil(downscale).max(1),
+        height: frame.height.div_ceil(downscale).max(1),
     }
 }
 
@@ -1572,16 +1587,23 @@ mod tests {
 
     #[test]
     fn field_is_half_size_and_steps_reach_one() {
-        let size = field_size(vk::Extent2D {
+        let frame = vk::Extent2D {
             width: 1920,
             height: 1009,
-        });
+        };
+        let size = field_size(frame, field_downscale_for(AdapterKind::Discrete));
         assert_eq!((size.width, size.height), (960, 505));
+        let small = field_size(frame, field_downscale_for(AdapterKind::Integrated));
+        assert_eq!((small.width, small.height), (480, 253));
+        assert_eq!(jfa_steps(small).len(), 10);
         assert_eq!(jfa_steps(size), [512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1]);
-        let tiny = field_size(vk::Extent2D {
-            width: 1,
-            height: 1,
-        });
+        let tiny = field_size(
+            vk::Extent2D {
+                width: 1,
+                height: 1,
+            },
+            4,
+        );
         assert_eq!((tiny.width, tiny.height), (1, 1));
         assert_eq!(jfa_steps(tiny), [1]);
     }
