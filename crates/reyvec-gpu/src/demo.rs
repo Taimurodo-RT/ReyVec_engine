@@ -1374,7 +1374,9 @@ impl Demo {
         field: ImageHandle,
     ) -> ImageHandle {
         let layout = bindless.pipeline_layout;
-        let size = field_size(frame.extent, self.field_downscale);
+        // Свет мельче кадра вдвое на любой видеокарте, даже если поле мельче: при
+        // растяжении из четверти кадра резкие края теней шли лесенкой (узкое место 5).
+        let size = field_size(frame.extent, LIGHT_DOWNSCALE);
         let light = graph.create("свет", size, LIGHT_FORMAT);
         let camera = self.camera;
         graph.add_pass(
@@ -1519,6 +1521,10 @@ fn sdf_push(
 
 /// Формат картинки света (4.3): свет может быть ярче 1, поэтому с плавающей точкой.
 const LIGHT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Во сколько раз картинка света меньше кадра по каждой стороне (поле может быть ещё
+/// меньше, свет читает его со смешиванием соседних точек).
+const LIGHT_DOWNSCALE: u32 = 2;
 
 /// Шейдеры поля расстояний (4.2) по порядку проходов.
 const FIELD_SHADERS: [&str; 5] = [

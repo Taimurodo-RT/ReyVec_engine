@@ -11,7 +11,7 @@ struct Push
     uint texture; // номер картинки сцены в общем списке текстур
     uint light;   // номер картинки света (если use_light)
     uint use_light;
-    uint field;   // номер картинки поля расстояний (того же размера, что свет)
+    uint field;   // номер картинки поля расстояний (бывает меньше картинки света)
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -53,7 +53,8 @@ float4 light_at(float2 uv)
             int2 q = clamp(base + int2(x, y), int2(0, 0), size - 1);
             float wx = x == 0 ? 1.0 - k.x : k.x;
             float wy = y == 0 ? 1.0 - k.y : k.y;
-            bool same = (textures[pc.field].Load(int3(q, 0)).r < 0.0) == inside;
+            float2 at = (float2(q) + 0.5) / float2(size);
+            bool same = (textures[pc.field].SampleLevel(samplers[0], at, 0.0).r < 0.0) == inside;
             float weight = wx * wy * (same ? 1.0 : 0.001) + 1e-6;
             sum += textures[pc.light].Load(int3(q, 0)) * weight;
             total += weight;
