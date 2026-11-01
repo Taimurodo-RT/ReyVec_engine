@@ -1222,15 +1222,18 @@ impl Demo {
         }
 
         let mut uses = vec![(scene, Access::Sampled), (target, Access::ColorAttachment)];
-        if let Some(l) = light {
+        let light = light.zip(field);
+        if let Some((l, f)) = light {
             uses.push((l, Access::Sampled));
+            uses.push((f, Access::Sampled));
         }
         graph.add_pass("вывод", &uses, move |p| {
-            let mut push = [0u8; 12];
+            let mut push = [0u8; 16];
             push[..4].copy_from_slice(&p.texture(scene).to_ne_bytes());
-            if let Some(l) = light {
+            if let Some((l, f)) = light {
                 push[4..8].copy_from_slice(&p.texture(l).to_ne_bytes());
-                push[8..].copy_from_slice(&1u32.to_ne_bytes());
+                push[8..12].copy_from_slice(&1u32.to_ne_bytes());
+                push[12..].copy_from_slice(&p.texture(f).to_ne_bytes());
             }
             let (d, cmd) = (p.device, p.cmd);
             // SAFETY: граф перевёл сцену в чтение, а цель в раскладку рисования.
