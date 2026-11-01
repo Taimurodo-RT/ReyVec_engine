@@ -120,14 +120,16 @@ float2 closest_on_segments(float2 p1, float2 q1, float2 p2, float2 q2)
 }
 
 // Что видит луч из o в направлении v на отрезке пути [t0, t1].
-float4 trace(float2 o, float2 v, float t0, float t1)
+float4 trace(float2 o, float2 v, float t0, float t1, bool probe_inside)
 {
     float t = t0;
     float end = t1;
     bool blocked = false;
-    // Зонд каскада 0 бывает внутри предмета: сначала луч выходит наружу (поверхность
-    // предмета освещается снаружи), и только потом предметы его останавливают.
-    bool outside = pc.cascade > 0;
+    // Зонд бывает внутри предмета: тогда луч сначала выходит наружу (поверхность
+    // предмета освещается снаружи), и только потом предметы его останавливают. Так и у
+    // каскадов выше: их отрезки начинаются дальше, но всё ещё могут быть внутри того же
+    // предмета (стол толще отрезка каскада 0).
+    bool outside = !probe_inside;
     float step_min = 1.0 / (float(pc.field_size.y) * pc.zoom);
     for (int i = 0; i < MAX_STEPS && t < t1; i++)
     {
@@ -158,7 +160,9 @@ float4 trace(float2 o, float2 v, float t0, float t1)
         Light l = pc.lights[i];
         if (l.kind != 0)
             continue;
-        float radius = max(l.softness, 0.02);
+        // Размер светящейся поверхности: у неона и ламп не больше 0,04 (иначе большой
+        // светящийся круг виден сам и залезает в соседние предметы).
+        float radius = clamp(l.softness, 0.015, 0.04);
         float2 st = closest_on_segments(p0, p1, l.a, l.b);
         float2 on_ray = lerp(p0, p1, st.x);
         float2 on_light = lerp(l.a, l.b, st.y);
@@ -208,7 +212,7 @@ float4 fs_main(VertexOut input) : SV_Target
     float scale = float(1u << (2u * pc.cascade)); // 4^i
     float t0 = pc.r0 * (scale - 1.0) / 3.0;
     float t1 = pc.r0 * (scale * 4.0 - 1.0) / 3.0;
-    float4 near = trace(o, v, t0, t1);
+    float4 near = trace(o, v, t0, t1, field_at(o) < 0.0);
     if (pc.last != 0 || near.a == 0.0)
         return near;
 
