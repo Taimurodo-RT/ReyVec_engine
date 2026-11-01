@@ -17,7 +17,9 @@ struct Push
     uint field_texture; // картинка поля расстояний (4.2), если flags & 1
     uint flags;         // 1: линии фона по полю из картинки (jump flooding), а не точному;
                         // 2: сцена с лампами (светлый пол, свет умножит вывод);
-                        // 4: без фигур, только пол (сцена «слизь и магия»)
+                        // 4: без фигур, только пол (сцены «слизь и магия» и
+                        //    «лаборатория мага»);
+                        // 8: фон лаборатории мага: каменная стена и дощатый пол
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -42,6 +44,54 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID)
     return o;
 }
 
+// Случайное число 0…1 для клетки (камня, доски): одно и то же для всех её точек.
+float cell_random(float2 cell)
+{
+    return frac(sin(dot(cell, float2(127.1, 311.7))) * 43758.5453);
+}
+
+// Высота пола лаборатории (как FLOOR в src/lab.rs).
+static const float LAB_FLOOR = -0.78;
+
+// Фон лаборатории мага (4.6) в точке сцены p: стена из тёсаного камня и дощатый пол.
+// Цвета до освещения: свет ламп потом умножает вывод, поэтому вдали от ламп фон почти
+// чёрный. Швы считаются как расстояние до края камня или доски (мягкий край в пиксель).
+float3 lab_backdrop(float2 p, float pixel)
+{
+    if (p.y < LAB_FLOOR)
+    {
+        // Доски вдоль пола, стыки досок разнесены по рядам.
+        const float2 BOARD = float2(0.9, 0.07);
+        float depth = LAB_FLOOR - p.y;
+        float row = floor(depth / BOARD.y);
+        float x = p.x + row * 0.37;
+        float col = floor(x / BOARD.x);
+        float2 local = float2(x - col * BOARD.x, depth - row * BOARD.y);
+        float seam = min(min(local.x, BOARD.x - local.x), min(local.y, BOARD.y - local.y));
+        float shade = 0.75 + 0.35 * cell_random(float2(col, row));
+        // Волокна дерева: тонкие продольные полосы.
+        float grain = 0.92 + 0.08 * sin(depth * 260.0 + sin(x * 7.0 + row) * 3.0);
+        float3 wood = float3(0.2, 0.11, 0.055) * shade * grain;
+        return lerp(wood, wood * 0.3, sdf_coverage(seam - 0.004, pixel));
+    }
+    // Камни стены: ряды со сдвигом на полкамня.
+    const float2 STONE = float2(0.3, 0.15);
+    float row = floor((p.y - LAB_FLOOR) / STONE.y);
+    float x = p.x + (fmod(row, 2.0) == 0.0 ? 0.0 : STONE.x * 0.5);
+    float col = floor(x / STONE.x);
+    float2 local = float2(x - col * STONE.x, (p.y - LAB_FLOOR) - row * STONE.y);
+    float seam = min(min(local.x, STONE.x - local.x), min(local.y, STONE.y - local.y));
+    float r = cell_random(float2(col, row));
+    // Камни немного разные по цвету: серые с тёплым или холодным отливом.
+    float3 stone = lerp(float3(0.17, 0.16, 0.17), float3(0.2, 0.17, 0.14), r) * (0.8 + 0.3 * r);
+    // Камень чуть выпуклый: к краям темнее.
+    stone *= 0.75 + 0.25 * saturate(seam / 0.03);
+    float3 mortar = float3(0.05, 0.045, 0.045);
+    float3 wall = lerp(stone, mortar, sdf_coverage(seam - 0.006, pixel));
+    // Плинтус: тёмная полоса у пола.
+    return lerp(wall, float3(0.05, 0.035, 0.025), sdf_coverage(p.y - (LAB_FLOOR + 0.025), pixel));
+}
+
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
@@ -52,6 +102,8 @@ float4 fs_main(VertexOut input) : SV_Target
     float field = 1e9;
     // Пол: в сцене с лампами светлый (его затемняет и красит свет), иначе тёмный.
     float3 color = (pc.flags & 2) != 0 ? float3(0.32, 0.33, 0.36) : float3(0.02, 0.025, 0.035);
+    if ((pc.flags & 8) != 0)
+        color = lab_backdrop(p, pixel);
     bool shapes = (pc.flags & 4) == 0;
     // Сначала поле: считаем расстояние до ближайшей фигуры, потом рисуем линии. Без фигур
     // их и не считаем (это дорого, узкое место света 1).

@@ -441,6 +441,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::KeyL => Some(DemoScene::Light),
         KeyCode::KeyK => Some(DemoScene::Lamps),
         KeyCode::KeyJ => Some(DemoScene::Blobs),
+        KeyCode::KeyH => Some(DemoScene::Lab),
         _ => None,
     }
 }
