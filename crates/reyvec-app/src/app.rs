@@ -35,8 +35,9 @@ pub struct AppConfig {
     pub tracy: bool,
     /// С какой сцены песочницы начать (клавиши 0–9 переключают).
     pub scene: DemoScene,
-    /// Сглаживание сцены (клавиша M переключает).
-    pub msaa: Msaa,
+    /// Сглаживание сцены (клавиша M переключает). `None`: по видеокарте, 2× на встроенной
+    /// и 4× на остальных (задача 4.0).
+    pub msaa: Option<Msaa>,
     /// Края при MSAA «как в редакторах» (клавиша G переключает). Дороже обычных: см.
     /// `docs/decisions/0009-vector-layer.md`.
     pub perceptual_edges: bool,
@@ -210,7 +211,17 @@ impl App {
         self.window = Some(window);
         let mut renderer = renderer;
         renderer.set_scene(self.config.scene);
-        renderer.set_msaa(self.config.msaa);
+        let default_msaa = renderer.msaa_default();
+        let msaa = self.config.msaa.unwrap_or(default_msaa);
+        if self.config.msaa.is_none() {
+            tracing::info!(
+                "Сглаживание по умолчанию для видеокарты «{}» ({}): {}. Клавиша M меняет, --msaa задаёт при запуске",
+                renderer.adapter().name,
+                renderer.adapter().kind,
+                default_msaa.title()
+            );
+        }
+        renderer.set_msaa(msaa);
         renderer.set_perceptual_edges(self.config.perceptual_edges);
         renderer.set_fill(self.config.fill);
         renderer.set_zoom(self.config.zoom);
@@ -247,6 +258,7 @@ impl App {
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),
+                msaa_is_default: renderer.msaa() == renderer.msaa_default(),
                 compact_scene: renderer.compact_scene(),
                 perceptual_edges: renderer.perceptual_edges(),
                 fill: renderer.fill().label(),

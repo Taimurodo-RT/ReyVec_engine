@@ -19,6 +19,7 @@
 use ash::vk;
 
 use crate::GpuError;
+use crate::adapter::AdapterKind;
 use crate::bindless::{Bindless, SamplerKind};
 use crate::context::GpuContext;
 use crate::demo_vector::VectorDemo;
@@ -139,6 +140,8 @@ impl DemoScene {
 pub enum Msaa {
     /// Без сглаживания: края «лесенкой».
     Off,
+    /// 2 точки на пиксель: по умолчанию на встроенных видеокартах.
+    X2,
     /// 4 точки на пиксель.
     #[default]
     X4,
@@ -151,24 +154,37 @@ impl Msaa {
     pub fn title(self) -> &'static str {
         match self {
             Self::Off => "выкл",
+            Self::X2 => "MSAA 2×",
             Self::X4 => "MSAA 4×",
             Self::X8 => "MSAA 8×",
         }
     }
 
-    /// Следующий вариант по кругу: выкл → 4× → 8× → выкл.
+    /// Следующий вариант по кругу: выкл → 2× → 4× → 8× → выкл.
     pub fn next(self) -> Self {
         match self {
-            Self::Off => Self::X4,
+            Self::Off => Self::X2,
+            Self::X2 => Self::X4,
             Self::X4 => Self::X8,
             Self::X8 => Self::Off,
         }
     }
 
-    /// Вариант по имени из командной строки: `off`, `4` или `8`.
+    /// Сглаживание по умолчанию для видеокарты этого типа (задача 4.0). Встроенная делит
+    /// память с процессором, и MSAA 4× съедает на ней около 1,6 мс кадра (узкие места 9 и
+    /// 40): берём 2×, а края обводок и текста и так сглаживает шейдер. Остальным 4×.
+    pub fn for_adapter(kind: AdapterKind) -> Self {
+        match kind {
+            AdapterKind::Integrated => Self::X2,
+            _ => Self::X4,
+        }
+    }
+
+    /// Вариант по имени из командной строки: `off`, `2`, `4` или `8`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "off" | "0" | "1" => Some(Self::Off),
+            "2" => Some(Self::X2),
             "4" => Some(Self::X4),
             "8" => Some(Self::X8),
             _ => None,
@@ -178,6 +194,7 @@ impl Msaa {
     pub(crate) fn samples(self) -> vk::SampleCountFlags {
         match self {
             Self::Off => vk::SampleCountFlags::TYPE_1,
+            Self::X2 => vk::SampleCountFlags::TYPE_2,
             Self::X4 => vk::SampleCountFlags::TYPE_4,
             Self::X8 => vk::SampleCountFlags::TYPE_8,
         }
@@ -185,7 +202,7 @@ impl Msaa {
 
     /// Самый близкий вариант не больше `self`, который видеокарта умеет для кадра сцены.
     pub(crate) fn supported(self, counts: vk::SampleCountFlags) -> Self {
-        [Self::X8, Self::X4, Self::Off]
+        [Self::X8, Self::X4, Self::X2, Self::Off]
             .into_iter()
             .find(|m| *m <= self && counts.contains(m.samples()))
             .unwrap_or(Self::Off)
@@ -1325,6 +1342,25 @@ fn hue_to_rgb(h: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msaa_defaults_and_cycle() {
+        assert_eq!(Msaa::for_adapter(AdapterKind::Integrated), Msaa::X2);
+        assert_eq!(Msaa::for_adapter(AdapterKind::Discrete), Msaa::X4);
+        assert_eq!(Msaa::for_adapter(AdapterKind::Cpu), Msaa::X4);
+        let mut m = Msaa::Off;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            m = m.next();
+            seen.push(m);
+        }
+        assert_eq!(seen, [Msaa::X2, Msaa::X4, Msaa::X8, Msaa::Off]);
+        // Видеокарта без 2×: берётся ближайшее меньшее.
+        let no_x2 = vk::SampleCountFlags::TYPE_1 | vk::SampleCountFlags::TYPE_4;
+        assert_eq!(Msaa::X2.supported(no_x2), Msaa::Off);
+        assert_eq!(Msaa::X8.supported(no_x2), Msaa::X4);
+        assert_eq!(Msaa::from_name("2"), Some(Msaa::X2));
+    }
 
     #[test]
     fn layer_images_are_rect_sized_with_headroom() {

@@ -13,7 +13,7 @@
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
 //! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph`: с какой сцены начать (по умолчанию `vector`);
-//! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
+//! - `--msaa off|2|4|8`: сглаживание сцены (по умолчанию 2 на встроенной видеокарте, 4 на остальных);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
 //!   у каждой фигуры свой способ, остальные варианты для сравнения);
@@ -49,7 +49,7 @@ const HELP: &str = "\
   --svg <файл.svg>       показать свой рисунок SVG в сцене «SVG» (клавиша 6, с неё и начнёт)
   --motif <файл.reyvec.json>  показать свои перетекающие фигуры от Motif в сцене «Motif»
                          (клавиша 7, с неё и начнёт)
-  --msaa <off|4|8>       сглаживание краёв (по умолчанию 4)
+  --msaa <off|2|4|8>     сглаживание краёв (по умолчанию 2 на встроенной, 4 на остальных)
   --editor-edges         края «как в редакторах» (дороже, особенно на встроенной видеокарте)
   --fill <shape|triangles|stencil>  заливки векторов: у каждой фигуры свой способ (по умолчанию),
                          все треугольниками или все трафаретом
@@ -130,10 +130,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 })?);
             }
             "--msaa" => {
-                let n = it.next().ok_or("после --msaa нужно off, 4 или 8")?;
+                let n = it.next().ok_or("после --msaa нужно off, 2, 4 или 8")?;
                 out.msaa = Some(
                     reyvec_app::Msaa::from_name(&n)
-                        .ok_or_else(|| format!("--msaa: «{n}», а нужно off, 4 или 8"))?,
+                        .ok_or_else(|| format!("--msaa: «{n}», а нужно off, 2, 4 или 8"))?,
                 );
             }
             "--fill" => {
@@ -327,7 +327,7 @@ fn main() -> ExitCode {
         hot_reload: !args.no_hot_reload,
         tracy: !args.no_tracy,
         scene: args.scene.unwrap_or_default(),
-        msaa: args.msaa.unwrap_or_default(),
+        msaa: args.msaa,
         perceptual_edges: args.editor_edges,
         fill: args.fill.unwrap_or_default(),
         zoom: args.zoom,
@@ -464,7 +464,8 @@ mod tests {
             parse("--msaa off").unwrap().msaa,
             Some(reyvec_app::Msaa::Off)
         );
-        assert!(parse("--msaa 2").is_err());
+        assert_eq!(parse("--msaa 2").unwrap().msaa, Some(reyvec_app::Msaa::X2));
+        assert!(parse("--msaa 3").is_err());
         assert!(parse("--scene").is_err());
     }
 

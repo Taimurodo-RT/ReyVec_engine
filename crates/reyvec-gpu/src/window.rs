@@ -241,7 +241,7 @@ impl WindowRenderer {
             demo: None,
             files: options.files.clone(),
             scene: DemoScene::default(),
-            msaa_wanted: Msaa::default(),
+            msaa_wanted: Msaa::for_adapter(ctx.adapter.kind),
             compact_scene_wanted: true,
             ui: None,
             ui_textures: egui::TexturesDelta::default(),
@@ -372,6 +372,11 @@ impl WindowRenderer {
         self.demo
             .as_ref()
             .map_or(Msaa::Off, |d| d.msaa_supported(msaa))
+    }
+
+    /// Сглаживание по умолчанию для этой видеокарты: 2× на встроенной, 4× на остальных.
+    pub fn msaa_default(&self) -> Msaa {
+        Msaa::for_adapter(self.ctx.adapter.kind)
     }
 
     /// Просит сглаживание со следующего кадра. Если видеокарта не умеет столько точек на
