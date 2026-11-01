@@ -280,6 +280,17 @@ impl App {
                     }
                 );
             }
+            PanelAction::Glow(on) => {
+                r.set_glow(on);
+                tracing::info!(
+                    "Свечение и мягкие пересветы: {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
+            PanelAction::Dither(on) => {
+                r.set_dither(on);
+                tracing::info!("Шум против полос: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
                 tracing::info!("Камера в начале");
@@ -346,6 +357,8 @@ impl App {
                 compact_supported: renderer.compact_scene_supported(),
                 fill_mode: renderer.fill(),
                 light_field: renderer.light_field(),
+                glow: renderer.glow(),
+                dither: renderer.dither(),
             };
             panel.frame(window, &info)
         });
@@ -562,6 +575,36 @@ impl ApplicationHandler for App {
                 if let Some(r) = self.renderer.as_ref() {
                     let fill = r.fill().next();
                     self.apply(PanelAction::Fill(fill));
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyB),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_ref() {
+                    let on = !r.glow();
+                    self.apply(PanelAction::Glow(on));
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyD),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_ref() {
+                    let on = !r.dither();
+                    self.apply(PanelAction::Dither(on));
                 }
             }
             WindowEvent::KeyboardInput {

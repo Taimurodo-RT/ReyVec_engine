@@ -4,6 +4,11 @@
 // их свечение. Картинка света меньше кадра; при растяжении смешиваются только её точки с
 // той же стороны края фигуры, что и пиксель (край виден по полю расстояний), иначе тень
 // снаружи заползает на край фигуры ступеньками (узкое место света 5).
+// Свечение и пересветы (4.4): к освещённому кадру добавляется свечение ярких мест
+// (bloom_down/bloom_up.slang), а яркость выше белого мягко сводится к белому (тонмаппинг),
+// вместо того чтобы обрезаться пятнами одного цвета. Лёгкий шум (дизеринг) убирает
+// полосы на плавных переходах: экран хранит 256 ступеней яркости, и без шума плавный
+// тёмный переход виден ступенями (узкое место векторов 53).
 // Кадр сцены хранится в линейном цвете, перевод в цвет экрана делает формат окна (sRGB).
 
 struct Push
@@ -12,6 +17,10 @@ struct Push
     uint light;   // номер картинки света (если use_light)
     uint use_light;
     uint field;   // номер картинки поля расстояний (бывает меньше картинки света)
+    uint bloom;   // номер картинки свечения (если флаг FLAG_GLOW)
+    uint flags;   // FLAG_GLOW, FLAG_DITHER
+    float glow;   // сила свечения
+    float pad;
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -63,6 +72,56 @@ float4 light_at(float2 uv)
     return sum / total;
 }
 
+static const uint FLAG_GLOW = 1;
+static const uint FLAG_DITHER = 2;
+
+// Мягкий переход к белому: до SHOULDER яркость как есть (цвета векторов не меняются),
+// выше плавно приближается к 1 и никогда её не перескакивает. Сжимается самый яркий
+// канал, остальные в той же пропорции, поэтому оттенок сохраняется; очень яркое
+// (в несколько раз ярче белого) постепенно белеет, как пересвет на фото.
+static const float SHOULDER = 0.8;
+
+float3 tonemap(float3 c)
+{
+    float m = max(c.r, max(c.g, c.b));
+    if (m <= SHOULDER)
+        return c;
+    float over = (m - SHOULDER) / (1.0 - SHOULDER);
+    float mapped = SHOULDER + (1.0 - SHOULDER) * (1.0 - exp(-over));
+    float3 hue = c * (mapped / m);
+    float white = saturate((m - 1.0) / 4.0);
+    return lerp(hue, float3(mapped, mapped, mapped), white * 0.6);
+}
+
+float srgb_encode(float x)
+{
+    return x <= 0.0031308 ? x * 12.92 : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+
+float srgb_decode(float x)
+{
+    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+}
+
+// Шум для пикселя p в пределах ±1 ступени экрана (сумма двух равномерных — треугольное
+// распределение: так ступени исчезают, а шум почти не заметен). Не меняется от кадра к
+// кадру, чтобы не мерцать.
+float noise(float2 p)
+{
+    float a = frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
+    float b = frac(52.9829189 * frac(dot(p + float2(17.0, 59.0), float2(0.00583715, 0.06711056))));
+    return a + b - 1.0;
+}
+
+float3 dither(float3 c, float2 p)
+{
+    float n = noise(p) / 255.0;
+    float3 e = float3(srgb_encode(saturate(c.r)), srgb_encode(saturate(c.g)),
+                      srgb_encode(saturate(c.b)));
+    e = saturate(e + n);
+    return float3(srgb_decode(e.r), srgb_decode(e.g), srgb_decode(e.b));
+}
+
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
@@ -74,6 +133,13 @@ float4 fs_main(VertexOut input) : SV_Target
         float2 uv = input.position.xy / float2(w, h);
         float4 light = light_at(uv);
         color.rgb = color.rgb * light.rgb + light.rgb * light.a * 0.6;
+        if ((pc.flags & FLAG_GLOW) != 0)
+        {
+            float3 glow = textures[pc.bloom].SampleLevel(samplers[0], uv, 0.0).rgb;
+            color.rgb = tonemap(color.rgb + glow * pc.glow);
+        }
     }
+    if ((pc.flags & FLAG_DITHER) != 0)
+        color.rgb = dither(color.rgb, input.position.xy);
     return color;
 }

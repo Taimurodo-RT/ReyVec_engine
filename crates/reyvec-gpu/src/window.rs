@@ -372,6 +372,30 @@ impl WindowRenderer {
         }
     }
 
+    /// Свечение и мягкий переход к белому в сцене «лампы и тени» (4.4).
+    pub fn glow(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::glow)
+    }
+
+    /// Включает свечение и мягкий переход к белому со следующего кадра.
+    pub fn set_glow(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_glow(on);
+        }
+    }
+
+    /// Лёгкий шум при выводе против полос на плавных переходах (4.4).
+    pub fn dither(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::dither)
+    }
+
+    /// Включает шум против полос со следующего кадра.
+    pub fn set_dither(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_dither(on);
+        }
+    }
+
     /// Лупа векторной сцены (увеличение в 8 раз у края сердца) со следующего кадра.
     pub fn set_zoom(&mut self, on: bool) {
         if let Some(demo) = self.demo.as_mut() {

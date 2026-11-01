@@ -306,6 +306,13 @@ pub(crate) struct Demo {
     /// Свет сцены «лампы и тени» (4.3): проход «свет» и источники каждого кадра.
     light: vk::Pipeline,
     light_buffers: Vec<BufferId>,
+    /// Свечение ярких мест (4.4): шаги вниз и вверх по цепочке уменьшенных картинок.
+    bloom_down: vk::Pipeline,
+    bloom_up: vk::Pipeline,
+    /// Свечение и мягкий переход к белому в сцене «лампы и тени».
+    glow: bool,
+    /// Лёгкий шум при выводе против полос на плавных переходах.
+    dither: bool,
     sprites: vk::Pipeline,
     /// Копирует кадр сцены в окно; зависит от формата окна.
     present: vk::Pipeline,
@@ -438,6 +445,10 @@ impl Demo {
             field_downscale: field_downscale_for(ctx.adapter.kind),
             light: vk::Pipeline::null(),
             light_buffers,
+            bloom_down: vk::Pipeline::null(),
+            bloom_up: vk::Pipeline::null(),
+            glow: true,
+            dither: true,
             sprites: vk::Pipeline::null(),
             present: vk::Pipeline::null(),
             resolve: vk::Pipeline::null(),
@@ -496,6 +507,16 @@ impl Demo {
                     build(ctx, res, shaders, name, field_format(name), Msaa::Off, None)?;
             }
             demo.light = build(ctx, res, shaders, "light", LIGHT_FORMAT, Msaa::Off, None)?;
+            demo.bloom_down = build(
+                ctx,
+                res,
+                shaders,
+                "bloom_down",
+                BLOOM_FORMAT,
+                Msaa::Off,
+                None,
+            )?;
+            demo.bloom_up = build(ctx, res, shaders, "bloom_up", BLOOM_FORMAT, Msaa::Off, None)?;
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -545,6 +566,26 @@ impl Demo {
     /// Включает линии фона сцены «свет» по полю из картинки.
     pub fn set_light_field(&mut self, on: bool) {
         self.light_field = on;
+    }
+
+    /// Свечение ярких мест и мягкий переход к белому в сцене «лампы и тени» (4.4).
+    pub fn glow(&self) -> bool {
+        self.glow
+    }
+
+    /// Включает свечение и мягкий переход к белому со следующего кадра.
+    pub fn set_glow(&mut self, on: bool) {
+        self.glow = on;
+    }
+
+    /// Лёгкий шум при выводе против полос на плавных переходах (4.4).
+    pub fn dither(&self) -> bool {
+        self.dither
+    }
+
+    /// Включает шум против полос со следующего кадра.
+    pub fn set_dither(&mut self, on: bool) {
+        self.dither = on;
     }
 
     /// Камера векторных сцен.
@@ -732,6 +773,8 @@ impl Demo {
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
                 "light" => (&mut self.light, LIGHT_FORMAT, Msaa::Off, None),
+                "bloom_down" => (&mut self.bloom_down, BLOOM_FORMAT, Msaa::Off, None),
+                "bloom_up" => (&mut self.bloom_up, BLOOM_FORMAT, Msaa::Off, None),
                 n if FIELD_SHADERS.contains(&n) => {
                     (self.field.slot(n), field_format(n), Msaa::Off, None)
                 }
@@ -1221,20 +1264,38 @@ impl Demo {
             );
         }
 
-        let mut uses = vec![(scene, Access::Sampled), (target, Access::ColorAttachment)];
         let light = light.zip(field);
+        // Свечение читает готовый кадр сцены, поэтому идёт после его сведения.
+        let bloom = light
+            .filter(|_| self.glow)
+            .map(|(l, _)| self.add_bloom_passes(graph, bindless, frame, scene, l));
+        let mut uses = vec![(scene, Access::Sampled), (target, Access::ColorAttachment)];
         if let Some((l, f)) = light {
             uses.push((l, Access::Sampled));
             uses.push((f, Access::Sampled));
         }
+        if let Some(b) = bloom {
+            uses.push((b, Access::Sampled));
+        }
+        let dither = self.dither;
         graph.add_pass("вывод", &uses, move |p| {
-            let mut push = [0u8; 16];
+            let mut push = [0u8; 32];
             push[..4].copy_from_slice(&p.texture(scene).to_ne_bytes());
             if let Some((l, f)) = light {
                 push[4..8].copy_from_slice(&p.texture(l).to_ne_bytes());
                 push[8..12].copy_from_slice(&1u32.to_ne_bytes());
-                push[12..].copy_from_slice(&p.texture(f).to_ne_bytes());
+                push[12..16].copy_from_slice(&p.texture(f).to_ne_bytes());
             }
+            let mut flags = 0u32;
+            if let Some(b) = bloom {
+                push[16..20].copy_from_slice(&p.texture(b).to_ne_bytes());
+                flags |= PRESENT_GLOW;
+            }
+            if dither {
+                flags |= PRESENT_DITHER;
+            }
+            push[20..24].copy_from_slice(&flags.to_ne_bytes());
+            push[24..28].copy_from_slice(&GLOW_STRENGTH.to_ne_bytes());
             let (d, cmd) = (p.device, p.cmd);
             // SAFETY: граф перевёл сцену в чтение, а цель в раскладку рисования.
             unsafe {
@@ -1366,6 +1427,94 @@ impl Demo {
     /// Проход «свет» сцены «лампы и тени» (4.3): в разрешении поля для каждой точки
     /// складывает свет всех источников с мягкими тенями по полю `field`. Возвращает
     /// картинку света, на которую «вывод» умножает кадр.
+    /// Проходы свечения (4.4): «свечение» уменьшает освещённый кадр цепочкой картинок
+    /// (половина кадра, четверть, … до [`BLOOM_LEVELS`] ступеней), оставляя только то,
+    /// что ярче [`GLOW_THRESHOLD`], и собирает цепочку обратно с размытием. Возвращает
+    /// картинку в половину кадра, которую вывод добавляет к кадру.
+    fn add_bloom_passes<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        bindless: &'a Bindless,
+        frame: FrameData,
+        scene: ImageHandle,
+        light: ImageHandle,
+    ) -> ImageHandle {
+        let layout = bindless.pipeline_layout;
+        let sizes = bloom_sizes(frame.extent);
+        let down: Vec<ImageHandle> = sizes
+            .iter()
+            .map(|&size| graph.create("свечение вниз", size, BLOOM_FORMAT))
+            .collect();
+        let draw = move |p: &PassContext,
+                         target: ImageHandle,
+                         size: vk::Extent2D,
+                         pipeline: vk::Pipeline,
+                         push: &[u8]| {
+            let (d, cmd) = (p.device, p.cmd);
+            // SAFETY: граф перевёл цель в раскладку рисования, а прочитанные картинки — в
+            // чтение; конвейер жив, пока кадр рисуется.
+            unsafe {
+                begin_color_pass(d, cmd, p.view(target), size);
+                bindless.bind(d, cmd);
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, push);
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+                d.cmd_end_rendering(cmd);
+            }
+        };
+        let texel = |size: vk::Extent2D| [1.0 / size.width as f32, 1.0 / size.height as f32];
+        for (i, &size) in sizes.iter().enumerate() {
+            let target = down[i];
+            let source = if i == 0 { scene } else { down[i - 1] };
+            let mut uses = vec![(source, Access::Sampled), (target, Access::ColorAttachment)];
+            if i == 0 {
+                uses.push((light, Access::Sampled));
+            }
+            let pipeline = self.bloom_down;
+            graph.add_pass("свечение", &uses, move |p| {
+                let mut push = [0u8; 24];
+                push[..4].copy_from_slice(&p.texture(source).to_ne_bytes());
+                if i == 0 {
+                    push[4..8].copy_from_slice(&p.texture(light).to_ne_bytes());
+                }
+                push[8..12].copy_from_slice(&u32::from(i > 0).to_ne_bytes());
+                push[12..16].copy_from_slice(&GLOW_THRESHOLD.to_ne_bytes());
+                let t = texel(size);
+                push[16..20].copy_from_slice(&t[0].to_ne_bytes());
+                push[20..24].copy_from_slice(&t[1].to_ne_bytes());
+                draw(p, target, size, pipeline, &push);
+            });
+        }
+        // Обратно: каждая ступень = своя картинка шага вниз + растянутая ступень меньше.
+        let mut small = down[down.len() - 1];
+        for i in (0..sizes.len() - 1).rev() {
+            let size = sizes[i];
+            let same = down[i];
+            let target = graph.create("свечение вверх", size, BLOOM_FORMAT);
+            let pipeline = self.bloom_up;
+            let from = small;
+            graph.add_pass(
+                "свечение",
+                &[
+                    (from, Access::Sampled),
+                    (same, Access::Sampled),
+                    (target, Access::ColorAttachment),
+                ],
+                move |p| {
+                    let mut push = [0u8; 16];
+                    push[..4].copy_from_slice(&p.texture(from).to_ne_bytes());
+                    push[4..8].copy_from_slice(&p.texture(same).to_ne_bytes());
+                    let t = texel(size);
+                    push[8..12].copy_from_slice(&t[0].to_ne_bytes());
+                    push[12..16].copy_from_slice(&t[1].to_ne_bytes());
+                    draw(p, target, size, pipeline, &push);
+                },
+            );
+            small = target;
+        }
+        small
+    }
+
     fn add_light_pass<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -1424,6 +1573,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.light, None);
+            ctx.device.destroy_pipeline(self.bloom_down, None);
+            ctx.device.destroy_pipeline(self.bloom_up, None);
             for name in FIELD_SHADERS {
                 ctx.device.destroy_pipeline(*self.field.slot(name), None);
             }
@@ -1431,6 +1582,8 @@ impl Demo {
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
+        self.bloom_down = vk::Pipeline::null();
+        self.bloom_up = vk::Pipeline::null();
         self.field = FieldPipelines::default();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
@@ -1521,6 +1674,31 @@ fn sdf_push(
 
 /// Формат картинки света (4.3): свет может быть ярче 1, поэтому с плавающей точкой.
 const LIGHT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Формат картинок свечения: яркость выше белого нужна, прозрачность нет.
+const BLOOM_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Сколько ступеней в цепочке свечения: от половины кадра до 1/32 (у 1920×1009 это
+/// 60×32 точки, свечение расходится примерно на десятую часть экрана).
+const BLOOM_LEVELS: usize = 5;
+
+/// С какой яркости начинается свечение (1 — белый; плавно с 0,5 ниже).
+const GLOW_THRESHOLD: f32 = 1.0;
+
+/// Сила свечения при выводе. Цепочка складывает все ступени, поэтому их сумма примерно
+/// в BLOOM_LEVELS раз ярче ярких мест.
+const GLOW_STRENGTH: f32 = 0.08;
+
+/// Флаги вывода (`present.slang`).
+const PRESENT_GLOW: u32 = 1;
+const PRESENT_DITHER: u32 = 2;
+
+/// Размеры ступеней свечения для кадра `frame`: половина, четверть, … (не меньше 1).
+fn bloom_sizes(frame: vk::Extent2D) -> Vec<vk::Extent2D> {
+    (1..=BLOOM_LEVELS as u32)
+        .map(|k| field_size(frame, 1 << k))
+        .collect()
+}
 
 /// Во сколько раз картинка света меньше кадра по каждой стороне (поле может быть ещё
 /// меньше, свет читает его со смешиванием соседних точек).
@@ -1793,6 +1971,28 @@ mod tests {
         assert_eq!(mask_rect(r(8, 20, 8, 4), 4, size), r(2, 5, 2, 1));
         // У края кадра не выходит за маску.
         assert_eq!(mask_rect(r(1900, 1000, 20, 9), 4, size), r(475, 250, 5, 3));
+    }
+
+    #[test]
+    fn bloom_levels_halve_down_to_a_thirty_second() {
+        let frame = vk::Extent2D {
+            width: 1920,
+            height: 1009,
+        };
+        let sizes: Vec<(u32, u32)> = bloom_sizes(frame)
+            .iter()
+            .map(|s| (s.width, s.height))
+            .collect();
+        assert_eq!(
+            sizes,
+            [(960, 505), (480, 253), (240, 127), (120, 64), (60, 32)]
+        );
+        // Даже у крошечного кадра ступени не пропадают до нуля.
+        let tiny = bloom_sizes(vk::Extent2D {
+            width: 3,
+            height: 1,
+        });
+        assert!(tiny.iter().all(|s| s.width >= 1 && s.height >= 1));
     }
 
     #[test]

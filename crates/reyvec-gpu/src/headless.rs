@@ -283,6 +283,9 @@ fn render(
             demo.set_perceptual_edges(scene.perceptual_edges);
             demo.set_fill(scene.fill);
             demo.set_zoom(scene.zoom);
+            // Шум против полос случайно сдвигает пиксели на ступень: эталоны сравниваются без
+            // него.
+            demo.set_dither(false);
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
