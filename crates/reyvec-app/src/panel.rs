@@ -23,6 +23,7 @@ pub(crate) enum PanelAction {
     PerceptualEdges(bool),
     Fill(FillMode),
     Zoom(bool),
+    LightField(bool),
     ResetCamera,
     Snapshot,
 }
@@ -92,6 +93,8 @@ pub(crate) struct PanelInfo<'a> {
     pub compact_supported: bool,
     /// Способ заливки векторных фигур.
     pub fill_mode: FillMode,
+    /// Линии фона сцены «свет» по полю из картинки (jump flooding).
+    pub light_field: bool,
 }
 
 pub(crate) struct Panel {
@@ -356,6 +359,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
     if ui.checkbox(&mut zoom, "Лупа ×8 (Z)").changed() {
         actions.push(PanelAction::Zoom(zoom));
     }
+    if info.scene_id == DemoScene::Light {
+        let mut field = info.light_field;
+        if ui
+            .checkbox(&mut field, "Свет: линии по полю из картинки")
+            .on_hover_text(
+                "Поле расстояний, построенное jump flooding в половинном разрешении, \
+                 вместо точного расчёта",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::LightField(field));
+        }
+    }
     ui.horizontal(|ui| {
         if ui.button("Камера в начало (R)").clicked() {
             actions.push(PanelAction::ResetCamera);
@@ -505,6 +521,7 @@ mod tests {
             msaa_options: &[Msaa::Off, Msaa::X2, Msaa::X4, Msaa::X8],
             compact_supported: true,
             fill_mode: FillMode::PerShape,
+            light_field: false,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {

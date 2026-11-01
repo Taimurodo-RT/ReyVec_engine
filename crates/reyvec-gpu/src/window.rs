@@ -360,6 +360,18 @@ impl WindowRenderer {
             .filter(|c| c.shapes > 0)
     }
 
+    /// Линии фона сцены «свет» берутся из картинки поля расстояний.
+    pub fn light_field(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::light_field)
+    }
+
+    /// Линии фона сцены «свет» по полю из картинки (jump flooding, 4.2), а не точному.
+    pub fn set_light_field(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_light_field(on);
+        }
+    }
+
     /// Лупа векторной сцены (увеличение в 8 раз у края сердца) со следующего кадра.
     pub fn set_zoom(&mut self, on: bool) {
         if let Some(demo) = self.demo.as_mut() {
