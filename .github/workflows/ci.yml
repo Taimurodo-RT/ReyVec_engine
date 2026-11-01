@@ -114,6 +114,8 @@ jobs:
           cargo build -p reyvec-sandbox
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --list-gpus
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --seconds 7
+          # Сцена «слои»: проходы слоёв с прямоугольниками и вложенным слоем.
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --scene layers --seconds 3
       # Снимки кадра: без окна (--snapshot) и из окна по F12.
       - name: Frame snapshots (headless and F12 in window)
         run: |

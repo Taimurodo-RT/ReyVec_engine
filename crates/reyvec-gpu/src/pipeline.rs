@@ -251,10 +251,12 @@ pub(crate) unsafe fn begin_color_pass(
 /// Начинает проход сцены: цвет в `color_view` (очистка цветом `clear`). Если задан `resolve_view`,
 /// в конце прохода точки MSAA усредняются в него, а `color_view` не сохраняется. Если задан
 /// `stencil_view`, трафарет очищается нулём и после прохода не нужен. Все картинки в
-/// раскладках целей рисования.
+/// раскладках целей рисования. Очистка, рисование (ножницы) и сведение MSAA только в
+/// `area` (по умолчанию вся картинка), область вывода на всю картинку `extent`.
 ///
 /// # Safety
 /// `cmd` в состоянии записи, картинки живы до конца выполнения команд.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn begin_scene_pass(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -262,6 +264,7 @@ pub(crate) unsafe fn begin_scene_pass(
     resolve_view: Option<vk::ImageView>,
     stencil_view: Option<vk::ImageView>,
     extent: vk::Extent2D,
+    area: Option<vk::Rect2D>,
     clear: [f32; 4],
 ) {
     let mut color = vk::RenderingAttachmentInfo::default()
@@ -293,7 +296,7 @@ pub(crate) unsafe fn begin_scene_pass(
                 },
             })
     });
-    let area = vk::Rect2D::default().extent(extent);
+    let area = area.unwrap_or(vk::Rect2D::default().extent(extent));
     let mut rendering = vk::RenderingInfo::default()
         .render_area(area)
         .layer_count(1)

@@ -113,6 +113,46 @@ struct MeshRange {
     /// ключевого контура (0 у обычных фигур).
     morph_stride: u32,
     morph_last: u32,
+    /// Прямоугольник фигуры в её координатах (с запасом обводки и всеми ключевыми
+    /// контурами перетекания): мин. x, мин. y, макс. x, макс. y. У пустой фигуры
+    /// [`EMPTY_BOUNDS`].
+    bounds: Bounds,
+}
+
+/// Прямоугольник: мин. x, мин. y, макс. x, макс. y.
+type Bounds = [f32; 4];
+const EMPTY_BOUNDS: Bounds = [
+    f32::INFINITY,
+    f32::INFINITY,
+    f32::NEG_INFINITY,
+    f32::NEG_INFINITY,
+];
+
+fn union(a: Bounds, b: Bounds) -> Bounds {
+    [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ]
+}
+
+fn bounds_of<'p>(points: impl IntoIterator<Item = &'p [f32; 2]>) -> Bounds {
+    points
+        .into_iter()
+        .fold(EMPTY_BOUNDS, |b, p| union(b, [p[0], p[1], p[0], p[1]]))
+}
+
+/// Прямоугольник `b` после преобразования `t` (вокруг четырёх повёрнутых углов).
+fn transform_bounds(t: &reyvec_vector::Affine, b: Bounds) -> Bounds {
+    if b[0] > b[2] {
+        return EMPTY_BOUNDS;
+    }
+    let corners = [[b[0], b[1]], [b[2], b[1]], [b[0], b[3]], [b[2], b[3]]].map(|[x, y]| {
+        let p = *t * reyvec_vector::Point::new(f64::from(x), f64::from(y));
+        [p.x as f32, p.y as f32]
+    });
+    bounds_of(&corners)
 }
 
 /// Треугольники всех фигур на видеокарте.
@@ -154,6 +194,8 @@ struct FrameBuffers {
     targets: Vec<Vec<Op>>,
     /// Слои в порядке рисования: вложенные раньше тех, в которые они вложены.
     layer_order: Vec<u32>,
+    /// Прямоугольник каждой цели в координатах сцены (у цели 0 не используется).
+    bounds: Vec<Bounds>,
 }
 
 /// Что нужно команде рисования в этом кадре. Готовится в [`VectorRenderer::prepare`].
@@ -250,6 +292,7 @@ impl VectorRenderer {
                 )?,
                 targets: Vec::new(),
                 layer_order: Vec::new(),
+                bounds: Vec::new(),
             });
         }
         Ok(Self {
@@ -358,7 +401,13 @@ impl VectorRenderer {
             let curve_first = curve_index_count;
             let keyframes = library.morph_keyframes(id);
             let mut morph_stride = 0;
+            let mut bounds = bounds_of(&mesh.vertices);
             if let Some(c) = curves {
+                bounds = keyframes
+                    .iter()
+                    .fold(union(bounds, bounds_of(&c.vertices)), |b, k| {
+                        union(b, bounds_of(k))
+                    });
                 // Точки первого ключевого контура, за ними остальных: номер точки в
                 // контуре k = номер в первом + k · stride.
                 for positions in std::iter::once(&c.vertices).chain(keyframes) {
@@ -394,6 +443,7 @@ impl VectorRenderer {
                 paint,
                 morph_stride,
                 morph_last: keyframes.len() as u32,
+                bounds,
             });
             vertex_count += mesh.vertices.len() as u32;
             index_count += mesh.indices.len() as u32;
@@ -496,6 +546,7 @@ impl VectorRenderer {
         res.write_buffer(frame.commands, 0, &packed.commands);
         frame.targets = packed.targets;
         frame.layer_order = packed.layer_order;
+        frame.bounds = packed.bounds;
         Some(VectorData {
             indices: res.buffer_address(meshes.indices),
             vertices: res.buffer_address(meshes.vertices),
@@ -516,6 +567,18 @@ impl VectorRenderer {
         &self.frames[data.slot].layer_order
     }
 
+    /// Прямоугольник пикселей кадра размером `extent`, который занимают фигуры слоя
+    /// `layer`, с запасом в 2 пикселя на сглаживание. Слой рисуется и накладывается только
+    /// в нём. Не меньше 1×1 (пустой проход видеокарта не принимает).
+    pub fn layer_rect(&self, data: &VectorData, layer: u32, extent: vk::Extent2D) -> vk::Rect2D {
+        let b = self.frames[data.slot]
+            .bounds
+            .get(layer as usize)
+            .copied()
+            .unwrap_or(EMPTY_BOUNDS);
+        pixel_rect(b, data.aspect, extent)
+    }
+
     /// Слои, которые накладываются прямо в цель `target`: их картинки проход этой цели
     /// читает.
     pub fn layer_children(&self, data: &VectorData, target: usize) -> Vec<u32> {
@@ -532,15 +595,17 @@ impl VectorRenderer {
     }
 
     /// Записывает рисование цели `target` (0 — кадр сцены, иначе слой из
-    /// [`Self::layer_order`]) в открытый проход рисования. `layer_textures[k]` — номер в
-    /// общем списке текстур готовой картинки слоя `k` (для слоёв, которые здесь
-    /// накладываются).
+    /// [`Self::layer_order`]) в открытый проход рисования. `layers[k]` — готовая
+    /// картинка слоя `k` (для слоёв, которые здесь накладываются): номер в общем списке
+    /// текстур и прямоугольник, где она нарисована. `area` — область рисования прохода:
+    /// после наложения слоя ножницы возвращаются на неё.
     ///
     /// # Safety
     /// `cmd` записывается внутри `vkCmdBeginRendering` с картинкой формата
     /// [`SCENE_FORMAT`] и трафаретом формата, переданного в [`Self::new`], общая раскладка
     /// конвейеров уже привязана; буферы `data` живы, пока видеокарта рисует кадр;
-    /// картинки слоёв из `layer_textures` уже нарисованы и доступны для чтения.
+    /// картинки слоёв из `layers` уже нарисованы и доступны для чтения.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn record(
         &self,
         device: &ash::Device,
@@ -548,7 +613,8 @@ impl VectorRenderer {
         layout: vk::PipelineLayout,
         data: VectorData,
         target: usize,
-        layer_textures: &[u32],
+        layers: &[Option<LayerTexture>],
+        area: vk::Rect2D,
     ) {
         let push = |indices: vk::DeviceAddress, vertices: vk::DeviceAddress| {
             let mut push = [0u8; PUSH_SIZE];
@@ -611,10 +677,11 @@ impl VectorRenderer {
                     opacity,
                     blend,
                 } => {
-                    let Some(&texture) = layer_textures
-                        .get(layer as usize)
-                        .filter(|&&t| t != u32::MAX)
+                    let Some(&Some(LayerTexture { texture, rect })) = layers.get(layer as usize)
                     else {
+                        continue;
+                    };
+                    let Some(scissor) = intersect(rect, area) else {
                         continue;
                     };
                     let mut push = [0u8; 8];
@@ -625,7 +692,10 @@ impl VectorRenderer {
                     unsafe {
                         device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                         device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        // Только прямоугольник слоя: остальное в картинке слоя не рисовалось.
+                        device.cmd_set_scissor(cmd, 0, &[scissor]);
                         device.cmd_draw(cmd, 3, 1, 0, 0);
+                        device.cmd_set_scissor(cmd, 0, &[area]);
                     }
                 }
             }
@@ -648,6 +718,9 @@ struct Packed {
     targets: Vec<Vec<Op>>,
     /// Непустые слои в порядке рисования: вложенные раньше внешних.
     layer_order: Vec<u32>,
+    /// Прямоугольник каждой цели в координатах сцены: всё, что в неё рисуется, включая
+    /// вложенные слои.
+    bounds: Vec<Bounds>,
     /// Экземпляров больше [`MAX_INSTANCES`], лишние пропущены.
     overflow: bool,
 }
@@ -671,6 +744,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
     let mut out = Vec::new();
     let mut commands: Vec<[u32; 4]> = Vec::new();
     let mut targets: Vec<Vec<Op>> = vec![Vec::new()];
+    let mut bounds: Vec<Bounds> = vec![EMPTY_BOUNDS];
     let mut layer_order = Vec::new();
     // Открытые слои: номер цели, прозрачность, режим.
     let mut stack: Vec<(usize, f32, BlendMode)> = Vec::new();
@@ -681,6 +755,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
     let close = |layer: (usize, f32, BlendMode),
                  stack: &[(usize, f32, BlendMode)],
                  targets: &mut Vec<Vec<Op>>,
+                 bounds: &mut Vec<Bounds>,
                  layer_order: &mut Vec<u32>| {
         let (idx, opacity, blend) = layer;
         if targets[idx].is_empty() {
@@ -688,6 +763,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         }
         layer_order.push(idx as u32);
         let parent = stack.last().map_or(0, |l| l.0);
+        bounds[parent] = union(bounds[parent], bounds[idx]);
         targets[parent].push(Op::Composite {
             layer: idx as u32,
             opacity,
@@ -699,6 +775,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         let inst = match *item {
             SceneItem::BeginLayer { opacity, blend } => {
                 targets.push(Vec::new());
+                bounds.push(EMPTY_BOUNDS);
                 let opacity = if opacity.is_nan() {
                     0.0
                 } else {
@@ -710,7 +787,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
             }
             SceneItem::EndLayer => {
                 if let Some(layer) = stack.pop() {
-                    close(layer, &stack, &mut targets, &mut layer_order);
+                    close(layer, &stack, &mut targets, &mut bounds, &mut layer_order);
                 }
                 last = None;
                 continue;
@@ -744,6 +821,12 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         out.extend_from_slice(&range.morph_last.to_ne_bytes());
         out.extend_from_slice(&inst.morph.to_ne_bytes());
         out.extend_from_slice(&range.paint.to_ne_bytes());
+        if target != 0 {
+            bounds[target] = union(
+                bounds[target],
+                transform_bounds(&inst.transform, range.bounds),
+            );
+        }
         let ops = &mut targets[target];
         if stencil {
             ops.push(Op::Stencil {
@@ -778,7 +861,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         written += 1;
     }
     while let Some(layer) = stack.pop() {
-        close(layer, &stack, &mut targets, &mut layer_order);
+        close(layer, &stack, &mut targets, &mut bounds, &mut layer_order);
     }
     Packed {
         instances: out,
@@ -789,7 +872,56 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
             .collect(),
         targets,
         layer_order,
+        bounds,
         overflow,
+    }
+}
+
+/// Готовая картинка слоя для наложения.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LayerTexture {
+    /// Номер в общем списке текстур.
+    pub texture: u32,
+    /// Где в картинке нарисованы фигуры слоя: накладывается только этот прямоугольник.
+    pub rect: vk::Rect2D,
+}
+
+/// Общая часть двух прямоугольников пикселей или `None`, если её нет.
+fn intersect(a: vk::Rect2D, b: vk::Rect2D) -> Option<vk::Rect2D> {
+    let x0 = a.offset.x.max(b.offset.x);
+    let y0 = a.offset.y.max(b.offset.y);
+    let x1 = (a.offset.x + a.extent.width as i32).min(b.offset.x + b.extent.width as i32);
+    let y1 = (a.offset.y + a.extent.height as i32).min(b.offset.y + b.extent.height as i32);
+    (x1 > x0 && y1 > y0).then(|| vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: (x1 - x0) as u32,
+            height: (y1 - y0) as u32,
+        },
+    })
+}
+
+/// Пиксели кадра `extent`, которые накрывает прямоугольник сцены `b` (y вверх от −1 до 1,
+/// x от −aspect до aspect), с запасом в 2 пикселя. Не меньше 1×1, внутри кадра.
+fn pixel_rect(b: Bounds, aspect: f32, extent: vk::Extent2D) -> vk::Rect2D {
+    const PAD: f32 = 2.0;
+    let (w, h) = (extent.width as f32, extent.height as f32);
+    let to_x = |x: f32| (x / aspect + 1.0) * 0.5 * w;
+    let to_y = |y: f32| (1.0 - y) * 0.5 * h;
+    let clamp = |v: f32, max: f32| if v.is_nan() { 0.0 } else { v.clamp(0.0, max) };
+    let x0 = clamp((to_x(b[0]) - PAD).floor(), w - 1.0);
+    let x1 = clamp((to_x(b[2]) + PAD).ceil(), w);
+    let y0 = clamp((to_y(b[3]) - PAD).floor(), h - 1.0);
+    let y1 = clamp((to_y(b[1]) + PAD).ceil(), h);
+    vk::Rect2D {
+        offset: vk::Offset2D {
+            x: x0 as i32,
+            y: y0 as i32,
+        },
+        extent: vk::Extent2D {
+            width: ((x1 - x0) as u32).max(1),
+            height: ((y1 - y0) as u32).max(1),
+        },
     }
 }
 
@@ -925,6 +1057,7 @@ mod tests {
         paint: NO_PAINT,
         morph_stride: 0,
         morph_last: 0,
+        bounds: [-1.0, -1.0, 1.0, 1.0],
     };
 
     fn items(instances: &[Instance]) -> Vec<SceneItem> {
@@ -1201,6 +1334,11 @@ mod tests {
         assert!(packed.targets[3].is_empty());
         assert_eq!(packed.targets[4], [tri(5)]);
         assert_eq!(packed.layer_order, [2, 1, 4], "вложенные раньше внешних");
+        // Все экземпляры в нуле, прямоугольник фигуры ±1: у слоёв ±1, вложенный внутри
+        // внешнего; у пустого слоя пусто.
+        assert_eq!(packed.bounds[1], [-1.0, -1.0, 1.0, 1.0]);
+        assert_eq!(packed.bounds[2], [-1.0, -1.0, 1.0, 1.0]);
+        assert_eq!(packed.bounds[3], EMPTY_BOUNDS);
         assert_eq!(words(&packed.commands).len(), 6 * 4);
         assert!(!packed.overflow);
     }
@@ -1217,5 +1355,65 @@ mod tests {
         assert!(packed.overflow);
         assert_eq!(packed.instances.len(), MAX_INSTANCES * INSTANCE_SIZE);
         assert_eq!(words(&packed.commands)[1], MAX_INSTANCES as u32);
+    }
+
+    #[test]
+    fn layer_bounds_follow_instances_and_nested_layers() {
+        let ranges = [MeshRange {
+            index_count: 3,
+            bounds: [0.0, 0.0, 0.1, 0.2],
+            ..PLAIN
+        }];
+        let at = |t| SceneItem::from(Instance::new(ShapeId(0), t));
+        let items = [
+            SceneItem::layer(1.0),
+            at(Affine::translate((1.0, 0.0))),
+            SceneItem::layer(1.0),
+            // Повёрнут на 90°: (0..0.1, 0..0.2) → (−0.2..0, 0..0.1), потом сдвиг.
+            at(Affine::translate((-1.0, -0.5)) * Affine::rotate(std::f64::consts::FRAC_PI_2)),
+            SceneItem::EndLayer,
+            SceneItem::EndLayer,
+        ];
+        let packed = pack(&ranges, &items, FillMode::PerShape);
+        let near = |a: Bounds, b: Bounds| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(
+            near(packed.bounds[2], [-1.2, -0.5, -1.0, -0.4]),
+            "{:?}",
+            packed.bounds[2]
+        );
+        assert!(
+            near(packed.bounds[1], [-1.2, -0.5, 1.1, 0.2]),
+            "{:?}",
+            packed.bounds[1]
+        );
+    }
+
+    #[test]
+    fn pixel_rect_maps_scene_to_pixels_with_padding() {
+        let extent = vk::Extent2D {
+            width: 200,
+            height: 100,
+        };
+        // aspect 2: сцена x −2..2, y −1..1. Квадрат 0..1 × 0..0.5 → пиксели x 100..150,
+        // y 25..50, плюс 2 пикселя запаса.
+        let r = pixel_rect([0.0, 0.0, 1.0, 0.5], 2.0, extent);
+        assert_eq!((r.offset.x, r.offset.y), (98, 23));
+        assert_eq!((r.extent.width, r.extent.height), (54, 29));
+        // Вылезает за кадр: обрезается по краю.
+        let r = pixel_rect([-5.0, -5.0, 5.0, 5.0], 2.0, extent);
+        assert_eq!(
+            (r.offset.x, r.offset.y, r.extent.width, r.extent.height),
+            (0, 0, 200, 100)
+        );
+        // Пустой и за кадром: 1×1 внутри кадра.
+        for b in [EMPTY_BOUNDS, [10.0, 10.0, 11.0, 11.0]] {
+            let r = pixel_rect(b, 2.0, extent);
+            assert_eq!((r.extent.width, r.extent.height), (1, 1));
+            assert!(r.offset.x < 200 && r.offset.y < 100);
+        }
+        let full = vk::Rect2D::default().extent(extent);
+        assert!(intersect(r, full).is_some());
+        let a = pixel_rect([0.0, 0.0, 1.0, 0.5], 2.0, extent);
+        assert_eq!(intersect(a, full).map(|r| r.extent.width), Some(54));
     }
 }
