@@ -68,17 +68,35 @@ float soft_shadow(float2 p, float2 dir, float dist, float softness, float step_m
 {
     float lit = 1.0;
     float t = step_min;
-    float prev = 1e10;
+    float prev = -1.0; // поле на прошлом шаге (< 0 — шага ещё не было)
+    float step = 0.0;  // длина прошлого шага
     for (int i = 0; i < SHADOW_STEPS && t < dist; i++)
     {
         float h = field_at(p + dir * t);
         if (h < 0.0)
             return 0.0;
-        float y = h * h / (2.0 * prev);
-        float d = sqrt(max(h * h - y * y, 0.0));
+        // Ближайшая к фигуре точка луча между шагами: пересечение кругов «свободного
+        // места» радиусом prev вокруг прошлой точки и h вокруг текущей; y — насколько
+        // она позади текущей точки, d — её расстояние до фигуры. Шаг бывает длиннее prev
+        // (не короче точки поля), поэтому берётся настоящая длина шага; если круги не
+        // пересекаются (поле из картинки не точное), считаем просто по текущей точке.
+        // Раньше здесь стояла формула для шага ровно prev: при более длинном шаге она
+        // давала d = 0 и чёрные точки в тени у острых краёв фигур.
+        float y = 0.0;
+        float d = h;
+        if (prev >= 0.0)
+        {
+            float k = (step * step + h * h - prev * prev) / (2.0 * step);
+            if (k > 0.0 && k < h)
+            {
+                y = k;
+                d = sqrt(h * h - k * k);
+            }
+        }
         lit = min(lit, d / (softness * max(t - y, 1e-6)));
         prev = h;
-        t += max(h, step_min);
+        step = max(h, step_min);
+        t += step;
     }
     lit = saturate(lit);
     return lit * lit * (3.0 - 2.0 * lit);
