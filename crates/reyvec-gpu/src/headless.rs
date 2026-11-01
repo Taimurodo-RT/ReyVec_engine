@@ -283,6 +283,7 @@ fn render(
             demo.set_perceptual_edges(scene.perceptual_edges);
             demo.set_fill(scene.fill);
             demo.set_zoom(scene.zoom);
+            demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d

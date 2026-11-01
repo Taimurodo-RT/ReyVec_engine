@@ -34,7 +34,9 @@ pub use curves::{CurveMesh, curve_mesh};
 pub use kurbo;
 pub use kurbo::{Affine, BezPath, Circle, PathEl, Point, Rect, Vec2};
 pub use layer::{BlendMode, MaskMode, SceneItem, TextId, TextInstance};
-pub use library::{Instance, ShapeId, ShapeLibrary};
+pub use library::{
+    DETAIL_COARSEST, DETAIL_FINEST, DETAIL_LEVELS, DetailError, Instance, ShapeId, ShapeLibrary,
+};
 pub use morph::{MorphError, MorphMesh, morph_mesh};
 pub use paint::{Gradient, GradientKind, GradientStop, Paint, Spread};
 pub use shape::{FillMethod, FillRule, LineCap, LineJoin, Shape, Stroke, Style};
