@@ -7,6 +7,11 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # paste: макрос, который работает только при сборке (через nalgebra у fdsm, атлас букв
+    # 3.6). Автор больше его не развивает, но уязвимостей нет и в игру он не попадает.
+    { id = "RUSTSEC-2024-0436", reason = "paste: только при сборке, уязвимостей нет; придёт с fdsm через nalgebra" },
+]
 
 [licenses]
 version = 2

@@ -13,7 +13,7 @@
 //! по прозрачности (обрезка по силуэту, как clip-path в SVG, или мягкий край градиентом)
 //! или по яркости (белое видно, чёрное нет, как `mask` в SVG), можно обратную.
 
-use crate::Instance;
+use crate::{Affine, Color, Instance};
 
 /// Как слой накладывается на то, что под ним. Цвет слоя здесь уже умножен на его
 /// прозрачность.
@@ -68,6 +68,8 @@ impl MaskMode {
 pub enum SceneItem {
     /// Фигура.
     Shape(Instance),
+    /// Готовый блок текста (см. крейт `reyvec-text`).
+    Text(TextInstance),
     /// Начало слоя: всё до парного [`SceneItem::EndLayer`] рисуется в слой.
     BeginLayer { opacity: f32, blend: BlendMode },
     /// Конец слоя. Лишний конец пропускается, незакрытые слои закрываются в конце кадра.
@@ -81,6 +83,42 @@ pub enum SceneItem {
     EndMask,
 }
 
+/// Номер готового блока текста в библиотеке текста (`reyvec-text`). Здесь только номер:
+/// раскладка строк и атлас букв живут в своём крейте, а сцене нужно знать лишь, какой блок
+/// где стоит.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TextId(pub u32);
+
+/// Блок текста на сцене в этом кадре: как у фигуры, только место и оттенок. Буквы уже
+/// разложены по строкам и лежат на видеокарте, процессор каждый кадр пишет одну запись на
+/// блок, сколько бы в нём ни было букв.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextInstance {
+    pub text: TextId,
+    /// Из координат блока (левый верхний угол в нуле, y вверх, текст уходит вниз) в
+    /// координаты сцены.
+    pub transform: Affine,
+    /// Множитель цвета текста (прозрачность в `a`).
+    pub tint: Color,
+}
+
+impl TextInstance {
+    /// Блок `text` с левым верхним углом в точке `(x, y)` сцены, без поворота.
+    pub fn at(text: TextId, x: f64, y: f64) -> Self {
+        Self {
+            text,
+            transform: Affine::translate((x, y)),
+            tint: Color::WHITE,
+        }
+    }
+}
+
+impl From<TextInstance> for SceneItem {
+    fn from(t: TextInstance) -> Self {
+        Self::Text(t)
+    }
+}
+
 impl From<Instance> for SceneItem {
     fn from(i: Instance) -> Self {
         Self::Shape(i)
@@ -88,6 +126,23 @@ impl From<Instance> for SceneItem {
 }
 
 impl SceneItem {
+    /// Тот же элемент, сдвинутый преобразованием `place` (из его координат сцены в новые):
+    /// у фигур и текста оно ставится перед их собственным, скобки слоёв не меняются.
+    #[must_use]
+    pub fn placed(self, place: Affine) -> Self {
+        match self {
+            Self::Shape(mut i) => {
+                i.transform = place * i.transform;
+                Self::Shape(i)
+            }
+            Self::Text(mut t) => {
+                t.transform = place * t.transform;
+                Self::Text(t)
+            }
+            other => other,
+        }
+    }
+
     /// Начало слоя с прозрачностью `opacity` и обычным наложением.
     pub fn layer(opacity: f32) -> Self {
         Self::BeginLayer {

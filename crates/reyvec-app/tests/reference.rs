@@ -180,6 +180,15 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Motif, 2.5, false)
             },
         },
+        // Текст: заголовок, колонки с четырьмя выравниваниями, строки 10–32 пикселей,
+        // текст в слое с маской и повёрнутое слово.
+        Case {
+            name: "text-3s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Text, 3.0, false)
+            },
+        },
         Case {
             name: "vector-2s-msaa4-editor",
             scene: HeadlessScene {

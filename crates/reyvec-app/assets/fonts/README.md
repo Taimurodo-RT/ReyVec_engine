@@ -1,6 +1,6 @@
-# Шрифты панели отладки
+# Шрифты панели отладки и текста сцены
 
-Встроены в программу (`include_bytes!` в `crates/reyvec-app/src/panel.rs`).
+Встроены в программу (`include_bytes!` в `crates/reyvec-app/src/panel.rs`; Inter ещё и в `crates/reyvec-text/src/lib.rs`: шрифт текста на векторном слое по умолчанию).
 
 | Файл | Шрифт | Лицензия |
 | --- | --- | --- |
