@@ -556,6 +556,7 @@ impl WindowRenderer {
 
             if let (Some(demo), Some(res)) = (self.demo.as_mut(), self.resources.as_mut()) {
                 let data = demo.prepare(
+                    &self.ctx,
                     res,
                     self.frame_index,
                     extent,

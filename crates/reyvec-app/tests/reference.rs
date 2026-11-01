@@ -180,6 +180,15 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Motif, 2.5, false)
             },
         },
+        // Поток: к 25 с все 200 новых фигур добавлены во время работы и загружены
+        // внутри кадра.
+        Case {
+            name: "stream-25s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Stream, 25.0, false)
+            },
+        },
         Case {
             name: "vector-2s-msaa4-editor",
             scene: HeadlessScene {

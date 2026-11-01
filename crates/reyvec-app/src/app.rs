@@ -32,7 +32,7 @@ pub struct AppConfig {
     pub hot_reload: bool,
     /// Включить замеры для Tracy: программа Tracy сможет подключиться к движку.
     pub tracy: bool,
-    /// С какой сцены песочницы начать (клавиши 1–7 переключают).
+    /// С какой сцены песочницы начать (клавиши 1–8 переключают).
     pub scene: DemoScene,
     /// Сглаживание сцены (клавиша M переключает).
     pub msaa: Msaa,
@@ -307,6 +307,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::Digit5 | KeyCode::Numpad5 => Some(DemoScene::Masks),
         KeyCode::Digit6 | KeyCode::Numpad6 => Some(DemoScene::Svg),
         KeyCode::Digit7 | KeyCode::Numpad7 => Some(DemoScene::Motif),
+        KeyCode::Digit8 | KeyCode::Numpad8 => Some(DemoScene::Stream),
         _ => None,
     }
 }

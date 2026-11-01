@@ -311,7 +311,15 @@ fn render(
         .ctx("запись команд")?;
         let gpu = r.gpu.as_mut().expect("ресурсы созданы выше");
         let demo = r.demo.as_mut().expect("сцена создана выше");
-        let data = demo.prepare(gpu, 0, extent, scene.time, scene.shader_error, scene.scene);
+        let data = demo.prepare(
+            ctx,
+            gpu,
+            0,
+            extent,
+            scene.time,
+            scene.shader_error,
+            scene.scene,
+        );
         let demo = &*demo;
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();

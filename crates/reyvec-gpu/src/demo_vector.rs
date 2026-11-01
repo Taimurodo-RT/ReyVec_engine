@@ -59,7 +59,18 @@ pub(crate) struct VectorDemo {
     user_svg: bool,
     /// Сцена «Motif»: перетекающие фигуры из файла (пример или свой).
     motif: Vec<MorphShape>,
+    /// Сцена «поток»: фигуры, добавленные во время работы (по одной каждые
+    /// 1 / [`STREAM_RATE`] секунды), и когда каждая появилась.
+    stream: Vec<(ShapeId, f32)>,
 }
+
+/// Сколько новых фигур в секунду добавляет сцена «поток».
+const STREAM_RATE: f32 = 10.0;
+/// Сетка сцены «поток»: столбцов, строк. Когда она заполнится, фигуры больше не добавляются.
+const STREAM_GRID: (usize, usize) = (20, 10);
+/// Радиус фигуры потока в единицах сцены (примерно её размер в кадре 16:9): под него
+/// подобран допуск разбиения кривых.
+const STREAM_SIZE: f64 = 0.08;
 
 /// Пример файла от Motif: круг → звезда → сердце, «плей» → «пауза», рот.
 const MOTIF_EXAMPLE: &[u8] = include_bytes!("../../../assets/motif/morph.reyvec.json");
@@ -202,6 +213,7 @@ impl VectorDemo {
             svgs: Vec::new(),
             user_svg: false,
             motif: Vec::new(),
+            stream: Vec::new(),
         }
         .with_svgs(files.svg.as_deref())
         .with_motif(files.motif.as_deref())
@@ -236,6 +248,45 @@ impl VectorDemo {
             .or_else(|| load("пример", MOTIF_EXAMPLE))
             .unwrap_or_default();
         self
+    }
+
+    /// Сцена «поток» в момент `time`: добавляет в набор фигуры, которым пора появиться
+    /// (каждая новая: своя форма из кривых, свой цвет, у каждой третьей градиент, у каждой
+    /// пятой обводка), и раскладывает все сеткой. Новые фигуры режутся на треугольники
+    /// здесь же, а на видеокарту попадают внутри кадра без ожидания
+    /// (`VectorRenderer::stream`). Появившись, фигура за 0,3 с вырастает из точки.
+    pub fn stream_items(&mut self, time: f32, aspect: f32) -> Vec<SceneItem> {
+        let (cols, rows) = STREAM_GRID;
+        let wanted = ((time.max(0.0) * STREAM_RATE) as usize + 1).min(cols * rows);
+        while self.stream.len() < wanted {
+            let i = self.stream.len();
+            let shape = stream_shape(i);
+            match self.library.add(shape) {
+                Ok(id) => self.stream.push((id, i as f32 / STREAM_RATE)),
+                Err(e) => {
+                    tracing::error!("фигура потока №{i}: {e}");
+                    break;
+                }
+            }
+        }
+        let aspect = f64::from(aspect);
+        let (cw, ch) = (2.0 * aspect / cols as f64, 2.0 / rows as f64);
+        self.stream
+            .iter()
+            .enumerate()
+            .map(|(i, &(id, born))| {
+                let (c, r) = (i % cols, i / cols);
+                let center = (-aspect + cw * (c as f64 + 0.5), 1.0 - ch * (r as f64 + 0.5));
+                let grow = ((time - born) / 0.3).clamp(0.0, 1.0);
+                let k = cw.min(ch) * 0.45 / STREAM_SIZE * f64::from(grow * (2.0 - grow));
+                SceneItem::Shape(Instance::new(
+                    id,
+                    Affine::translate(center)
+                        * Affine::rotate(f64::from(time) * 0.3 + i as f64)
+                        * Affine::scale(k),
+                ))
+            })
+            .collect()
     }
 
     /// Сцена «Motif» в момент `time`: фигуры в ряд (до четырёх в ряду), каждая по
@@ -639,6 +690,63 @@ impl VectorDemo {
     }
 }
 
+/// Число от 0 до 1 из номера `i` и соли `salt`: одинаковое при каждом запуске.
+fn noise(i: usize, salt: u64) -> f64 {
+    let mut x =
+        (i as u64 ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_add(0x632B_E59B_D9B4_E019);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Фигура потока №`i`: гладкое пятно радиуса около [`STREAM_SIZE`] из квадратичных кривых через
+/// середины между случайными точками на окружности.
+fn stream_shape(i: usize) -> Shape {
+    let n = 5 + (noise(i, 1) * 5.0) as usize;
+    let points: Vec<(f64, f64)> = (0..n)
+        .map(|k| {
+            let a = TAU * k as f64 / n as f64;
+            let r = STREAM_SIZE * (0.55 + 0.45 * noise(i * 16 + k, 2));
+            (r * a.cos(), r * a.sin())
+        })
+        .collect();
+    let mid = |a: (f64, f64), b: (f64, f64)| ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let mut path = BezPath::new();
+    path.move_to(mid(points[n - 1], points[0]));
+    for k in 0..n {
+        path.quad_to(points[k], mid(points[k], points[(k + 1) % n]));
+    }
+    path.close_path();
+    // Цвета по кругу оттенков с шагом «золотого угла»: соседние фигуры не похожи.
+    let hue = (i as f64 * 0.618_034).fract();
+    let color = hsv(hue, 0.65, 0.95);
+    if i % 5 == 4 {
+        return Shape::stroke(
+            path,
+            Stroke::new(STREAM_SIZE * 0.18).with_join(LineJoin::Round),
+            color,
+        );
+    }
+    if i % 3 == 2 {
+        let gradient = Gradient::linear((0.0, -STREAM_SIZE), (0.0, STREAM_SIZE))
+            .stop(0.0, color)
+            .stop(1.0, hsv((hue + 0.15).fract(), 0.5, 1.0));
+        return Shape::fill(path, gradient);
+    }
+    Shape::fill(path, color)
+}
+
+/// Цвет из оттенка, насыщенности и яркости (всё от 0 до 1), в sRGB.
+fn hsv(h: f64, s: f64, v: f64) -> Color {
+    let f = |n: f64| {
+        let k = (n + h * 6.0) % 6.0;
+        v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    let byte = |x: f64| (x * 255.0).round() as u8;
+    Color::from_srgb8(byte(f(5.0)), byte(f(3.0)), byte(f(1.0)))
+}
+
 /// Прямоугольник `w`×`h` с центром в нуле.
 fn rect(w: f64, h: f64) -> BezPath {
     use reyvec_vector::kurbo::Shape as _;
@@ -753,6 +861,14 @@ mod tests {
                     != !demo.library.morph_keyframes(id).is_empty())
         );
         assert_eq!(demo.motif.len(), 3);
+        let mut demo = demo;
+        let before = demo.library.len();
+        assert_eq!(demo.stream_items(0.0, 1.0).len(), 1);
+        assert_eq!(demo.stream_items(100.0, 1.0).len(), 200);
+        assert_eq!(demo.library.len(), before + 200);
+        // Повторный вызов не добавляет фигур.
+        demo.stream_items(100.0, 1.0);
+        assert_eq!(demo.library.len(), before + 200);
         let motif = demo.motif_items(1.0, 16.0 / 9.0);
         assert_eq!(motif.len(), 3);
         assert_eq!(demo.library.method(demo.heart), Some(FillMethod::Stencil));
