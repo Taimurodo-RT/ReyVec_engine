@@ -45,8 +45,10 @@ pub struct AppConfig {
     pub fill: reyvec_gpu::FillMode,
     /// Лупа векторной сцены (клавиша Z переключает).
     pub zoom: bool,
-    /// Свои файлы для сцен «SVG» и «Motif».
+    /// Свои файлы для сцен «SVG», «Motif» и «из файла».
     pub files: reyvec_gpu::UserFiles,
+    /// Файл сцены, за которым следить: после сохранения сцена «из файла» обновляется.
+    pub scene_file: Option<std::path::PathBuf>,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -106,6 +108,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         closed_at: None,
         cursor: None,
         dragging: false,
+        scene_watcher: None,
+        scene_file_label: None,
     };
     event_loop
         .run_app(&mut app)
@@ -156,6 +160,9 @@ struct App {
     cursor: Option<PhysicalPosition<f64>>,
     /// Левая кнопка мыши зажата над сценой: движение мыши двигает камеру.
     dragging: bool,
+    /// Слежка за файлом сцены (5.1) и его путь для панели.
+    scene_watcher: Option<reyvec_scene::SceneWatcher>,
+    scene_file_label: Option<String>,
 }
 
 impl App {
@@ -207,6 +214,17 @@ impl App {
             tracing::info!("Перезагрузка шейдеров включена");
         }
         tracing::info!("Панель счётчиков: F1 показывает и прячет");
+        if let Some(path) = &self.config.scene_file {
+            match reyvec_scene::SceneWatcher::new(path) {
+                Ok(w) => {
+                    self.scene_file_label = Some(w.path().display().to_string());
+                    self.scene_watcher = Some(w);
+                }
+                Err(e) => {
+                    tracing::warn!("Не удалось следить за файлом сцены {}: {e}", path.display())
+                }
+            }
+        }
         self.panel = Some(Panel::new(&window));
         self.window = Some(window);
         let mut renderer = renderer;
@@ -333,6 +351,16 @@ impl App {
             return;
         };
         let _zone = reyvec_gpu::cpu_zone!("кадр");
+        if let Some(watcher) = self.scene_watcher.as_mut() {
+            match watcher.poll() {
+                Some(Ok(text)) => {
+                    tracing::info!("Файл сцены сохранён, читаю заново");
+                    renderer.set_scene_file(&text);
+                }
+                Some(Err(e)) => tracing::warn!("Файл сцены: {e}"),
+                None => {}
+            }
+        }
         let size = window.inner_size();
         let time = self.start.elapsed().as_secs_f32();
         let msaa_options: Vec<Msaa> = [Msaa::Off, Msaa::X2, Msaa::X4, Msaa::X8]
@@ -352,6 +380,8 @@ impl App {
                 validation_errors: reyvec_gpu::validation_error_count(),
                 hot_reload: renderer.shaders_hot_reload(),
                 shader_error: renderer.shader_error(),
+                scene_file: self.scene_file_label.as_deref(),
+                scene_error: renderer.scene_error(),
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),
@@ -394,9 +424,15 @@ impl App {
                     }
                 }
                 let now = Instant::now();
-                let base = match renderer.shader_error() {
-                    Some(err) => format!("ОШИБКА ШЕЙДЕРА: {err} | {}", self.config.title),
-                    None => self.config.title.clone(),
+                let scene_error = renderer
+                    .scene_error()
+                    .filter(|_| renderer.scene() == DemoScene::File);
+                let base = match (renderer.shader_error(), scene_error) {
+                    (Some(err), _) => format!("ОШИБКА ШЕЙДЕРА: {err} | {}", self.config.title),
+                    (None, Some(err)) => {
+                        format!("ОШИБКА В ФАЙЛЕ СЦЕНЫ: {err} | {}", self.config.title)
+                    }
+                    (None, None) => self.config.title.clone(),
                 };
                 if let Some(title) = self.stats.frame(now, &base) {
                     window.set_title(&title);
@@ -454,6 +490,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::KeyK => Some(DemoScene::Lamps),
         KeyCode::KeyJ => Some(DemoScene::Blobs),
         KeyCode::KeyH => Some(DemoScene::Lab),
+        KeyCode::KeyN => Some(DemoScene::File),
         _ => None,
     }
 }

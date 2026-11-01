@@ -58,6 +58,7 @@ const SCENES: &[(&str, &[(DemoScene, &str)])] = &[
             (DemoScene::Lab, "H"),
         ],
     ),
+    ("Этап 5: сцена", &[(DemoScene::File, "N")]),
 ];
 
 /// Что показывает панель. Собирается окном каждый кадр.
@@ -74,6 +75,9 @@ pub(crate) struct PanelInfo<'a> {
     pub validation_errors: u32,
     pub hot_reload: bool,
     pub shader_error: Option<String>,
+    /// Файл сцены «из файла» (если за ним следим) и ошибка последнего сохранения.
+    pub scene_file: Option<&'a str>,
+    pub scene_error: Option<String>,
     /// Имя файла последнего снимка кадра.
     pub last_snapshot: Option<&'a str>,
     /// Название сцены песочницы.
@@ -264,6 +268,22 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             ui.label("Шейдеры: перезагрузка на лету включена");
         }
         None => {}
+    }
+    if info.scene_id == DemoScene::File {
+        match (&info.scene_error, info.scene_file) {
+            (Some(err), _) => {
+                ui.label(
+                    RichText::new(format!("Ошибка в файле сцены: {err}"))
+                        .color(Color32::from_rgb(255, 90, 80)),
+                );
+            }
+            (None, Some(path)) => {
+                ui.label(format!("Файл сцены: {path} (правка видна сразу)"));
+            }
+            (None, None) => {
+                ui.label("Файл сцены: встроенный пример (файл не найден)");
+            }
+        }
     }
     if let Some(name) = info.last_snapshot {
         ui.label(mono(format!("Снимок: {name}")));
@@ -558,6 +578,8 @@ mod tests {
             validation_errors: 0,
             hot_reload: true,
             shader_error: None,
+            scene_file: None,
+            scene_error: None,
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
             msaa: "MSAA 4×",

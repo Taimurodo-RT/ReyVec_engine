@@ -101,6 +101,26 @@ impl SdfObject {
     }
 }
 
+// Файл сцены (5.1) проверяет те же пределы, что у видеокарты.
+const _: () =
+    assert!(reyvec_scene::MAX_OBJECTS == MAX_OBJECTS && reyvec_scene::MAX_PARTS == MAX_BLOBS);
+
+impl From<&reyvec_scene::SceneObject> for SdfObject {
+    fn from(o: &reyvec_scene::SceneObject) -> Self {
+        Self {
+            blobs: o
+                .parts
+                .iter()
+                .map(|p| Blob::capsule(p.a, p.b, p.r))
+                .collect(),
+            k: o.k,
+            color: o.color,
+            flags: if o.glow { OBJECT_EMISSIVE } else { 0 }
+                | if o.shadow { OBJECT_CASTS_SHADOW } else { 0 },
+        }
+    }
+}
+
 /// Записи объектов и частей для буферов видеокарты (не больше [`MAX_OBJECTS`] и
 /// [`MAX_BLOBS`]; лишнее отбрасывается).
 pub(crate) fn pack(objects: &[SdfObject]) -> (Vec<u8>, Vec<u8>, u32) {

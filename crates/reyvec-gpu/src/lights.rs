@@ -99,6 +99,25 @@ impl Light {
     }
 }
 
+// Файл сцены (5.1) проверяет то же число источников, что берёт видеокарта.
+const _: () = assert!(reyvec_scene::MAX_LIGHTS == MAX_LIGHTS);
+
+impl From<&reyvec_scene::SceneLight> for Light {
+    fn from(l: &reyvec_scene::SceneLight) -> Self {
+        Self {
+            kind: match l.kind {
+                reyvec_scene::LightKind::Local => LightKind::Local,
+                reyvec_scene::LightKind::Directional => LightKind::Directional,
+            },
+            a: l.a,
+            b: l.b,
+            color: l.color,
+            reach: l.reach,
+            softness: l.softness,
+        }
+    }
+}
+
 /// Общий тусклый свет, который есть везде, даже в тени (линейный цвет).
 pub(crate) const AMBIENT: [f32; 3] = [0.06, 0.065, 0.08];
 

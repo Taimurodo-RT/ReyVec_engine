@@ -12,7 +12,9 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
-//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph|light|lamps|blobs|lab`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph|light|lamps|blobs|lab|file`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene-file <файл.ron>`: свой файл сцены для сцены «из файла» (клавиша N); без него
+//!   берётся `scenes/first-room.ron` из папки проекта. После сохранения файла сцена обновляется;
 //! - `--msaa off|2|4|8`: сглаживание сцены (по умолчанию 2 на встроенной видеокарте, 4 на остальных);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
@@ -48,8 +50,11 @@ const HELP: &str = "\
                          фигур), stress-morph (10 000 перетекающих фигур),
                          light (свет на SDF, этап 4; клавиша L), lamps (лампы
                          и мягкие тени; клавиша K), blobs (слизь, капли и магия
-                         из SDF; клавиша J) или lab (демо-сцена «лаборатория мага»;
-                         клавиша H)
+                         из SDF; клавиша J), lab (демо-сцена «лаборатория мага»;
+                         клавиша H) или file (сцена из файла, этап 5; клавиша N)
+  --scene-file <файл.ron>  свой файл сцены для сцены «из файла» (с неё и начнёт); без него
+                         берётся scenes\\first-room.ron из папки проекта. Правка файла
+                         видна в окне сразу после сохранения
   --svg <файл.svg>       показать свой рисунок SVG в сцене «SVG» (клавиша 6, с неё и начнёт)
   --motif <файл.reyvec.json>  показать свои перетекающие фигуры от Motif в сцене «Motif»
                          (клавиша 7, с неё и начнёт)
@@ -92,6 +97,7 @@ struct Args {
     zoom: bool,
     svg: Option<String>,
     motif: Option<String>,
+    scene_file: Option<String>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -125,11 +131,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--scene" => {
                 let n = it.next().ok_or(
-                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs или lab",
+                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs, lab или file",
                 )?;
                 out.scene = Some(reyvec_app::DemoScene::from_name(&n).ok_or_else(|| {
                     format!(
-                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs или lab"
+                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs, lab или file"
                     )
                 })?);
             }
@@ -156,6 +162,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 out.motif = Some(
                     it.next()
                         .ok_or("после --motif нужен путь к файлу *.reyvec.json")?,
+                );
+            }
+            "--scene-file" => {
+                out.scene_file = Some(
+                    it.next()
+                        .ok_or("после --scene-file нужен путь к файлу сцены .ron")?,
                 );
             }
             "--snapshot" => {
@@ -190,6 +202,56 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
     let (w, h) = s.split_once(['x', 'X', 'х', 'Х', '×'])?;
     let ok = |v: u32| (1..=8192).contains(&v).then_some(v);
     Some((ok(w.trim().parse().ok()?)?, ok(h.trim().parse().ok()?)?))
+}
+
+/// Пример сцены в папке проекта: рядом с `dist` (где лежит собранная песочница) или там,
+/// где проект собирали.
+fn default_scene_file() -> Option<std::path::PathBuf> {
+    const NAME: &str = "scenes/first-room.ron";
+    let near_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join(NAME)));
+    let built_here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(NAME);
+    near_exe
+        .into_iter()
+        .chain([built_here])
+        .find(|p| p.is_file())
+}
+
+/// Файл сцены для сцены «из файла» и его текст: свой (`--scene-file`) или пример из папки
+/// проекта. Если примера нет рядом, сцена берёт встроенную копию и за файлом не следит.
+#[allow(clippy::type_complexity)]
+fn scene_file(
+    own: &Option<String>,
+) -> Result<(Option<std::path::PathBuf>, Option<std::sync::Arc<str>>), ExitCode> {
+    let path = match own {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match default_scene_file() {
+            Some(p) => p,
+            None => {
+                tracing::info!(
+                    "Файл сцены scenes/first-room.ron не найден, беру встроенный пример"
+                );
+                return Ok((None, None));
+            }
+        },
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            tracing::info!("Файл сцены: {}", path.display());
+            Ok((Some(path), Some(text.into())))
+        }
+        Err(e) => {
+            tracing::error!("Не прочитать файл сцены «{}»: {e}", path.display());
+            if own.is_some() {
+                Err(ExitCode::FAILURE)
+            } else {
+                Ok((None, None))
+            }
+        }
+    }
 }
 
 /// Рисует кадр без окна и сохраняет его в `path`.
@@ -307,13 +369,23 @@ fn main() -> ExitCode {
             }
         },
     };
+    let (scene_file, scene_text) = match scene_file(&args.scene_file) {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
     let files = match (read("SVG", &args.svg), read("файл Motif", &args.motif)) {
-        (Ok(svg), Ok(motif)) => reyvec_app::UserFiles { svg, motif },
+        (Ok(svg), Ok(motif)) => reyvec_app::UserFiles {
+            svg,
+            motif,
+            scene: scene_text,
+        },
         (Err(code), _) | (_, Err(code)) => return code,
     };
     // Со своим файлом песочница начинает с его сцены.
     if args.scene.is_none() {
-        if files.motif.is_some() {
+        if args.scene_file.is_some() {
+            args.scene = Some(reyvec_app::DemoScene::File);
+        } else if files.motif.is_some() {
             args.scene = Some(reyvec_app::DemoScene::Motif);
         } else if files.svg.is_some() {
             args.scene = Some(reyvec_app::DemoScene::Svg);
@@ -337,6 +409,7 @@ fn main() -> ExitCode {
         fill: args.fill.unwrap_or_default(),
         zoom: args.zoom,
         files,
+        scene_file,
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
@@ -452,6 +525,15 @@ mod tests {
             Some(reyvec_app::DemoScene::Svg)
         );
         assert_eq!(parse("--svg a.svg").unwrap().svg.as_deref(), Some("a.svg"));
+        assert_eq!(
+            parse("--scene file").unwrap().scene,
+            Some(reyvec_app::DemoScene::File)
+        );
+        assert_eq!(
+            parse("--scene-file my.ron").unwrap().scene_file.as_deref(),
+            Some("my.ron")
+        );
+        assert!(parse("--scene-file").is_err());
         assert!(parse("--svg").is_err());
         assert_eq!(
             parse("--scene motif").unwrap().scene,

@@ -243,6 +243,14 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Lab, 2.0, false)
             },
         },
+        // Этап 5.1: сцена из файла `scenes/first-room.ron` (встроенная копия примера).
+        Case {
+            name: "file-first-room-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::File, 0.0, false)
+            },
+        },
     ]
 }
 
@@ -624,5 +632,72 @@ fn blobs_scene_draws_slime_and_glowing_orb() {
     assert!(
         sum(floor) * 2 > sum(corner) * 3,
         "пол у лампы {floor:?}, угол {corner:?}"
+    );
+}
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn file_scene_draws_what_the_text_says() {
+    // Сцена «из файла» (5.1): красный квадрат в слое с тенью, лампа справа от него и
+    // зелёный светящийся шар слева. Квадрат красный, шар зелёный и яркий, а за квадратом
+    // (с другой стороны от лампы) тень темнее, чем пол перед ним.
+    let text = r##"(
+        format: "reyvec-scene",
+        version: 1,
+        layers: [(shadow: true, shapes: [Rect(at: (0.0, 0.0), size: (0.3, 0.3), color: "#ff2020")])],
+        lights: [Point(at: (0.6, 0.0), color: "#ffffff", power: 2.0, reach: 3.0, size: 0.02)],
+        objects: [(parts: [Circle(at: (-1.2, 0.6), r: 0.1)], color: "#20ff40", power: 3.0, glow: true)],
+    )"##;
+    let (width, height) = (640u32, 360u32);
+    let scene = HeadlessScene {
+        width,
+        height,
+        time: 0.0,
+        shader_error: false,
+        scene: DemoScene::File,
+        msaa: Msaa::X4,
+        perceptual_edges: false,
+        fill: FillMode::Triangles,
+        zoom: false,
+        files: reyvec_app::UserFiles {
+            scene: Some(text.into()),
+            ..Default::default()
+        },
+        cascades: false,
+    };
+    let options = GpuOptions {
+        validation: true,
+        gpu: None,
+    };
+    let frame = render_headless(&options, &scene).expect("кадр без окна");
+    assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+    let aspect = width as f32 / height as f32;
+    let pixel = |x: f32, y: f32| {
+        let px = ((x / aspect + 1.0) * 0.5 * width as f32) as u32;
+        let py = ((1.0 - y) * 0.5 * height as f32) as u32;
+        let i = ((py * width + px) * 4) as usize;
+        [
+            u32::from(frame.image.rgba[i]),
+            u32::from(frame.image.rgba[i + 1]),
+            u32::from(frame.image.rgba[i + 2]),
+        ]
+    };
+    let sum = |c: [u32; 3]| c.iter().sum::<u32>();
+    let rect = pixel(0.0, 0.0);
+    let orb = pixel(-1.2, 0.6);
+    let lit = pixel(0.3, 0.0);
+    let shadow = pixel(-0.4, 0.0);
+    eprintln!("квадрат {rect:?}, шар {orb:?}, пол у лампы {lit:?}, в тени {shadow:?}");
+    assert!(
+        rect[0] > rect[1] * 2 && rect[0] > rect[2] * 2,
+        "квадрат не красный: {rect:?}"
+    );
+    assert!(
+        orb[1] > orb[0] && orb[1] > orb[2],
+        "шар не зелёный: {orb:?}"
+    );
+    assert!(
+        sum(lit) > sum(shadow) * 3 / 2,
+        "нет тени: у лампы {lit:?}, за квадратом {shadow:?}"
     );
 }

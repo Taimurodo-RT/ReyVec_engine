@@ -89,6 +89,9 @@ pub enum DemoScene {
     /// Этап 4: демо-сцена «лаборатория мага» (4.6): всё вместе — векторные предметы с
     /// тенями, светящиеся зелья, неон, свеча, котёл и магический шар.
     Lab,
+    /// Этап 5: сцена из файла (`scenes/first-room.ron` или свой файл): правка файла
+    /// сразу видна в окне (5.1).
+    File,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -98,6 +101,8 @@ pub struct UserFiles {
     pub svg: Option<std::sync::Arc<[u8]>>,
     /// Перетекающие фигуры от Motif (`*.reyvec.json`) для сцены «Motif».
     pub motif: Option<std::sync::Arc<[u8]>>,
+    /// Текст файла сцены (RON) для сцены «из файла». Без него — пример «первая комната».
+    pub scene: Option<std::sync::Arc<str>>,
 }
 
 impl DemoScene {
@@ -119,12 +124,13 @@ impl DemoScene {
             Self::Lamps => "лампы и тени",
             Self::Blobs => "слизь и магия",
             Self::Lab => "лаборатория мага",
+            Self::File => "из файла",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
     /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph`, `light`, `lamps`,
-    /// `blobs` или `lab`.
+    /// `blobs`, `lab` или `file`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -142,13 +148,17 @@ impl DemoScene {
             "lamps" => Some(Self::Lamps),
             "blobs" => Some(Self::Blobs),
             "lab" => Some(Self::Lab),
+            "file" => Some(Self::File),
             _ => None,
         }
     }
 
     /// Сцены этапа 4 с SDF-фигурами и полем расстояний.
     pub fn uses_field(self) -> bool {
-        matches!(self, Self::Light | Self::Lamps | Self::Blobs | Self::Lab)
+        matches!(
+            self,
+            Self::Light | Self::Lamps | Self::Blobs | Self::Lab | Self::File
+        )
     }
 
     /// Сцены с SDF-фигурами библиотеки на весь экран (`sdf_demo.slang`); у остальных
@@ -159,7 +169,7 @@ impl DemoScene {
 
     /// Сцены этапа 4, освещённые лампами (свет, тени, свечение).
     pub fn uses_lights(self) -> bool {
-        matches!(self, Self::Lamps | Self::Blobs | Self::Lab)
+        matches!(self, Self::Lamps | Self::Blobs | Self::Lab | Self::File)
     }
 
     /// Другой вариант стресс-теста (движение ↔ перетекание). У остальных сцен `None`.
@@ -316,6 +326,9 @@ pub(crate) struct FrameData {
     objects_address: vk::DeviceAddress,
     blobs_address: vk::DeviceAddress,
     object_count: u32,
+    /// Общий тусклый свет (линейный цвет) и фон «лаборатории» (каменная стена и пол).
+    ambient: [f32; 3],
+    lab_backdrop: bool,
     time: f32,
     aspect: f32,
     extent: vk::Extent2D,
@@ -390,6 +403,11 @@ pub(crate) struct Demo {
     /// (остальные за краем экрана).
     vector_items: usize,
     vector_drawn: usize,
+    /// Сцена «из файла» (5.1): последняя сцена, которая прочиталась без ошибок, готовые
+    /// формы её фигур и ошибка последнего сохранения файла (если была).
+    file_scene: reyvec_scene::Scene,
+    file_shapes: reyvec_scene::ShapeCache,
+    scene_error: Option<String>,
 }
 
 /// Во сколько раз увеличивает лупа векторной сцены.
@@ -497,6 +515,9 @@ impl Demo {
             sdf: vk::Pipeline::null(),
             field: FieldPipelines::default(),
             light_field: false,
+            file_scene: reyvec_scene::Scene::default(),
+            file_shapes: reyvec_scene::ShapeCache::new(),
+            scene_error: None,
             field_downscale: field_downscale_for(ctx.adapter.kind),
             light: vk::Pipeline::null(),
             light_buffers,
@@ -534,6 +555,7 @@ impl Demo {
             vector_items: 0,
             vector_drawn: 0,
         };
+        demo.set_scene_file(files.scene.as_deref().unwrap_or(reyvec_scene::EXAMPLE));
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
             demo.triangle = build(
@@ -608,6 +630,39 @@ impl Demo {
                 Err(e)
             }
         }
+    }
+
+    /// Читает текст файла сцены для сцены «из файла». Если в нём ошибка, остаётся прошлая
+    /// сцена, а ошибка видна через [`Demo::scene_error`]. Новые формы фигур нарезаются
+    /// здесь же и едут на видеокарту в следующем кадре.
+    pub fn set_scene_file(&mut self, text: &str) {
+        let _zone = crate::cpu_zone!("файл сцены");
+        let started = std::time::Instant::now();
+        let built = reyvec_scene::SceneFile::parse(text)
+            .and_then(|f| f.build(&mut self.vector_demo.library, &mut self.file_shapes));
+        match built {
+            Ok(scene) => {
+                tracing::info!(
+                    "Сцена из файла: фигур {}, источников света {}, SDF-объектов {}, разных форм {} ({:.2} мс)",
+                    scene.shapes,
+                    scene.lights.len(),
+                    scene.objects.len(),
+                    self.file_shapes.len(),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                self.file_scene = scene;
+                self.scene_error = None;
+            }
+            Err(e) => {
+                tracing::warn!("Файл сцены не принят: {e}");
+                self.scene_error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Ошибка в последнем сохранении файла сцены (рисуется прошлая сцена).
+    pub fn scene_error(&self) -> Option<&str> {
+        self.scene_error.as_deref()
     }
 
     /// Сглаживание, с которым рисуется сцена.
@@ -1000,6 +1055,7 @@ impl Demo {
                 self.vector_demo.light_items(time)
             }
             DemoScene::Lab => self.vector_demo.lab.items(time),
+            DemoScene::File => self.file_scene.items.clone(),
             DemoScene::Stress | DemoScene::StressMorph => self
                 .vector_demo
                 .stress_instances(time, aspect, scene == DemoScene::StressMorph)
@@ -1131,6 +1187,7 @@ impl Demo {
             DemoScene::Lamps => crate::lights::demo_lights(time),
             DemoScene::Blobs => crate::blobs::demo_lights(time),
             DemoScene::Lab => crate::lab::lights(time),
+            DemoScene::File => self.file_scene.lights.iter().map(Into::into).collect(),
             _ => Vec::new(),
         };
         let light_count = lights.len().min(MAX_LIGHTS);
@@ -1143,6 +1200,7 @@ impl Demo {
         let objects = match scene {
             DemoScene::Blobs => crate::blobs::demo_objects(time),
             DemoScene::Lab => crate::lab::objects(time),
+            DemoScene::File => self.file_scene.objects.iter().map(Into::into).collect(),
             _ => Vec::new(),
         };
         let (object_bytes, blob_bytes, object_count) = crate::blobs::pack(&objects);
@@ -1161,6 +1219,14 @@ impl Demo {
             objects_address: res.buffer_address(object_buffer),
             blobs_address: res.buffer_address(blob_buffer),
             object_count,
+            ambient: if scene == DemoScene::File {
+                self.file_scene.ambient
+            } else {
+                crate::lights::AMBIENT
+            },
+            lab_backdrop: scene == DemoScene::Lab
+                || (scene == DemoScene::File
+                    && self.file_scene.background == reyvec_scene::Background::Lab),
             time,
             aspect,
             extent,
@@ -1343,7 +1409,7 @@ impl Demo {
                         field_texture,
                         frame.scene.uses_lights(),
                         !frame.scene.has_demo_shapes(),
-                        frame.scene == DemoScene::Lab,
+                        frame.lab_backdrop,
                     );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sdf);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
@@ -1690,9 +1756,9 @@ impl Demo {
                     camera.center.y as f32,
                     frame.aspect,
                     camera.zoom as f32,
-                    crate::lights::AMBIENT[0],
-                    crate::lights::AMBIENT[1],
-                    crate::lights::AMBIENT[2],
+                    frame.ambient[0],
+                    frame.ambient[1],
+                    frame.ambient[2],
                 ];
                 for (i, v) in values.into_iter().enumerate() {
                     push[16 + 4 * i..20 + 4 * i].copy_from_slice(&v.to_ne_bytes());
@@ -1805,6 +1871,7 @@ impl Demo {
         let c0 = images[0];
         let probes = sizes[0].1;
         let pipeline = self.rc_gather;
+        let ambient = frame.ambient;
         graph.add_pass(
             "свет",
             &[(c0, Access::Sampled), (light, Access::ColorAttachment)],
@@ -1813,7 +1880,7 @@ impl Demo {
                 push[..4].copy_from_slice(&p.texture(c0).to_ne_bytes());
                 push[8..12].copy_from_slice(&probes[0].to_ne_bytes());
                 push[12..16].copy_from_slice(&probes[1].to_ne_bytes());
-                for (k, v) in crate::lights::AMBIENT.into_iter().enumerate() {
+                for (k, v) in ambient.into_iter().enumerate() {
                     push[16 + 4 * k..20 + 4 * k].copy_from_slice(&v.to_ne_bytes());
                 }
                 draw(p, light, size, pipeline, &push);
