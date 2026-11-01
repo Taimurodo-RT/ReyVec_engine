@@ -1,10 +1,11 @@
-//! Панель со счётчиками поверх кадра (egui). F1 показывает и прячет её.
+//! Панели поверх кадра (egui): счётчики слева, выбор сцены и настройки справа. F1
+//! показывает и прячет обе.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, RichText};
-use reyvec_gpu::{GpuFrameTimings, GraphReport, UiFrame};
+use reyvec_gpu::{DemoScene, FillMode, GpuFrameTimings, GraphReport, Msaa, UiFrame};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
@@ -12,6 +13,40 @@ use winit::window::Window;
 const GPU_BUDGET_MS: f64 = 4.0;
 /// Сколько последних кадров видно на графике.
 const HISTORY: usize = 240;
+
+/// Что попросили мышкой на панели. То же, что делают клавиши.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PanelAction {
+    Scene(DemoScene),
+    Msaa(Msaa),
+    CompactScene(bool),
+    PerceptualEdges(bool),
+    Fill(FillMode),
+    Zoom(bool),
+    ResetCamera,
+    Snapshot,
+}
+
+/// Сцены песочницы по этапам и клавиши, которые их включают.
+const SCENES: &[(&str, &[(DemoScene, &str)])] = &[
+    ("Этап 2", &[(DemoScene::Gpu, "1")]),
+    (
+        "Этап 3: векторы",
+        &[
+            (DemoScene::Vector, "2"),
+            (DemoScene::Morph, "3"),
+            (DemoScene::Layers, "4"),
+            (DemoScene::Masks, "5"),
+            (DemoScene::Svg, "6"),
+            (DemoScene::Motif, "7"),
+            (DemoScene::Stream, "8"),
+            (DemoScene::Text, "9"),
+            (DemoScene::Stress, "0"),
+            (DemoScene::StressMorph, "T"),
+        ],
+    ),
+    ("Этап 4: свет", &[(DemoScene::Light, "L")]),
+];
 
 /// Что показывает панель. Собирается окном каждый кадр.
 pub(crate) struct PanelInfo<'a> {
@@ -48,6 +83,15 @@ pub(crate) struct PanelInfo<'a> {
     /// Время процессора на подготовку векторного кадра (мс), число фигур в кадре и
     /// сколько из них нарисовано (остальные за краем экрана).
     pub vector_cpu: Option<reyvec_gpu::VectorCpu>,
+    /// Сцена, которая рисуется сейчас.
+    pub scene_id: DemoScene,
+    /// Сглаживание сейчас и варианты, которые умеет видеокарта.
+    pub msaa_now: Msaa,
+    pub msaa_options: &'a [Msaa],
+    /// Видеокарта умеет компактный кадр сцены.
+    pub compact_supported: bool,
+    /// Способ заливки векторных фигур.
+    pub fill_mode: FillMode,
 }
 
 pub(crate) struct Panel {
@@ -56,6 +100,8 @@ pub(crate) struct Panel {
     visible: bool,
     /// Время видеокарты последних кадров, мс.
     gpu_history: VecDeque<f32>,
+    /// Что нажали мышкой с прошлого раза.
+    actions: Vec<PanelAction>,
 }
 
 impl Panel {
@@ -76,6 +122,7 @@ impl Panel {
             state,
             visible: true,
             gpu_history: VecDeque::with_capacity(HISTORY),
+            actions: Vec::new(),
         }
     }
 
@@ -87,6 +134,11 @@ impl Panel {
     /// Отдаёт событие окна egui (мышь, клавиатура, масштаб). `true`: событие для панели.
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         self.state.on_window_event(window, event).consumed
+    }
+
+    /// Что нажали мышкой на панели с прошлого вызова.
+    pub fn take_actions(&mut self) -> Vec<PanelAction> {
+        std::mem::take(&mut self.actions)
     }
 
     /// Добавляет время видеокарты кадра на график.
@@ -105,12 +157,18 @@ impl Panel {
         let _zone = reyvec_gpu::cpu_zone!("панель");
         let input = self.state.take_egui_input(window);
         let history = &self.gpu_history;
+        let actions = &mut self.actions;
         let out = self.ctx.run_ui(input, |ui| {
             egui::Window::new("Счётчики")
                 .title_bar(false)
                 .resizable(false)
                 .default_pos([12.0, 12.0])
                 .show(ui.ctx(), |ui| contents(ui, info, history));
+            egui::Window::new("Сцены")
+                .title_bar(false)
+                .resizable(false)
+                .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
+                .show(ui.ctx(), |ui| controls(ui, info, actions));
         });
         self.state
             .handle_platform_output(window, out.platform_output);
@@ -236,11 +294,76 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
     }
     ui.label(
         RichText::new(
-            "0–9 сцена, L свет, T вариант стресса, M сглаживание, G края, P кадр сцены, F заливка, Z лупа, \
-             колесо и мышь камера, R сброс, F1 прячет панель, F12 снимок",
+            "Сцены и настройки — на панели справа (или клавишами в скобках). \
+             Колесо и мышь двигают камеру, F1 прячет панели",
         )
         .weak(),
     );
+}
+
+/// Панель справа: выбор сцены и настройки мышкой. Нажатое попадает в `actions`.
+fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>) {
+    ui.label(RichText::new("Сцены").strong());
+    for (stage, scenes) in SCENES {
+        ui.label(RichText::new(*stage).weak());
+        for (scene, key) in *scenes {
+            let text = format!("{}  ({key})", scene.title());
+            if ui.selectable_label(info.scene_id == *scene, text).clicked() {
+                actions.push(PanelAction::Scene(*scene));
+            }
+        }
+    }
+    ui.separator();
+    ui.label(RichText::new("Настройки").strong());
+    ui.label("Сглаживание (M)");
+    ui.horizontal(|ui| {
+        for m in info.msaa_options {
+            if ui
+                .selectable_label(info.msaa_now == *m, m.title())
+                .clicked()
+            {
+                actions.push(PanelAction::Msaa(*m));
+            }
+        }
+    });
+    let mut compact = info.compact_scene;
+    if ui
+        .add_enabled(
+            info.compact_supported,
+            egui::Checkbox::new(&mut compact, "Компактный кадр сцены (P)"),
+        )
+        .changed()
+    {
+        actions.push(PanelAction::CompactScene(compact));
+    }
+    let mut edges = info.perceptual_edges;
+    if ui
+        .checkbox(&mut edges, "Края как в редакторах (G)")
+        .changed()
+    {
+        actions.push(PanelAction::PerceptualEdges(edges));
+    }
+    ui.label("Заливка векторов (F)");
+    for fill in [FillMode::PerShape, FillMode::Triangles, FillMode::Stencil] {
+        if ui
+            .selectable_label(info.fill_mode == fill, fill.label())
+            .clicked()
+        {
+            actions.push(PanelAction::Fill(fill));
+        }
+    }
+    let mut zoom = info.zoom;
+    if ui.checkbox(&mut zoom, "Лупа ×8 (Z)").changed() {
+        actions.push(PanelAction::Zoom(zoom));
+    }
+    ui.horizontal(|ui| {
+        if ui.button("Камера в начало (R)").clicked() {
+            actions.push(PanelAction::ResetCamera);
+        }
+        if ui.button("Снимок (F12)").clicked() {
+            actions.push(PanelAction::Snapshot);
+        }
+    });
 }
 
 /// Приближение для панели: «2.5», «0.25», «128».
@@ -377,6 +500,11 @@ mod tests {
                 shapes: 10_000,
                 drawn: 312,
             }),
+            scene_id: DemoScene::Vector,
+            msaa_now: Msaa::X4,
+            msaa_options: &[Msaa::Off, Msaa::X2, Msaa::X4, Msaa::X8],
+            compact_supported: true,
+            fill_mode: FillMode::PerShape,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
         let input = egui::RawInput {
@@ -388,12 +516,16 @@ mod tests {
         };
         // Первый проход egui только меряет окна и ничего не рисует, поэтому кадров два.
         let mut atlas = false;
+        let mut actions = Vec::new();
         let mut prims = Vec::new();
         for _ in 0..2 {
             let mut out = ctx.run_ui(input.clone(), |ui| {
                 egui::Window::new("Счётчики")
                     .title_bar(false)
                     .show(ui.ctx(), |ui| contents(ui, &info, &history));
+                egui::Window::new("Сцены")
+                    .title_bar(false)
+                    .show(ui.ctx(), |ui| controls(ui, &info, &mut actions));
             });
             atlas |= !out.textures_delta.set.is_empty();
             out.textures_delta.clear();
@@ -401,5 +533,6 @@ mod tests {
         }
         assert!(!prims.is_empty(), "панель нарисована");
         assert!(atlas, "атлас шрифта загружается");
+        assert!(actions.is_empty(), "без нажатий действий нет");
     }
 }

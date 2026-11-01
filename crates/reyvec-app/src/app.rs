@@ -15,7 +15,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use crate::panel::{Panel, PanelInfo};
+use crate::panel::{Panel, PanelAction, PanelInfo};
 
 /// Как часто обновлять счётчик кадров в заголовке окна.
 const TITLE_INTERVAL: Duration = Duration::from_millis(500);
@@ -232,9 +232,69 @@ impl App {
         Ok(())
     }
 
+    /// Выполняет просьбу с панели или с клавиатуры.
+    fn apply(&mut self, action: PanelAction) {
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        match action {
+            PanelAction::Scene(scene) => {
+                r.set_scene(scene);
+                tracing::info!("Сцена: {}", scene.title());
+            }
+            PanelAction::Msaa(msaa) => r.set_msaa(msaa),
+            PanelAction::CompactScene(on) => {
+                if r.compact_scene_supported() {
+                    r.set_compact_scene(on);
+                } else {
+                    tracing::info!("Компактный кадр сцены эта видеокарта не умеет");
+                }
+            }
+            PanelAction::PerceptualEdges(on) => {
+                r.set_perceptual_edges(on);
+                tracing::info!(
+                    "Края при MSAA: {}",
+                    if on {
+                        "как в редакторах"
+                    } else {
+                        "физически точные"
+                    }
+                );
+            }
+            PanelAction::Fill(fill) => {
+                r.set_fill(fill);
+                tracing::info!("Заливка векторных фигур: {}", fill.label());
+            }
+            PanelAction::Zoom(on) => {
+                r.set_zoom(on);
+                tracing::info!("Лупа векторной сцены: {}", if on { "×8" } else { "выкл" });
+            }
+            PanelAction::ResetCamera => {
+                r.set_camera(Camera2D::default());
+                tracing::info!("Камера в начале");
+            }
+            PanelAction::Snapshot => {
+                if !r.request_snapshot() {
+                    tracing::warn!(
+                        "Эта видеокарта не умеет копировать картинку окна: снимка не будет"
+                    );
+                }
+            }
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         if self.closing {
             return;
+        }
+        // Нажатое мышкой на панели в прошлом кадре.
+        let actions = self
+            .panel
+            .as_mut()
+            .map(Panel::take_actions)
+            .unwrap_or_default();
+        for action in actions {
+            self.apply(action);
         }
         let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer) else {
             return;
@@ -242,6 +302,10 @@ impl App {
         let _zone = reyvec_gpu::cpu_zone!("кадр");
         let size = window.inner_size();
         let time = self.start.elapsed().as_secs_f32();
+        let msaa_options: Vec<Msaa> = [Msaa::Off, Msaa::X2, Msaa::X4, Msaa::X8]
+            .into_iter()
+            .filter(|m| renderer.msaa_supported(*m) == *m)
+            .collect();
         let ui = self.panel.as_mut().and_then(|panel| {
             let info = PanelInfo {
                 adapter: &self.stats.adapter,
@@ -265,6 +329,11 @@ impl App {
                 zoom: renderer.zoom(),
                 camera_zoom: renderer.camera().zoom,
                 vector_cpu: renderer.vector_cpu(),
+                scene_id: renderer.scene(),
+                msaa_now: renderer.msaa(),
+                msaa_options: &msaa_options,
+                compact_supported: renderer.compact_scene_supported(),
+                fill_mode: renderer.fill(),
             };
             panel.frame(window, &info)
         });
@@ -399,13 +468,7 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut()
-                    && !r.request_snapshot()
-                {
-                    tracing::warn!(
-                        "Эта видеокарта не умеет копировать картинку окна: снимка не будет"
-                    );
-                }
+                self.apply(PanelAction::Snapshot);
             }
             WindowEvent::KeyboardInput {
                 event:
@@ -417,9 +480,8 @@ impl ApplicationHandler for App {
                     },
                 ..
             } if scene_for_key(code).is_some() => {
-                if let (Some(r), Some(scene)) = (self.renderer.as_mut(), scene_for_key(code)) {
-                    r.set_scene(scene);
-                    tracing::info!("Сцена: {}", scene.title());
+                if let Some(scene) = scene_for_key(code) {
+                    self.apply(PanelAction::Scene(scene));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -432,17 +494,16 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.renderer.as_ref() {
                     // Если видеокарта не умеет следующий вариант, пропускаем его.
-                    let current = r.msaa();
-                    let mut next = current.next();
-                    for _ in 0..2 {
+                    let mut next = r.msaa().next();
+                    for _ in 0..3 {
                         if r.msaa_supported(next) == next {
                             break;
                         }
                         next = next.next();
                     }
-                    r.set_msaa(next);
+                    self.apply(PanelAction::Msaa(next));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -455,12 +516,9 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut() {
-                    if r.compact_scene_supported() {
-                        r.set_compact_scene(!r.compact_scene());
-                    } else {
-                        tracing::info!("Компактный кадр сцены эта видеокарта не умеет");
-                    }
+                if let Some(r) = self.renderer.as_ref() {
+                    let on = !r.compact_scene();
+                    self.apply(PanelAction::CompactScene(on));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -473,17 +531,9 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.renderer.as_ref() {
                     let on = !r.perceptual_edges();
-                    r.set_perceptual_edges(on);
-                    tracing::info!(
-                        "Края при MSAA: {}",
-                        if on {
-                            "как в редакторах"
-                        } else {
-                            "физически точные"
-                        }
-                    );
+                    self.apply(PanelAction::PerceptualEdges(on));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -496,10 +546,9 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.renderer.as_ref() {
                     let fill = r.fill().next();
-                    r.set_fill(fill);
-                    tracing::info!("Заливка векторных фигур: {}", fill.label());
+                    self.apply(PanelAction::Fill(fill));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -512,10 +561,9 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut() {
+                if let Some(r) = self.renderer.as_ref() {
                     let on = !r.zoom();
-                    r.set_zoom(on);
-                    tracing::info!("Лупа векторной сцены: {}", if on { "×8" } else { "выкл" });
+                    self.apply(PanelAction::Zoom(on));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -528,11 +576,12 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut()
-                    && let Some(next) = r.scene().stress_variant()
+                if let Some(next) = self
+                    .renderer
+                    .as_ref()
+                    .and_then(|r| r.scene().stress_variant())
                 {
-                    r.set_scene(next);
-                    tracing::info!("Сцена: {}", next.title());
+                    self.apply(PanelAction::Scene(next));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -545,10 +594,7 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if let Some(r) = self.renderer.as_mut() {
-                    r.set_camera(Camera2D::default());
-                    tracing::info!("Камера в начале");
-                }
+                self.apply(PanelAction::ResetCamera);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let (true, Some(prev), Some(r), Some(w)) = (
