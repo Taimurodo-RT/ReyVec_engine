@@ -8,6 +8,8 @@ struct CurveVertex
     float2 uv;
 };
 
+#include "include/paint.slang"
+
 struct Instance
 {
     float4 linear;
@@ -18,7 +20,7 @@ struct Instance
     uint morph_stride; // перетекание: точек между ключевыми контурами в буфере
     uint morph_last;   // номер последнего ключевого контура (0 у обычных фигур)
     float morph;       // форма: 0 первый контур, 1 второй, 1.5 между вторым и третьим
-    uint pad;
+    uint paint;        // градиент из списка закрасок (NO_PAINT у фигур одного цвета)
 };
 
 struct Push
@@ -28,6 +30,8 @@ struct Push
     Instance* instances;
     float aspect;
     uint samples;
+    Paint* paints;
+    GradientStop* stops;
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -35,6 +39,8 @@ struct VertexOut
 {
     float4 position : SV_Position;
     nointerpolation float4 color : COLOR;
+    float2 local : LOCAL;
+    nointerpolation uint paint : PAINT;
 };
 
 // Положение точки у перетекающей фигуры: смесь двух соседних ключевых контуров. Точки
@@ -64,11 +70,16 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
     VertexOut o;
     o.position = float4(p.x, -p.y, 0.0, 1.0);
     o.color = inst.color;
+    o.local = shape;
+    o.paint = inst.paint;
     return o;
 }
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
-    return input.color;
+    float4 color = input.color;
+    if (input.paint != NO_PAINT)
+        color *= paint_color(pc.paints, pc.stops, input.paint, input.local);
+    return color;
 }

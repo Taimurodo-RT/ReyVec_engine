@@ -3,7 +3,7 @@
 //! Здесь живёт описание фигур и всё, что с ними делает процессор:
 //!
 //! - [`Shape`]: контур из прямых и кривых Безье ([`BezPath`] из `kurbo`), заливка или
-//!   обводка и цвет;
+//!   обводка и закраска: цвет или градиент ([`Paint`]);
 //! - [`tessellate`]: разбиение фигуры на треугольники (библиотека `lyon`). Делается один
 //!   раз, когда фигура появляется, а не каждый кадр;
 //! - [`ShapeLibrary`]: набор фигур с готовыми треугольниками;
@@ -21,6 +21,7 @@ mod color;
 mod curves;
 mod library;
 mod morph;
+mod paint;
 mod shape;
 mod tessellate;
 
@@ -31,5 +32,6 @@ pub use kurbo;
 pub use kurbo::{Affine, BezPath, Circle, PathEl, Point, Rect, Vec2};
 pub use library::{Instance, ShapeId, ShapeLibrary};
 pub use morph::{MorphError, MorphMesh, morph_mesh};
+pub use paint::{Gradient, GradientKind, GradientStop, Paint, Spread};
 pub use shape::{FillMethod, FillRule, LineCap, LineJoin, Shape, Stroke, Style};
 pub use tessellate::{EdgeData, Mesh, TessellationError, tessellate, tessellate_smooth};

@@ -44,6 +44,25 @@ impl Color {
     pub fn to_array(self) -> [f32; 4] {
         [self.r, self.g, self.b, self.a]
     }
+
+    /// Составляющие в sRGB (как в редакторах) от 0 до 1, альфа как есть.
+    pub fn to_srgb_array(self) -> [f32; 4] {
+        [
+            linear_to_srgb(self.r),
+            linear_to_srgb(self.g),
+            linear_to_srgb(self.b),
+            self.a,
+        ]
+    }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 fn srgb_to_linear(c: u8) -> f32 {
@@ -65,6 +84,14 @@ mod tests {
         assert!((Color::from_srgb8(255, 255, 255).g - 1.0).abs() < 1e-6);
         // Серый 50% в sRGB в линейном пространстве около 0.214.
         assert!((Color::from_srgb8(128, 128, 128).b - 0.2158).abs() < 1e-3);
+    }
+
+    #[test]
+    fn srgb_round_trip() {
+        let c = Color::from_srgb8(10, 128, 250).to_srgb_array();
+        for (got, want) in c.iter().zip([10.0, 128.0, 250.0]) {
+            assert!((got * 255.0 - want).abs() < 0.01);
+        }
     }
 
     #[test]

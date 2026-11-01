@@ -18,7 +18,10 @@
 //! следующие рисуются поверх предыдущих.
 
 use ash::vk;
-use reyvec_vector::{Color, FillMethod, FillRule, Instance, ShapeLibrary, Style};
+use reyvec_vector::{
+    Color, FillMethod, FillRule, Gradient, GradientKind, Instance, Paint, ShapeLibrary, Spread,
+    Style,
+};
 
 use crate::GpuError;
 use crate::context::GpuContext;
@@ -34,8 +37,13 @@ pub(crate) const MAX_INSTANCES: usize = 16 * 1024;
 const INSTANCE_SIZE: usize = 64;
 /// Байт на команду рисования (`VkDrawIndirectCommand`).
 const COMMAND_SIZE: usize = 16;
-/// Байт на точку веера и кривых: положение и координаты кривой.
-const CURVE_VERTEX_SIZE: usize = 16;
+/// Байт на градиент (`Paint` в `include/paint.slang`) и на его точку цвета.
+const PAINT_SIZE: usize = 64;
+const STOP_SIZE: usize = 32;
+/// Номер закраски у фигур одного цвета (`NO_PAINT` в шейдере).
+const NO_PAINT: u32 = u32::MAX;
+/// Байт констант векторных конвейеров.
+const PUSH_SIZE: usize = 48;
 
 /// Как рисовать залитые фигуры во всей сцене.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -99,6 +107,8 @@ struct MeshRange {
     even_odd: bool,
     color: Color,
     method: FillMethod,
+    /// Номер градиента в буфере закрасок или [`NO_PAINT`].
+    paint: u32,
     /// Перетекание: сколько точек между ключевыми контурами в буфере и номер последнего
     /// ключевого контура (0 у обычных фигур).
     morph_stride: u32,
@@ -111,6 +121,8 @@ struct Meshes {
     indices: BufferId,
     curve_vertices: BufferId,
     curve_indices: BufferId,
+    paints: BufferId,
+    stops: BufferId,
     ranges: Vec<MeshRange>,
     revision: u64,
 }
@@ -142,6 +154,8 @@ pub(crate) struct VectorData {
     vertices: vk::DeviceAddress,
     curve_indices: vk::DeviceAddress,
     curve_vertices: vk::DeviceAddress,
+    paints: vk::DeviceAddress,
+    stops: vk::DeviceAddress,
     instances: vk::DeviceAddress,
     commands: vk::Buffer,
     slot: usize,
@@ -306,6 +320,10 @@ impl VectorRenderer {
         let mut indices: Vec<u8> = Vec::new();
         let mut curve_vertices: Vec<u8> = Vec::new();
         let mut curve_indices: Vec<u8> = Vec::new();
+        let mut paints: Vec<u8> = Vec::new();
+        let mut stops: Vec<u8> = Vec::new();
+        let mut paint_count = 0u32;
+        let mut stop_count = 0u32;
         let mut ranges = Vec::with_capacity(library.len());
         let mut vertex_count = 0u32;
         let mut index_count = 0u32;
@@ -341,14 +359,23 @@ impl VectorRenderer {
                 curve_vertex_count += morph_stride * (1 + keyframes.len() as u32);
                 curve_index_count += c.indices.len() as u32;
             }
+            let (color, paint) = match &shape.paint {
+                Paint::Solid(c) => (*c, NO_PAINT),
+                Paint::Gradient(g) => {
+                    pack_gradient(&mut paints, &mut stops, &mut stop_count, g);
+                    paint_count += 1;
+                    (Color::WHITE, paint_count - 1)
+                }
+            };
             ranges.push(MeshRange {
                 first_index: index_count,
                 index_count: mesh.indices.len() as u32,
                 curve_first_index: curve_first,
                 curve_index_count: curves.map_or(0, |c| c.indices.len() as u32),
                 even_odd: matches!(shape.style, Style::Fill(FillRule::EvenOdd)),
-                color: shape.color,
+                color,
                 method: library.method(id).unwrap_or_default(),
+                paint,
                 morph_stride,
                 morph_last: keyframes.len() as u32,
             });
@@ -358,9 +385,9 @@ impl VectorRenderer {
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let mut created: Vec<BufferId> = Vec::new();
         let mut make = |res: &mut GpuResources, bytes: &mut Vec<u8>, name: &str| {
-            // Пустой буфер создать нельзя: оставляем место хотя бы под одну точку.
+            // Пустой буфер создать нельзя: оставляем место хотя бы под одну запись.
             if bytes.is_empty() {
-                bytes.resize(CURVE_VERTEX_SIZE, 0);
+                bytes.resize(PAINT_SIZE, 0);
             }
             let id =
                 res.create_buffer(ctx, bytes.len() as u64, usage, BufferMemory::GpuOnly, name)?;
@@ -374,17 +401,20 @@ impl VectorRenderer {
                 make(res, &mut indices, "треугольники векторных фигур")?,
                 make(res, &mut curve_vertices, "точки веера и кривых")?,
                 make(res, &mut curve_indices, "треугольники веера и кривых")?,
+                make(res, &mut paints, "градиенты векторных фигур")?,
+                make(res, &mut stops, "точки цвета градиентов")?,
             ))
         })();
-        let (vertices_id, indices_id, curve_vertices_id, curve_indices_id) = match made {
-            Ok(ids) => ids,
-            Err(e) => {
-                for id in created {
-                    res.destroy_buffer(id);
+        let (vertices_id, indices_id, curve_vertices_id, curve_indices_id, paints_id, stops_id) =
+            match made {
+                Ok(ids) => ids,
+                Err(e) => {
+                    for id in created {
+                        res.destroy_buffer(id);
+                    }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
         // Старые буферы может ещё читать кадр в работе: они уходят в очередь отложенного удаления.
         if let Some(old) = self.meshes.take() {
             for id in [
@@ -392,22 +422,33 @@ impl VectorRenderer {
                 old.indices,
                 old.curve_vertices,
                 old.curve_indices,
+                old.paints,
+                old.stops,
             ] {
                 res.destroy_buffer(id);
             }
         }
         tracing::info!(
-            "Векторные фигуры на видеокарте: {} фигур, {} треугольников, для трафарета {} треугольников, {} КБ",
+            "Векторные фигуры на видеокарте: {} фигур, {} треугольников, для трафарета {} треугольников, градиентов {}, {} КБ",
             library.len(),
             index_count / 3,
             curve_index_count / 3,
-            (vertices.len() + indices.len() + curve_vertices.len() + curve_indices.len()) / 1024
+            paint_count,
+            (vertices.len()
+                + indices.len()
+                + curve_vertices.len()
+                + curve_indices.len()
+                + paints.len()
+                + stops.len())
+                / 1024
         );
         self.meshes = Some(Meshes {
             vertices: vertices_id,
             indices: indices_id,
             curve_vertices: curve_vertices_id,
             curve_indices: curve_indices_id,
+            paints: paints_id,
+            stops: stops_id,
             ranges,
             revision: library.revision(),
         });
@@ -448,6 +489,8 @@ impl VectorRenderer {
             vertices: res.buffer_address(meshes.vertices),
             curve_indices: res.buffer_address(meshes.curve_indices),
             curve_vertices: res.buffer_address(meshes.curve_vertices),
+            paints: res.buffer_address(meshes.paints),
+            stops: res.buffer_address(meshes.stops),
             instances: res.buffer_address(frame.instances),
             commands: res.buffer_raw(frame.commands)?,
             slot,
@@ -469,18 +512,20 @@ impl VectorRenderer {
         data: VectorData,
     ) {
         let push = |indices: vk::DeviceAddress, vertices: vk::DeviceAddress| {
-            let mut push = [0u8; 32];
+            let mut push = [0u8; PUSH_SIZE];
             push[..8].copy_from_slice(&indices.to_ne_bytes());
             push[8..16].copy_from_slice(&vertices.to_ne_bytes());
             push[16..24].copy_from_slice(&data.instances.to_ne_bytes());
             push[24..28].copy_from_slice(&data.aspect.to_ne_bytes());
-            push[28..].copy_from_slice(&self.msaa.samples().as_raw().to_ne_bytes());
+            push[28..32].copy_from_slice(&self.msaa.samples().as_raw().to_ne_bytes());
+            push[32..40].copy_from_slice(&data.paints.to_ne_bytes());
+            push[40..48].copy_from_slice(&data.stops.to_ne_bytes());
             push
         };
         let triangles_push = push(data.indices, data.vertices);
         let curves_push = push(data.curve_indices, data.curve_vertices);
         let p = &self.pipelines;
-        let bind = |pipeline: vk::Pipeline, push: &[u8; 32]| {
+        let bind = |pipeline: vk::Pipeline, push: &[u8; PUSH_SIZE]| {
             // SAFETY: условия функции.
             unsafe {
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
@@ -571,7 +616,7 @@ fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMode) -> Packed 
         out.extend_from_slice(&range.morph_stride.to_ne_bytes());
         out.extend_from_slice(&range.morph_last.to_ne_bytes());
         out.extend_from_slice(&inst.morph.to_ne_bytes());
-        out.extend_from_slice(&0u32.to_ne_bytes());
+        out.extend_from_slice(&range.paint.to_ne_bytes());
         if stencil {
             ops.push(Op::Stencil {
                 instance: written,
@@ -650,6 +695,49 @@ fn build(
     }
 }
 
+/// Пишет градиент в формате шейдера (`Paint` и `GradientStop` в `include/paint.slang`).
+fn pack_gradient(paints: &mut Vec<u8>, stops: &mut Vec<u8>, stop_count: &mut u32, g: &Gradient) {
+    let start = paints.len();
+    let [a, b, c, d, e, f] = g.transform.inverse().as_coeffs().map(|v| v as f32);
+    let normalized = g.normalized_stops();
+    let (kind, geometry, radius) = match g.kind {
+        GradientKind::Linear { start, end } => (0u32, [start.x, start.y, end.x, end.y], 0.0),
+        GradientKind::Radial { center, radius, .. } => {
+            let focus = g.clamped_focus().unwrap_or(center);
+            (1, [center.x, center.y, focus.x, focus.y], radius)
+        }
+    };
+    let spread: u32 = match g.spread {
+        Spread::Pad => 0,
+        Spread::Reflect => 1,
+        Spread::Repeat => 2,
+    };
+    let mut put = |v: [u8; 4]| paints.extend_from_slice(&v);
+    for v in [a, b, c, d, e, f] {
+        put(v.to_ne_bytes());
+    }
+    put(kind.to_ne_bytes());
+    put(spread.to_ne_bytes());
+    for v in geometry {
+        put((v as f32).to_ne_bytes());
+    }
+    put((radius as f32).to_ne_bytes());
+    put(stop_count.to_ne_bytes());
+    put((normalized.len() as u32).to_ne_bytes());
+    put(0u32.to_ne_bytes());
+    debug_assert_eq!(paints.len() - start, PAINT_SIZE);
+    for (offset, color) in normalized {
+        let s = stops.len();
+        for v in color {
+            stops.extend_from_slice(&v.to_ne_bytes());
+        }
+        stops.extend_from_slice(&offset.to_ne_bytes());
+        stops.extend_from_slice(&[0u8; 12]);
+        debug_assert_eq!(stops.len() - s, STOP_SIZE);
+        *stop_count += 1;
+    }
+}
+
 /// Размер точки на видеокарте: положение, смещение от контура, данные края (см. `vector.slang`).
 const VERTEX_SIZE: usize = 32;
 
@@ -685,6 +773,7 @@ mod tests {
         even_odd: false,
         color: Color::WHITE,
         method: FillMethod::Triangles,
+        paint: NO_PAINT,
         morph_stride: 0,
         morph_last: 0,
     };
@@ -757,7 +846,38 @@ mod tests {
         assert_eq!([f(4), f(5)], [5.0, 2.0]);
         assert_eq!(words(&last[24..32]), [0, 0]);
         assert_eq!([f(8), f(9), f(10), f(11)], [0.5, 0.0, 0.0, 0.25]);
-        assert_eq!(words(&last[48..64]), [0, 0, 0, 0]);
+        assert_eq!(words(&last[48..64]), [0, 0, 0, NO_PAINT]);
+    }
+
+    #[test]
+    fn gradient_layout_matches_shader() {
+        let g = Gradient::radial((1.0, 2.0), 3.0)
+            .with_focus((9.0, 2.0))
+            .with_spread(Spread::Reflect)
+            .with_transform(Affine::scale(2.0))
+            .stop(0.0, Color::WHITE)
+            .stop(1.0, Color::linear(0.0, 0.0, 0.0, 0.5));
+        let (mut paints, mut stops, mut count) = (Vec::new(), Vec::new(), 5u32);
+        pack_gradient(&mut paints, &mut stops, &mut count, &g);
+        assert_eq!(
+            (paints.len(), stops.len(), count),
+            (PAINT_SIZE, 2 * STOP_SIZE, 7)
+        );
+        let f = |b: &[u8], i: usize| f32::from_ne_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        // Обратное преобразование: масштаб 0.5.
+        assert_eq!([f(&paints, 0), f(&paints, 3)], [0.5, 0.5]);
+        assert_eq!(words(&paints[24..32]), [1, 1], "радиальный, отражать");
+        // Фокус вне круга подтянут к краю.
+        assert_eq!([f(&paints, 8), f(&paints, 9)], [1.0, 2.0]);
+        assert!(f(&paints, 10) < 4.0 && f(&paints, 10) > 3.99);
+        assert_eq!(f(&paints, 12), 3.0);
+        assert_eq!(
+            words(&paints[52..60]),
+            [5, 2],
+            "первая точка цвета и сколько их"
+        );
+        // Вторая точка: чёрный с прозрачностью 0.5 на доле 1.
+        assert_eq!([f(&stops, 8 + 3), f(&stops, 8 + 4)], [0.5, 1.0]);
     }
 
     #[test]
