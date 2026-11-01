@@ -815,6 +815,7 @@ impl Demo {
             DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
             DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
             DemoScene::Text => self.vector_demo.text_items(time, aspect),
+            DemoScene::Light => self.vector_demo.light_items(time),
             DemoScene::Stress | DemoScene::StressMorph => self
                 .vector_demo
                 .stress_instances(time, aspect, scene == DemoScene::StressMorph)
@@ -887,7 +888,7 @@ impl Demo {
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let vector = match scene {
-            DemoScene::Gpu | DemoScene::Light => {
+            DemoScene::Gpu => {
                 self.vector_items = 0;
                 None
             }
@@ -1064,8 +1065,13 @@ impl Demo {
             None => Vec::new(),
         };
 
+        // Слои, фигуры которых отбрасывают тень: их силуэты читает маска теней.
+        let shadow_images = match frame.vector {
+            Some(vector) => layer_images(&layers, self.vector.shadow_layers(&vector)),
+            None => Vec::new(),
+        };
         let field = (frame.scene == DemoScene::Light)
-            .then(|| self.add_field_passes(graph, bindless, frame));
+            .then(|| self.add_field_passes(graph, bindless, frame, shadow_images));
 
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
@@ -1180,13 +1186,15 @@ impl Demo {
     }
 
     /// Проходы поля расстояний сцены «свет» (4.2): «маска» рисует фигуры, отбрасывающие
-    /// тень, в половинном разрешении; «поле» строит из неё расстояния jump flooding.
+    /// тень, в уменьшенном разрешении (SDF-фигуры сцены и силуэты слоёв `shadows` из их
+    /// готовых картинок); «поле» строит из неё расстояния jump flooding.
     /// Возвращает картинку поля (расстояние со знаком в единицах сцены).
     fn add_field_passes<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
         bindless: &'a Bindless,
         frame: FrameData,
+        shadows: Vec<LayerImage>,
     ) -> ImageHandle {
         let layout = bindless.pipeline_layout;
         let size = field_size(frame.extent, self.field_downscale);
@@ -1212,9 +1220,40 @@ impl Demo {
                     d.cmd_end_rendering(cmd);
                 }
             };
-        graph.add_pass("маска", &[(mask, Access::ColorAttachment)], move |p| {
+        let downscale = self.field_downscale;
+        let mut uses = vec![(mask, Access::ColorAttachment)];
+        uses.extend(shadows.iter().map(|l| (l.image, Access::Sampled)));
+        graph.add_pass("маска", &uses, move |p| {
             let push = sdf_push(frame.time, frame.extent, camera, None);
-            draw(p, mask, self.field.mask, &push[..24]);
+            let (d, cmd) = (p.device, p.cmd);
+            // SAFETY: граф перевёл маску в раскладку рисования, а картинки слоёв (уже
+            // нарисованные) в чтение; конвейеры живы, пока кадр рисуется.
+            unsafe {
+                begin_color_pass(d, cmd, p.view(mask), size);
+                bindless.bind(d, cmd);
+                // Сначала SDF-фигуры сцены на всю маску, потом силуэты слоёв поверх.
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.field.mask);
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push[..24]);
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+                if !shadows.is_empty() {
+                    d.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.field.mask_layer,
+                    );
+                }
+                for l in &shadows {
+                    let mut push = [0u8; 16];
+                    push[..4].copy_from_slice(&p.texture(l.image).to_ne_bytes());
+                    push[4..8].copy_from_slice(&(downscale as f32).to_ne_bytes());
+                    push[8..12].copy_from_slice(&l.rect.offset.x.to_ne_bytes());
+                    push[12..].copy_from_slice(&l.rect.offset.y.to_ne_bytes());
+                    d.cmd_set_scissor(cmd, 0, &[mask_rect(l.rect, downscale, size)]);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                }
+                d.cmd_end_rendering(cmd);
+            }
         });
         graph.add_pass(
             "поле",
@@ -1360,7 +1399,13 @@ fn sdf_push(
 }
 
 /// Шейдеры поля расстояний (4.2) по порядку проходов.
-const FIELD_SHADERS: [&str; 4] = ["light_mask", "jfa_seed", "jfa_step", "jfa_field"];
+const FIELD_SHADERS: [&str; 5] = [
+    "light_mask",
+    "light_mask_layer",
+    "jfa_seed",
+    "jfa_step",
+    "jfa_field",
+];
 
 /// Во сколько раз поле расстояний меньше кадра по каждой стороне на видеокарте этого
 /// типа. Jump flooding упирается в память: на встроенной Radeon поле в половину кадра
@@ -1378,9 +1423,26 @@ pub(crate) fn field_downscale_for(kind: AdapterKind) -> u32 {
 /// число со знаком.
 fn field_format(name: &str) -> vk::Format {
     match name {
-        "light_mask" => vk::Format::R8_UNORM,
+        "light_mask" | "light_mask_layer" => vk::Format::R8_UNORM,
         "jfa_seed" | "jfa_step" => vk::Format::R16G16_SFLOAT,
         _ => vk::Format::R16_SFLOAT,
+    }
+}
+
+/// Прямоугольник кадра `rect` в точках маски, которая в `downscale` раз меньше кадра
+/// (с округлением наружу), внутри маски размером `size`.
+fn mask_rect(rect: vk::Rect2D, downscale: u32, size: vk::Extent2D) -> vk::Rect2D {
+    let ds = downscale.max(1) as i32;
+    let x0 = rect.offset.x.max(0) / ds;
+    let y0 = rect.offset.y.max(0) / ds;
+    let x1 = ((rect.offset.x + rect.extent.width as i32 + ds - 1) / ds).min(size.width as i32);
+    let y1 = ((rect.offset.y + rect.extent.height as i32 + ds - 1) / ds).min(size.height as i32);
+    vk::Rect2D {
+        offset: vk::Offset2D { x: x0, y: y0 },
+        extent: vk::Extent2D {
+            width: (x1 - x0).max(1) as u32,
+            height: (y1 - y0).max(1) as u32,
+        },
     }
 }
 
@@ -1409,6 +1471,8 @@ fn jfa_steps(size: vk::Extent2D) -> Vec<i32> {
 #[derive(Default)]
 struct FieldPipelines {
     mask: vk::Pipeline,
+    /// Силуэты слоёв, отбрасывающих тень, поверх маски.
+    mask_layer: vk::Pipeline,
     seed: vk::Pipeline,
     step: vk::Pipeline,
     field: vk::Pipeline,
@@ -1418,6 +1482,7 @@ impl FieldPipelines {
     fn slot(&mut self, name: &str) -> &mut vk::Pipeline {
         match name {
             "light_mask" => &mut self.mask,
+            "light_mask_layer" => &mut self.mask_layer,
             "jfa_seed" => &mut self.seed,
             "jfa_step" => &mut self.step,
             _ => &mut self.field,
@@ -1584,6 +1649,22 @@ fn hue_to_rgb(h: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_rect_in_mask_points_rounds_outward() {
+        let r = |x, y, width, height| vk::Rect2D {
+            offset: vk::Offset2D { x, y },
+            extent: vk::Extent2D { width, height },
+        };
+        let size = vk::Extent2D {
+            width: 480,
+            height: 253,
+        };
+        assert_eq!(mask_rect(r(10, 21, 7, 4), 4, size), r(2, 5, 3, 2));
+        assert_eq!(mask_rect(r(8, 20, 8, 4), 4, size), r(2, 5, 2, 1));
+        // У края кадра не выходит за маску.
+        assert_eq!(mask_rect(r(1900, 1000, 20, 9), 4, size), r(475, 250, 5, 3));
+    }
 
     #[test]
     fn field_is_half_size_and_steps_reach_one() {
