@@ -56,7 +56,7 @@ pub struct HeadlessScene {
     /// Края при MSAA «как в редакторах» (`true`) или физически точные.
     pub perceptual_edges: bool,
     /// Как рисовать залитые векторные фигуры.
-    pub fill: crate::FillMethod,
+    pub fill: crate::FillMode,
     /// Лупа векторной сцены (увеличение в 8 раз у края сердца).
     pub zoom: bool,
 }
@@ -137,7 +137,7 @@ pub fn render_triangle_headless(
             scene: DemoScene::Gpu,
             msaa: Msaa::Off,
             perceptual_edges: false,
-            fill: crate::FillMethod::Triangles,
+            fill: crate::FillMode::PerShape,
             zoom: false,
         },
     )

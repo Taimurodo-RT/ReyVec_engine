@@ -197,7 +197,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
     )));
     ui.label(
         RichText::new(
-            "1 и 2 сцена, M сглаживание, G края, F заливка, Z лупа, F1 прячет панель, F12 снимок",
+            "1–3 сцена, M сглаживание, G края, F заливка, Z лупа, F1 прячет панель, F12 снимок",
         )
         .weak(),
     );
@@ -315,7 +315,7 @@ mod tests {
             scene: "векторы",
             msaa: "MSAA 4×",
             perceptual_edges: true,
-            fill: "треугольники",
+            fill: "у каждой фигуры свой способ",
             zoom: false,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();

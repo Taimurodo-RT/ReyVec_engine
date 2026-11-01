@@ -3,7 +3,8 @@
 use kurbo::Affine;
 
 use crate::{
-    Color, CurveMesh, Mesh, Shape, Style, TessellationError, curve_mesh, tessellate_smooth,
+    Color, CurveMesh, FillMethod, FillRule, Mesh, MorphError, MorphMesh, Shape, Style,
+    TessellationError, curve_mesh, morph_mesh, tessellate_smooth,
 };
 
 /// Номер фигуры в [`ShapeLibrary`].
@@ -15,6 +16,9 @@ struct Entry {
     mesh: Mesh,
     /// Треугольники для заливки через трафарет (только у заливок).
     curves: Option<CurveMesh>,
+    /// Положения точек `curves` у остальных ключевых контуров (только у перетекающих).
+    morph: Vec<Vec<[f32; 2]>>,
+    method: FillMethod,
 }
 
 /// Фигуры, уже разбитые на треугольники. Разбиение делается один раз в [`Self::add`],
@@ -36,19 +40,71 @@ impl ShapeLibrary {
         }
     }
 
-    /// Добавляет фигуру и сразу разбивает её на треугольники. Обводки получают запас под
+    /// Добавляет фигуру и сразу разбивает её на треугольники. Заливка рисуется
+    /// треугольниками ([`FillMethod::Triangles`]). Обводки получают запас под
     /// сглаживание в шейдере: [`Self::aa_margin`].
     pub fn add(&mut self, shape: Shape) -> Result<ShapeId, TessellationError> {
+        self.add_with(shape, FillMethod::Triangles)
+    }
+
+    /// Как [`Self::add`], но заливку рисовать способом `method`.
+    pub fn add_with(
+        &mut self,
+        shape: Shape,
+        method: FillMethod,
+    ) -> Result<ShapeId, TessellationError> {
         let mesh = tessellate_smooth(&shape, self.tolerance, self.aa_margin())?;
         let curves =
             matches!(shape.style, Style::Fill(_)).then(|| curve_mesh(&shape.path, self.tolerance));
-        self.entries.push(Entry {
+        Ok(self.push(Entry {
             shape,
             mesh,
             curves,
-        });
+            morph: Vec::new(),
+            method,
+        }))
+    }
+
+    /// Добавляет перетекающую заливку: фигуру, которая меняет форму между контурами
+    /// `keyframes` (не меньше двух). Какая сейчас форма, задаёт каждый экземпляр
+    /// ([`Instance::with_morph`]), смешивает точки видеокарта. Рисуется всегда трафаретом:
+    /// заранее разбить на треугольники все промежуточные формы нельзя.
+    pub fn add_morph(
+        &mut self,
+        keyframes: &[kurbo::BezPath],
+        rule: FillRule,
+        color: Color,
+    ) -> Result<ShapeId, MorphError> {
+        let MorphMesh {
+            mesh,
+            keyframes: other,
+        } = morph_mesh(keyframes, self.tolerance)?;
+        Ok(self.push(Entry {
+            shape: Shape::fill_with(keyframes[0].clone(), rule, color),
+            mesh: Mesh::default(),
+            curves: Some(mesh),
+            morph: other,
+            method: FillMethod::Stencil,
+        }))
+    }
+
+    fn push(&mut self, entry: Entry) -> ShapeId {
+        self.entries.push(entry);
         self.revision += 1;
-        Ok(ShapeId(self.entries.len() as u32 - 1))
+        ShapeId(self.entries.len() as u32 - 1)
+    }
+
+    /// Способ рисования заливки фигуры (у перетекающих всегда трафарет).
+    pub fn method(&self, id: ShapeId) -> Option<FillMethod> {
+        self.entries.get(id.0 as usize).map(|e| e.method)
+    }
+
+    /// Положения точек [`Self::curves`] у ключевых контуров перетекающей фигуры, кроме
+    /// первого (его точки в самих `curves`). Пусто у обычных фигур.
+    pub fn morph_keyframes(&self, id: ShapeId) -> &[Vec<[f32; 2]>] {
+        self.entries
+            .get(id.0 as usize)
+            .map_or(&[], |e| e.morph.as_slice())
     }
 
     /// Фигура по номеру.
@@ -112,6 +168,9 @@ pub struct Instance {
     pub transform: Affine,
     /// Множитель цвета фигуры (белый ничего не меняет, альфа делает прозрачнее).
     pub tint: Color,
+    /// Форма перетекающей фигуры: 0 = первый ключевой контур, 1 = второй, 1.5 = посередине
+    /// между вторым и третьим. У обычных фигур ни на что не влияет.
+    pub morph: f32,
 }
 
 impl Instance {
@@ -121,12 +180,18 @@ impl Instance {
             shape,
             transform,
             tint: Color::WHITE,
+            morph: 0.0,
         }
     }
 
     /// С оттенком.
     pub fn with_tint(self, tint: Color) -> Self {
         Self { tint, ..self }
+    }
+
+    /// С формой перетекания (см. [`Self::morph`]).
+    pub fn with_morph(self, morph: f32) -> Self {
+        Self { morph, ..self }
     }
 }
 
@@ -158,5 +223,33 @@ mod tests {
         assert!((lib.mesh(b).unwrap().area() - 2.0).abs() < 1e-6);
         assert!(lib.mesh(ShapeId(9)).is_none());
         assert_eq!(lib.iter().count(), 2);
+        assert_eq!(lib.method(a), Some(FillMethod::Triangles));
+        assert!(lib.morph_keyframes(a).is_empty());
+    }
+
+    #[test]
+    fn morph_shapes_use_stencil_and_keep_keyframes() {
+        let mut lib = ShapeLibrary::new(0.01);
+        let small = Rect::new(0.0, 0.0, 1.0, 1.0).to_path(0.1);
+        let big = Rect::new(0.0, 0.0, 3.0, 2.0).to_path(0.1);
+        let id = lib
+            .add_morph(&[small.clone(), big], FillRule::NonZero, Color::WHITE)
+            .unwrap();
+        assert_eq!(lib.method(id), Some(FillMethod::Stencil));
+        let curves = lib.curves(id).unwrap();
+        assert_eq!(lib.morph_keyframes(id).len(), 1);
+        assert_eq!(lib.morph_keyframes(id)[0].len(), curves.vertices.len());
+        assert_eq!(lib.mesh(id).unwrap().triangle_count(), 0);
+        assert!(
+            lib.add_morph(&[small], FillRule::NonZero, Color::WHITE)
+                .is_err()
+        );
+        let s = lib
+            .add_with(
+                Shape::fill(Rect::new(0.0, 0.0, 1.0, 1.0).to_path(0.1), Color::WHITE),
+                FillMethod::Stencil,
+            )
+            .unwrap();
+        assert_eq!(lib.method(s), Some(FillMethod::Stencil));
     }
 }
