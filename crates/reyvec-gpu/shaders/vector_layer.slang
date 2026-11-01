@@ -10,6 +10,9 @@ struct Push
     float opacity;  // прозрачность слоя целиком
     uint mask;      // номер картинки маски (если mask_mode не 0)
     uint mask_mode; // 0 нет маски, 1 по прозрачности, 2 по яркости, +4 обратная
+    int2 offset;    // пиксель цели + offset = пиксель картинки слоя (она размером с
+                    // прямоугольник слоя, а не с кадр)
+    int2 mask_offset; // то же для картинки маски
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -57,9 +60,9 @@ float mask_value(float4 m, uint mode)
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
-    int3 pixel = int3(int2(input.position.xy), 0);
+    int2 pixel = int2(input.position.xy);
     float k = pc.opacity;
     if (pc.mask_mode != 0)
-        k *= mask_value(textures[pc.mask].Load(pixel), pc.mask_mode);
-    return textures[pc.texture].Load(pixel) * k;
+        k *= mask_value(textures[pc.mask].Load(int3(pixel + pc.mask_offset, 0)), pc.mask_mode);
+    return textures[pc.texture].Load(int3(pixel + pc.offset, 0)) * k;
 }

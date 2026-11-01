@@ -663,20 +663,18 @@ impl Demo {
         );
         // Слои векторных фигур: каждый рисуется своим проходом в свою картинку
         // (прозрачный фон, то же сглаживание и тот же трафарет), а потом накладывается
-        // в проходе, где он стоит. Вложенные слои идут раньше внешних. Рисуется и
-        // накладывается слой только в прямоугольнике, который занимают его фигуры.
+        // в проходе, где он стоит. Вложенные слои идут раньше внешних. Картинка слоя
+        // размером с прямоугольник, который занимают его фигуры (а не с кадр): её
+        // очистка и сведение MSAA стоят пропорционально площади, а на встроенной
+        // видеокарте это главная цена слоя.
         let mut layers: Vec<LayerImage> = Vec::new();
         if let Some(vector) = frame.vector {
             for &layer in self.vector.layer_order(&vector) {
                 let rect = self.vector.layer_rect(&vector, layer, frame.extent);
-                let image = graph.create("слой", frame.extent, SCENE_FORMAT);
+                let size = layer_image_size(rect.extent, frame.extent);
+                let image = graph.create("слой", size, SCENE_FORMAT);
                 let ms = (frame.msaa != Msaa::Off).then(|| {
-                    graph.create_multisampled(
-                        "слой MSAA",
-                        frame.extent,
-                        SCENE_FORMAT,
-                        frame.msaa.samples(),
-                    )
+                    graph.create_multisampled("слой MSAA", size, SCENE_FORMAT, frame.msaa.samples())
                 });
                 let mut uses = vec![
                     (ms.unwrap_or(image), Access::ColorAttachment),
@@ -702,13 +700,22 @@ impl Demo {
                             p.view(ms.unwrap_or(image)),
                             ms.map(|_| p.view(image)),
                             Some(p.view(stencil)),
-                            p.extent(image),
-                            Some(rect),
+                            frame.extent,
+                            rect.offset,
+                            Some(vk::Rect2D::default().extent(rect.extent)),
                             [0.0; 4],
                         );
                         bindless.bind(d, cmd);
-                        self.vector
-                            .record(d, cmd, layout, vector, layer as usize, &textures, rect);
+                        self.vector.record(
+                            d,
+                            cmd,
+                            layout,
+                            vector,
+                            layer as usize,
+                            &textures,
+                            rect,
+                            rect.offset,
+                        );
                         d.cmd_end_rendering(cmd);
                     }
                 });
@@ -748,6 +755,7 @@ impl Demo {
                     hardware_resolve.map(|_| p.view(scene)),
                     Some(p.view(stencil)),
                     p.extent(scene),
+                    vk::Offset2D::default(),
                     None,
                     CLEAR_COLOR,
                 );
@@ -759,8 +767,16 @@ impl Demo {
                 }
                 if let Some(vector) = frame.vector {
                     let full = vk::Rect2D::default().extent(p.extent(scene));
-                    self.vector
-                        .record(d, cmd, layout, vector, 0, &textures, full);
+                    self.vector.record(
+                        d,
+                        cmd,
+                        layout,
+                        vector,
+                        0,
+                        &textures,
+                        full,
+                        vk::Offset2D::default(),
+                    );
                 }
                 if frame.sprite_count > 0 {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
@@ -841,6 +857,17 @@ struct LayerImage {
     image: ImageHandle,
     /// Где в ней нарисованы фигуры слоя.
     rect: vk::Rect2D,
+}
+
+/// Размер картинки слоя с прямоугольником `rect`: с запасом до кратного 128 пикселям
+/// (чтобы слой, который двигается и меняет размер, чаще брал из пула ту же картинку), но
+/// не больше кадра `frame`.
+fn layer_image_size(rect: vk::Extent2D, frame: vk::Extent2D) -> vk::Extent2D {
+    let up = |v: u32, max: u32| v.div_ceil(128).saturating_mul(128).min(max).max(v);
+    vk::Extent2D {
+        width: up(rect.width, frame.width),
+        height: up(rect.height, frame.height),
+    }
 }
 
 /// Картинки слоёв `wanted` из уже нарисованных `layers`.
@@ -995,6 +1022,17 @@ fn hue_to_rgb(h: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layer_images_are_rect_sized_with_headroom() {
+        let e = |width, height| vk::Extent2D { width, height };
+        let frame = e(1920, 1009);
+        assert_eq!(layer_image_size(e(1, 1), frame), e(128, 128));
+        assert_eq!(layer_image_size(e(130, 128), frame), e(256, 128));
+        // Не больше кадра, но и не меньше прямоугольника.
+        assert_eq!(layer_image_size(e(1900, 1000), frame), e(1920, 1009));
+        assert_eq!(layer_image_size(e(100, 50), e(90, 40)), e(100, 50));
+    }
 
     #[test]
     fn sprite_layout_matches_std430() {
