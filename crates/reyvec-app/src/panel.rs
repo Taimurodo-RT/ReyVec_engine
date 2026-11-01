@@ -54,6 +54,7 @@ const SCENES: &[(&str, &[(DemoScene, &str)])] = &[
             (DemoScene::Light, "L"),
             (DemoScene::Lamps, "K"),
             (DemoScene::Blobs, "J"),
+            (DemoScene::Lab, "H"),
         ],
     ),
 ];

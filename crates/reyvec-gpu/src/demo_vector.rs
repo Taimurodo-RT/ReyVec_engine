@@ -71,6 +71,8 @@ pub(crate) struct VectorDemo {
     pub text: TextLibrary,
     /// Сцена «текст».
     text_scene: TextScene,
+    /// Сцена «лаборатория мага» (4.6).
+    pub lab: crate::lab::LabShapes,
 }
 
 /// Векторные фигуры сцены «свет» стоят ниже этой высоты (единицы сцены при камере по
@@ -243,6 +245,7 @@ impl VectorDemo {
         let morph = library
             .add_morph(&morph_keyframes, FillRule::NonZero, Color::WHITE)
             .expect("контуры перетекания корректны (проверено тестом)");
+        let lab = crate::lab::LabShapes::new(&mut library);
         let (text, text_scene) = text_scene();
         Self {
             library,
@@ -268,6 +271,7 @@ impl VectorDemo {
             stream: Vec::new(),
             text,
             text_scene,
+            lab,
         }
         .with_svgs(files.svg.as_deref())
         .with_motif(files.motif.as_deref())

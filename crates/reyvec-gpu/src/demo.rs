@@ -86,6 +86,9 @@ pub enum DemoScene {
     /// Этап 4: объекты целиком из SDF (слизь, капли, магический шар) рядом с векторными,
     /// со светом и тенями (4.5).
     Blobs,
+    /// Этап 4: демо-сцена «лаборатория мага» (4.6): всё вместе — векторные предметы с
+    /// тенями, светящиеся зелья, неон, свеча, котёл и магический шар.
+    Lab,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -115,12 +118,13 @@ impl DemoScene {
             Self::Light => "свет (SDF)",
             Self::Lamps => "лампы и тени",
             Self::Blobs => "слизь и магия",
+            Self::Lab => "лаборатория мага",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph`, `light`, `lamps` или
-    /// `blobs`.
+    /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph`, `light`, `lamps`,
+    /// `blobs` или `lab`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -137,18 +141,25 @@ impl DemoScene {
             "light" => Some(Self::Light),
             "lamps" => Some(Self::Lamps),
             "blobs" => Some(Self::Blobs),
+            "lab" => Some(Self::Lab),
             _ => None,
         }
     }
 
     /// Сцены этапа 4 с SDF-фигурами и полем расстояний.
     pub fn uses_field(self) -> bool {
-        matches!(self, Self::Light | Self::Lamps | Self::Blobs)
+        matches!(self, Self::Light | Self::Lamps | Self::Blobs | Self::Lab)
+    }
+
+    /// Сцены с SDF-фигурами библиотеки на весь экран (`sdf_demo.slang`); у остальных
+    /// сцен этапа 4 шейдер рисует только фон.
+    fn has_demo_shapes(self) -> bool {
+        matches!(self, Self::Light | Self::Lamps)
     }
 
     /// Сцены этапа 4, освещённые лампами (свет, тени, свечение).
     pub fn uses_lights(self) -> bool {
-        matches!(self, Self::Lamps | Self::Blobs)
+        matches!(self, Self::Lamps | Self::Blobs | Self::Lab)
     }
 
     /// Другой вариант стресс-теста (движение ↔ перетекание). У остальных сцен `None`.
@@ -959,6 +970,7 @@ impl Demo {
             DemoScene::Light | DemoScene::Lamps | DemoScene::Blobs => {
                 self.vector_demo.light_items(time)
             }
+            DemoScene::Lab => self.vector_demo.lab.items(time),
             DemoScene::Stress | DemoScene::StressMorph => self
                 .vector_demo
                 .stress_instances(time, aspect, scene == DemoScene::StressMorph)
@@ -1089,6 +1101,7 @@ impl Demo {
         let lights = match scene {
             DemoScene::Lamps => crate::lights::demo_lights(time),
             DemoScene::Blobs => crate::blobs::demo_lights(time),
+            DemoScene::Lab => crate::lab::lights(time),
             _ => Vec::new(),
         };
         let light_count = lights.len().min(MAX_LIGHTS);
@@ -1098,10 +1111,10 @@ impl Demo {
             .collect();
         let light_buffer = self.light_buffers[slot];
         res.write_buffer(light_buffer, 0, &light_bytes);
-        let objects = if scene == DemoScene::Blobs {
-            crate::blobs::demo_objects(time)
-        } else {
-            Vec::new()
+        let objects = match scene {
+            DemoScene::Blobs => crate::blobs::demo_objects(time),
+            DemoScene::Lab => crate::lab::objects(time),
+            _ => Vec::new(),
         };
         let (object_bytes, blob_bytes, object_count) = crate::blobs::pack(&objects);
         let (object_buffer, blob_buffer) = (self.object_buffers[slot], self.blob_buffers[slot]);
@@ -1296,7 +1309,8 @@ impl Demo {
                         self.camera,
                         field_texture,
                         frame.scene.uses_lights(),
-                        frame.scene == DemoScene::Blobs,
+                        !frame.scene.has_demo_shapes(),
+                        frame.scene == DemoScene::Lab,
                     );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sdf);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
@@ -1437,7 +1451,7 @@ impl Demo {
         let mut uses = vec![(mask, Access::ColorAttachment)];
         uses.extend(shadows.iter().map(|l| (l.image, Access::Sampled)));
         graph.add_pass("маска", &uses, move |p| {
-            let push = sdf_push(frame.time, frame.extent, camera, None, false, false);
+            let push = sdf_push(frame.time, frame.extent, camera, None, false, false, false);
             let (d, cmd) = (p.device, p.cmd);
             // SAFETY: граф перевёл маску в раскладку рисования, а картинки слоёв (уже
             // нарисованные) в чтение; конвейеры живы, пока кадр рисуется.
@@ -1448,9 +1462,9 @@ impl Demo {
                 // перекрывают SDF-фигуры сцены «свет»).
                 begin_color_pass_with(d, cmd, p.view(mask), size, [0.0; 4]);
                 bindless.bind(d, cmd);
-                // Сначала SDF-фигуры сцены на всю маску (в сцене «слизь и магия» их нет,
+                // Сначала SDF-фигуры сцены на всю маску (в сценах «слизь и магия» и «лаборатория мага» их нет,
                 // маска просто очищена), потом SDF-объекты и силуэты слоёв поверх.
-                if frame.scene != DemoScene::Blobs {
+                if frame.scene.has_demo_shapes() {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.field.mask);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push[..24]);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
@@ -1759,6 +1773,7 @@ fn sdf_push(
     field: Option<u32>,
     lit: bool,
     no_shapes: bool,
+    lab: bool,
 ) -> [u8; 32] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let values = [
@@ -1774,7 +1789,10 @@ fn sdf_push(
         push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
     }
     push[24..28].copy_from_slice(&field.unwrap_or(0).to_ne_bytes());
-    let flags = u32::from(field.is_some()) | (u32::from(lit) << 1) | (u32::from(no_shapes) << 2);
+    let flags = u32::from(field.is_some())
+        | (u32::from(lit) << 1)
+        | (u32::from(no_shapes) << 2)
+        | (u32::from(lab) << 3);
     push[28..32].copy_from_slice(&flags.to_ne_bytes());
     push
 }
