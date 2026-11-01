@@ -30,7 +30,7 @@ struct Push
     CurveVertex* vertices;
     Instance* instances;
     float aspect;
-    uint samples; // точек MSAA на пиксель: 1, 4 или 8
+    uint samples; // точек MSAA на пиксель: 1, 2, 4 или 8
     uint unused0, unused1, unused2, unused3; // место градиентов в общих константах (здесь не нужны)
     float4 view_linear; // вид камеры (Camera2D в reyvec-vector): матрица 2×2 (a, b, c, d)
     float2 view_offset; // и сдвиг: сцена → экран, одинаково для всех фигур кадра
@@ -77,6 +77,7 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
 }
 
 // Стандартные положения точек MSAA в Vulkan (доли пикселя от левого верхнего угла).
+static const float2 SAMPLES_2[2] = { float2(0.75, 0.75), float2(0.25, 0.25) };
 static const float2 SAMPLES_4[4] = {
     float2(0.375, 0.125), float2(0.875, 0.375), float2(0.125, 0.625), float2(0.625, 0.875)
 };
@@ -111,6 +112,14 @@ float4 fs_main(VertexOut input, out uint coverage : SV_Coverage) : SV_Target
         for (uint i = 0; i < 4; i++)
         {
             float2 o = SAMPLES_4[i] - 0.5;
+            if (inside(input.uv + dx * o.x + dy * o.y)) mask |= 1u << i;
+        }
+    }
+    else if (pc.samples >= 2)
+    {
+        for (uint i = 0; i < 2; i++)
+        {
+            float2 o = SAMPLES_2[i] - 0.5;
             if (inside(input.uv + dx * o.x + dy * o.y)) mask |= 1u << i;
         }
     }

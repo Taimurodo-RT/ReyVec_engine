@@ -33,6 +33,8 @@ pub(crate) struct PanelInfo<'a> {
     pub scene: &'a str,
     /// Сглаживание сцены словами.
     pub msaa: &'a str,
+    /// Сглаживание совпадает с выбранным по умолчанию для этой видеокарты.
+    pub msaa_is_default: bool,
     /// Кадр сцены компактный (4 байта на точку), а не точный (8 байт).
     pub compact_scene: bool,
     /// Края при MSAA «как в редакторах», а не физически точные.
@@ -186,8 +188,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         ui.label(mono(format!("Снимок: {name}")));
     }
     ui.label(mono(format!(
-        "Сцена: {}, сглаживание: {}",
-        info.scene, info.msaa
+        "Сцена: {}, сглаживание: {}{}",
+        info.scene,
+        info.msaa,
+        if info.msaa_is_default {
+            " (по умолчанию для этой видеокарты)"
+        } else {
+            ""
+        }
     )));
     ui.label(mono(format!(
         "Кадр сцены: {}",
@@ -357,6 +365,7 @@ mod tests {
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
             msaa: "MSAA 4×",
+            msaa_is_default: true,
             compact_scene: true,
             perceptual_edges: true,
             fill: "у каждой фигуры свой способ",
