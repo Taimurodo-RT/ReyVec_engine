@@ -630,8 +630,9 @@ pub(crate) fn objects(t: f32) -> Vec<SdfObject> {
         flags: OBJECT_EMISSIVE,
     });
 
-    // Голубая неоновая лента под верхней полкой.
-    let half = f(SHELF_W / 2.0) - 0.08;
+    // Голубая неоновая лента под верхней полкой, между её уголками (уголок занимает
+    // 0,13 от края полки; конец ленты внутри уголка затенял бы всё вокруг).
+    let half = f(SHELF_W / 2.0) - 0.17;
     out.push(SdfObject {
         blobs: vec![Blob::capsule(
             [f(SHELF_X) - half, STRIP_Y],
@@ -651,7 +652,7 @@ pub(crate) fn lights(t: f32) -> Vec<Light> {
     let neon = neon_flicker(t);
     let candle = candle_flicker(t);
     let brew = 1.0 + 0.1 * (t * 5.0).sin() * (t * 1.3).sin();
-    let half = f(SHELF_W / 2.0) - 0.08;
+    let half = f(SHELF_W / 2.0) - 0.17;
     let x = f(CAULDRON_X);
     vec![
         Light::point(SIGIL, [0.6 * neon, 0.1 * neon, 0.42 * neon], 1.2, 0.2),
