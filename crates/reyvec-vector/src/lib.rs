@@ -19,6 +19,7 @@
 
 mod color;
 mod curves;
+mod layer;
 mod library;
 mod morph;
 mod paint;
@@ -30,6 +31,7 @@ pub use curves::{CurveMesh, curve_mesh};
 /// Библиотека кривых целиком: прямоугольники, круги, эллипсы и прочее (`kurbo::Shape::to_path`).
 pub use kurbo;
 pub use kurbo::{Affine, BezPath, Circle, PathEl, Point, Rect, Vec2};
+pub use layer::{BlendMode, SceneItem};
 pub use library::{Instance, ShapeId, ShapeLibrary};
 pub use morph::{MorphError, MorphMesh, morph_mesh};
 pub use paint::{Gradient, GradientKind, GradientStop, Paint, Spread};

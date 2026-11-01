@@ -19,8 +19,8 @@
 
 use ash::vk;
 use reyvec_vector::{
-    Color, FillMethod, FillRule, Gradient, GradientKind, Instance, Paint, ShapeLibrary, Spread,
-    Style,
+    BlendMode, Color, FillMethod, FillRule, Gradient, GradientKind, Paint, SceneItem, ShapeId,
+    ShapeLibrary, Spread, Style,
 };
 
 use crate::GpuError;
@@ -128,7 +128,7 @@ struct Meshes {
 }
 
 /// Что рисовать в кадре, по порядку.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Op {
     /// Команды `first..first + count` из буфера команд (способ 1 и обводки).
     Triangles { first: u32, count: u32 },
@@ -138,13 +138,22 @@ enum Op {
         index_count: u32,
         even_odd: bool,
     },
+    /// Наложить готовый слой `layer` (номер цели рисования) с прозрачностью и режимом.
+    Composite {
+        layer: u32,
+        opacity: f32,
+        blend: BlendMode,
+    },
 }
 
 /// Буферы одного кадра в работе: пока видеокарта читает одни, процессор пишет в другие.
 struct FrameBuffers {
     instances: BufferId,
     commands: BufferId,
-    ops: Vec<Op>,
+    /// Что рисовать в каждую цель: 0 — кадр сцены, остальные — слои.
+    targets: Vec<Vec<Op>>,
+    /// Слои в порядке рисования: вложенные раньше тех, в которые они вложены.
+    layer_order: Vec<u32>,
 }
 
 /// Что нужно команде рисования в этом кадре. Готовится в [`VectorRenderer::prepare`].
@@ -169,6 +178,8 @@ struct Pipelines {
     count_nonzero: vk::Pipeline,
     count_even_odd: vk::Pipeline,
     cover: vk::Pipeline,
+    /// Наложение слоя по режимам: обычное, умножение, экран, сложение.
+    composite: [vk::Pipeline; 4],
 }
 
 impl Pipelines {
@@ -177,6 +188,7 @@ impl Pipelines {
         count_nonzero: vk::Pipeline::null(),
         count_even_odd: vk::Pipeline::null(),
         cover: vk::Pipeline::null(),
+        composite: [vk::Pipeline::null(); 4],
     };
 
     fn destroy(self, ctx: &GpuContext) {
@@ -185,7 +197,10 @@ impl Pipelines {
             self.count_nonzero,
             self.count_even_odd,
             self.cover,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.composite)
+        {
             // SAFETY: вызывающий гарантирует, что видеокарта конвейеры не использует.
             unsafe { ctx.device.destroy_pipeline(p, None) };
         }
@@ -206,7 +221,7 @@ pub(crate) struct VectorRenderer {
 }
 
 /// Шейдеры векторного слоя: при их перезагрузке конвейеры пересобираются.
-const SHADERS: [&str; 3] = ["vector", "vector_stencil", "vector_cover"];
+const SHADERS: [&str; 4] = ["vector", "vector_stencil", "vector_cover", "vector_layer"];
 
 impl VectorRenderer {
     pub fn new(
@@ -233,7 +248,8 @@ impl VectorRenderer {
                     BufferMemory::CpuToGpu,
                     &format!("векторные команды кадра {i}"),
                 )?,
-                ops: Vec::new(),
+                targets: Vec::new(),
+                layer_order: Vec::new(),
             });
         }
         Ok(Self {
@@ -461,29 +477,25 @@ impl VectorRenderer {
         &mut self,
         res: &mut GpuResources,
         slot: usize,
-        instances: &[Instance],
+        items: &[SceneItem],
         aspect: f32,
     ) -> Option<VectorData> {
         let meshes = self.meshes.as_ref()?;
-        if instances.len() > MAX_INSTANCES && !self.warned_overflow {
+        let packed = pack(&meshes.ranges, items, self.fill);
+        if packed.overflow && !self.warned_overflow {
             tracing::warn!(
-                "Векторных фигур в кадре {}, а помещается {MAX_INSTANCES}: лишние не рисуются",
-                instances.len()
+                "Векторных фигур в кадре больше, чем помещается ({MAX_INSTANCES}): лишние не рисуются"
             );
             self.warned_overflow = true;
         }
-        let packed = pack(
-            &meshes.ranges,
-            &instances[..instances.len().min(MAX_INSTANCES)],
-            self.fill,
-        );
-        if packed.ops.is_empty() {
+        if packed.targets.iter().all(Vec::is_empty) {
             return None;
         }
         let frame = &mut self.frames[slot];
         res.write_buffer(frame.instances, 0, &packed.instances);
         res.write_buffer(frame.commands, 0, &packed.commands);
-        frame.ops = packed.ops;
+        frame.targets = packed.targets;
+        frame.layer_order = packed.layer_order;
         Some(VectorData {
             indices: res.buffer_address(meshes.indices),
             vertices: res.buffer_address(meshes.vertices),
@@ -498,18 +510,45 @@ impl VectorRenderer {
         })
     }
 
-    /// Записывает рисование фигур в открытый проход рисования в кадр сцены.
+    /// Слои кадра `data` в порядке рисования (номера целей, см. [`Self::record`]).
+    /// Каждый рисуется своим проходом раньше прохода, в котором его накладывают.
+    pub fn layer_order(&self, data: &VectorData) -> &[u32] {
+        &self.frames[data.slot].layer_order
+    }
+
+    /// Слои, которые накладываются прямо в цель `target`: их картинки проход этой цели
+    /// читает.
+    pub fn layer_children(&self, data: &VectorData, target: usize) -> Vec<u32> {
+        self.frames[data.slot]
+            .targets
+            .get(target)
+            .into_iter()
+            .flatten()
+            .filter_map(|op| match *op {
+                Op::Composite { layer, .. } => Some(layer),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Записывает рисование цели `target` (0 — кадр сцены, иначе слой из
+    /// [`Self::layer_order`]) в открытый проход рисования. `layer_textures[k]` — номер в
+    /// общем списке текстур готовой картинки слоя `k` (для слоёв, которые здесь
+    /// накладываются).
     ///
     /// # Safety
     /// `cmd` записывается внутри `vkCmdBeginRendering` с картинкой формата
     /// [`SCENE_FORMAT`] и трафаретом формата, переданного в [`Self::new`], общая раскладка
-    /// конвейеров уже привязана; буферы `data` живы, пока видеокарта рисует кадр.
+    /// конвейеров уже привязана; буферы `data` живы, пока видеокарта рисует кадр;
+    /// картинки слоёв из `layer_textures` уже нарисованы и доступны для чтения.
     pub unsafe fn record(
         &self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         layout: vk::PipelineLayout,
         data: VectorData,
+        target: usize,
+        layer_textures: &[u32],
     ) {
         let push = |indices: vk::DeviceAddress, vertices: vk::DeviceAddress| {
             let mut push = [0u8; PUSH_SIZE];
@@ -532,7 +571,10 @@ impl VectorRenderer {
                 device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, push);
             }
         };
-        for &op in &self.frames[data.slot].ops {
+        let Some(ops) = self.frames[data.slot].targets.get(target) else {
+            return;
+        };
+        for &op in ops {
             match op {
                 Op::Triangles { first, count } => {
                     bind(p.triangles, &triangles_push);
@@ -564,6 +606,28 @@ impl VectorRenderer {
                     // SAFETY: условия функции.
                     unsafe { device.cmd_draw(cmd, index_count, 1, 0, instance) };
                 }
+                Op::Composite {
+                    layer,
+                    opacity,
+                    blend,
+                } => {
+                    let Some(&texture) = layer_textures
+                        .get(layer as usize)
+                        .filter(|&&t| t != u32::MAX)
+                    else {
+                        continue;
+                    };
+                    let mut push = [0u8; 8];
+                    push[..4].copy_from_slice(&texture.to_ne_bytes());
+                    push[4..].copy_from_slice(&opacity.to_ne_bytes());
+                    let pipeline = p.composite[blend_index(blend)];
+                    // SAFETY: условия функции; картинка слоя готова к чтению.
+                    unsafe {
+                        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                        device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        device.cmd_draw(cmd, 3, 1, 0, 0);
+                    }
+                }
             }
         }
     }
@@ -580,27 +644,90 @@ impl VectorRenderer {
 struct Packed {
     instances: Vec<u8>,
     commands: Vec<u8>,
-    ops: Vec<Op>,
+    /// Что рисовать в каждую цель: 0 — кадр сцены, остальные — слои.
+    targets: Vec<Vec<Op>>,
+    /// Непустые слои в порядке рисования: вложенные раньше внешних.
+    layer_order: Vec<u32>,
+    /// Экземпляров больше [`MAX_INSTANCES`], лишние пропущены.
+    overflow: bool,
 }
 
-/// Раскладывает экземпляры в байты для видеокарты: экземпляры (std430), команды
-/// рисования треугольников и порядок рисования. Подряд идущие экземпляры одной фигуры,
-/// которые рисуются треугольниками, становятся одной командой. Экземпляры неизвестных и
-/// пустых фигур пропускаются. Фигуры без треугольников (перетекающие) рисуются трафаретом
-/// при любом `fill`.
-fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMode) -> Packed {
-    let mut out = Vec::with_capacity(instances.len() * INSTANCE_SIZE);
+/// Номер конвейера наложения слоя.
+fn blend_index(blend: BlendMode) -> usize {
+    match blend {
+        BlendMode::Normal => 0,
+        BlendMode::Multiply => 1,
+        BlendMode::Screen => 2,
+        BlendMode::Add => 3,
+    }
+}
+
+/// Раскладывает кадр в байты для видеокарты: экземпляры (std430), команды рисования
+/// треугольников и порядок рисования каждой цели (кадр сцены и слои). Подряд идущие
+/// экземпляры одной фигуры в одной цели, которые рисуются треугольниками, становятся одной
+/// командой. Экземпляры неизвестных и пустых фигур пропускаются, пустые слои тоже. Фигуры
+/// без треугольников (перетекающие) рисуются трафаретом при любом `fill`.
+fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
+    let mut out = Vec::new();
     let mut commands: Vec<[u32; 4]> = Vec::new();
-    let mut ops: Vec<Op> = Vec::new();
-    let mut last_shape = None;
+    let mut targets: Vec<Vec<Op>> = vec![Vec::new()];
+    let mut layer_order = Vec::new();
+    // Открытые слои: номер цели, прозрачность, режим.
+    let mut stack: Vec<(usize, f32, BlendMode)> = Vec::new();
+    let mut last: Option<(usize, ShapeId)> = None;
     let mut written = 0u32;
-    for inst in instances {
+    let mut overflow = false;
+
+    let close = |layer: (usize, f32, BlendMode),
+                 stack: &[(usize, f32, BlendMode)],
+                 targets: &mut Vec<Vec<Op>>,
+                 layer_order: &mut Vec<u32>| {
+        let (idx, opacity, blend) = layer;
+        if targets[idx].is_empty() {
+            return;
+        }
+        layer_order.push(idx as u32);
+        let parent = stack.last().map_or(0, |l| l.0);
+        targets[parent].push(Op::Composite {
+            layer: idx as u32,
+            opacity,
+            blend,
+        });
+    };
+
+    for item in items {
+        let inst = match *item {
+            SceneItem::BeginLayer { opacity, blend } => {
+                targets.push(Vec::new());
+                let opacity = if opacity.is_nan() {
+                    0.0
+                } else {
+                    opacity.clamp(0.0, 1.0)
+                };
+                stack.push((targets.len() - 1, opacity, blend));
+                last = None;
+                continue;
+            }
+            SceneItem::EndLayer => {
+                if let Some(layer) = stack.pop() {
+                    close(layer, &stack, &mut targets, &mut layer_order);
+                }
+                last = None;
+                continue;
+            }
+            SceneItem::Shape(inst) => inst,
+        };
+        let target = stack.last().map_or(0, |l| l.0);
         let Some(range) = ranges.get(inst.shape.0 as usize) else {
             continue;
         };
         let stencil =
             range.curve_index_count > 0 && (range.index_count == 0 || fill.stencil(range.method));
         if range.index_count == 0 && !stencil {
+            continue;
+        }
+        if written as usize >= MAX_INSTANCES {
+            overflow = true;
             continue;
         }
         let [a, b, c, d, e, f] = inst.transform.as_coeffs().map(|v| v as f32);
@@ -617,32 +744,41 @@ fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMode) -> Packed 
         out.extend_from_slice(&range.morph_last.to_ne_bytes());
         out.extend_from_slice(&inst.morph.to_ne_bytes());
         out.extend_from_slice(&range.paint.to_ne_bytes());
+        let ops = &mut targets[target];
         if stencil {
             ops.push(Op::Stencil {
                 instance: written,
                 index_count: range.curve_index_count,
                 even_odd: range.even_odd,
             });
-            last_shape = None;
+            last = None;
         } else {
-            match (commands.last_mut(), ops.last_mut()) {
-                (Some(cmd), Some(Op::Triangles { .. })) if last_shape == Some(inst.shape) => {
-                    cmd[1] += 1;
-                }
+            let same = last == Some((target, inst.shape));
+            // `last` ставится только после команды треугольников этой цели и
+            // сбрасывается на всём остальном, поэтому последняя команда и есть отрезок
+            // этой фигуры.
+            match (commands.last_mut(), ops.last()) {
+                (Some(cmd), Some(Op::Triangles { .. })) if same => cmd[1] += 1,
                 _ => {
                     commands.push([range.index_count, 1, 0, written]);
+                    let new = commands.len() as u32 - 1;
                     match ops.last_mut() {
-                        Some(Op::Triangles { count, .. }) => *count += 1,
+                        Some(Op::Triangles { first, count }) if *first + *count == new => {
+                            *count += 1;
+                        }
                         _ => ops.push(Op::Triangles {
-                            first: commands.len() as u32 - 1,
+                            first: new,
                             count: 1,
                         }),
                     }
                 }
             }
-            last_shape = Some(inst.shape);
+            last = Some((target, inst.shape));
         }
         written += 1;
+    }
+    while let Some(layer) = stack.pop() {
+        close(layer, &stack, &mut targets, &mut layer_order);
     }
     Packed {
         instances: out,
@@ -651,7 +787,9 @@ fn pack(ranges: &[MeshRange], instances: &[Instance], fill: FillMode) -> Packed 
             .flatten()
             .flat_map(|w| w.to_ne_bytes())
             .collect(),
-        ops,
+        targets,
+        layer_order,
+        overflow,
     }
 }
 
@@ -684,6 +822,17 @@ fn build(
         made.count_nonzero = one("vector_stencil", Blend::Opaque, StencilUse::CountNonZero)?;
         made.count_even_odd = one("vector_stencil", Blend::Opaque, StencilUse::CountEvenOdd)?;
         made.cover = one("vector_cover", Blend::Alpha, StencilUse::Cover)?;
+        for (i, blend) in [
+            Blend::Premultiplied,
+            Blend::Multiply,
+            Blend::Screen,
+            Blend::Add,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            made.composite[i] = one("vector_layer", blend, StencilUse::Ignore)?;
+        }
         Ok(())
     })();
     match result {
@@ -763,7 +912,7 @@ fn pack_vertex(out: &mut Vec<u8>, position: [f32; 2], edge: &reyvec_vector::Edge
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reyvec_vector::{Affine, ShapeId};
+    use reyvec_vector::{Affine, Instance};
 
     const PLAIN: MeshRange = MeshRange {
         first_index: 0,
@@ -777,6 +926,10 @@ mod tests {
         morph_stride: 0,
         morph_last: 0,
     };
+
+    fn items(instances: &[Instance]) -> Vec<SceneItem> {
+        instances.iter().copied().map(SceneItem::from).collect()
+    }
 
     fn words(bytes: &[u8]) -> Vec<u32> {
         bytes
@@ -830,10 +983,11 @@ mod tests {
         let Packed {
             instances: inst,
             commands: cmds,
-            ops,
-        } = pack(&ranges, &instances, FillMode::Triangles);
+            targets,
+            ..
+        } = pack(&ranges, &items(&instances), FillMode::Triangles);
         assert_eq!(inst.len(), 5 * INSTANCE_SIZE);
-        assert_eq!(ops, [Op::Triangles { first: 0, count: 3 }]);
+        assert_eq!(targets, [[Op::Triangles { first: 0, count: 3 }]]);
         assert_eq!(
             words(&cmds),
             [6, 3, 0, 0, 3, 1, 0, 3, 6, 1, 0, 4],
@@ -911,9 +1065,9 @@ mod tests {
             index_count,
             even_odd: false,
         };
-        let per_shape = pack(&ranges, &instances, FillMode::PerShape);
+        let per_shape = pack(&ranges, &items(&instances), FillMode::PerShape);
         assert_eq!(
-            per_shape.ops,
+            per_shape.targets[0],
             [
                 Op::Triangles { first: 0, count: 1 },
                 stencil(1, 6),
@@ -924,13 +1078,16 @@ mod tests {
         assert_eq!(words(&morph[..8]), [12, 2]);
         assert_eq!(f32::from_ne_bytes(morph[8..12].try_into().unwrap()), 1.5);
         // «Все треугольниками»: перетекающая всё равно трафаретом.
-        let triangles = pack(&ranges, &instances, FillMode::Triangles);
+        let triangles = pack(&ranges, &items(&instances), FillMode::Triangles);
         assert_eq!(
-            triangles.ops,
+            triangles.targets[0],
             [Op::Triangles { first: 0, count: 2 }, stencil(2, 12)]
         );
-        let all = pack(&ranges, &instances, FillMode::Stencil);
-        assert_eq!(all.ops, [stencil(0, 6), stencil(1, 6), stencil(2, 12)]);
+        let all = pack(&ranges, &items(&instances), FillMode::Stencil);
+        assert_eq!(
+            all.targets[0],
+            [stencil(0, 6), stencil(1, 6), stencil(2, 12)]
+        );
     }
 
     #[test]
@@ -948,9 +1105,9 @@ mod tests {
         let ranges = [range(0, 12, false), range(3, 0, false), range(6, 9, true)];
         let at = |shape: u32| Instance::new(ShapeId(shape), Affine::IDENTITY);
         let instances = [at(1), at(1), at(0), at(1), at(2), at(2)];
-        let packed = pack(&ranges, &instances, FillMode::Stencil);
+        let packed = pack(&ranges, &items(&instances), FillMode::Stencil);
         assert_eq!(
-            packed.ops,
+            packed.targets[0],
             [
                 Op::Triangles { first: 0, count: 1 },
                 Op::Stencil {
@@ -975,7 +1132,90 @@ mod tests {
         // Номер первого треугольника веера лежит в экземпляре рядом с номером способа 1.
         assert_eq!(words(&packed.instances[24..32]), [3, 30]);
         // Тот же кадр треугольниками: все шесть экземпляров в командах.
-        let triangles = pack(&ranges, &instances, FillMode::Triangles);
-        assert_eq!(triangles.ops, [Op::Triangles { first: 0, count: 4 }]);
+        let triangles = pack(&ranges, &items(&instances), FillMode::Triangles);
+        assert_eq!(triangles.targets[0], [Op::Triangles { first: 0, count: 4 }]);
+    }
+
+    #[test]
+    fn layers_get_own_targets_and_composite_in_parent() {
+        let ranges = [
+            MeshRange {
+                index_count: 3,
+                ..PLAIN
+            },
+            MeshRange {
+                first_index: 3,
+                index_count: 3,
+                ..PLAIN
+            },
+        ];
+        let shape = |s: u32| SceneItem::from(Instance::new(ShapeId(s), Affine::IDENTITY));
+        let items = [
+            shape(0),
+            SceneItem::layer(0.5),
+            shape(0), // та же фигура, но в слое: отдельная команда
+            SceneItem::blend(BlendMode::Multiply, 2.0),
+            shape(1),
+            SceneItem::EndLayer,
+            shape(0), // после вложенного слоя: снова новая команда
+            SceneItem::EndLayer,
+            SceneItem::EndLayer, // лишний конец: пропускается
+            SceneItem::layer(1.0),
+            SceneItem::EndLayer, // пустой слой: не рисуется
+            shape(0),
+            SceneItem::blend(BlendMode::Add, 0.25),
+            shape(1), // незакрытый слой закрывается в конце кадра
+        ];
+        let packed = pack(&ranges, &items, FillMode::PerShape);
+        let tri = |first| Op::Triangles { first, count: 1 };
+        assert_eq!(
+            packed.targets[0],
+            [
+                tri(0),
+                Op::Composite {
+                    layer: 1,
+                    opacity: 0.5,
+                    blend: BlendMode::Normal
+                },
+                tri(4),
+                Op::Composite {
+                    layer: 4,
+                    opacity: 0.25,
+                    blend: BlendMode::Add
+                },
+            ]
+        );
+        assert_eq!(
+            packed.targets[1],
+            [
+                tri(1),
+                Op::Composite {
+                    layer: 2,
+                    opacity: 1.0,
+                    blend: BlendMode::Multiply
+                },
+                tri(3),
+            ]
+        );
+        assert_eq!(packed.targets[2], [tri(2)]);
+        assert!(packed.targets[3].is_empty());
+        assert_eq!(packed.targets[4], [tri(5)]);
+        assert_eq!(packed.layer_order, [2, 1, 4], "вложенные раньше внешних");
+        assert_eq!(words(&packed.commands).len(), 6 * 4);
+        assert!(!packed.overflow);
+    }
+
+    #[test]
+    fn too_many_instances_are_dropped_with_flag() {
+        let ranges = [MeshRange {
+            index_count: 3,
+            ..PLAIN
+        }];
+        let one = Instance::new(ShapeId(0), Affine::IDENTITY);
+        let items = vec![SceneItem::from(one); MAX_INSTANCES + 2];
+        let packed = pack(&ranges, &items, FillMode::PerShape);
+        assert!(packed.overflow);
+        assert_eq!(packed.instances.len(), MAX_INSTANCES * INSTANCE_SIZE);
+        assert_eq!(words(&packed.commands)[1], MAX_INSTANCES as u32);
     }
 }

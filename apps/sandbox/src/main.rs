@@ -1,7 +1,7 @@
 //! Песочница ReyVec: программа, которую запускают для проверки каждого этапа.
 //!
-//! Окно с тестовыми сценами (клавиши 1, 2 и 3): треугольник и спрайты с текстурами
-//! (этап 2), векторные фигуры и перетекание (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
+//! Окно с тестовыми сценами (клавиши 1–4): треугольник и спрайты с текстурами
+//! (этап 2), векторные фигуры, перетекание и слои (этап 3). FPS в заголовке, панель счётчиков (F1 прячет).
 //! Шейдеры можно править на ходу: после сохранения файла картинка обновится.
 //!
 //! Флаги:
@@ -10,7 +10,7 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
-//! - `--scene gpu|vector|morph`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene gpu|vector|morph|layers`: с какой сцены начать (по умолчанию `vector`);
 //! - `--msaa off|4|8`: сглаживание сцены (по умолчанию 4);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
@@ -37,8 +37,8 @@ const HELP: &str = "\
   --no-vsync             без вертикальной синхронизации
   --no-hot-reload        не перезагружать шейдеры после сохранения файлов
   --no-tracy             не включать замеры для программы Tracy
-  --scene <gpu|vector|morph>  с какой сцены начать: gpu (этап 2), vector (векторы, по умолчанию)
-                         или morph (перетекание)
+  --scene <gpu|vector|morph|layers>  с какой сцены начать: gpu (этап 2), vector (векторы,
+                         по умолчанию), morph (перетекание) или layers (слои)
   --msaa <off|4|8>       сглаживание краёв (по умолчанию 4)
   --editor-edges         края «как в редакторах» (дороже, особенно на встроенной видеокарте)
   --fill <shape|triangles|stencil>  заливки векторов: у каждой фигуры свой способ (по умолчанию),
@@ -53,7 +53,7 @@ const HELP: &str = "\
   --version, -V          версия
   --help, -h             эта справка
 
-В окне: Esc закрывает окно, 1, 2 и 3 переключают сцену, M переключает сглаживание, G вид краёв, F1 прячет и показывает панель счётчиков,
+В окне: Esc закрывает окно, 1–4 переключают сцену, M переключает сглаживание, G вид краёв, F1 прячет и показывает панель счётчиков,
 F12 сохраняет снимок кадра в папку snapshots рядом с программой.";
 
 #[derive(Debug, Default, PartialEq)]
@@ -110,11 +110,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--scene" => {
                 let n = it
                     .next()
-                    .ok_or("после --scene нужно gpu, vector или morph")?;
-                out.scene = Some(
-                    reyvec_app::DemoScene::from_name(&n)
-                        .ok_or_else(|| format!("--scene: «{n}», а нужно gpu, vector или morph"))?,
-                );
+                    .ok_or("после --scene нужно gpu, vector, morph или layers")?;
+                out.scene = Some(reyvec_app::DemoScene::from_name(&n).ok_or_else(|| {
+                    format!("--scene: «{n}», а нужно gpu, vector, morph или layers")
+                })?);
             }
             "--msaa" => {
                 let n = it.next().ok_or("после --msaa нужно off, 4 или 8")?;
@@ -363,6 +362,10 @@ mod tests {
         assert_eq!(
             parse("--scene morph").unwrap().scene,
             Some(reyvec_app::DemoScene::Morph)
+        );
+        assert_eq!(
+            parse("--scene layers").unwrap().scene,
+            Some(reyvec_app::DemoScene::Layers)
         );
         assert_eq!(
             parse("--fill shape").unwrap().fill,
