@@ -206,8 +206,15 @@ pub(crate) struct Sprite {
 }
 
 const SPRITE_SIZE: usize = std::mem::size_of::<Sprite>();
-/// Формат кадра сцены: линейный цвет с запасом точности (для будущих эффектов и HDR).
-pub(crate) const SCENE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// Формат картинок слоёв векторов: линейный цвет с прозрачностью и запасом точности.
+pub(crate) const LAYER_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// Формат кадра сцены, если видеокарта его умеет: линейный цвет с запасом яркости (HDR),
+/// но без прозрачности и вдвое компактнее [`LAYER_FORMAT`] (4 байта на точку вместо 8).
+/// Кадр сцены очищается, рисуется и сводится из MSAA каждый кадр во весь экран, и на
+/// встроенной видеокарте с общей памятью это главная постоянная цена кадра (узкое место
+/// 40 в `docs/vector-bottlenecks.md`). Прозрачность кадру сцены не нужна: слои с
+/// прозрачностью рисуются в свои картинки.
+const COMPACT_SCENE_FORMAT: vk::Format = vk::Format::B10G11R11_UFLOAT_PACK32;
 const MAX_SPRITES: usize = 64;
 /// Размеры клеток шахматки по очереди, в пикселях текстуры.
 const CHECKER_CELLS: [u32; 3] = [16, 32, 8];
@@ -282,6 +289,10 @@ pub(crate) struct Demo {
     perceptual_edges: bool,
     /// Формат трафарета прохода сцены (нужен заливке через трафарет).
     stencil_format: vk::Format,
+    /// Формат кадра сцены: компактный ([`COMPACT_SCENE_FORMAT`]) или [`LAYER_FORMAT`].
+    scene_format: vk::Format,
+    /// Видеокарта умеет компактный кадр сцены ([`pick_scene_format`]).
+    compact_supported: bool,
     /// Камера векторных сцен (сдвиг и приближение). Лупа — одно её положение.
     camera: reyvec_vector::Camera2D,
     /// Время процессора на подготовку векторного кадра, мс (сглаженное).
@@ -333,13 +344,26 @@ impl Demo {
         }
         let vector_demo = VectorDemo::new(files);
         let stencil_format = pick_stencil_format(ctx)?;
-        let mut vector = VectorRenderer::new(ctx, res, shaders, frames_in_flight, stencil_format)?;
         // SAFETY: physical получен из этого экземпляра.
         let limits = unsafe {
             ctx.instance()
                 .get_physical_device_properties(ctx.physical)
                 .limits
         };
+        // Картинку MSAA и рисуют, и читают в шейдере сведения; трафарет того же размера.
+        let msaa_counts = limits.framebuffer_color_sample_counts
+            & limits.sampled_image_color_sample_counts
+            & limits.framebuffer_stencil_sample_counts;
+        let scene_format = pick_scene_format(ctx, msaa_counts);
+        tracing::info!("Формат кадра сцены: {scene_format:?}");
+        let mut vector = VectorRenderer::new(
+            ctx,
+            res,
+            shaders,
+            frames_in_flight,
+            stencil_format,
+            scene_format,
+        )?;
         if let Err(e) = vector
             .upload(ctx, res, &vector_demo.library)
             .and_then(|()| vector.upload_text(ctx, res, &vector_demo.text))
@@ -362,12 +386,11 @@ impl Demo {
             vector_demo,
             uploads: Uploads::default(),
             msaa: Msaa::Off,
-            // Картинку MSAA и рисуют, и читают в шейдере сведения; трафарет того же размера.
-            msaa_counts: limits.framebuffer_color_sample_counts
-                & limits.sampled_image_color_sample_counts
-                & limits.framebuffer_stencil_sample_counts,
+            msaa_counts,
             perceptual_edges: false,
             stencil_format,
+            scene_format,
+            compact_supported: scene_format == COMPACT_SCENE_FORMAT,
             camera: reyvec_vector::Camera2D::default(),
             vector_cpu: VectorCpu::default(),
             vector_items: 0,
@@ -380,7 +403,7 @@ impl Demo {
                 res,
                 shaders,
                 "triangle",
-                SCENE_FORMAT,
+                scene_format,
                 Msaa::Off,
                 Some(stencil_format),
             )?;
@@ -389,11 +412,11 @@ impl Demo {
                 res,
                 shaders,
                 "sprite",
-                SCENE_FORMAT,
+                scene_format,
                 Msaa::Off,
                 Some(stencil_format),
             )?;
-            demo.resolve = build(ctx, res, shaders, "resolve", SCENE_FORMAT, Msaa::Off, None)?;
+            demo.resolve = build(ctx, res, shaders, "resolve", scene_format, Msaa::Off, None)?;
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -484,47 +507,7 @@ impl Demo {
         if msaa == self.msaa {
             return Ok(msaa);
         }
-        let triangle = build(
-            ctx,
-            res,
-            shaders,
-            "triangle",
-            SCENE_FORMAT,
-            msaa,
-            Some(self.stencil_format),
-        )?;
-        let sprites = match build(
-            ctx,
-            res,
-            shaders,
-            "sprite",
-            SCENE_FORMAT,
-            msaa,
-            Some(self.stencil_format),
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                // SAFETY: конвейер только что создан и нигде не используется.
-                unsafe { ctx.device.destroy_pipeline(triangle, None) };
-                return Err(e);
-            }
-        };
-        if let Err(e) = self.vector.set_msaa(ctx, res, shaders, msaa) {
-            // SAFETY: конвейеры только что созданы и нигде не используются.
-            unsafe {
-                ctx.device.destroy_pipeline(triangle, None);
-                ctx.device.destroy_pipeline(sprites, None);
-            }
-            return Err(e);
-        }
-        // SAFETY: видеокарта простаивает (условие функции).
-        unsafe {
-            ctx.device.destroy_pipeline(self.triangle, None);
-            ctx.device.destroy_pipeline(self.sprites, None);
-        }
-        self.triangle = triangle;
-        self.sprites = sprites;
-        self.msaa = msaa;
+        self.set_targets(ctx, res, shaders, msaa, self.scene_format)?;
         if msaa != wanted {
             tracing::warn!(
                 "Видеокарта не умеет {}, сглаживание: {}",
@@ -534,6 +517,82 @@ impl Demo {
         }
         tracing::info!("Сглаживание сцены: {}", msaa.title());
         Ok(msaa)
+    }
+
+    /// Компактный ли кадр сцены (4 байта на точку, без прозрачности) или точный
+    /// (16 бит на канал, как у слоёв).
+    pub fn compact_scene(&self) -> bool {
+        self.scene_format != LAYER_FORMAT
+    }
+
+    /// Умеет ли видеокарта компактный кадр сцены.
+    pub fn compact_scene_supported(&self) -> bool {
+        self.compact_supported
+    }
+
+    /// Компактный или точный кадр сцены (для сравнения скорости и вида). Если видеокарта
+    /// компактный не умеет, остаётся точный. Вызывать, когда видеокарта простаивает.
+    pub fn set_compact_scene(
+        &mut self,
+        ctx: &GpuContext,
+        res: &GpuResources,
+        shaders: &ShaderLibrary,
+        compact: bool,
+    ) -> Result<(), GpuError> {
+        let format = if compact && self.compact_supported {
+            COMPACT_SCENE_FORMAT
+        } else {
+            LAYER_FORMAT
+        };
+        if format == self.scene_format {
+            return Ok(());
+        }
+        self.set_targets(ctx, res, shaders, self.msaa, format)?;
+        tracing::info!("Кадр сцены: {format:?}");
+        Ok(())
+    }
+
+    /// Пересобирает конвейеры, которые рисуют в кадр сцены, под сглаживание `msaa` и
+    /// формат `format`. Видеокарта простаивает.
+    fn set_targets(
+        &mut self,
+        ctx: &GpuContext,
+        res: &GpuResources,
+        shaders: &ShaderLibrary,
+        msaa: Msaa,
+        format: vk::Format,
+    ) -> Result<(), GpuError> {
+        let stencil = Some(self.stencil_format);
+        let mut made: Vec<vk::Pipeline> = Vec::new();
+        let result = (|| {
+            for (name, samples, stencil) in [
+                ("triangle", msaa, stencil),
+                ("sprite", msaa, stencil),
+                ("resolve", Msaa::Off, None),
+            ] {
+                made.push(build(ctx, res, shaders, name, format, samples, stencil)?);
+            }
+            self.vector.set_targets(ctx, res, shaders, msaa, format)
+        })();
+        if let Err(e) = result {
+            // SAFETY: конвейеры только что созданы и нигде не используются.
+            for p in made {
+                unsafe { ctx.device.destroy_pipeline(p, None) };
+            }
+            return Err(e);
+        }
+        // SAFETY: видеокарта простаивает (условие функции).
+        unsafe {
+            ctx.device.destroy_pipeline(self.triangle, None);
+            ctx.device.destroy_pipeline(self.sprites, None);
+            ctx.device.destroy_pipeline(self.resolve, None);
+        }
+        self.triangle = made[0];
+        self.sprites = made[1];
+        self.resolve = made[2];
+        self.msaa = msaa;
+        self.scene_format = format;
+        Ok(())
     }
 
     /// Формат картинки, в которую выводится кадр.
@@ -575,10 +634,10 @@ impl Demo {
         for name in names {
             let stencil = Some(self.stencil_format);
             let (slot, format, msaa, stencil) = match name.as_str() {
-                "triangle" => (&mut self.triangle, SCENE_FORMAT, self.msaa, stencil),
-                "sprite" => (&mut self.sprites, SCENE_FORMAT, self.msaa, stencil),
+                "triangle" => (&mut self.triangle, self.scene_format, self.msaa, stencil),
+                "sprite" => (&mut self.sprites, self.scene_format, self.msaa, stencil),
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
-                "resolve" => (&mut self.resolve, SCENE_FORMAT, Msaa::Off, None),
+                "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 _ => continue,
             };
             match build(ctx, res, shaders, name, format, msaa, stencil) {
@@ -847,7 +906,7 @@ impl Demo {
                 unsafe { VectorRenderer::record_uploads(p.device, p.cmd, &self.uploads) };
             });
         }
-        let scene = graph.create("кадр сцены", frame.extent, SCENE_FORMAT);
+        let scene = graph.create("кадр сцены", frame.extent, self.scene_format);
         // Со сглаживанием сцена рисуется в картинку с несколькими точками на пиксель. Точки
         // усредняет в обычный кадр сцены сама видеокарта в конце прохода «сцена» (быстро:
         // картинка MSAA не пишется в память). Для краёв «как в редакторах» усредняет свой
@@ -856,7 +915,7 @@ impl Demo {
             graph.create_multisampled(
                 "кадр сцены MSAA",
                 frame.extent,
-                SCENE_FORMAT,
+                self.scene_format,
                 frame.msaa.samples(),
             )
         });
@@ -883,9 +942,9 @@ impl Demo {
             for &layer in self.vector.layer_order(&vector) {
                 let rect = self.vector.layer_rect(&vector, layer, frame.extent);
                 let size = layer_image_size(rect.extent, frame.extent);
-                let image = graph.create("слой", size, SCENE_FORMAT);
+                let image = graph.create("слой", size, LAYER_FORMAT);
                 let ms = (frame.msaa != Msaa::Off).then(|| {
-                    graph.create_multisampled("слой MSAA", size, SCENE_FORMAT, frame.msaa.samples())
+                    graph.create_multisampled("слой MSAA", size, LAYER_FORMAT, frame.msaa.samples())
                 });
                 let mut uses = vec![
                     (ms.unwrap_or(image), Access::ColorAttachment),
@@ -1139,6 +1198,39 @@ fn build(
 
 /// Формат трафарета для прохода сцены: первый, который видеокарта умеет как цель рисования.
 /// Только трафарет (S8) экономнее всего; AMD не умеет D24S8, поэтому есть и D32S8.
+/// Формат кадра сцены: [`COMPACT_SCENE_FORMAT`], если видеокарта умеет в него рисовать
+/// со смешиванием, читать его в шейдере и делать MSAA со всеми числами точек `msaa_counts`;
+/// иначе [`LAYER_FORMAT`].
+fn pick_scene_format(ctx: &GpuContext, msaa_counts: vk::SampleCountFlags) -> vk::Format {
+    let format = COMPACT_SCENE_FORMAT;
+    // SAFETY: physical получен из этого экземпляра.
+    let features = unsafe {
+        ctx.instance()
+            .get_physical_device_format_properties(ctx.physical, format)
+    }
+    .optimal_tiling_features;
+    let needed = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    // SAFETY: physical получен из этого экземпляра.
+    let samples = unsafe {
+        ctx.instance().get_physical_device_image_format_properties(
+            ctx.physical,
+            format,
+            vk::ImageType::TYPE_2D,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageCreateFlags::empty(),
+        )
+    }
+    .map_or(vk::SampleCountFlags::empty(), |p| p.sample_counts);
+    if features.contains(needed) && samples.contains(msaa_counts) {
+        format
+    } else {
+        LAYER_FORMAT
+    }
+}
+
 fn pick_stencil_format(ctx: &GpuContext) -> Result<vk::Format, GpuError> {
     let candidates = [
         vk::Format::S8_UINT,

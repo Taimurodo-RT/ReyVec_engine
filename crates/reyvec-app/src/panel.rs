@@ -33,6 +33,8 @@ pub(crate) struct PanelInfo<'a> {
     pub scene: &'a str,
     /// Сглаживание сцены словами.
     pub msaa: &'a str,
+    /// Кадр сцены компактный (4 байта на точку), а не точный (8 байт).
+    pub compact_scene: bool,
     /// Края при MSAA «как в редакторах», а не физически точные.
     pub perceptual_edges: bool,
     /// Как рисуются заливки векторных фигур.
@@ -188,6 +190,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         info.scene, info.msaa
     )));
     ui.label(mono(format!(
+        "Кадр сцены: {}",
+        if info.compact_scene {
+            "компактный (4 байта на точку)"
+        } else {
+            "точный (8 байт на точку)"
+        }
+    )));
+    ui.label(mono(format!(
         "Края: {}",
         if info.perceptual_edges {
             "как в редакторах"
@@ -218,7 +228,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
     }
     ui.label(
         RichText::new(
-            "0–9 сцена, T вариант стресса, M сглаживание, G края, F заливка, Z лупа, \
+            "0–9 сцена, T вариант стресса, M сглаживание, G края, P кадр сцены, F заливка, Z лупа, \
              колесо и мышь камера, R сброс, F1 прячет панель, F12 снимок",
         )
         .weak(),
@@ -347,6 +357,7 @@ mod tests {
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
             msaa: "MSAA 4×",
+            compact_scene: true,
             perceptual_edges: true,
             fill: "у каждой фигуры свой способ",
             zoom: false,

@@ -157,6 +157,8 @@ pub struct WindowRenderer {
     scene: DemoScene,
     /// Какое сглаживание просили (видеокарта может уметь меньше).
     msaa_wanted: Msaa,
+    /// Просили ли компактный кадр сцены (видеокарта может не уметь).
+    compact_scene_wanted: bool,
     ui: Option<UiRenderer>,
     /// Изменения текстур панели, ещё не попавшие на видеокарту. Копятся, пока кадры
     /// пропускаются (окно свёрнуто): иначе, например, атлас шрифта потерялся бы.
@@ -240,6 +242,7 @@ impl WindowRenderer {
             files: options.files.clone(),
             scene: DemoScene::default(),
             msaa_wanted: Msaa::default(),
+            compact_scene_wanted: true,
             ui: None,
             ui_textures: egui::TexturesDelta::default(),
             shaders: ShaderLibrary::new(options.hot_reload),
@@ -377,6 +380,24 @@ impl WindowRenderer {
         self.msaa_wanted = msaa;
     }
 
+    /// Рисуется ли сцена в компактный кадр (4 байта на точку) вместо точного (8 байт).
+    pub fn compact_scene(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::compact_scene)
+    }
+
+    /// Умеет ли видеокарта компактный кадр сцены.
+    pub fn compact_scene_supported(&self) -> bool {
+        self.demo
+            .as_ref()
+            .is_some_and(Demo::compact_scene_supported)
+    }
+
+    /// Просит компактный или точный кадр сцены со следующего кадра. Смена на миг
+    /// останавливает видеокарту.
+    pub fn set_compact_scene(&mut self, compact: bool) {
+        self.compact_scene_wanted = compact;
+    }
+
     /// Режим показа кадров словами: с вертикальной синхронизацией или без.
     pub fn present_mode_name(&self) -> &'static str {
         match self.present_mode {
@@ -471,6 +492,13 @@ impl WindowRenderer {
             // SAFETY: ждём, пока видеокарта перестанет использовать старые конвейеры.
             unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
             demo.set_msaa(&self.ctx, res, &self.shaders, self.msaa_wanted)?;
+        }
+        if let (Some(demo), Some(res)) = (self.demo.as_mut(), self.resources.as_ref())
+            && demo.compact_scene() != (self.compact_scene_wanted && demo.compact_scene_supported())
+        {
+            // SAFETY: ждём, пока видеокарта перестанет использовать старые конвейеры.
+            unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
+            demo.set_compact_scene(&self.ctx, res, &self.shaders, self.compact_scene_wanted)?;
         }
         let shader_error = self.shaders.error().is_some();
         let in_flight = self.frames[self.frame_index].in_flight;

@@ -30,7 +30,7 @@ use reyvec_vector::{
 
 use crate::GpuError;
 use crate::context::GpuContext;
-use crate::demo::{Msaa, SCENE_FORMAT};
+use crate::demo::{LAYER_FORMAT, Msaa};
 use crate::pipeline::{Blend, Stencil, StencilUse, graphics_pipeline_stencil};
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
@@ -501,7 +501,10 @@ impl Pipelines {
 }
 
 pub(crate) struct VectorRenderer {
-    pipelines: Pipelines,
+    /// Конвейеры для кадра сцены и для картинок слоёв (у них разные форматы).
+    pipelines: [Pipelines; 2],
+    /// Формат кадра сцены (у слоёв всегда [`LAYER_FORMAT`]).
+    scene_format: vk::Format,
     /// Сглаживание, под которое собраны конвейеры.
     msaa: Msaa,
     /// Формат трафарета прохода сцены.
@@ -639,6 +642,7 @@ impl VectorRenderer {
         shaders: &ShaderLibrary,
         frames_in_flight: usize,
         stencil_format: vk::Format,
+        scene_format: vk::Format,
     ) -> Result<Self, GpuError> {
         let mut frames = Vec::with_capacity(frames_in_flight);
         for i in 0..frames_in_flight {
@@ -665,7 +669,8 @@ impl VectorRenderer {
             });
         }
         Ok(Self {
-            pipelines: build(ctx, res, shaders, Msaa::Off, stencil_format)?,
+            pipelines: build_both(ctx, res, shaders, Msaa::Off, stencil_format, scene_format)?,
+            scene_format,
             msaa: Msaa::Off,
             stencil_format,
             fill: FillMode::default(),
@@ -700,10 +705,19 @@ impl VectorRenderer {
         if !names.iter().any(|n| SHADERS.contains(&n.as_str())) {
             return;
         }
-        match build(ctx, res, shaders, self.msaa, self.stencil_format) {
+        match build_both(
+            ctx,
+            res,
+            shaders,
+            self.msaa,
+            self.stencil_format,
+            self.scene_format,
+        ) {
             Ok(new) => {
                 // Видеокарта простаивает (условие функции).
-                self.pipelines.destroy(ctx);
+                for p in &mut self.pipelines {
+                    p.destroy(ctx);
+                }
                 self.pipelines = new;
             }
             Err(e) => {
@@ -714,22 +728,27 @@ impl VectorRenderer {
         }
     }
 
-    /// Пересобирает конвейеры под другое сглаживание. Видеокарта простаивает.
-    pub fn set_msaa(
+    /// Пересобирает конвейеры под другое сглаживание и формат кадра сцены. Видеокарта
+    /// простаивает.
+    pub fn set_targets(
         &mut self,
         ctx: &GpuContext,
         res: &GpuResources,
         shaders: &ShaderLibrary,
         msaa: Msaa,
+        scene_format: vk::Format,
     ) -> Result<(), GpuError> {
-        if msaa == self.msaa {
+        if msaa == self.msaa && scene_format == self.scene_format {
             return Ok(());
         }
-        let new = build(ctx, res, shaders, msaa, self.stencil_format)?;
+        let new = build_both(ctx, res, shaders, msaa, self.stencil_format, scene_format)?;
         // Видеокарта простаивает (условие функции).
-        self.pipelines.destroy(ctx);
+        for p in &mut self.pipelines {
+            p.destroy(ctx);
+        }
         self.pipelines = new;
         self.msaa = msaa;
+        self.scene_format = scene_format;
         Ok(())
     }
 
@@ -1214,8 +1233,8 @@ impl VectorRenderer {
     /// начинается картинка цели (у кадра сцены ноль).
     ///
     /// # Safety
-    /// `cmd` записывается внутри `vkCmdBeginRendering` с картинкой формата
-    /// [`SCENE_FORMAT`] и трафаретом формата, переданного в [`Self::new`], общая раскладка
+    /// `cmd` записывается внутри `vkCmdBeginRendering` с картинкой формата кадра сцены
+    /// (цель 0) или [`LAYER_FORMAT`] (слои) и трафаретом формата, переданного в [`Self::new`], общая раскладка
     /// конвейеров уже привязана; буферы `data` живы, пока видеокарта рисует кадр;
     /// картинки слоёв из `layers` уже нарисованы и доступны для чтения.
     #[allow(clippy::too_many_arguments)]
@@ -1245,7 +1264,7 @@ impl VectorRenderer {
         };
         let triangles_push = push(data.indices, data.vertices);
         let curves_push = push(data.curve_indices, data.curve_vertices);
-        let p = &self.pipelines;
+        let p = &self.pipelines[usize::from(target != 0)];
         let bind = |pipeline: vk::Pipeline, push: &[u8; PUSH_SIZE]| {
             // SAFETY: условия функции.
             unsafe {
@@ -1367,8 +1386,10 @@ impl VectorRenderer {
     /// Уничтожает конвейеры, когда видеокарта их не использует. Буферы уходят вместе с
     /// [`GpuResources`].
     pub fn destroy(&mut self, ctx: &GpuContext) {
-        self.pipelines.destroy(ctx);
-        self.pipelines = Pipelines::NULL;
+        for p in &mut self.pipelines {
+            p.destroy(ctx);
+        }
+        self.pipelines = [Pipelines::NULL, Pipelines::NULL];
     }
 }
 
@@ -2148,12 +2169,32 @@ fn pixel_rect(b: Bounds, aspect: f32, extent: vk::Extent2D) -> vk::Rect2D {
     }
 }
 
+/// Конвейеры для кадра сцены формата `scene_format` и для слоёв ([`LAYER_FORMAT`]).
+fn build_both(
+    ctx: &GpuContext,
+    res: &GpuResources,
+    shaders: &ShaderLibrary,
+    msaa: Msaa,
+    stencil_format: vk::Format,
+    scene_format: vk::Format,
+) -> Result<[Pipelines; 2], GpuError> {
+    let scene = build(ctx, res, shaders, msaa, stencil_format, scene_format)?;
+    match build(ctx, res, shaders, msaa, stencil_format, LAYER_FORMAT) {
+        Ok(layers) => Ok([scene, layers]),
+        Err(e) => {
+            scene.destroy(ctx);
+            Err(e)
+        }
+    }
+}
+
 fn build(
     ctx: &GpuContext,
     res: &GpuResources,
     shaders: &ShaderLibrary,
     msaa: Msaa,
     stencil_format: vk::Format,
+    format: vk::Format,
 ) -> Result<Pipelines, GpuError> {
     let one = |name: &str, blend: Blend, usage: StencilUse| {
         let pair = shaders.get(name);
@@ -2162,7 +2203,7 @@ fn build(
             res.bindless.pipeline_layout,
             &pair.vs,
             &pair.fs,
-            SCENE_FORMAT,
+            format,
             blend,
             msaa.samples(),
             Some(Stencil {

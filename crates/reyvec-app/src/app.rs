@@ -247,6 +247,7 @@ impl App {
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),
+                compact_scene: renderer.compact_scene(),
                 perceptual_edges: renderer.perceptual_edges(),
                 fill: renderer.fill().label(),
                 zoom: renderer.zoom(),
@@ -428,6 +429,24 @@ impl ApplicationHandler for App {
                         next = next.next();
                     }
                     r.set_msaa(next);
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyP),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    if r.compact_scene_supported() {
+                        r.set_compact_scene(!r.compact_scene());
+                    } else {
+                        tracing::info!("Компактный кадр сцены эта видеокарта не умеет");
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
