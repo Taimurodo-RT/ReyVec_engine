@@ -1,0 +1,19 @@
+[package]
+name = "reyvec-motif"
+description = "ReyVec: чтение файлов перетекающих фигур от редактора Motif (*.reyvec.json), без кода Motif."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+reyvec-vector.workspace = true
+kurbo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

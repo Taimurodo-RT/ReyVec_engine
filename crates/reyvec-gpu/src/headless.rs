@@ -59,8 +59,8 @@ pub struct HeadlessScene {
     pub fill: crate::FillMode,
     /// Лупа векторной сцены (увеличение в 8 раз у края сердца).
     pub zoom: bool,
-    /// Свой SVG для сцены «SVG» (содержимое файла); без него там тестовые рисунки.
-    pub svg: Option<std::sync::Arc<[u8]>>,
+    /// Свои файлы для сцен «SVG» и «Motif»; без них там примеры.
+    pub files: crate::UserFiles,
 }
 
 /// Кадр, нарисованный без окна.
@@ -141,7 +141,7 @@ pub fn render_triangle_headless(
             perceptual_edges: false,
             fill: crate::FillMode::PerShape,
             zoom: false,
-            svg: None,
+            files: crate::UserFiles::default(),
         },
     )
 }
@@ -274,7 +274,7 @@ fn render(
             &ShaderLibrary::new(false),
             FORMAT,
             1,
-            scene.svg.as_deref(),
+            &scene.files,
         )?);
         // Шахматка меняет клетки со временем: загружаем ту, что нужна в момент scene.time.
         if let (Some(demo), Some(gpu)) = (r.demo.as_mut(), r.gpu.as_mut()) {
