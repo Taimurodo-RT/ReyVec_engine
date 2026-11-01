@@ -268,8 +268,10 @@ pub(crate) struct Demo {
     camera: reyvec_vector::Camera2D,
     /// Время процессора на подготовку векторного кадра, мс (сглаженное).
     vector_cpu_ms: f64,
-    /// Векторных фигур и блоков текста в последнем кадре.
+    /// Векторных фигур и блоков текста в последнем кадре и сколько из них нарисовано
+    /// (остальные за краем экрана).
     vector_items: usize,
+    vector_drawn: usize,
 }
 
 /// Во сколько раз увеличивает лупа векторной сцены.
@@ -351,6 +353,7 @@ impl Demo {
             camera: reyvec_vector::Camera2D::default(),
             vector_cpu_ms: 0.0,
             vector_items: 0,
+            vector_drawn: 0,
         };
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
@@ -425,9 +428,10 @@ impl Demo {
     }
 
     /// Сколько процессор тратит на подготовку векторного кадра (раскладка фигур, запись
-    /// экземпляров и команд), мс, сглажено за последние кадры, и сколько в кадре фигур.
-    pub fn vector_cpu(&self) -> (f64, usize) {
-        (self.vector_cpu_ms, self.vector_items)
+    /// экземпляров и команд), мс, сглажено за последние кадры, сколько в кадре фигур и
+    /// сколько из них нарисовано (остальные целиком за краем экрана).
+    pub fn vector_cpu(&self) -> (f64, usize, usize) {
+        (self.vector_cpu_ms, self.vector_items, self.vector_drawn)
     }
 
     /// Края сводятся «как в редакторах» (`true`) или физически точно.
@@ -722,6 +726,7 @@ impl Demo {
                     self.vector_cpu_ms * 0.9 + ms * 0.1
                 };
                 self.vector_items = items.len();
+                self.vector_drawn = self.vector.drawn() as usize;
                 data
             }
         };
