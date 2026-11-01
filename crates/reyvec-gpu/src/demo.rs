@@ -25,7 +25,7 @@ use crate::pipeline::{
 };
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
-use crate::vector::{FillMode, VectorData, VectorRenderer};
+use crate::vector::{FillMode, LayerTexture, VectorData, VectorRenderer};
 
 /// Какую сцену песочницы рисовать.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -650,10 +650,12 @@ impl Demo {
         );
         // Слои векторных фигур: каждый рисуется своим проходом в свою картинку
         // (прозрачный фон, то же сглаживание и тот же трафарет), а потом накладывается
-        // в проходе, где он стоит. Вложенные слои идут раньше внешних.
-        let mut layers: Vec<(u32, ImageHandle)> = Vec::new();
+        // в проходе, где он стоит. Вложенные слои идут раньше внешних. Рисуется и
+        // накладывается слой только в прямоугольнике, который занимают его фигуры.
+        let mut layers: Vec<LayerImage> = Vec::new();
         if let Some(vector) = frame.vector {
             for &layer in self.vector.layer_order(&vector) {
+                let rect = self.vector.layer_rect(&vector, layer, frame.extent);
                 let image = graph.create("слой", frame.extent, SCENE_FORMAT);
                 let ms = (frame.msaa != Msaa::Off).then(|| {
                     graph.create_multisampled(
@@ -674,7 +676,7 @@ impl Demo {
                     &layers,
                     &self.vector.layer_children(&vector, layer as usize),
                 );
-                uses.extend(children.iter().map(|&(_, h)| (h, Access::Sampled)));
+                uses.extend(children.iter().map(|l| (l.image, Access::Sampled)));
                 graph.add_pass("слой", &uses, move |p| {
                     let textures = layer_textures(p, &children);
                     let (d, cmd) = (p.device, p.cmd);
@@ -688,15 +690,16 @@ impl Demo {
                             ms.map(|_| p.view(image)),
                             Some(p.view(stencil)),
                             p.extent(image),
+                            Some(rect),
                             [0.0; 4],
                         );
                         bindless.bind(d, cmd);
                         self.vector
-                            .record(d, cmd, layout, vector, layer as usize, &textures);
+                            .record(d, cmd, layout, vector, layer as usize, &textures, rect);
                         d.cmd_end_rendering(cmd);
                     }
                 });
-                layers.push((layer, image));
+                layers.push(LayerImage { layer, image, rect });
             }
         }
         let scene_children = match frame.vector {
@@ -711,7 +714,7 @@ impl Demo {
         if hardware_resolve.is_some() {
             uses.push((scene, Access::ColorAttachment));
         }
-        uses.extend(scene_children.iter().map(|&(_, h)| (h, Access::Sampled)));
+        uses.extend(scene_children.iter().map(|l| (l.image, Access::Sampled)));
 
         graph.add_pass("сцена", &uses, move |p| {
             let mut triangle_push = [0u8; 8];
@@ -732,6 +735,7 @@ impl Demo {
                     hardware_resolve.map(|_| p.view(scene)),
                     Some(p.view(stencil)),
                     p.extent(scene),
+                    None,
                     CLEAR_COLOR,
                 );
                 bindless.bind(d, cmd);
@@ -741,7 +745,9 @@ impl Demo {
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
                 if let Some(vector) = frame.vector {
-                    self.vector.record(d, cmd, layout, vector, 0, &textures);
+                    let full = vk::Rect2D::default().extent(p.extent(scene));
+                    self.vector
+                        .record(d, cmd, layout, vector, 0, &textures, full);
                 }
                 if frame.sprite_count > 0 {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
@@ -815,25 +821,37 @@ impl Demo {
     }
 }
 
-/// Картинки слоёв `wanted` из уже нарисованных `layers` (номер слоя, картинка).
-fn layer_images(layers: &[(u32, ImageHandle)], wanted: &[u32]) -> Vec<(u32, ImageHandle)> {
+/// Картинка слоя векторных фигур в графе кадра.
+#[derive(Clone, Copy)]
+struct LayerImage {
+    layer: u32,
+    image: ImageHandle,
+    /// Где в ней нарисованы фигуры слоя.
+    rect: vk::Rect2D,
+}
+
+/// Картинки слоёв `wanted` из уже нарисованных `layers`.
+fn layer_images(layers: &[LayerImage], wanted: &[u32]) -> Vec<LayerImage> {
     layers
         .iter()
         .copied()
-        .filter(|(layer, _)| wanted.contains(layer))
+        .filter(|l| wanted.contains(&l.layer))
         .collect()
 }
 
-/// Номера в общем списке текстур по номеру слоя (для [`VectorRenderer::record`]).
-fn layer_textures(p: &PassContext, layers: &[(u32, ImageHandle)]) -> Vec<u32> {
+/// Картинки по номеру слоя (для [`VectorRenderer::record`]).
+fn layer_textures(p: &PassContext, layers: &[LayerImage]) -> Vec<Option<LayerTexture>> {
     let len = layers
         .iter()
-        .map(|&(l, _)| l as usize + 1)
+        .map(|l| l.layer as usize + 1)
         .max()
         .unwrap_or(0);
-    let mut out = vec![u32::MAX; len];
-    for &(layer, h) in layers {
-        out[layer as usize] = p.texture(h);
+    let mut out = vec![None; len];
+    for l in layers {
+        out[l.layer as usize] = Some(LayerTexture {
+            texture: p.texture(l.image),
+            rect: l.rect,
+        });
     }
     out
 }
