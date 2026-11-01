@@ -384,6 +384,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Опыт 4.6: свет каскадами лучей вместо лучей к каждому источнику.
+    pub fn cascades(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::cascades)
+    }
+
+    /// Включает свет каскадами лучей со следующего кадра.
+    pub fn set_cascades(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_cascades(on);
+        }
+    }
+
     /// Лёгкий шум при выводе против полос на плавных переходах (4.4).
     pub fn dither(&self) -> bool {
         self.demo.as_ref().is_some_and(Demo::dither)

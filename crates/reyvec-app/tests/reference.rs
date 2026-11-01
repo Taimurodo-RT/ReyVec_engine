@@ -41,6 +41,7 @@ fn cases() -> Vec<Case> {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
+        cascades: false,
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
@@ -230,6 +231,15 @@ fn cases() -> Vec<Case> {
             name: "lab-2s-msaa4",
             scene: HeadlessScene {
                 msaa: Msaa::X4,
+                ..at(DemoScene::Lab, 2.0, false)
+            },
+        },
+        // Опыт 4.6: та же лаборатория со светом каскадами лучей (radiance cascades).
+        Case {
+            name: "lab-cascades-2s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                cascades: true,
                 ..at(DemoScene::Lab, 2.0, false)
             },
         },
@@ -448,6 +458,7 @@ fn light_scene_matches_cpu() {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
+        cascades: false,
     };
     let options = GpuOptions {
         validation: true,
@@ -522,6 +533,7 @@ fn lamps_scene_lights_around_lamps() {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
+        cascades: false,
     };
     let options = GpuOptions {
         validation: true,
@@ -570,6 +582,7 @@ fn blobs_scene_draws_slime_and_glowing_orb() {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
+        cascades: false,
     };
     let options = GpuOptions {
         validation: true,

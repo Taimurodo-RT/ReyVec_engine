@@ -494,17 +494,17 @@ pub(crate) fn objects(t: f32) -> Vec<SdfObject> {
     )];
     blobs.extend(bubbles(
         t,
-        [SPOTS.beaker[0], table + 0.16],
-        0.09,
-        0.02,
-        0.016,
+        [SPOTS.beaker[0], table + 0.17],
+        0.08,
+        0.026,
+        0.011,
         0.9,
-        5,
+        6,
         2.0,
     ));
     out.push(SdfObject {
         blobs,
-        k: 0.04,
+        k: 0.02,
         color: [1.0, 0.36, 0.05, 1.0],
         flags: OBJECT_EMISSIVE,
     });
