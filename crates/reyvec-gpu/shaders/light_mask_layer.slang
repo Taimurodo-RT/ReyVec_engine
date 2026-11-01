@@ -10,6 +10,8 @@ struct Push
     uint texture;   // номер картинки слоя в общем списке текстур
     float downscale; // во сколько раз маска меньше кадра
     int2 offset;    // пиксель кадра, с которого начинается картинка слоя
+    float2 extent;  // размер прямоугольника слоя в пикселях: дальше в картинке не
+                    // очищенная память (картинка больше прямоугольника), её не читаем
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -31,6 +33,15 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID)
     return o;
 }
 
+// Прозрачность картинки слоя в точке `pixel` (пиксели картинки). Сэмплер смешивает 2×2
+// соседних пикселя, поэтому точка прижимается к прямоугольнику слоя на полпикселя: за его
+// краем память не очищена, и без этого там читался мусор (столбик точек в поле).
+float layer_alpha(float2 pixel, float2 size)
+{
+    pixel = clamp(pixel, float2(0.5, 0.5), pc.extent - 0.5);
+    return textures[pc.texture].SampleLevel(samplers[0], pixel / size, 0.0).a;
+}
+
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
@@ -44,9 +55,9 @@ float4 fs_main(VertexOut input) : SV_Target
     float2 center = frame_pixel - float2(pc.offset);
     float q = pc.downscale * 0.25;
     float alpha = 0.0;
-    alpha += textures[pc.texture].SampleLevel(samplers[0], (center + float2(-q, -q)) / size, 0.0).a;
-    alpha += textures[pc.texture].SampleLevel(samplers[0], (center + float2(q, -q)) / size, 0.0).a;
-    alpha += textures[pc.texture].SampleLevel(samplers[0], (center + float2(-q, q)) / size, 0.0).a;
-    alpha += textures[pc.texture].SampleLevel(samplers[0], (center + float2(q, q)) / size, 0.0).a;
+    alpha += layer_alpha(center + float2(-q, -q), size);
+    alpha += layer_alpha(center + float2(q, -q), size);
+    alpha += layer_alpha(center + float2(-q, q), size);
+    alpha += layer_alpha(center + float2(q, q), size);
     return float4(alpha * 0.25, 0.0, 0.0, 1.0);
 }
