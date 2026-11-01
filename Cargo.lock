@@ -2440,6 +2440,7 @@ dependencies = [
  "notify",
  "raw-window-handle",
  "reyvec-motif",
+ "reyvec-sdf",
  "reyvec-svg",
  "reyvec-text",
  "reyvec-vector",

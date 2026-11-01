@@ -16,7 +16,8 @@ struct Push
     float height;  // высота окна в пикселях
     uint field_texture; // картинка поля расстояний (4.2), если flags & 1
     uint flags;         // 1: линии фона по полю из картинки (jump flooding), а не точному;
-                        // 2: сцена «лампы и тени» (светлый пол, свет умножит вывод)
+                        // 2: сцена с лампами (светлый пол, свет умножит вывод);
+                        // 4: без фигур, только пол (сцена «слизь и магия»)
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -48,14 +49,19 @@ float4 fs_main(VertexOut input) : SV_Target
     float pixel = 2.0 / (pc.height * pc.zoom);
     float t = pc.time;
 
-    DemoShapes all = demo_shapes(p, t);
-
     float field = 1e9;
     // Пол: в сцене с лампами светлый (его затемняет и красит свет), иначе тёмный.
     float3 color = (pc.flags & 2) != 0 ? float3(0.32, 0.33, 0.36) : float3(0.02, 0.025, 0.035);
-    // Сначала поле: считаем расстояние до ближайшей фигуры, потом рисуем линии.
-    for (int i = 0; i < DEMO_SHAPES; i++)
-        field = min(field, all.shapes[i].d);
+    bool shapes = (pc.flags & 4) == 0;
+    // Сначала поле: считаем расстояние до ближайшей фигуры, потом рисуем линии. Без фигур
+    // их и не считаем (это дорого, узкое место света 1).
+    DemoShapes all;
+    if (shapes)
+    {
+        all = demo_shapes(p, t);
+        for (int i = 0; i < DEMO_SHAPES; i++)
+            field = min(field, all.shapes[i].d);
+    }
     // Поле для линий фона: точное или из картинки, построенной jump flooding (задача 4.2).
     // Картинка в половинном разрешении, между её пикселями значения смешиваются.
     float lines_field = field;
@@ -72,6 +78,8 @@ float4 fs_main(VertexOut input) : SV_Target
     // Ореол у края, чтобы было видно, что поле продолжается и снаружи фигур.
     color += float3(0.04, 0.05, 0.07) * exp(-12.0 * max(lines_field, 0.0));
 
+    if (!shapes)
+        return float4(color, 1.0);
     // Фигуры поверх поля, каждая со своим мягким краем в пиксель.
     for (int i = 0; i < DEMO_SHAPES; i++)
         color = lerp(color, all.shapes[i].color, sdf_coverage(all.shapes[i].d, pixel));

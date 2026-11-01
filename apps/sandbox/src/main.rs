@@ -12,7 +12,7 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
-//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph|light|lamps`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph|light|lamps|blobs`: с какой сцены начать (по умолчанию `vector`);
 //! - `--msaa off|2|4|8`: сглаживание сцены (по умолчанию 2 на встроенной видеокарте, 4 на остальных);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
@@ -46,8 +46,9 @@ const HELP: &str = "\
                          motif (перетекающие фигуры из Motif), stream (новые фигуры
                          во время работы), text (текст), stress (10 000 движущихся
                          фигур), stress-morph (10 000 перетекающих фигур),
-                         light (свет на SDF, этап 4; клавиша L) или lamps (лампы
-                         и мягкие тени; клавиша K)
+                         light (свет на SDF, этап 4; клавиша L), lamps (лампы
+                         и мягкие тени; клавиша K) или blobs (слизь, капли и магия
+                         из SDF; клавиша J)
   --svg <файл.svg>       показать свой рисунок SVG в сцене «SVG» (клавиша 6, с неё и начнёт)
   --motif <файл.reyvec.json>  показать свои перетекающие фигуры от Motif в сцене «Motif»
                          (клавиша 7, с неё и начнёт)
@@ -123,11 +124,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--scene" => {
                 let n = it.next().ok_or(
-                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light или lamps",
+                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps или blobs",
                 )?;
                 out.scene = Some(reyvec_app::DemoScene::from_name(&n).ok_or_else(|| {
                     format!(
-                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light или lamps"
+                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps или blobs"
                     )
                 })?);
             }
@@ -423,6 +424,10 @@ mod tests {
         assert_eq!(
             parse("--scene lamps").unwrap().scene,
             Some(reyvec_app::DemoScene::Lamps)
+        );
+        assert_eq!(
+            parse("--scene blobs").unwrap().scene,
+            Some(reyvec_app::DemoScene::Blobs)
         );
         assert_eq!(
             parse("--scene morph").unwrap().scene,

@@ -542,3 +542,53 @@ fn lamps_scene_lights_around_lamps() {
     eprintln!("яркость у лампы {lamp}, в углу {corner}");
     assert!(lamp > corner * 2, "у лампы {lamp}, в углу {corner}");
 }
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn blobs_scene_draws_slime_and_glowing_orb() {
+    // Сцена «слизь и магия» (4.5): SDF-объекты в кадре и в маске теней, свет и свечение
+    // без ошибок валидации. Слизь зелёная, магический шар ярче угла сцены.
+    let (width, height, time) = (640u32, 360u32, 1.0f32);
+    let scene = HeadlessScene {
+        width,
+        height,
+        time,
+        shader_error: false,
+        scene: DemoScene::Blobs,
+        msaa: Msaa::X4,
+        perceptual_edges: false,
+        fill: FillMode::Triangles,
+        zoom: false,
+        files: Default::default(),
+    };
+    let options = GpuOptions {
+        validation: true,
+        gpu: None,
+    };
+    let frame = render_headless(&options, &scene).expect("кадр без окна");
+    assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+    let aspect = width as f32 / height as f32;
+    let pixel = |x: f32, y: f32| {
+        let px = ((x / aspect + 1.0) * 0.5 * width as f32) as u32;
+        let py = ((1.0 - y) * 0.5 * height as f32) as u32;
+        let i = ((py * width + px) * 4) as usize;
+        [
+            u32::from(frame.image.rgba[i]),
+            u32::from(frame.image.rgba[i + 1]),
+            u32::from(frame.image.rgba[i + 2]),
+        ]
+    };
+    // Середина тела слизи (blobs::demo_objects).
+    let slime = pixel(-0.8, -0.42);
+    eprintln!("слизь {slime:?}");
+    assert!(
+        slime[1] > slime[0] && slime[1] > slime[2],
+        "слизь не зелёная: {slime:?}"
+    );
+    // Магический шар при t = 1: (0; 0,3 + 0,05·sin 1,5).
+    let orb = pixel(0.0, 0.3 + 0.05 * 1.5f32.sin());
+    let corner = pixel(1.7, 0.9);
+    eprintln!("шар {orb:?}, угол {corner:?}");
+    let sum = |c: [u32; 3]| c.iter().sum::<u32>();
+    assert!(sum(orb) > sum(corner) * 3, "шар {orb:?}, угол {corner:?}");
+}

@@ -30,6 +30,7 @@ macro_rules! cpu_zone {
 
 mod adapter;
 mod bindless;
+mod blobs;
 mod context;
 mod demo;
 mod demo_vector;
