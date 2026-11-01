@@ -31,6 +31,9 @@ struct Push
     Instance* instances;
     float aspect;
     uint samples; // точек MSAA на пиксель: 1, 4 или 8
+    uint unused0, unused1, unused2, unused3; // место градиентов в общих константах (здесь не нужны)
+    float4 view_linear; // вид камеры (Camera2D в reyvec-vector): матрица 2×2 (a, b, c, d)
+    float2 view_offset; // и сдвиг: сцена → экран, одинаково для всех фигур кадра
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -63,6 +66,9 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
     float2 p = float2(
         inst.linear.x * shape.x + inst.linear.z * shape.y,
         inst.linear.y * shape.x + inst.linear.w * shape.y) + inst.offset;
+    p = float2(
+        pc.view_linear.x * p.x + pc.view_linear.z * p.y,
+        pc.view_linear.y * p.x + pc.view_linear.w * p.y) + pc.view_offset;
     p.x /= pc.aspect;
     VertexOut o;
     o.position = float4(p.x, -p.y, 0.0, 1.0);

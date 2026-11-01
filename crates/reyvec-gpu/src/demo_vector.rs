@@ -73,6 +73,10 @@ pub(crate) struct VectorDemo {
     text_scene: TextScene,
 }
 
+/// Фигур в сцене «стресс» и их сетка: столбцов, строк.
+pub(crate) const STRESS_COUNT: usize = 10_000;
+const STRESS_GRID: (usize, usize) = (125, 80);
+
 /// Сколько новых фигур в секунду добавляет сцена «поток».
 const STREAM_RATE: f32 = 10.0;
 /// Сетка сцены «поток»: столбцов, строк. Когда она заполнится, фигуры больше не добавляются.
@@ -752,6 +756,63 @@ impl VectorDemo {
                 .with_tint(Color::from_srgb8(242, 193, 78))
                 .with_morph(swing(0.0)),
         );
+        out
+    }
+
+    /// Сцена «стресс» в момент `time`: [`STRESS_COUNT`] фигур сеткой на весь кадр, каждая
+    /// кружит на своём месте и вращается со своей скоростью. `morph`: все фигуры
+    /// перетекающие и меняют форму каждый кадр (каждая рисуется трафаретом), иначе пять
+    /// разных обычных фигур вперемешку (треугольниками). Каждый кадр процессор только
+    /// считает положения: кривые не пересчитываются.
+    pub fn stress_instances(&self, time: f32, aspect: f32, morph: bool) -> Vec<Instance> {
+        let (cols, rows) = STRESS_GRID;
+        let t = f64::from(time);
+        // Сетка на весь кадр с небольшим полем.
+        let width = 2.0 * f64::from(aspect) * 0.96;
+        let height = 2.0 * 0.96;
+        let (cw, ch) = (width / cols as f64, height / rows as f64);
+        let cell = cw.min(ch);
+        // Обычные фигуры и во сколько раз их уменьшить до размера клетки (радиус ~1).
+        let shapes = [
+            (self.star_nonzero, 1.0 / 0.32),
+            (self.ring, 1.0 / 0.28),
+            (self.petal, 1.0 / 0.36),
+            (self.core, 1.0 / 0.07),
+            (self.star_evenodd, 1.0 / 0.32),
+        ];
+        let mut out = Vec::with_capacity(STRESS_COUNT);
+        for i in 0..STRESS_COUNT {
+            let (c, r) = (i % cols, i / cols);
+            let x = -width / 2.0 + (c as f64 + 0.5) * cw;
+            let y = -height / 2.0 + (r as f64 + 0.5) * ch;
+            let speed = 0.5 + 1.5 * noise(i, 1);
+            let phase = noise(i, 2) * TAU;
+            let orbit = 0.25 * cell;
+            let a = t * speed + phase;
+            let place = Affine::translate((x + orbit * a.cos(), y + orbit * a.sin()));
+            let k = (c as f32 / cols as f32 + r as f32 / rows as f32) * 0.5;
+            let [red, green, blue] = soft_hue(k);
+            let tint = Color::linear(red, green, blue, 0.9);
+            out.push(if morph {
+                // Туда и обратно по всем четырём контурам, у каждой свой темп.
+                let swing = 3.0 * (0.5 - 0.5 * (t * 0.8 * speed + phase).cos());
+                Instance::new(
+                    self.morph,
+                    place * Affine::rotate(a * 0.5) * Affine::scale(0.4 * cell / 0.45),
+                )
+                .with_tint(tint)
+                .with_morph(swing as f32)
+            } else {
+                // Фигуры вперемешку: соседние почти всегда разные, как в настоящей сцене.
+                let pick = (noise(i, 3) * shapes.len() as f64) as usize;
+                let (shape, unit) = shapes[pick.min(shapes.len() - 1)];
+                Instance::new(
+                    shape,
+                    place * Affine::rotate(a) * Affine::scale(0.4 * cell * unit),
+                )
+                .with_tint(tint)
+            });
+        }
         out
     }
 

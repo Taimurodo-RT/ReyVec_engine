@@ -7,9 +7,10 @@ use reyvec_gpu::{
     DemoScene, FrameStatus, GpuError, GpuFrameTimings, GpuOptions, GpuTimingAverage, Msaa,
     RendererOptions, WindowRenderer,
 };
+use reyvec_vector::{Camera2D, Point, Vec2};
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -32,7 +33,7 @@ pub struct AppConfig {
     pub hot_reload: bool,
     /// Включить замеры для Tracy: программа Tracy сможет подключиться к движку.
     pub tracy: bool,
-    /// С какой сцены песочницы начать (клавиши 1–8 переключают).
+    /// С какой сцены песочницы начать (клавиши 0–9 переключают).
     pub scene: DemoScene,
     /// Сглаживание сцены (клавиша M переключает).
     pub msaa: Msaa,
@@ -102,6 +103,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         minimized: false,
         closing: false,
         closed_at: None,
+        cursor: None,
+        dragging: false,
     };
     event_loop
         .run_app(&mut app)
@@ -148,6 +151,10 @@ struct App {
     closing: bool,
     /// Когда окно попросили закрыть: до этого момента считаем средний FPS.
     closed_at: Option<Instant>,
+    /// Где сейчас мышь в окне (пиксели).
+    cursor: Option<PhysicalPosition<f64>>,
+    /// Левая кнопка мыши зажата над сценой: движение мыши двигает камеру.
+    dragging: bool,
 }
 
 impl App {
@@ -243,6 +250,8 @@ impl App {
                 perceptual_edges: renderer.perceptual_edges(),
                 fill: renderer.fill().label(),
                 zoom: renderer.zoom(),
+                camera_zoom: renderer.camera().zoom,
+                vector_cpu: renderer.vector_cpu(),
             };
             panel.frame(window, &info)
         });
@@ -296,6 +305,17 @@ impl App {
     }
 }
 
+/// Во сколько раз приближает один щелчок колеса мыши.
+const ZOOM_STEP: f64 = 1.2;
+
+/// Точка окна (пиксели, y вниз) в координатах экрана сцены: y вверх от -1 до 1, x от
+/// `-aspect` до `aspect`. Возвращается вектором от центра окна.
+fn to_screen(p: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> Vec2 {
+    let h = f64::from(size.height.max(1));
+    let w = f64::from(size.width);
+    Vec2::new((2.0 * p.x - w) / h, (h - 2.0 * p.y) / h)
+}
+
 /// Клавиша выбора сцены песочницы. Клавиши по месту на клавиатуре, поэтому раскладка
 /// не важна.
 fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
@@ -309,6 +329,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::Digit7 | KeyCode::Numpad7 => Some(DemoScene::Motif),
         KeyCode::Digit8 | KeyCode::Numpad8 => Some(DemoScene::Stream),
         KeyCode::Digit9 | KeyCode::Numpad9 => Some(DemoScene::Text),
+        KeyCode::Digit0 | KeyCode::Numpad0 => Some(DemoScene::Stress),
         _ => None,
     }
 }
@@ -324,8 +345,9 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let mut panel_took = false;
         if let (Some(panel), Some(window)) = (self.panel.as_mut(), &self.window) {
-            panel.on_window_event(window, &event);
+            panel_took = panel.on_window_event(window, &event);
         }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
@@ -461,6 +483,82 @@ impl ApplicationHandler for App {
                     let on = !r.zoom();
                     r.set_zoom(on);
                     tracing::info!("Лупа векторной сцены: {}", if on { "×8" } else { "выкл" });
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyT),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut()
+                    && let Some(next) = r.scene().stress_variant()
+                {
+                    r.set_scene(next);
+                    tracing::info!("Сцена: {}", next.title());
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyR | KeyCode::Home),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_camera(Camera2D::default());
+                    tracing::info!("Камера в начале");
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let (true, Some(prev), Some(r), Some(w)) = (
+                    self.dragging,
+                    self.cursor,
+                    self.renderer.as_mut(),
+                    &self.window,
+                ) {
+                    let size = w.inner_size();
+                    let delta = to_screen(position, size) - to_screen(prev, size);
+                    let mut camera = r.camera();
+                    camera.pan_screen(delta);
+                    r.set_camera(camera);
+                }
+                self.cursor = Some(position);
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.dragging = false;
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // Панель забирает нажатия над собой: там мышь камеру не двигает.
+                self.dragging = state == ElementState::Pressed && !panel_took;
+            }
+            WindowEvent::MouseWheel { delta, .. } if !panel_took => {
+                // Один щелчок колеса: в 1,2 раза. Тачпад даёт пиксели: та же скорость
+                // примерно на 50 пикселей.
+                let steps = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
+                };
+                if let (Some(r), Some(w)) = (self.renderer.as_mut(), &self.window) {
+                    let size = w.inner_size();
+                    let at = self
+                        .cursor
+                        .map_or(Point::ZERO, |c| to_screen(c, size).to_point());
+                    let mut camera = r.camera();
+                    camera.zoom_at(at, ZOOM_STEP.powf(steps));
+                    r.set_camera(camera);
                 }
             }
             WindowEvent::Resized(size) => {

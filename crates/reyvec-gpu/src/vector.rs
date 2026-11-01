@@ -58,8 +58,9 @@ const ARENA_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
 fn arena_capacity(used: u64) -> u64 {
     used.max(MIN_ARENA).next_power_of_two()
 }
-/// Байт констант векторных конвейеров.
-const PUSH_SIZE: usize = 48;
+/// Байт констант векторных конвейеров. С 48-го байта у всех лежит вид камеры (24 байта).
+const PUSH_SIZE: usize = 72;
+const VIEW_OFFSET: usize = 48;
 /// Байт на букву текста: прямоугольник и его место в атласе (`Glyph` в `vector_text.slang`).
 const GLYPH_SIZE: usize = 32;
 
@@ -445,6 +446,8 @@ pub(crate) struct VectorData {
     atlas_size: [f32; 2],
     slot: usize,
     aspect: f32,
+    /// Вид камеры (a, b, c, d, e, f): сцена → экран.
+    view: [f32; 6],
 }
 
 /// Конвейеры векторного слоя под одно сглаживание.
@@ -949,10 +952,11 @@ impl VectorRenderer {
         slot: usize,
         items: &[SceneItem],
         aspect: f32,
+        view: reyvec_vector::Affine,
     ) -> Option<VectorData> {
         let meshes = self.meshes.as_ref()?;
         let texts = self.text.as_ref().map_or(&[][..], |t| &t.ranges[..]);
-        let packed = pack_frame(&meshes.ranges, texts, items, self.fill);
+        let packed = pack_frame(&meshes.ranges, texts, items, self.fill, view);
         if packed.overflow && !self.warned_overflow {
             tracing::warn!(
                 "Векторных фигур в кадре больше, чем помещается ({MAX_INSTANCES}): лишние не рисуются"
@@ -985,6 +989,7 @@ impl VectorRenderer {
             atlas_size: self.text.as_ref().map_or([1.0; 2], |t| t.atlas_size),
             slot,
             aspect,
+            view: view.as_coeffs().map(|v| v as f32),
         })
     }
 
@@ -1059,6 +1064,7 @@ impl VectorRenderer {
             push[28..32].copy_from_slice(&self.msaa.samples().as_raw().to_ne_bytes());
             push[32..40].copy_from_slice(&data.paints.to_ne_bytes());
             push[40..48].copy_from_slice(&data.stops.to_ne_bytes());
+            write_view(&mut push, data.view);
             push
         };
         let triangles_push = push(data.indices, data.vertices);
@@ -1110,7 +1116,8 @@ impl VectorRenderer {
                     instance,
                     glyph_count,
                 } => {
-                    let mut push = [0u8; 40];
+                    let mut push = [0u8; PUSH_SIZE];
+                    write_view(&mut push, data.view);
                     push[..8].copy_from_slice(&data.glyphs.to_ne_bytes());
                     push[8..16].copy_from_slice(&data.instances.to_ne_bytes());
                     push[16..20].copy_from_slice(&data.aspect.to_ne_bytes());
@@ -1194,7 +1201,7 @@ struct Packed {
     targets: Vec<Vec<Op>>,
     /// Непустые слои в порядке рисования: вложенные раньше внешних.
     layer_order: Vec<u32>,
-    /// Прямоугольник каждой цели в координатах сцены: всё, что в неё рисуется, включая
+    /// Прямоугольник каждой цели на экране (после камеры): всё, что в неё рисуется, включая
     /// вложенные слои.
     bounds: Vec<Bounds>,
     /// Экземпляров больше [`MAX_INSTANCES`], лишние пропущены.
@@ -1218,15 +1225,25 @@ fn blend_index(blend: BlendMode) -> usize {
 /// без треугольников (перетекающие) рисуются трафаретом при любом `fill`.
 #[cfg(test)]
 fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
-    pack_frame(ranges, &[], items, fill)
+    pack_frame(ranges, &[], items, fill, reyvec_vector::Affine::IDENTITY)
 }
 
-/// Как [`pack`], и ещё блоки текста `texts` (по номерам [`reyvec_vector::TextId`]).
+/// Пишет вид камеры в константы конвейера (`view_linear`, `view_offset` в шейдерах).
+fn write_view(push: &mut [u8; PUSH_SIZE], view: [f32; 6]) {
+    for (i, v) in view.into_iter().enumerate() {
+        let at = VIEW_OFFSET + 4 * i;
+        push[at..at + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+}
+
+/// Как [`pack`], и ещё блоки текста `texts` (по номерам [`reyvec_vector::TextId`]) и вид
+/// камеры `view`: прямоугольники слоёв считаются уже на экране.
 fn pack_frame(
     ranges: &[MeshRange],
     texts: &[TextRange],
     items: &[SceneItem],
     fill: FillMode,
+    view: reyvec_vector::Affine,
 ) -> Packed {
     let mut out = Vec::new();
     let mut commands: Vec<[u32; 4]> = Vec::new();
@@ -1345,8 +1362,10 @@ fn pack_frame(
                 out.extend_from_slice(&[0u8; 12]);
                 out.extend_from_slice(&NO_PAINT.to_ne_bytes());
                 if target != 0 {
-                    bounds[target] =
-                        union(bounds[target], transform_bounds(&t.transform, range.bounds));
+                    bounds[target] = union(
+                        bounds[target],
+                        transform_bounds(&(view * t.transform), range.bounds),
+                    );
                 }
                 targets[target].push(Op::Text {
                     instance: written,
@@ -1387,7 +1406,7 @@ fn pack_frame(
         if target != 0 {
             bounds[target] = union(
                 bounds[target],
-                transform_bounds(&inst.transform, range.bounds),
+                transform_bounds(&(view * inst.transform), range.bounds),
             );
         }
         let ops = &mut targets[target];
@@ -2140,7 +2159,13 @@ mod tests {
             text(0, 1.0),
             SceneItem::EndLayer,
         ];
-        let packed = pack_frame(&ranges, &texts, &items, FillMode::PerShape);
+        let packed = pack_frame(
+            &ranges,
+            &texts,
+            &items,
+            FillMode::PerShape,
+            reyvec_vector::Affine::IDENTITY,
+        );
         assert_eq!(
             packed.targets[0],
             vec![
@@ -2204,6 +2229,33 @@ mod tests {
             "{:?}",
             packed.bounds[1]
         );
+    }
+
+    #[test]
+    fn layer_bounds_are_on_screen_under_camera() {
+        let ranges = [MeshRange {
+            index_count: 3,
+            bounds: [0.0, 0.0, 0.1, 0.2],
+            ..PLAIN
+        }];
+        let items = [
+            SceneItem::layer(1.0),
+            SceneItem::from(Instance::new(ShapeId(0), Affine::translate((1.0, 0.0)))),
+            SceneItem::EndLayer,
+        ];
+        // Камера с центром (1, 0) и приближением 4: фигура 1..1.1 × 0..0.2 на экране
+        // 0..0.4 × 0..0.8 (слой рисуется в прямоугольнике там, где фигура видна).
+        let view = reyvec_vector::Camera2D::new((1.0, 0.0), 4.0).view();
+        let packed = pack_frame(&ranges, &[], &items, FillMode::PerShape, view);
+        let near = |a: Bounds, b: Bounds| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
+        assert!(
+            near(packed.bounds[1], [0.0, 0.0, 0.4, 0.8]),
+            "{:?}",
+            packed.bounds[1]
+        );
+        // Сами экземпляры не меняются: камеру применяет видеокарта.
+        let plain = pack(&ranges, &items, FillMode::PerShape);
+        assert_eq!(packed.instances, plain.instances);
     }
 
     #[test]

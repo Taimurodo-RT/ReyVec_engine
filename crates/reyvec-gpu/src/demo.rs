@@ -53,6 +53,10 @@ pub enum DemoScene {
     Stream,
     /// Этап 3: текст (кириллица и латиница, переносы, выравнивание, слои и маски).
     Text,
+    /// Этап 3: 10 000 движущихся фигур (замер нагрузки на процессор и видеокарту).
+    Stress,
+    /// Этап 3: 10 000 перетекающих фигур, все меняют форму каждый кадр.
+    StressMorph,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -77,11 +81,13 @@ impl DemoScene {
             Self::Motif => "Motif",
             Self::Stream => "поток",
             Self::Text => "текст",
+            Self::Stress => "стресс: движение",
+            Self::StressMorph => "стресс: перетекание",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg`, `motif`, `stream` или `text`.
+    /// `svg`, `motif`, `stream`, `text`, `stress` или `stress-morph`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -93,6 +99,17 @@ impl DemoScene {
             "motif" => Some(Self::Motif),
             "stream" => Some(Self::Stream),
             "text" => Some(Self::Text),
+            "stress" => Some(Self::Stress),
+            "stress-morph" => Some(Self::StressMorph),
+            _ => None,
+        }
+    }
+
+    /// Другой вариант стресс-теста (движение ↔ перетекание). У остальных сцен `None`.
+    pub fn stress_variant(self) -> Option<Self> {
+        match self {
+            Self::Stress => Some(Self::StressMorph),
+            Self::StressMorph => Some(Self::Stress),
             _ => None,
         }
     }
@@ -247,14 +264,23 @@ pub(crate) struct Demo {
     perceptual_edges: bool,
     /// Формат трафарета прохода сцены (нужен заливке через трафарет).
     stencil_format: vk::Format,
-    /// Лупа: векторная сцена увеличена в [`ZOOM`] раз вокруг края сердца.
-    zoom: bool,
+    /// Камера векторных сцен (сдвиг и приближение). Лупа — одно её положение.
+    camera: reyvec_vector::Camera2D,
+    /// Время процессора на подготовку векторного кадра, мс (сглаженное).
+    vector_cpu_ms: f64,
+    /// Векторных фигур и блоков текста в последнем кадре.
+    vector_items: usize,
 }
 
 /// Во сколько раз увеличивает лупа векторной сцены.
 pub(crate) const ZOOM: f64 = 8.0;
 /// Точка сцены, которая под лупой оказывается в центре окна: край левой половинки сердца.
 const ZOOM_CENTER: (f64, f64) = (0.95, 0.6);
+
+/// Камера в положении лупы.
+fn lens() -> reyvec_vector::Camera2D {
+    reyvec_vector::Camera2D::new(ZOOM_CENTER, ZOOM)
+}
 
 impl Demo {
     pub fn new(
@@ -322,7 +348,9 @@ impl Demo {
                 & limits.framebuffer_stencil_sample_counts,
             perceptual_edges: false,
             stencil_format,
-            zoom: false,
+            camera: reyvec_vector::Camera2D::default(),
+            vector_cpu_ms: 0.0,
+            vector_items: 0,
         };
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
@@ -371,14 +399,35 @@ impl Demo {
         self.vector.set_fill(fill);
     }
 
-    /// Включена ли лупа векторной сцены.
+    /// Камера стоит в положении лупы.
     pub fn zoom(&self) -> bool {
-        self.zoom
+        self.camera == lens()
     }
 
-    /// Лупа векторной сцены: увеличение в [`ZOOM`] раз, чтобы были видны изгибы кривых.
+    /// Лупа векторной сцены: камера с увеличением в [`ZOOM`] раз у края сердца, чтобы были
+    /// видны изгибы кривых. Выключение возвращает камеру в начало.
     pub fn set_zoom(&mut self, on: bool) {
-        self.zoom = on;
+        self.camera = if on {
+            lens()
+        } else {
+            reyvec_vector::Camera2D::default()
+        };
+    }
+
+    /// Камера векторных сцен.
+    pub fn camera(&self) -> reyvec_vector::Camera2D {
+        self.camera
+    }
+
+    /// Ставит камеру векторных сцен со следующего кадра.
+    pub fn set_camera(&mut self, camera: reyvec_vector::Camera2D) {
+        self.camera = camera;
+    }
+
+    /// Сколько процессор тратит на подготовку векторного кадра (раскладка фигур, запись
+    /// экземпляров и команд), мс, сглажено за последние кадры, и сколько в кадре фигур.
+    pub fn vector_cpu(&self) -> (f64, usize) {
+        (self.vector_cpu_ms, self.vector_items)
     }
 
     /// Края сводятся «как в редакторах» (`true`) или физически точно.
@@ -609,10 +658,14 @@ impl Demo {
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let vector = match scene {
-            DemoScene::Gpu => None,
+            DemoScene::Gpu => {
+                self.vector_items = 0;
+                None
+            }
             _ => {
                 let _zone = crate::cpu_zone!("векторные фигуры");
-                let mut items: Vec<reyvec_vector::SceneItem> = match scene {
+                let started = std::time::Instant::now();
+                let items: Vec<reyvec_vector::SceneItem> = match scene {
                     DemoScene::Morph => self
                         .vector_demo
                         .morph_instances(time)
@@ -625,6 +678,12 @@ impl Demo {
                     DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
                     DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
                     DemoScene::Text => self.vector_demo.text_items(time, aspect),
+                    DemoScene::Stress | DemoScene::StressMorph => self
+                        .vector_demo
+                        .stress_instances(time, aspect, scene == DemoScene::StressMorph)
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                     _ => self
                         .vector_demo
                         .instances(time)
@@ -632,13 +691,6 @@ impl Demo {
                         .map(Into::into)
                         .collect(),
                 };
-                if self.zoom {
-                    let lens = reyvec_vector::Affine::scale(ZOOM)
-                        * reyvec_vector::Affine::translate((-ZOOM_CENTER.0, -ZOOM_CENTER.1));
-                    for item in &mut items {
-                        *item = item.placed(lens);
-                    }
-                }
                 // Фигуры, добавленные с прошлого кадра, едут на видеокарту в этом же
                 // кадре (копирование в начале кадра, без ожидания).
                 self.uploads = match self
@@ -659,7 +711,18 @@ impl Demo {
                         self.vector.uploaded_shapes()
                     );
                 }
-                self.vector.prepare(res, slot, &items, aspect)
+                let data = self
+                    .vector
+                    .prepare(res, slot, &items, aspect, self.camera.view());
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                // Сглаживание: число на панели не прыгает от кадра к кадру.
+                self.vector_cpu_ms = if self.vector_items == 0 {
+                    ms
+                } else {
+                    self.vector_cpu_ms * 0.9 + ms * 0.1
+                };
+                self.vector_items = items.len();
+                data
             }
         };
         let sprites = self.sprites_at(scene, time, aspect, shader_error);

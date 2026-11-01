@@ -13,6 +13,7 @@ png.workspace = true
 egui.workspace = true
 egui-winit.workspace = true
 reyvec-gpu.workspace = true
+reyvec-vector.workspace = true
 thiserror.workspace = true
 tracy-client.workspace = true
 tracing.workspace = true

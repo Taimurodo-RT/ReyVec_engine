@@ -198,6 +198,22 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Text, 3.0, false)
             },
         },
+        // Стресс: 10 000 фигур сеткой на весь кадр, вперемешку пять обычных фигур, и
+        // те же 10 000 перетекающими (каждая трафаретом).
+        Case {
+            name: "stress-2s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Stress, 2.0, false)
+            },
+        },
+        Case {
+            name: "stress-morph-2s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::StressMorph, 2.0, false)
+            },
+        },
         Case {
             name: "vector-2s-msaa4-editor",
             scene: HeadlessScene {
