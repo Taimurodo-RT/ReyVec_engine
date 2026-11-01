@@ -1,5 +1,8 @@
-// Jump flooding, итог: расстояние со знаком до границы маски в единицах сцены
-// (внутри отрицательное). Где фигур нет вовсе — большое число.
+// Jump flooding, итог: расстояние со знаком до края фигур в единицах сцены (внутри
+// отрицательное). Где фигур нет вовсе — большое число. Зеркало на процессоре:
+// reyvec_sdf::jump_flood.
+
+#include "include/jfa.slang"
 
 struct Push
 {
@@ -30,10 +33,10 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID)
 float4 fs_main(VertexOut input) : SV_Target
 {
     int2 q = int2(input.position.xy);
-    float2 s = textures[pc.seeds].Load(int3(q, 0)).xy;
-    if (s.x < 0.0)
+    float2 offset = textures[pc.seeds].Load(int3(q, 0)).xy;
+    if (!has_seed(offset))
         return float4(10000.0, 0.0, 0.0, 1.0);
-    float d = (length(s - float2(q)) + 0.5) * pc.scene_per_pixel;
-    bool inside = textures[pc.mask].Load(int3(q, 0)).r > 0.5;
+    float d = length(offset) * pc.scene_per_pixel;
+    bool inside = textures[pc.mask].Load(int3(q, 0)).r >= 0.5;
     return float4(inside ? -d : d, 0.0, 0.0, 1.0);
 }

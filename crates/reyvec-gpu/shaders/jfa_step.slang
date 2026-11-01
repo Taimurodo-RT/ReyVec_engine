@@ -1,5 +1,9 @@
-// Jump flooding, один шаг: из 9 точек через step пикселей берётся ближайшее семя.
-// Шаги идут от половины размера картинки до 1 (и ещё раз 1).
+// Jump flooding, один шаг: из 9 точек через step пикселей берётся ближайшая точка края.
+// Шаги идут от половины размера картинки до 1 (и ещё раз 1). Точка края хранится
+// сдвигом от своей точки маски (см. jfa_seed.slang): рядом с краем сдвиг маленький, и
+// половинной точности картинки хватает с запасом.
+
+#include "include/jfa.slang"
 
 struct Push
 {
@@ -32,7 +36,7 @@ float4 fs_main(VertexOut input) : SV_Target
     textures[pc.seeds].GetDimensions(w, h);
     int2 size = int2(w, h);
     int2 q = int2(input.position.xy);
-    float2 best = float2(-1.0, -1.0);
+    float2 best = float2(NO_SEED, NO_SEED);
     float best_d = 1e30;
     for (int dy = -1; dy <= 1; dy++)
     {
@@ -41,15 +45,16 @@ float4 fs_main(VertexOut input) : SV_Target
             int2 n = q + int2(dx, dy) * pc.step;
             if (any(n < int2(0, 0)) || any(n >= size))
                 continue;
-            float2 s = textures[pc.seeds].Load(int3(n, 0)).xy;
-            if (s.x < 0.0)
+            float2 offset = textures[pc.seeds].Load(int3(n, 0)).xy;
+            if (!has_seed(offset))
                 continue;
-            float2 v = s - float2(q);
+            // Точка края соседа, теперь сдвигом от q.
+            float2 v = float2(n - q) + offset;
             float d = dot(v, v);
             if (d < best_d)
             {
                 best_d = d;
-                best = s;
+                best = v;
             }
         }
     }

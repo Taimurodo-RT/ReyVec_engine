@@ -199,24 +199,31 @@ pub fn coverage(d: f32, pixel: f32) -> f32 {
 
 /// Поле расстояний по маске методом jump flooding — зеркало проходов `jfa_*.slang`.
 ///
-/// `mask` — `width * height` пикселей, `true` внутри фигур. Семена — пиксели на границе
-/// (у них есть сосед по стороне с другим значением маски). Каждый шаг смотрит на 9 точек
-/// через `step` пикселей и запоминает ближайшее семя; шаг делится пополам до 1, и в конце
-/// ещё один шаг 1 (поправляет редкие ошибки метода). Возвращается расстояние со знаком в
-/// пикселях: внутри отрицательное, снаружи положительное. Где фигур нет вовсе — `f32::MAX`.
-pub fn jump_flood(mask: &[bool], width: usize, height: usize) -> Vec<f32> {
-    const NONE: (i32, i32) = (-1, -1);
-    let at = |x: usize, y: usize| mask[y * width + x];
-    let mut seeds = vec![NONE; width * height];
+/// `coverage` — `width * height` точек маски: какая доля точки закрыта фигурами (1
+/// внутри, 0 снаружи, на краю плавно на ширине одной точки, как [`coverage`]). Внутри
+/// считаются точки с долей от половины. Семена — точки на краю (закрытые не целиком или с
+/// соседом по стороне с другой стороны); каждое запоминает точку края рядом с собой
+/// ([`edge_point`]), точнее размера точки маски. Каждый шаг смотрит на 9 точек через
+/// `step` и берёт ближайшую из их точек края; шаг делится пополам до 1, и в конце ещё
+/// один шаг 1 (поправляет редкие ошибки метода). На видеокарте точка края хранится
+/// сдвигом от своей точки маски: рядом с краем сдвиг маленький и хранится точно.
+/// Возвращается расстояние со знаком в точках маски: внутри отрицательное, снаружи
+/// положительное. Где фигур нет вовсе — `f32::MAX`.
+pub fn jump_flood(coverage: &[f32], width: usize, height: usize) -> Vec<f32> {
+    let inside = |x: usize, y: usize| coverage[y * width + x] >= 0.5;
+    let mut seeds: Vec<Option<V2>> = vec![None; width * height];
     for y in 0..height {
         for x in 0..width {
-            let m = at(x, y);
-            let edge = (x > 0 && at(x - 1, y) != m)
-                || (x + 1 < width && at(x + 1, y) != m)
-                || (y > 0 && at(x, y - 1) != m)
-                || (y + 1 < height && at(x, y + 1) != m);
+            let m = inside(x, y);
+            let c = coverage[y * width + x];
+            let edge = (c > 0.0 && c < 1.0)
+                || (x > 0 && inside(x - 1, y) != m)
+                || (x + 1 < width && inside(x + 1, y) != m)
+                || (y > 0 && inside(x, y - 1) != m)
+                || (y + 1 < height && inside(x, y + 1) != m);
             if edge {
-                seeds[y * width + x] = (x as i32, y as i32);
+                seeds[y * width + x] =
+                    Some(edge_point(coverage, width, height, (x as i32, y as i32)));
             }
         }
     }
@@ -227,43 +234,88 @@ pub fn jump_flood(mask: &[bool], width: usize, height: usize) -> Vec<f32> {
         step /= 2;
     }
     steps.push(1);
-    let dist2 = |a: (i32, i32), b: (i32, i32)| {
-        let (dx, dy) = ((a.0 - b.0) as i64, (a.1 - b.1) as i64);
-        dx * dx + dy * dy
-    };
     for step in steps {
         let prev = seeds.clone();
         for y in 0..height as i32 {
             for x in 0..width as i32 {
-                let mut best = prev[(y as usize) * width + x as usize];
+                let p = V2::new(x as f32, y as f32);
+                let mut best: Option<(V2, f32)> = None;
                 for dy in [-step, 0, step] {
                     for dx in [-step, 0, step] {
                         let (nx, ny) = (x + dx, y + dy);
                         if nx < 0 || ny < 0 || nx >= width as i32 || ny >= height as i32 {
                             continue;
                         }
-                        let s = prev[(ny as usize) * width + nx as usize];
-                        if s != NONE && (best == NONE || dist2(s, (x, y)) < dist2(best, (x, y))) {
-                            best = s;
+                        if let Some(e) = prev[(ny as usize) * width + nx as usize] {
+                            let d = (e - p).length();
+                            if best.is_none_or(|(_, b)| d < b) {
+                                best = Some((e, d));
+                            }
                         }
                     }
                 }
-                seeds[(y as usize) * width + x as usize] = best;
+                seeds[(y as usize) * width + x as usize] = best.map(|(e, _)| e);
             }
         }
     }
     seeds
         .iter()
         .enumerate()
-        .map(|(i, &s)| {
-            if s == NONE {
+        .map(|(i, &e)| {
+            let Some(e) = e else {
                 return f32::MAX;
-            }
-            let p = ((i % width) as i32, (i / width) as i32);
-            let d = (dist2(s, p) as f32).sqrt() + 0.5;
-            if mask[i] { -d } else { d }
+            };
+            let p = V2::new((i % width) as f32, (i / width) as f32);
+            let d = (p - e).length();
+            if coverage[i] >= 0.5 { -d } else { d }
         })
         .collect()
+}
+
+/// Точка края рядом с точкой маски `s` — зеркало `edge_point` в `jfa_seed.slang`. Если
+/// `s` закрыта целиком или пуста, край проходит через соседа по стороне с долей ближе
+/// всего к половине. Доля `c` у точки края значит, что край на `0,5 − c` от её середины
+/// наружу, против наклона доли (наклон по 8 соседям, диагональные с меньшим весом).
+pub fn edge_point(coverage: &[f32], width: usize, height: usize, s: (i32, i32)) -> V2 {
+    let at = |x: i32, y: i32| {
+        let x = x.clamp(0, width as i32 - 1) as usize;
+        let y = y.clamp(0, height as i32 - 1) as usize;
+        coverage[y * width + x]
+    };
+    let mut t = s;
+    let c = at(s.0, s.1);
+    if c <= 0.0 || c >= 1.0 {
+        for n in [
+            (s.0 + 1, s.1),
+            (s.0 - 1, s.1),
+            (s.0, s.1 + 1),
+            (s.0, s.1 - 1),
+        ] {
+            if (at(n.0, n.1) - 0.5).abs() < (at(t.0, t.1) - 0.5).abs() {
+                t = n;
+            }
+        }
+    }
+    let c = at(t.0, t.1);
+    // Наклон доли по 8 соседям (диагональные с меньшим весом): куда фигура убывает.
+    let r2 = std::f32::consts::SQRT_2;
+    let (x, y) = t;
+    let gx = at(x + 1, y - 1) + r2 * at(x + 1, y) + at(x + 1, y + 1)
+        - at(x - 1, y - 1)
+        - r2 * at(x - 1, y)
+        - at(x - 1, y + 1);
+    let gy = at(x - 1, y + 1) + r2 * at(x, y + 1) + at(x + 1, y + 1)
+        - at(x - 1, y - 1)
+        - r2 * at(x, y - 1)
+        - at(x + 1, y - 1);
+    let slope = V2::new(gx, gy);
+    let len = slope.length();
+    let p = V2::new(x as f32, y as f32);
+    if len < 1e-4 {
+        return p;
+    }
+    // Край на 0,5 − c от середины точки наружу (против наклона).
+    p - slope * ((c - 0.5) / len)
 }
 
 #[cfg(test)]
@@ -382,54 +434,44 @@ mod tests {
     }
 
     #[test]
-    fn jump_flood_matches_brute_force() {
-        // Маска из двух кругов и прямоугольника, как у сцены «свет».
+    fn jump_flood_matches_exact_field() {
+        // Маска из двух кругов и прямоугольника, как у сцены «свет»: доля точки, закрытая
+        // фигурами, по точному расстоянию (так рисует маску light_mask.slang).
         let (w, h) = (97, 61);
-        let mut mask = vec![false; w * h];
-        for y in 0..h {
-            for x in 0..w {
-                let p = V2::new(x as f32 + 0.5, y as f32 + 0.5);
-                let d = sd_circle(p - V2::new(20.0, 20.0), 9.0)
-                    .min(sd_circle(p - V2::new(70.0, 40.0), 14.0))
-                    .min(sd_box(p - V2::new(45.0, 50.0), V2::new(12.0, 4.0)));
-                mask[y * w + x] = d < 0.0;
-            }
-        }
-        let field = jump_flood(&mask, w, h);
-        // Перебор: расстояние до ближайшего пикселя границы.
-        let edge: Vec<(f32, f32)> = (0..w * h)
-            .filter(|&i| {
-                let (x, y) = (i % w, i / w);
-                let m = mask[i];
-                (x > 0 && mask[i - 1] != m)
-                    || (x + 1 < w && mask[i + 1] != m)
-                    || (y > 0 && mask[i - w] != m)
-                    || (y + 1 < h && mask[i + w] != m)
-            })
-            .map(|i| ((i % w) as f32, (i / w) as f32))
+        let exact = |x: usize, y: usize| {
+            let p = V2::new(x as f32, y as f32);
+            sd_circle(p - V2::new(20.3, 20.1), 9.2)
+                .min(sd_circle(p - V2::new(70.0, 40.4), 14.3))
+                .min(sd_box(
+                    rotate(p - V2::new(45.0, 50.0), 0.3),
+                    V2::new(12.0, 4.0),
+                ))
+        };
+        let cov: Vec<f32> = (0..w * h)
+            .map(|i| coverage(exact(i % w, i / w), 1.0))
             .collect();
+        let field = jump_flood(&cov, w, h);
         let mut worst = 0.0f32;
         let mut total = 0.0f32;
         for i in 0..w * h {
-            let (x, y) = ((i % w) as f32, (i / w) as f32);
-            let exact = edge
-                .iter()
-                .map(|&(ex, ey)| ((ex - x).powi(2) + (ey - y).powi(2)).sqrt())
-                .fold(f32::MAX, f32::min)
-                + 0.5;
-            let got = field[i].abs();
-            assert_eq!(field[i] < 0.0, mask[i], "знак в пикселе {i}");
-            worst = worst.max((got - exact).abs());
-            total += (got - exact).abs();
+            let d = exact(i % w, i / w);
+            assert_eq!(field[i] < 0.0, cov[i] >= 0.5, "знак в точке {i}");
+            let err = (field[i] - d).abs();
+            worst = worst.max(err);
+            total += err;
         }
         let mean = total / (w * h) as f32;
-        assert!(worst < 1.5, "наибольшая ошибка {worst} пикселя");
-        assert!(mean < 0.02, "средняя ошибка {mean} пикселя");
+        eprintln!("ошибка поля: средняя {mean}, наибольшая {worst}");
+        // Край ставится внутри точки: в среднем ошибка в сотые доли точки маски, больше
+        // всего у острых углов (там край не прямой). Без уточнения, по маске «да/нет»,
+        // ошибка доходила до точки и давала ступеньки.
+        assert!(worst < 0.45, "наибольшая ошибка {worst} точки");
+        assert!(mean < 0.04, "средняя ошибка {mean} точки");
     }
 
     #[test]
     fn jump_flood_without_shapes() {
-        let field = jump_flood(&[false; 12], 4, 3);
+        let field = jump_flood(&[0.0; 12], 4, 3);
         assert!(field.iter().all(|&d| d == f32::MAX));
     }
 
