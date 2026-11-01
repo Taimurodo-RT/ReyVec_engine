@@ -234,15 +234,29 @@ pub(crate) unsafe fn begin_color_pass(
     view: vk::ImageView,
     extent: vk::Extent2D,
 ) {
+    // SAFETY: условия те же, что у этой функции.
+    unsafe { begin_color_pass_with(device, cmd, view, extent, CLEAR_COLOR) };
+}
+
+/// То же, что [`begin_color_pass`], но с очисткой цветом `clear` (например нулём для
+/// маски, где фон означает «ничего не закрыто»).
+///
+/// # Safety
+/// `cmd` в состоянии записи, `view` жив до конца выполнения команд.
+pub(crate) unsafe fn begin_color_pass_with(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+    clear: [f32; 4],
+) {
     let attachments = [vk::RenderingAttachmentInfo::default()
         .image_view(view)
         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: CLEAR_COLOR,
-            },
+            color: vk::ClearColorValue { float32: clear },
         })];
     // SAFETY: условия описаны в контракте функции.
     unsafe { begin_rendering(device, cmd, &attachments, extent) };
