@@ -176,16 +176,24 @@ fn bounds_of<'p>(points: impl IntoIterator<Item = &'p [f32; 2]>) -> Bounds {
         .fold(EMPTY_BOUNDS, |b, p| union(b, [p[0], p[1], p[0], p[1]]))
 }
 
-/// Прямоугольник `b` после преобразования `t` (вокруг четырёх повёрнутых углов).
+/// Прямоугольник `b` после преобразования `t`: центр переносится, полуширина и
+/// полувысота растягиваются на модули коэффициентов. Это ровно рамка четырёх
+/// повёрнутых углов, но без сравнений: функция вызывается для каждой фигуры в кадре.
 fn transform_bounds(t: &reyvec_vector::Affine, b: Bounds) -> Bounds {
     if b[0] > b[2] {
         return EMPTY_BOUNDS;
     }
-    let corners = [[b[0], b[1]], [b[2], b[1]], [b[0], b[3]], [b[2], b[3]]].map(|[x, y]| {
-        let p = *t * reyvec_vector::Point::new(f64::from(x), f64::from(y));
-        [p.x as f32, p.y as f32]
-    });
-    bounds_of(&corners)
+    let [a, bb, c, d, e, f] = t.as_coeffs();
+    let (cx, cy) = (f64::from(b[0] + b[2]) * 0.5, f64::from(b[1] + b[3]) * 0.5);
+    let (hw, hh) = (f64::from(b[2] - b[0]) * 0.5, f64::from(b[3] - b[1]) * 0.5);
+    let (x, y) = (a * cx + c * cy + e, bb * cx + d * cy + f);
+    let (rx, ry) = (a.abs() * hw + c.abs() * hh, bb.abs() * hw + d.abs() * hh);
+    [
+        (x - rx) as f32,
+        (y - ry) as f32,
+        (x + rx) as f32,
+        (y + ry) as f32,
+    ]
 }
 
 /// Один буфер фигур на видеокарте: новые фигуры дописываются в конец, старые не
@@ -377,9 +385,12 @@ fn stream_count(library: &ShapeLibrary, start: usize) -> usize {
 enum Op {
     /// Команды `first..first + count` из буфера команд (способ 1 и обводки).
     Triangles { first: u32, count: u32 },
-    /// Одна залитая фигура через трафарет: экземпляр и число номеров веера и кривых.
+    /// Залитые фигуры через трафарет: экземпляры `instance..instance + count` одной фигуры,
+    /// которые на экране не задевают друг друга (поэтому их можно рисовать одним вызовом),
+    /// и число номеров веера и кривых.
     Stencil {
         instance: u32,
+        count: u32,
         index_count: u32,
         even_odd: bool,
     },
@@ -503,6 +514,8 @@ pub(crate) struct VectorRenderer {
     warned_overflow: bool,
     /// Сколько фигур и блоков текста попало в последний кадр после отсечения.
     drawn: u32,
+    /// Память раскладки фигур трафаретом по слоям, общая для всех кадров.
+    stencil_run: StencilRun,
 }
 
 /// Шейдеры векторного слоя: при их перезагрузке конвейеры пересобираются.
@@ -556,6 +569,7 @@ impl VectorRenderer {
             frames,
             warned_overflow: false,
             drawn: 0,
+            stencil_run: StencilRun::default(),
         })
     }
 
@@ -972,6 +986,7 @@ impl VectorRenderer {
             self.fill,
             view,
             visible_area(aspect),
+            &mut self.stencil_run,
         );
         self.drawn = packed.drawn;
         if packed.overflow && !self.warned_overflow {
@@ -1114,6 +1129,7 @@ impl VectorRenderer {
                 }
                 Op::Stencil {
                     instance,
+                    count: instances,
                     index_count,
                     even_odd,
                 } => {
@@ -1122,12 +1138,14 @@ impl VectorRenderer {
                     } else {
                         p.count_nonzero
                     };
+                    // Фигуры вызова не пересекаются на экране: их трафареты не смешиваются,
+                    // а покрытие каждой очищает только свой трафарет.
                     bind(count, &curves_push);
                     // SAFETY: условия функции.
-                    unsafe { device.cmd_draw(cmd, index_count, 1, 0, instance) };
+                    unsafe { device.cmd_draw(cmd, index_count, instances, 0, instance) };
                     bind(p.cover, &curves_push);
                     // SAFETY: условия функции.
-                    unsafe { device.cmd_draw(cmd, index_count, 1, 0, instance) };
+                    unsafe { device.cmd_draw(cmd, index_count, instances, 0, instance) };
                 }
                 Op::Text {
                     instance,
@@ -1251,6 +1269,7 @@ fn pack(ranges: &[MeshRange], items: &[SceneItem], fill: FillMode) -> Packed {
         fill,
         reyvec_vector::Affine::IDENTITY,
         EVERYWHERE,
+        &mut StencilRun::default(),
     )
 }
 
@@ -1270,6 +1289,264 @@ fn visible_area(aspect: f32) -> Bounds {
         aspect + CULL_MARGIN,
         1.0 + CULL_MARGIN,
     ]
+}
+
+/// Запись экземпляра (16 слов по 4 байта) в байты для видеокарты одним куском: так
+/// процессор пишет её одной записью, а не шестнадцатью маленькими.
+fn instance_bytes(words: [u32; INSTANCE_SIZE / 4]) -> [u8; INSTANCE_SIZE] {
+    let mut out = [0u8; INSTANCE_SIZE];
+    for (chunk, w) in out.chunks_exact_mut(4).zip(words) {
+        chunk.copy_from_slice(&w.to_ne_bytes());
+    }
+    out
+}
+
+/// Пустая ссылка в цепочках сетки [`StencilRun`].
+const NONE: u32 = u32::MAX;
+
+/// Корзина клетки (x, y) сетки [`StencilRun`]; `mask` = число корзин − 1, корзин 4ᵏ.
+/// Сетка корзин квадратная и сворачивается по краям: соседние клетки лежат рядом в памяти,
+/// а одну корзину делят только далёкие друг от друга клетки.
+fn bucket_of(x: i64, y: i64, mask: usize) -> usize {
+    let side_bits = (mask + 1).trailing_zeros() / 2;
+    let side = (1usize << side_bits) - 1;
+    ((x as usize) & side) | (((y as usize) & side) << side_bits)
+}
+
+/// Подряд идущие экземпляры одной фигуры, которые рисуются трафаретом (обычно
+/// перетекающие). Их можно рисовать не по одному, а слоями: фигура попадает в слой на
+/// единицу выше самого верхнего слоя фигур, которые она задевает на экране и которые шли
+/// раньше. Фигуры одного слоя друг друга не задевают, поэтому слой рисуется одним вызовом
+/// трафарета и одним покрытием, а порядок рисования пересекающихся фигур сохраняется.
+/// Чтобы не сравнивать каждую фигуру со всеми, рамки разложены по клеткам сетки размером
+/// с первую рамку.
+#[derive(Default)]
+struct StencilRun {
+    target: usize,
+    shape: Option<ShapeId>,
+    index_count: u32,
+    even_odd: bool,
+    /// Слой каждого экземпляра и их данные подряд, в порядке сцены.
+    levels_of: Vec<u32>,
+    data: Vec<u8>,
+    /// Сколько экземпляров в каждом слое (для раскладки по слоям при записи).
+    per_level: Vec<u32>,
+    cell: f32,
+    /// Рамка, слой и следующая рамка той же корзины у каждой фигуры, разложенной по сетке.
+    placed: Vec<(Bounds, u32, u32)>,
+    /// Самая большая рамка группы и сколько клеток вокруг центра она может задеть.
+    max_size: f32,
+    reach: i64,
+    /// Сетка: клетка (x, y) попадает в корзину (см. [`bucket_of`]), у корзины цепочка
+    /// рамок через `placed`. Совпадение корзин у далёких клеток только добавляет лишнюю
+    /// проверку рамок. Без выделения памяти на каждую фигуру.
+    /// Начало цепочки корзины и поколение, в котором оно записано: запись старого
+    /// поколения значит «пусто», поэтому сброс сетки — это `generation += 1`.
+    heads: Vec<(u32, u32)>,
+    generation: u32,
+    /// Сколько слоёв уже есть.
+    levels: u32,
+    /// Ниже этого слоя новые фигуры не кладутся (после фигуры, которую не разложить по
+    /// сетке: она считается задевающей всё).
+    floor: u32,
+}
+
+impl StencilRun {
+    /// Рамка больше этого числа клеток (клетка — размер первой рамки) считается
+    /// задевающей все: иначе пришлось бы смотреть слишком много клеток.
+    const MAX_REACH: i64 = 3;
+    /// Корзин сетки в начале (степень двойки); растёт вместе с числом фигур.
+    const MIN_BUCKETS: usize = 256;
+
+    fn len(&self) -> usize {
+        self.levels_of.len()
+    }
+
+    /// Экземпляр фигуры `shape` в цель `target` продолжает накопленное.
+    fn accepts(&self, target: usize, shape: ShapeId) -> bool {
+        self.levels_of.is_empty() || (self.target == target && self.shape == Some(shape))
+    }
+
+    fn add(&mut self, target: usize, shape: ShapeId, range: &MeshRange, b: Bounds) -> &mut Vec<u8> {
+        let usable = b.iter().all(|v| v.is_finite()) && b[0] <= b[2] && b[1] <= b[3];
+        if self.levels_of.is_empty() {
+            self.target = target;
+            self.shape = Some(shape);
+            self.index_count = range.curve_index_count;
+            self.even_odd = range.even_odd;
+            // Клетка в полтора раза больше первой рамки: повёрнутые и чуть большие копии
+            // той же фигуры (рамка повёрнутой до √2 больше) всё ещё смотрят только 3×3
+            // клетки вокруг своей.
+            self.cell = if usable {
+                1.5 * (b[2] - b[0]).max(b[3] - b[1]).max(1e-4)
+            } else {
+                1.0
+            };
+        }
+        let level = self.place(b, usable);
+        self.levels = self.levels.max(level + 1);
+        if self.per_level.len() <= level as usize {
+            self.per_level.resize(level as usize + 1, 0);
+        }
+        self.per_level[level as usize] += 1;
+        self.levels_of.push(level);
+        &mut self.data
+    }
+
+    /// Слой для рамки `b`, и рамка запоминается. Рамка кладётся в клетку своего центра;
+    /// задевающие её рамки могут лежать только в клетках не дальше `reach` (размер самой
+    /// большой рамки в клетках), их и проверяем.
+    fn place(&mut self, b: Bounds, usable: bool) -> u32 {
+        let size = (b[2] - b[0]).max(b[3] - b[1]);
+        if !usable || size > Self::MAX_REACH as f32 * self.cell {
+            // Выше всех, и все следующие тоже выше неё.
+            let level = self.levels;
+            self.floor = level + 1;
+            return level;
+        }
+        if size > self.max_size {
+            self.max_size = size;
+            self.reach = ((size / self.cell).ceil() as i64).max(1);
+        }
+        if self.heads.is_empty() {
+            self.heads.resize(Self::MIN_BUCKETS, (0, NONE));
+        } else if self.placed.len() > 2 * self.heads.len() {
+            self.grow();
+        }
+        let (cx, cy) = self.center_cell(b);
+        let mask = self.heads.len() - 1;
+        let r = self.reach;
+        let mut level = self.floor;
+        // Полуоткрытые диапазоны: `..=` в горячем цикле заметно дороже.
+        for y in cy - r..cy + r + 1 {
+            for x in cx - r..cx + r + 1 {
+                let (generation, head) = self.heads[bucket_of(x, y, mask)];
+                let mut e = if generation == self.generation {
+                    head
+                } else {
+                    NONE
+                };
+                while e != NONE {
+                    let (other, other_level, next) = self.placed[e as usize];
+                    if other_level >= level && overlaps(other, b) {
+                        level = other_level + 1;
+                    }
+                    e = next;
+                }
+            }
+        }
+        let idx = self.placed.len() as u32;
+        self.placed.push((b, level, NONE));
+        self.insert(idx, cx, cy);
+        level
+    }
+
+    /// Клетка центра рамки `b`.
+    fn center_cell(&self, b: Bounds) -> (i64, i64) {
+        // Округление вниз без вызова floorf (он не встраивается и заметно дорог здесь).
+        let cell = |v: f32| {
+            let x = v / self.cell;
+            let t = x as i64;
+            if (t as f32) > x { t - 1 } else { t }
+        };
+        (cell((b[0] + b[2]) * 0.5), cell((b[1] + b[3]) * 0.5))
+    }
+
+    fn insert(&mut self, idx: u32, x: i64, y: i64) {
+        let mask = self.heads.len() - 1;
+        let slot = &mut self.heads[bucket_of(x, y, mask)];
+        let next = if slot.0 == self.generation {
+            slot.1
+        } else {
+            NONE
+        };
+        self.placed[idx as usize].2 = next;
+        *slot = (self.generation, idx);
+    }
+
+    /// Цепочки стали длинными: корзин в четыре раза больше, рамки раскладываются заново.
+    fn grow(&mut self) {
+        let size = self.heads.len() * 4;
+        self.heads.clear();
+        self.heads
+            .resize(size, (self.generation.wrapping_sub(1), NONE));
+        for idx in 0..self.placed.len() {
+            let (x, y) = self.center_cell(self.placed[idx].0);
+            self.insert(idx as u32, x, y);
+        }
+    }
+
+    /// Сетка снова пустая. Размер сетки остаётся, как у самой большой группы.
+    fn next_generation(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // Раз в 4 миллиарда сбросов: старые записи могли бы совпасть по поколению.
+            self.heads.fill((u32::MAX, NONE));
+        }
+    }
+
+    /// Забыть накопленное (память остаётся).
+    fn clear(&mut self) {
+        self.levels_of.clear();
+        self.data.clear();
+        self.per_level.clear();
+        self.next_generation();
+        self.placed.clear();
+        self.max_size = 0.0;
+        self.reach = 1;
+        self.levels = 0;
+        self.floor = 0;
+        self.shape = None;
+    }
+
+    /// Пишет накопленные экземпляры по слоям и по вызову на слой.
+    fn flush(&mut self, out: &mut Vec<u8>, targets: &mut [Vec<Op>], written: &mut u32) {
+        let n = self.levels_of.len();
+        if n == 0 {
+            return;
+        }
+        let ops = &mut targets[self.target];
+        let mut first = *written;
+        for &count in &self.per_level[..self.levels as usize] {
+            ops.push(Op::Stencil {
+                instance: first,
+                count,
+                index_count: self.index_count,
+                even_odd: self.even_odd,
+            });
+            first += count;
+        }
+        if self.levels == 1 {
+            out.extend_from_slice(&self.data);
+        } else {
+            // Слой за слоем, внутри слоя порядок сцены. Слоёв обычно единицы, поэтому
+            // несколько проходов по списку дешевле общей сортировки.
+            out.reserve(n * INSTANCE_SIZE);
+            for level in 0..self.levels {
+                for (data, _) in self
+                    .data
+                    .chunks_exact(INSTANCE_SIZE)
+                    .zip(&self.levels_of)
+                    .filter(|&(_, &l)| l == level)
+                {
+                    out.extend_from_slice(data);
+                }
+            }
+        }
+        *written += n as u32;
+        self.levels_of.clear();
+        self.data.clear();
+        self.per_level.clear();
+        if !self.placed.is_empty() {
+            self.next_generation();
+        }
+        self.placed.clear();
+        self.max_size = 0.0;
+        self.reach = 1;
+        self.levels = 0;
+        self.floor = 0;
+        self.shape = None;
+    }
 }
 
 /// Прямоугольники пересекаются (касание считается).
@@ -1295,6 +1572,7 @@ fn pack_frame(
     fill: FillMode,
     view: reyvec_vector::Affine,
     visible: Bounds,
+    run: &mut StencilRun,
 ) -> Packed {
     let mut out = Vec::new();
     let mut commands: Vec<[u32; 4]> = Vec::new();
@@ -1303,11 +1581,19 @@ fn pack_frame(
     let mut layer_order = Vec::new();
     let mut stack: Vec<Open> = Vec::new();
     let mut last: Option<(usize, ShapeId)> = None;
+    // Подряд идущие фигуры трафаретом копятся в `run` и пишутся слоями (см. `StencilRun`);
+    // его память живёт между кадрами.
+    run.clear();
     let mut written = 0u32;
     let mut overflow = false;
 
     for item in items {
         let skipping = matches!(stack.last(), Some(Open::Skip { .. }));
+        // Всё, кроме фигур, сначала дописывает накопленные фигуры трафаретом: порядок
+        // рисования сохраняется.
+        if !matches!(item, SceneItem::Shape(_)) {
+            run.flush(&mut out, &mut targets, &mut written);
+        }
         let inst = match *item {
             SceneItem::BeginLayer { opacity, blend } => {
                 last = None;
@@ -1406,16 +1692,25 @@ fn pack_frame(
                     continue;
                 }
                 let [a, b, c, d, e, f] = t.transform.as_coeffs().map(|v| v as f32);
-                for v in [a, b, c, d, e, f] {
-                    out.extend_from_slice(&v.to_ne_bytes());
-                }
-                out.extend_from_slice(&range.first_glyph.to_ne_bytes());
-                out.extend_from_slice(&range.glyph_count.to_ne_bytes());
-                for v in range.color.multiply(t.tint).to_array() {
-                    out.extend_from_slice(&v.to_ne_bytes());
-                }
-                out.extend_from_slice(&[0u8; 12]);
-                out.extend_from_slice(&NO_PAINT.to_ne_bytes());
+                let [r, g, bl, al] = range.color.multiply(t.tint).to_array();
+                out.extend_from_slice(&instance_bytes([
+                    a.to_bits(),
+                    b.to_bits(),
+                    c.to_bits(),
+                    d.to_bits(),
+                    e.to_bits(),
+                    f.to_bits(),
+                    range.first_glyph,
+                    range.glyph_count,
+                    r.to_bits(),
+                    g.to_bits(),
+                    bl.to_bits(),
+                    al.to_bits(),
+                    0,
+                    0,
+                    0,
+                    NO_PAINT,
+                ]));
                 if target != 0 {
                     bounds[target] = union(bounds[target], on_screen);
                 }
@@ -1441,36 +1736,48 @@ fn pack_frame(
         if !overlaps(on_screen, visible) {
             continue;
         }
-        if written as usize >= MAX_INSTANCES {
+        if !(stencil && run.accepts(target, inst.shape)) {
+            run.flush(&mut out, &mut targets, &mut written);
+        }
+        if written as usize + run.len() >= MAX_INSTANCES {
             overflow = true;
             continue;
         }
-        let [a, b, c, d, e, f] = inst.transform.as_coeffs().map(|v| v as f32);
-        let color = range.color.multiply(inst.tint).to_array();
-        for v in [a, b, c, d, e, f] {
-            out.extend_from_slice(&v.to_ne_bytes());
-        }
-        out.extend_from_slice(&range.first_index.to_ne_bytes());
-        out.extend_from_slice(&range.curve_first_index.to_ne_bytes());
-        for v in color {
-            out.extend_from_slice(&v.to_ne_bytes());
-        }
-        out.extend_from_slice(&range.morph_stride.to_ne_bytes());
-        out.extend_from_slice(&range.morph_last.to_ne_bytes());
-        out.extend_from_slice(&inst.morph.to_ne_bytes());
-        out.extend_from_slice(&range.paint.to_ne_bytes());
         if target != 0 {
             bounds[target] = union(bounds[target], on_screen);
         }
-        let ops = &mut targets[target];
-        if stencil {
-            ops.push(Op::Stencil {
-                instance: written,
-                index_count: range.curve_index_count,
-                even_odd: range.even_odd,
-            });
-            last = None;
+        // Фигуры трафаретом пишутся в накопитель (потом по слоям), остальные сразу.
+        let out = if stencil {
+            run.add(target, inst.shape, range, on_screen)
         } else {
+            &mut out
+        };
+        let [a, b, c, d, e, f] = inst.transform.as_coeffs().map(|v| v as f32);
+        let [r, g, bl, al] = range.color.multiply(inst.tint).to_array();
+        out.extend_from_slice(&instance_bytes([
+            a.to_bits(),
+            b.to_bits(),
+            c.to_bits(),
+            d.to_bits(),
+            e.to_bits(),
+            f.to_bits(),
+            range.first_index,
+            range.curve_first_index,
+            r.to_bits(),
+            g.to_bits(),
+            bl.to_bits(),
+            al.to_bits(),
+            range.morph_stride,
+            range.morph_last,
+            inst.morph.to_bits(),
+            range.paint,
+        ]));
+        if stencil {
+            last = None;
+            continue;
+        }
+        let ops = &mut targets[target];
+        {
             let same = last == Some((target, inst.shape));
             // `last` ставится только после команды треугольников этой цели и
             // сбрасывается на всём остальном, поэтому последняя команда и есть отрезок
@@ -1495,6 +1802,7 @@ fn pack_frame(
         }
         written += 1;
     }
+    run.flush(&mut out, &mut targets, &mut written);
     // Незакрытые слои и маски закрываются в конце кадра.
     while let Some(open) = stack.pop() {
         match open {
@@ -2008,6 +2316,7 @@ mod tests {
         let instances = [at(0), at(1), at(2).with_morph(1.5)];
         let stencil = |instance, index_count| Op::Stencil {
             instance,
+            count: 1,
             index_count,
             even_odd: false,
         };
@@ -2058,17 +2367,20 @@ mod tests {
                 Op::Triangles { first: 0, count: 1 },
                 Op::Stencil {
                     instance: 2,
+                    count: 1,
                     index_count: 12,
                     even_odd: false
                 },
                 Op::Triangles { first: 1, count: 1 },
                 Op::Stencil {
                     instance: 4,
+                    count: 1,
                     index_count: 9,
                     even_odd: true
                 },
                 Op::Stencil {
                     instance: 5,
+                    count: 1,
                     index_count: 9,
                     even_odd: true
                 },
@@ -2220,6 +2532,7 @@ mod tests {
             FillMode::PerShape,
             reyvec_vector::Affine::IDENTITY,
             EVERYWHERE,
+            &mut StencilRun::default(),
         );
         assert_eq!(
             packed.targets[0],
@@ -2301,7 +2614,15 @@ mod tests {
         // Камера с центром (1, 0) и приближением 4: фигура 1..1.1 × 0..0.2 на экране
         // 0..0.4 × 0..0.8 (слой рисуется в прямоугольнике там, где фигура видна).
         let view = reyvec_vector::Camera2D::new((1.0, 0.0), 4.0).view();
-        let packed = pack_frame(&ranges, &[], &items, FillMode::PerShape, view, EVERYWHERE);
+        let packed = pack_frame(
+            &ranges,
+            &[],
+            &items,
+            FillMode::PerShape,
+            view,
+            EVERYWHERE,
+            &mut StencilRun::default(),
+        );
         let near = |a: Bounds, b: Bounds| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-5);
         assert!(
             near(packed.bounds[1], [0.0, 0.0, 0.4, 0.8]),
@@ -2311,6 +2632,104 @@ mod tests {
         // Сами экземпляры не меняются: камеру применяет видеокарта.
         let plain = pack(&ranges, &items, FillMode::PerShape);
         assert_eq!(packed.instances, plain.instances);
+    }
+
+    #[test]
+    fn disjoint_stencil_shapes_share_one_draw() {
+        let ranges = [MeshRange {
+            index_count: 0,
+            curve_index_count: 12,
+            method: FillMethod::Stencil,
+            bounds: [-0.1, -0.1, 0.1, 0.1],
+            ..PLAIN
+        }];
+        let at = |x: f64| SceneItem::from(Instance::new(ShapeId(0), Affine::translate((x, 0.0))));
+        // Первые три стоят порознь, четвёртая налезает на третью, пятая снова отдельно:
+        // она идёт в первый слой, а четвёртая во второй, после третьей.
+        let items = [at(0.0), at(0.5), at(1.0), at(1.15), at(-1.0)];
+        let packed = pack(&ranges, &items, FillMode::PerShape);
+        let stencil = |instance, count| Op::Stencil {
+            instance,
+            count,
+            index_count: 12,
+            even_odd: false,
+        };
+        assert_eq!(packed.targets[0], [stencil(0, 4), stencil(4, 1)]);
+        let x = |i: usize| {
+            f32::from_ne_bytes(
+                packed.instances[i * INSTANCE_SIZE + 16..i * INSTANCE_SIZE + 20]
+                    .try_into()
+                    .unwrap(),
+            )
+        };
+        assert_eq!([x(0), x(1), x(2), x(3), x(4)], [0.0, 0.5, 1.0, -1.0, 1.15]);
+        // Три одинаковые друг на друге: три слоя по одной, в порядке сцены.
+        let packed = pack(&ranges, &[at(0.0), at(0.0), at(0.0)], FillMode::PerShape);
+        assert_eq!(
+            packed.targets[0],
+            [stencil(0, 1), stencil(1, 1), stencil(2, 1)]
+        );
+        // Много фигур сеткой: одна команда на всех.
+        let grid: Vec<_> = (0..400)
+            .map(|i| {
+                let (x, y) = ((i % 20) as f64 * 0.25, (i / 20) as f64 * 0.25);
+                SceneItem::from(Instance::new(ShapeId(0), Affine::translate((x, y))))
+            })
+            .collect();
+        let packed = pack(&ranges, &grid, FillMode::PerShape);
+        assert_eq!(packed.targets[0], [stencil(0, 400)]);
+    }
+
+    /// Замер: `cargo test --release -p reyvec-gpu pack_10k -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "замер, не проверка"]
+    fn pack_10k_timing() {
+        let ranges = [
+            MeshRange {
+                index_count: 0,
+                curve_index_count: 300,
+                method: FillMethod::Stencil,
+                bounds: [-0.45, -0.45, 0.45, 0.45],
+                ..PLAIN
+            },
+            MeshRange {
+                index_count: 30,
+                bounds: [-0.3, -0.3, 0.3, 0.3],
+                ..PLAIN
+            },
+        ];
+        for shape in [0u32, 1] {
+            let items: Vec<_> = (0..10_000)
+                .map(|i| {
+                    let (c, r) = ((i % 125) as f64, (i / 125) as f64);
+                    let t = Affine::translate((
+                        -1.7 + c * 0.0273 + 0.006 * (i as f64).sin(),
+                        -0.95 + r * 0.024,
+                    )) * Affine::scale(0.0243);
+                    SceneItem::from(Instance::new(ShapeId(shape), t))
+                })
+                .collect();
+            let mut run = StencilRun::default();
+            let started = std::time::Instant::now();
+            let mut ops = 0;
+            for _ in 0..100 {
+                ops = pack_frame(
+                    &ranges,
+                    &[],
+                    &items,
+                    FillMode::PerShape,
+                    Affine::IDENTITY,
+                    visible_area(1.9),
+                    &mut run,
+                )
+                .targets[0]
+                    .len();
+            }
+            eprintln!(
+                "shape {shape}: {:.3} ms per frame, {ops} ops",
+                started.elapsed().as_secs_f64() * 10.0
+            );
+        }
     }
 
     #[test]
@@ -2332,6 +2751,7 @@ mod tests {
             FillMode::PerShape,
             Affine::IDENTITY,
             visible,
+            &mut StencilRun::default(),
         );
         assert_eq!(packed.drawn, 3);
         assert_eq!(packed.instances.len(), 3 * INSTANCE_SIZE);
@@ -2339,7 +2759,15 @@ mod tests {
         assert_eq!(words(&packed.commands), [3, 3, 0, 0]);
         // С камерой, приближенной к дальней фигуре, видна только она.
         let view = reyvec_vector::Camera2D::new((5.05, 0.05), 8.0).view();
-        let packed = pack_frame(&ranges, &[], &items, FillMode::PerShape, view, visible);
+        let packed = pack_frame(
+            &ranges,
+            &[],
+            &items,
+            FillMode::PerShape,
+            view,
+            visible,
+            &mut StencilRun::default(),
+        );
         assert_eq!(packed.drawn, 1);
         assert_eq!(
             f32::from_ne_bytes(packed.instances[16..20].try_into().unwrap()),
