@@ -1243,11 +1243,13 @@ impl Demo {
                     );
                 }
                 for l in &shadows {
-                    let mut push = [0u8; 16];
+                    let mut push = [0u8; 24];
                     push[..4].copy_from_slice(&p.texture(l.image).to_ne_bytes());
                     push[4..8].copy_from_slice(&(downscale as f32).to_ne_bytes());
                     push[8..12].copy_from_slice(&l.rect.offset.x.to_ne_bytes());
-                    push[12..].copy_from_slice(&l.rect.offset.y.to_ne_bytes());
+                    push[12..16].copy_from_slice(&l.rect.offset.y.to_ne_bytes());
+                    push[16..20].copy_from_slice(&(l.rect.extent.width as f32).to_ne_bytes());
+                    push[20..].copy_from_slice(&(l.rect.extent.height as f32).to_ne_bytes());
                     d.cmd_set_scissor(cmd, 0, &[mask_rect(l.rect, downscale, size)]);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
