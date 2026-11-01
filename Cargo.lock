@@ -2419,6 +2419,7 @@ dependencies = [
  "png",
  "resvg",
  "reyvec-gpu",
+ "reyvec-sdf",
  "reyvec-vector",
  "thiserror 2.0.21",
  "tracing",
