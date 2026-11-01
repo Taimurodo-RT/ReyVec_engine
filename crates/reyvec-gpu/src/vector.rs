@@ -528,8 +528,9 @@ struct Details {
     table: Vec<[u32; DETAIL_LEVELS]>,
     revision: Option<u64>,
     tolerance: f32,
-    /// Ошибка уровня 0 в пикселях на единицу масштаба: допуск × пикселей на единицу экрана.
-    error_px: f32,
+    /// (допустимая ошибка / ошибка уровня 0 при масштабе 1)² в этом кадре; ошибка
+    /// уровня 0 = допуск × пикселей на единицу экрана.
+    limit: f64,
     requests: Vec<(ShapeId, i32)>,
     /// Биты уровней, уже попавших в `requests` в этом кадре (по фигурам).
     requested: Vec<u16>,
@@ -557,7 +558,8 @@ impl Details {
 
     /// Начало кадра: высота кадра в пикселях `height`, старые просьбы сбрасываются.
     fn begin(&mut self, height: f32) {
-        self.error_px = self.tolerance * height * 0.5;
+        let error_px = f64::from(self.tolerance) * f64::from(height) * 0.5;
+        self.limit = (f64::from(DETAIL_ERROR_PX) / error_px).powi(2);
         for &(id, _) in &self.requests {
             self.requested[id.0 as usize] = 0;
         }
@@ -566,51 +568,58 @@ impl Details {
 
     /// Какой фигурой рисовать экземпляр фигуры `id` с преобразованием на экран `m`:
     /// уровень, у которого ошибка ломаной на экране не больше [`DETAIL_ERROR_PX`]. Если
-    /// нужного уровня ещё нет (или он не загружен: номер не меньше `uploaded`), он
-    /// попадает в просьбы, а пока берётся ближайший готовый уровень между нужным и
-    /// обычным. Стоит несколько умножений и сравнений: кривые не трогаются.
-    fn pick(&mut self, id: ShapeId, m: &reyvec_vector::Affine, uploaded: usize) -> ShapeId {
+    /// нужного уровня ещё нет (или он не загружен: номер не меньше `uploaded`), берётся
+    /// ближайший готовый уровень между нужным и обычным, а вторым числом возвращается
+    /// недостающий уровень (0 — всё есть): попросить его построить ([`Self::request`])
+    /// стоит, только если фигура на экране. Стоит несколько умножений и сравнений: кривые
+    /// не трогаются.
+    #[inline]
+    fn pick(&self, id: ShapeId, m: &reyvec_vector::Affine, uploaded: usize) -> (ShapeId, i32) {
         let Some(row) = self.table.get(id.0 as usize) else {
-            return id;
+            return (id, 0);
         };
         let [a, b, c, d, _, _] = m.as_coeffs();
-        let stretch = (a * a + b * b).max(c * c + d * d) as f32;
-        // Нужный уровень: ⌊log₄(допустимая ошибка / ошибка уровня 0)⌋; логарифм по
-        // показателю степени числа f32, без вызова log2.
-        let ratio = DETAIL_ERROR_PX * DETAIL_ERROR_PX / (self.error_px * self.error_px * stretch);
-        if !(ratio.is_normal()) {
-            return id;
+        let stretch = (a * a + b * b).max(c * c + d * d);
+        // Нужный уровень: ⌊log₄(допустимая ошибка / ошибка уровня 0)⌋. ratio — квадрат
+        // этого отношения, поэтому уровень = ⌊log₂(ratio) / 4⌋; ⌊log₂⌋ берётся из
+        // показателя степени числа, без вызова log2.
+        let ratio = self.limit / stretch;
+        let exponent = ((ratio.to_bits() >> 52) & 0x7ff) as i32;
+        if exponent == 0 || exponent == 0x7ff {
+            return (id, 0); // ноль, бесконечность или не число
         }
-        let log2 = ((ratio.to_bits() >> 23) & 0xff) as i32 - 127;
-        // ratio — квадрат отношения, поэтому log₄ отношения = log₂(ratio) / 4.
-        let level = log2.div_euclid(4).clamp(DETAIL_FINEST, DETAIL_COARSEST);
+        let level = ((exponent - 1023) >> 2).clamp(DETAIL_FINEST, DETAIL_COARSEST);
         if level == 0 {
-            return id;
+            return (id, 0);
         }
         let at = |l: i32| row[(l - DETAIL_FINEST) as usize];
         let want = at(level);
         if want != u32::MAX && (want as usize) < uploaded {
-            return ShapeId(want);
+            return (ShapeId(want), 0);
         }
-        if want == u32::MAX {
-            let bit = 1u16 << (level - DETAIL_FINEST);
-            if let Some(mask) = self.requested.get_mut(id.0 as usize)
-                && *mask & bit == 0
-            {
-                *mask |= bit;
-                self.requests.push((id, level));
-            }
-        }
+        // Не построен — просим; построен, но ещё едет на видеокарту — просто ждём.
+        let missing = if want == u32::MAX { level } else { 0 };
         let step = -level.signum();
         let mut l = level + step;
         while l != 0 {
             let d = at(l);
             if d != u32::MAX && (d as usize) < uploaded {
-                return ShapeId(d);
+                return (ShapeId(d), missing);
             }
             l += step;
         }
-        id
+        (id, missing)
+    }
+
+    /// Просит построить уровень `level` фигуры `id` (один раз за кадр).
+    fn request(&mut self, id: ShapeId, level: i32) {
+        let bit = 1u16 << (level - DETAIL_FINEST);
+        if let Some(mask) = self.requested.get_mut(id.0 as usize)
+            && *mask & bit == 0
+        {
+            *mask |= bit;
+            self.requests.push((id, level));
+        }
     }
 }
 
@@ -1734,7 +1743,7 @@ fn pack_frame(
         let skipping = matches!(stack.last(), Some(Open::Skip { .. }));
         // Всё, кроме фигур, сначала дописывает накопленные фигуры трафаретом: порядок
         // рисования сохраняется.
-        if !matches!(item, SceneItem::Shape(_)) {
+        if run.len() > 0 && !matches!(item, SceneItem::Shape(_)) {
             run.flush(&mut out, &mut targets, &mut written);
         }
         let inst = match *item {
@@ -1868,29 +1877,25 @@ fn pack_frame(
         };
         let target = stack.last().map_or(0, Open::target);
         let to_screen = view * inst.transform;
-        let Some(base) = ranges.get(inst.shape.0 as usize) else {
+        // Уровень детализации под размер на экране; отсечение уже по его рамке (у уровня
+        // чуть другие точки и свой запас под мягкий край).
+        let (shape, missing) = details.pick(inst.shape, &to_screen, ranges.len());
+        let Some(range) = ranges.get(shape.0 as usize) else {
             continue;
         };
-        let mut on_screen = transform_bounds(&to_screen, base.bounds);
+        let on_screen = transform_bounds(&to_screen, range.bounds);
         if !overlaps(on_screen, visible) {
             continue;
         }
-        // Уровень детализации под размер на экране (у уровня своя рамка: чуть другие
-        // точки и запас под мягкий край).
-        let shape = details.pick(inst.shape, &to_screen, ranges.len());
-        let range = if shape == inst.shape {
-            base
-        } else {
-            let r = &ranges[shape.0 as usize];
-            on_screen = transform_bounds(&to_screen, r.bounds);
-            r
-        };
+        if missing != 0 {
+            details.request(inst.shape, missing);
+        }
         let stencil =
             range.curve_index_count > 0 && (range.index_count == 0 || fill.stencil(range.method));
         if range.index_count == 0 && !stencil {
             continue;
         }
-        if !(stencil && run.accepts(target, shape)) {
+        if run.len() > 0 && !(stencil && run.accepts(target, shape)) {
             run.flush(&mut out, &mut targets, &mut written);
         }
         if written as usize + run.len() >= MAX_INSTANCES {
@@ -2806,32 +2811,75 @@ mod tests {
         };
         details.begin(1000.0);
         let at = |s: f64| reyvec_vector::Affine::scale(s);
+        let id = ShapeId(0);
         // Масштаб 0.4: ошибка 0.2 пикселя, уровень 0.
-        assert_eq!(details.pick(ShapeId(0), &at(0.4), 3), ShapeId(0));
+        assert_eq!(details.pick(id, &at(0.4), 3), (id, 0));
         // Масштаб 1: ошибка 0.5 пикселя, нужен уровень −1; его нет, ближайший готовый
-        // между −1 и 0 — сама фигура, а −1 попадает в просьбы.
-        assert_eq!(details.pick(ShapeId(0), &at(1.0), 3), ShapeId(0));
+        // между −1 и 0 — сама фигура, и −1 нужно попросить.
+        assert_eq!(details.pick(id, &at(1.0), 3), (id, -1));
         // Масштаб 16: ошибка 8 пикселей, нужен −3 (8/64 ≤ ¼); есть −2 — он ближе.
-        assert_eq!(details.pick(ShapeId(0), &at(16.0), 3), ShapeId(1));
+        assert_eq!(details.pick(id, &at(16.0), 3), (ShapeId(1), -3));
         // Масштаб 4: ошибка 2 пикселя, уровень −2 готов.
-        assert_eq!(details.pick(ShapeId(0), &at(4.0), 3), ShapeId(1));
+        assert_eq!(details.pick(id, &at(4.0), 3), (ShapeId(1), 0));
         // Мелкая: масштаб 0.01, ошибка 0.005 пикселя — уровень 2 (×16 = 0.08 ≤ ¼).
-        assert_eq!(details.pick(ShapeId(0), &at(0.01), 3), ShapeId(2));
-        // Но если он ещё не загружен (загружено 2 фигуры), берётся сама фигура.
-        assert_eq!(details.pick(ShapeId(0), &at(0.01), 2), ShapeId(0));
+        assert_eq!(details.pick(id, &at(0.01), 3), (ShapeId(2), 0));
+        // Построен, но ещё не загружен (загружено 2 фигуры): сама фигура, просить не надо.
+        assert_eq!(details.pick(id, &at(0.01), 2), (id, 0));
         // Поворот не меняет уровень, растяжение по одной оси учитывается.
         let turned = reyvec_vector::Affine::rotate(0.7) * at(4.0);
-        assert_eq!(details.pick(ShapeId(0), &turned, 3), ShapeId(1));
+        assert_eq!(details.pick(id, &turned, 3), (ShapeId(1), 0));
         let stretched = reyvec_vector::Affine::scale_non_uniform(0.4, 4.0);
-        assert_eq!(details.pick(ShapeId(0), &stretched, 3), ShapeId(1));
-        // Просьбы без повторов: −1 и −3, каждая один раз.
-        assert_eq!(details.requests, vec![(ShapeId(0), -1), (ShapeId(0), -3)]);
+        assert_eq!(details.pick(id, &stretched, 3), (ShapeId(1), 0));
+        // Неизвестная фигура рисуется как есть.
+        assert_eq!(details.pick(ShapeId(7), &at(1.0), 3), (ShapeId(7), 0));
+        // Просьбы без повторов в пределах кадра.
+        details.request(id, -1);
+        details.request(id, -3);
+        details.request(id, -1);
+        assert_eq!(details.requests, vec![(id, -1), (id, -3)]);
         details.begin(1000.0);
         assert!(details.requests.is_empty());
-        assert_eq!(details.pick(ShapeId(0), &at(1.0), 3), ShapeId(0));
-        assert_eq!(details.requests, vec![(ShapeId(0), -1)]);
-        // Неизвестная фигура рисуется как есть.
-        assert_eq!(details.pick(ShapeId(7), &at(1.0), 3), ShapeId(7));
+        details.request(id, -1);
+        assert_eq!(details.requests, vec![(id, -1)]);
+    }
+
+    #[test]
+    fn offscreen_shapes_do_not_request_details() {
+        // Фигура 0 без готовых уровней, крупная (нужен подробный уровень): на экране
+        // просит уровень, за краем экрана — нет.
+        let ranges = [MeshRange {
+            index_count: 3,
+            bounds: [0.0, 0.0, 0.1, 0.1],
+            ..PLAIN
+        }];
+        let mut row = [u32::MAX; DETAIL_LEVELS];
+        row[(-DETAIL_FINEST) as usize] = 0;
+        let mut details = Details {
+            table: vec![row],
+            tolerance: 0.001,
+            requested: vec![0],
+            ..Details::default()
+        };
+        let big = |x: f64| {
+            SceneItem::from(Instance::new(
+                ShapeId(0),
+                Affine::translate((x, 0.0)) * Affine::scale(4.0),
+            ))
+        };
+        for (x, expected) in [(50.0, 0), (0.0, 1)] {
+            details.begin(1000.0);
+            pack_frame(
+                &ranges,
+                &[],
+                &[big(x)],
+                FillMode::PerShape,
+                Affine::IDENTITY,
+                visible_area(1.0),
+                &mut StencilRun::default(),
+                &mut details,
+            );
+            assert_eq!(details.requests.len(), expected, "x = {x}");
+        }
     }
 
     #[test]
@@ -2936,6 +2984,13 @@ mod tests {
                 ..PLAIN
             },
         ];
+        // Фигуры 2 и 3 — грубые уровни фигур 0 и 1 (мелкие фигуры рисуются ими).
+        let ranges = [ranges[0], ranges[1], ranges[0], ranges[1]];
+        let row = |base: u32, coarse: u32| {
+            let mut r = [coarse; DETAIL_LEVELS];
+            r[(-DETAIL_FINEST) as usize] = base;
+            r
+        };
         for shape in [0u32, 1] {
             let items: Vec<_> = (0..10_000)
                 .map(|i| {
@@ -2948,9 +3003,9 @@ mod tests {
                 })
                 .collect();
             let mut run = StencilRun::default();
-            // Все уровни уже готовы (указывают на саму фигуру): обычный кадр без просьб.
+            // Все уровни уже готовы: обычный кадр без просьб.
             let mut details = Details {
-                table: vec![[0; DETAIL_LEVELS], [1; DETAIL_LEVELS]],
+                table: vec![row(0, 2), row(1, 3)],
                 tolerance: 0.0005,
                 requested: vec![0; 2],
                 ..Details::default()
