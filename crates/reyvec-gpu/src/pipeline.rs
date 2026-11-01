@@ -19,6 +19,13 @@ pub(crate) enum Blend {
     Alpha,
     /// Прозрачность для цвета, уже умноженного на альфу (так рисует egui).
     Premultiplied,
+    /// Умножение цвета, уже умноженного на альфу, на то, что под ним. Точно, если под
+    /// ним непрозрачно (кадр сцены); внутри прозрачного слоя часть без фона пропадает.
+    Multiply,
+    /// Экран для цвета, уже умноженного на альфу: `S + D − S·D`.
+    Screen,
+    /// Сложение цвета, уже умноженного на альфу.
+    Add,
 }
 
 /// Что конвейер делает с трафаретом прохода.
@@ -114,24 +121,24 @@ pub(crate) fn graphics_pipeline_stencil(
         } else {
             vk::ColorComponentFlags::RGBA
         });
-    if blend == Blend::Alpha {
+    use vk::BlendFactor as F;
+    let factors = match blend {
+        Blend::Opaque => None,
+        Blend::Alpha => Some((F::SRC_ALPHA, F::ONE_MINUS_SRC_ALPHA)),
+        Blend::Premultiplied => Some((F::ONE, F::ONE_MINUS_SRC_ALPHA)),
+        Blend::Multiply => Some((F::DST_COLOR, F::ONE_MINUS_SRC_ALPHA)),
+        Blend::Screen => Some((F::ONE, F::ONE_MINUS_SRC_COLOR)),
+        Blend::Add => Some((F::ONE, F::ONE)),
+    };
+    if let Some((src, dst)) = factors {
+        // Альфа у всех одна: доля покрытия складывается как при обычном наложении.
         attachment = attachment
             .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .src_color_blend_factor(src)
+            .dst_color_blend_factor(dst)
             .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .alpha_blend_op(vk::BlendOp::ADD);
-    }
-    if blend == Blend::Premultiplied {
-        attachment = attachment
-            .blend_enable(true)
-            .src_color_blend_factor(vk::BlendFactor::ONE)
-            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-            .color_blend_op(vk::BlendOp::ADD)
-            .src_alpha_blend_factor(vk::BlendFactor::ONE)
-            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .src_alpha_blend_factor(F::ONE)
+            .dst_alpha_blend_factor(F::ONE_MINUS_SRC_ALPHA)
             .alpha_blend_op(vk::BlendOp::ADD);
     }
     let blend_attachment = [attachment];
@@ -241,7 +248,7 @@ pub(crate) unsafe fn begin_color_pass(
     unsafe { begin_rendering(device, cmd, &attachments, extent) };
 }
 
-/// Начинает проход сцены: цвет в `color_view` (очистка фоном). Если задан `resolve_view`,
+/// Начинает проход сцены: цвет в `color_view` (очистка цветом `clear`). Если задан `resolve_view`,
 /// в конце прохода точки MSAA усредняются в него, а `color_view` не сохраняется. Если задан
 /// `stencil_view`, трафарет очищается нулём и после прохода не нужен. Все картинки в
 /// раскладках целей рисования.
@@ -255,6 +262,7 @@ pub(crate) unsafe fn begin_scene_pass(
     resolve_view: Option<vk::ImageView>,
     stencil_view: Option<vk::ImageView>,
     extent: vk::Extent2D,
+    clear: [f32; 4],
 ) {
     let mut color = vk::RenderingAttachmentInfo::default()
         .image_view(color_view)
@@ -262,9 +270,7 @@ pub(crate) unsafe fn begin_scene_pass(
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
         .clear_value(vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: CLEAR_COLOR,
-            },
+            color: vk::ClearColorValue { float32: clear },
         });
     if let Some(r) = resolve_view {
         color = color

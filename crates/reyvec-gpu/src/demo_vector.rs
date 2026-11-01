@@ -1,4 +1,4 @@
-//! Сцены песочницы этапа 3: векторные фигуры и перетекание.
+//! Сцены песочницы этапа 3: векторные фигуры, перетекание и слои.
 //!
 //! Все фигуры готовятся один раз, при создании сцены. Каждый кадр меняются только их
 //! положения, повороты, масштабы, оттенки и форма перетекания ([`Instance`]), так что
@@ -14,8 +14,8 @@
 use std::f64::consts::{FRAC_PI_2, TAU};
 
 use reyvec_vector::{
-    Affine, BezPath, Circle, Color, FillMethod, FillRule, Gradient, Instance, LineCap, LineJoin,
-    Shape, ShapeId, ShapeLibrary, Spread, Stroke,
+    Affine, BezPath, BlendMode, Circle, Color, FillMethod, FillRule, Gradient, Instance, LineCap,
+    LineJoin, Rect, SceneItem, Shape, ShapeId, ShapeLibrary, Spread, Stroke,
 };
 
 /// Допуск разбиения кривых в единицах сцены (высота кадра = 2 единицы). В окне высотой
@@ -25,6 +25,8 @@ const TOLERANCE: f64 = 0.0005;
 const PETALS: usize = 12;
 /// Сетка маленьких перетекающих фигур в сцене «перетекание»: столбцов и строк.
 const MORPH_GRID: (usize, usize) = (17, 9);
+/// Фон режимов смешивания в сцене «слои»: центр x, y, ширина, высота.
+const BACKDROP: (f64, f64, f64, f64) = (0.95, 0.0, 1.6, 1.7);
 
 pub(crate) struct VectorDemo {
     pub library: ShapeLibrary,
@@ -38,6 +40,12 @@ pub(crate) struct VectorDemo {
     wave: ShapeId,
     /// Круг → звезда → сердце → кольцо.
     morph: ShapeId,
+    /// Сцена «слои»: белый круг радиуса 1 и белый квадрат 1×1 (размер и цвет задают
+    /// экземпляры), фон с градиентом и оранжевая капсула.
+    disk: ShapeId,
+    square: ShapeId,
+    backdrop: ShapeId,
+    pill: ShapeId,
 }
 
 impl VectorDemo {
@@ -99,6 +107,23 @@ impl VectorDemo {
             ring.extend(circle(0.22).reverse_subpaths());
             ring
         }];
+        let disk = add(Shape::fill(circle(1.0), Color::WHITE));
+        let square = add(Shape::fill(rect(1.0, 1.0), Color::WHITE));
+        // Фон режимов смешивания: светлый сверху, бирюзовый в середине, тёмный снизу.
+        let backdrop = add(Shape::fill(
+            rect(BACKDROP.2, BACKDROP.3),
+            Gradient::linear((0.0, BACKDROP.3 / 2.0), (0.0, -BACKDROP.3 / 2.0))
+                .stop(0.0, Color::from_srgb8(245, 245, 240))
+                .stop(0.5, Color::from_srgb8(50, 140, 170))
+                .stop(1.0, Color::from_srgb8(15, 15, 25)),
+        ));
+        let pill = add(Shape::fill(
+            {
+                use reyvec_vector::kurbo::{RoundedRect, Shape as _};
+                RoundedRect::new(-0.13, -0.6, 0.13, 0.6, 0.13).to_path(1e-6)
+            },
+            Color::from_srgb8(255, 140, 40),
+        ));
         let heart = library
             .add_with(heart_shape, FillMethod::Stencil)
             .expect("сердце корректно (проверено тестом)");
@@ -116,7 +141,127 @@ impl VectorDemo {
             joins,
             wave,
             morph,
+            disk,
+            square,
+            backdrop,
+            pill,
         }
+    }
+
+    /// Сцена «слои» в момент `time`.
+    ///
+    /// Слева два снеговика на полосатом фоне. У левого каждая часть полупрозрачная
+    /// отдельно: перекрытия светлее, сквозь тело видны края шаров и шляпы. Правый
+    /// целиком в слое с прозрачностью 0.5: он ровно полупрозрачный, как в редакторах.
+    /// Его голова со шляпой лежат во вложенном слое (проверка вложенности: если она
+    /// сломана, головы не будет).
+    ///
+    /// Справа фон с градиентом и четыре капсулы, каждая в своём слое с режимом
+    /// смешивания: обычное, умножение, экран, сложение (слева направо).
+    pub fn layer_items(&self, time: f32) -> Vec<SceneItem> {
+        let t = f64::from(time);
+        let mut out = Vec::with_capacity(64);
+        let shape = |id, transform| SceneItem::from(Instance::new(id, transform));
+        let tinted =
+            |id, transform, c: Color| SceneItem::from(Instance::new(id, transform).with_tint(c));
+        // Полосатый фон под снеговиками.
+        let (x0, x1) = (-1.7, -0.2);
+        let stripes = 10;
+        let w = (x1 - x0) / f64::from(stripes);
+        for i in 0..stripes {
+            let c = if i % 2 == 0 {
+                Color::from_srgb8(200, 60, 80)
+            } else {
+                Color::from_srgb8(40, 50, 90)
+            };
+            let x = x0 + w * (f64::from(i) + 0.5);
+            out.push(tinted(
+                self.square,
+                Affine::translate((x, 0.0)) * Affine::scale_non_uniform(w, 1.7),
+                c,
+            ));
+        }
+        // Снеговики: шары снизу вверх, потом шляпа (поля и тулья).
+        let sway = 0.03 * (t * 0.9).sin();
+        let snow = Color::from_srgb8(235, 242, 255);
+        let hat = Color::from_srgb8(30, 30, 45);
+        let body = |x: f64, alpha: f32| {
+            let c = |base: Color| Color {
+                a: base.a * alpha,
+                ..base
+            };
+            [
+                tinted(
+                    self.disk,
+                    Affine::translate((x, -0.5)) * Affine::scale(0.24),
+                    c(snow),
+                ),
+                tinted(
+                    self.disk,
+                    Affine::translate((x + sway * 0.5, -0.2)) * Affine::scale(0.17),
+                    c(snow),
+                ),
+            ]
+        };
+        let head = |x: f64, alpha: f32| {
+            let c = |base: Color| Color {
+                a: base.a * alpha,
+                ..base
+            };
+            let x = x + sway;
+            [
+                tinted(
+                    self.disk,
+                    Affine::translate((x, 0.04)) * Affine::scale(0.12),
+                    c(snow),
+                ),
+                tinted(
+                    self.square,
+                    Affine::translate((x, 0.13)) * Affine::scale_non_uniform(0.3, 0.04),
+                    c(hat),
+                ),
+                tinted(
+                    self.square,
+                    Affine::translate((x, 0.23)) * Affine::scale_non_uniform(0.17, 0.18),
+                    c(hat),
+                ),
+            ]
+        };
+        // Левый: каждая часть с прозрачностью 0.5.
+        out.extend(body(-1.32, 0.5));
+        out.extend(head(-1.32, 0.5));
+        // Правый: непрозрачные части в слое 0.5, голова во вложенном слое.
+        out.push(SceneItem::layer(0.5));
+        out.extend(body(-0.58, 1.0));
+        out.push(SceneItem::layer(1.0));
+        out.extend(head(-0.58, 1.0));
+        out.push(SceneItem::EndLayer);
+        out.push(SceneItem::EndLayer);
+
+        // Справа: фон и капсулы с режимами смешивания.
+        let (bx, by, _, _) = BACKDROP;
+        out.push(shape(self.backdrop, Affine::translate((bx, by))));
+        let modes = [
+            BlendMode::Normal,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Add,
+        ];
+        for (i, blend) in modes.into_iter().enumerate() {
+            let k = i as f64;
+            let x = bx + (k - 1.5) * 0.38;
+            let y = by + 0.12 * (t * 0.8 + k).sin();
+            out.push(SceneItem::blend(blend, 1.0));
+            out.push(shape(self.pill, Affine::translate((x, y))));
+            // Синий кружок внутри: слой накладывается вместе с ним как одно целое.
+            out.push(tinted(
+                self.disk,
+                Affine::translate((x, y + 0.3)) * Affine::scale(0.08),
+                Color::from_srgb8(70, 120, 255),
+            ));
+            out.push(SceneItem::EndLayer);
+        }
+        out
     }
 
     /// Сцена «перетекание» в момент `time`: сетка маленьких фигур, у каждой свой темп, и
@@ -200,6 +345,12 @@ impl VectorDemo {
         ));
         out
     }
+}
+
+/// Прямоугольник `w`×`h` с центром в нуле.
+fn rect(w: f64, h: f64) -> BezPath {
+    use reyvec_vector::kurbo::Shape as _;
+    Rect::new(-w / 2.0, -h / 2.0, w / 2.0, h / 2.0).to_path(1e-6)
 }
 
 /// Круг радиуса `r` с центром в нуле (четыре кубические кривые).
@@ -318,6 +469,21 @@ mod tests {
         // Кадры отличаются только экземплярами: фигуры не пересчитываются.
         let rev = demo.library.revision();
         let _ = demo.instances(2.0);
+        let _ = demo.layer_items(2.0);
         assert_eq!(demo.library.revision(), rev);
+        // Сцена «слои»: скобки слоёв парные, у правого снеговика вложенный слой.
+        let items = demo.layer_items(1.0);
+        let mut depth = 0i32;
+        let mut deepest = 0;
+        for item in &items {
+            match item {
+                SceneItem::BeginLayer { .. } => depth += 1,
+                SceneItem::EndLayer => depth -= 1,
+                SceneItem::Shape(_) => {}
+            }
+            assert!(depth >= 0);
+            deepest = deepest.max(depth);
+        }
+        assert_eq!((depth, deepest), (0, 2));
     }
 }

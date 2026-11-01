@@ -132,6 +132,21 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Morph, 2.2, false)
             },
         },
+        // Слои: снеговик частями и снеговик слоем 0.5, капсулы в режимах смешивания.
+        Case {
+            name: "layers-1s-msaa4",
+            scene: HeadlessScene {
+                msaa: Msaa::X4,
+                ..at(DemoScene::Layers, 1.0, false)
+            },
+        },
+        Case {
+            name: "layers-1s-msaa-off",
+            scene: HeadlessScene {
+                msaa: Msaa::Off,
+                ..at(DemoScene::Layers, 1.0, false)
+            },
+        },
         Case {
             name: "vector-2s-msaa4-editor",
             scene: HeadlessScene {

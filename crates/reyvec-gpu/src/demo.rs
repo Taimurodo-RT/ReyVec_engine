@@ -1,8 +1,9 @@
-//! Сцены песочницы. Их три, переключаются клавишами 1, 2 и 3 ([`DemoScene`]):
+//! Сцены песочницы. Их четыре, переключаются клавишами 1–4 ([`DemoScene`]):
 //!
 //! - «GPU-фундамент» (этап 2): треугольник этапа 1 плюс спрайты с текстурами;
 //! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`;
-//! - «Перетекание» (этап 3): фигуры, которые плавно меняют форму, там же.
+//! - «Перетекание» (этап 3): фигуры, которые плавно меняют форму, там же;
+//! - «Слои» (этап 3): прозрачность группы фигур и режимы смешивания, там же.
 //!
 //! Про сцену этапа 2.
 //!
@@ -17,10 +18,10 @@ use crate::GpuError;
 use crate::bindless::{Bindless, SamplerKind};
 use crate::context::GpuContext;
 use crate::demo_vector::VectorDemo;
-use crate::graph::{Access, ImageHandle, RenderGraph};
+use crate::graph::{Access, ImageHandle, PassContext, RenderGraph};
 use crate::pipeline::Blend;
 use crate::pipeline::{
-    Stencil, StencilUse, begin_color_pass, begin_scene_pass, graphics_pipeline_stencil,
+    CLEAR_COLOR, Stencil, StencilUse, begin_color_pass, begin_scene_pass, graphics_pipeline_stencil,
 };
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
@@ -36,6 +37,8 @@ pub enum DemoScene {
     Vector,
     /// Этап 3: перетекающие фигуры (большая в центре и сетка маленьких).
     Morph,
+    /// Этап 3: слои с общей прозрачностью и режимами смешивания.
+    Layers,
 }
 
 impl DemoScene {
@@ -45,15 +48,17 @@ impl DemoScene {
             Self::Gpu => "GPU-фундамент",
             Self::Vector => "векторы",
             Self::Morph => "перетекание",
+            Self::Layers => "слои",
         }
     }
 
-    /// Сцена по имени из командной строки: `gpu`, `vector` или `morph`.
+    /// Сцена по имени из командной строки: `gpu`, `vector`, `morph` или `layers`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
             "vector" => Some(Self::Vector),
             "morph" => Some(Self::Morph),
+            "layers" => Some(Self::Layers),
             _ => None,
         }
     }
@@ -561,21 +566,33 @@ impl Demo {
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
         let vector = match scene {
-            DemoScene::Vector | DemoScene::Morph => {
+            DemoScene::Vector | DemoScene::Morph | DemoScene::Layers => {
                 let _zone = crate::cpu_zone!("векторные фигуры");
-                let mut instances = if scene == DemoScene::Morph {
-                    self.vector_demo.morph_instances(time)
-                } else {
-                    self.vector_demo.instances(time)
+                let mut items: Vec<reyvec_vector::SceneItem> = match scene {
+                    DemoScene::Morph => self
+                        .vector_demo
+                        .morph_instances(time)
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                    DemoScene::Layers => self.vector_demo.layer_items(time),
+                    _ => self
+                        .vector_demo
+                        .instances(time)
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                 };
                 if self.zoom {
                     let lens = reyvec_vector::Affine::scale(ZOOM)
                         * reyvec_vector::Affine::translate((-ZOOM_CENTER.0, -ZOOM_CENTER.1));
-                    for i in &mut instances {
-                        i.transform = lens * i.transform;
+                    for item in &mut items {
+                        if let reyvec_vector::SceneItem::Shape(i) = item {
+                            i.transform = lens * i.transform;
+                        }
                     }
                 }
-                self.vector.prepare(res, slot, &instances, aspect)
+                self.vector.prepare(res, slot, &items, aspect)
             }
             DemoScene::Gpu => None,
         };
@@ -631,6 +648,62 @@ impl Demo {
             self.stencil_format,
             frame.msaa.samples(),
         );
+        // Слои векторных фигур: каждый рисуется своим проходом в свою картинку
+        // (прозрачный фон, то же сглаживание и тот же трафарет), а потом накладывается
+        // в проходе, где он стоит. Вложенные слои идут раньше внешних.
+        let mut layers: Vec<(u32, ImageHandle)> = Vec::new();
+        if let Some(vector) = frame.vector {
+            for &layer in self.vector.layer_order(&vector) {
+                let image = graph.create("слой", frame.extent, SCENE_FORMAT);
+                let ms = (frame.msaa != Msaa::Off).then(|| {
+                    graph.create_multisampled(
+                        "слой MSAA",
+                        frame.extent,
+                        SCENE_FORMAT,
+                        frame.msaa.samples(),
+                    )
+                });
+                let mut uses = vec![
+                    (ms.unwrap_or(image), Access::ColorAttachment),
+                    (stencil, Access::StencilAttachment),
+                ];
+                if ms.is_some() {
+                    uses.push((image, Access::ColorAttachment));
+                }
+                let children = layer_images(
+                    &layers,
+                    &self.vector.layer_children(&vector, layer as usize),
+                );
+                uses.extend(children.iter().map(|&(_, h)| (h, Access::Sampled)));
+                graph.add_pass("слой", &uses, move |p| {
+                    let textures = layer_textures(p, &children);
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинки слоя в раскладку цели рисования, а
+                    // вложенные слои в чтение; буферы кадра живы, пока он рисуется.
+                    unsafe {
+                        begin_scene_pass(
+                            d,
+                            cmd,
+                            p.view(ms.unwrap_or(image)),
+                            ms.map(|_| p.view(image)),
+                            Some(p.view(stencil)),
+                            p.extent(image),
+                            [0.0; 4],
+                        );
+                        bindless.bind(d, cmd);
+                        self.vector
+                            .record(d, cmd, layout, vector, layer as usize, &textures);
+                        d.cmd_end_rendering(cmd);
+                    }
+                });
+                layers.push((layer, image));
+            }
+        }
+        let scene_children = match frame.vector {
+            Some(vector) => layer_images(&layers, &self.vector.layer_children(&vector, 0)),
+            None => Vec::new(),
+        };
+
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
             (stencil, Access::StencilAttachment),
@@ -638,6 +711,7 @@ impl Demo {
         if hardware_resolve.is_some() {
             uses.push((scene, Access::ColorAttachment));
         }
+        uses.extend(scene_children.iter().map(|&(_, h)| (h, Access::Sampled)));
 
         graph.add_pass("сцена", &uses, move |p| {
             let mut triangle_push = [0u8; 8];
@@ -646,9 +720,10 @@ impl Demo {
             let mut sprite_push = [0u8; 16];
             sprite_push[..8].copy_from_slice(&frame.sprites_address.to_ne_bytes());
             sprite_push[8..12].copy_from_slice(&frame.aspect.to_ne_bytes());
+            let textures = layer_textures(p, &scene_children);
             let (d, cmd) = (p.device, p.cmd);
-            // SAFETY: граф перевёл картинку сцены в раскладку цели рисования; конвейеры
-            // и буфер спрайтов живы, пока видеокарта рисует этот кадр.
+            // SAFETY: граф перевёл картинку сцены в раскладку цели рисования, а слои в
+            // чтение; конвейеры и буфер спрайтов живы, пока видеокарта рисует этот кадр.
             unsafe {
                 begin_scene_pass(
                     d,
@@ -657,6 +732,7 @@ impl Demo {
                     hardware_resolve.map(|_| p.view(scene)),
                     Some(p.view(stencil)),
                     p.extent(scene),
+                    CLEAR_COLOR,
                 );
                 bindless.bind(d, cmd);
                 if frame.scene == DemoScene::Gpu {
@@ -665,7 +741,7 @@ impl Demo {
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
                 if let Some(vector) = frame.vector {
-                    self.vector.record(d, cmd, layout, vector);
+                    self.vector.record(d, cmd, layout, vector, 0, &textures);
                 }
                 if frame.sprite_count > 0 {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
@@ -737,6 +813,29 @@ impl Demo {
     pub fn destroy(mut self, ctx: &GpuContext) {
         self.destroy_pipelines(ctx);
     }
+}
+
+/// Картинки слоёв `wanted` из уже нарисованных `layers` (номер слоя, картинка).
+fn layer_images(layers: &[(u32, ImageHandle)], wanted: &[u32]) -> Vec<(u32, ImageHandle)> {
+    layers
+        .iter()
+        .copied()
+        .filter(|(layer, _)| wanted.contains(layer))
+        .collect()
+}
+
+/// Номера в общем списке текстур по номеру слоя (для [`VectorRenderer::record`]).
+fn layer_textures(p: &PassContext, layers: &[(u32, ImageHandle)]) -> Vec<u32> {
+    let len = layers
+        .iter()
+        .map(|&(l, _)| l as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut out = vec![u32::MAX; len];
+    for &(layer, h) in layers {
+        out[layer as usize] = p.texture(h);
+    }
+    out
 }
 
 fn build(
