@@ -1,4 +1,4 @@
-//! Сцены песочницы. Их семь, переключаются клавишами 1–7 ([`DemoScene`]):
+//! Сцены песочницы. Их восемь, переключаются клавишами 1–8 ([`DemoScene`]):
 //!
 //! - «GPU-фундамент» (этап 2): треугольник этапа 1 плюс спрайты с текстурами;
 //! - «Векторы» (этап 3): векторные фигуры, см. `demo_vector.rs`;
@@ -6,7 +6,8 @@
 //! - «Слои» (этап 3): прозрачность группы фигур и режимы смешивания, там же;
 //! - «Маски» (этап 3): обрезка по силуэту, маска по яркости и обратная, там же;
 //! - «SVG» (этап 3): тестовые рисунки SVG или свой файл (`--svg`), там же;
-//! - «Motif» (этап 3): перетекающие фигуры из файла Motif (`--motif`), там же.
+//! - «Motif» (этап 3): перетекающие фигуры из файла Motif (`--motif`), там же;
+//! - «поток» (этап 3): новые фигуры появляются во время работы, там же.
 //!
 //! Про сцену этапа 2.
 //!
@@ -28,7 +29,7 @@ use crate::pipeline::{
 };
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
-use crate::vector::{FillMode, LayerTexture, VectorData, VectorRenderer};
+use crate::vector::{FillMode, LayerTexture, Uploads, VectorData, VectorRenderer};
 
 /// Какую сцену песочницы рисовать.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,6 +49,8 @@ pub enum DemoScene {
     Svg,
     /// Этап 3: перетекающие фигуры из файла Motif (пример или свой файл).
     Motif,
+    /// Этап 3: новые фигуры появляются во время работы и загружаются внутри кадра.
+    Stream,
     /// Этап 3: текст (кириллица и латиница, переносы, выравнивание, слои и маски).
     Text,
 }
@@ -72,12 +75,13 @@ impl DemoScene {
             Self::Masks => "маски",
             Self::Svg => "SVG",
             Self::Motif => "Motif",
+            Self::Stream => "поток",
             Self::Text => "текст",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
-    /// `svg`, `motif` или `text`.
+    /// `svg`, `motif`, `stream` или `text`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -87,6 +91,7 @@ impl DemoScene {
             "masks" => Some(Self::Masks),
             "svg" => Some(Self::Svg),
             "motif" => Some(Self::Motif),
+            "stream" => Some(Self::Stream),
             "text" => Some(Self::Text),
             _ => None,
         }
@@ -232,6 +237,8 @@ pub(crate) struct Demo {
     instance_buffers: Vec<BufferId>,
     vector: VectorRenderer,
     vector_demo: VectorDemo,
+    /// Копирования новых фигур на видеокарту в начале этого кадра.
+    uploads: Uploads,
     /// Сглаживание, под которое собраны конвейеры сцены.
     msaa: Msaa,
     /// Какие числа точек на пиксель видеокарта умеет для кадра сцены.
@@ -307,6 +314,7 @@ impl Demo {
             instance_buffers,
             vector,
             vector_demo,
+            uploads: Uploads::default(),
             msaa: Msaa::Off,
             // Картинку MSAA и рисуют, и читают в шейдере сведения; трафарет того же размера.
             msaa_counts: limits.framebuffer_color_sample_counts
@@ -588,8 +596,10 @@ impl Demo {
 
     /// Готовит данные кадра: пишет спрайты в буфер `slot` (номер кадра в работе).
     /// Буфер `slot` видеокарта в этот момент читать не должна.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
+        ctx: &GpuContext,
         res: &mut GpuResources,
         slot: usize,
         extent: vk::Extent2D,
@@ -613,6 +623,7 @@ impl Demo {
                     DemoScene::Masks => self.vector_demo.mask_items(time),
                     DemoScene::Svg => self.vector_demo.svg_items(aspect),
                     DemoScene::Motif => self.vector_demo.motif_items(time, aspect),
+                    DemoScene::Stream => self.vector_demo.stream_items(time, aspect),
                     DemoScene::Text => self.vector_demo.text_items(time, aspect),
                     _ => self
                         .vector_demo
@@ -627,6 +638,26 @@ impl Demo {
                     for item in &mut items {
                         *item = item.placed(lens);
                     }
+                }
+                // Фигуры, добавленные с прошлого кадра, едут на видеокарту в этом же
+                // кадре (копирование в начале кадра, без ожидания).
+                self.uploads = match self
+                    .vector
+                    .stream(ctx, res, slot, &self.vector_demo.library)
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::error!("загрузка новых векторных фигур: {e}");
+                        Uploads::default()
+                    }
+                };
+                if !self.uploads.is_empty() {
+                    tracing::debug!(
+                        "внутри кадра загружено фигур: {} ({} КБ), всего на видеокарте {}",
+                        self.uploads.shapes,
+                        self.uploads.bytes / 1024,
+                        self.vector.uploaded_shapes()
+                    );
                 }
                 self.vector.prepare(res, slot, &items, aspect)
             }
@@ -658,6 +689,15 @@ impl Demo {
         frame: FrameData,
         target: ImageHandle,
     ) {
+        // Новые фигуры попадают на видеокарту первым делом (своим проходом, чтобы его
+        // время было видно на панели).
+        if !self.uploads.is_empty() {
+            graph.add_pass("загрузка фигур", &[], move |p| {
+                // SAFETY: проход вне рисования; буферы живы, пока выполняется кадр
+                // (старые удаляются отложенно).
+                unsafe { VectorRenderer::record_uploads(p.device, p.cmd, &self.uploads) };
+            });
+        }
         let scene = graph.create("кадр сцены", frame.extent, SCENE_FORMAT);
         // Со сглаживанием сцена рисуется в картинку с несколькими точками на пиксель. Точки
         // усредняет в обычный кадр сцены сама видеокарта в конце прохода «сцена» (быстро:

@@ -47,6 +47,17 @@ const PAINT_SIZE: usize = 64;
 const STOP_SIZE: usize = 32;
 /// Номер закраски у фигур одного цвета (`NO_PAINT` в шейдере).
 const NO_PAINT: u32 = u32::MAX;
+/// Как используются буферы фигур: шейдеры читают, копирование пишет и читает (при росте).
+const ARENA_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_SRC.as_raw(),
+);
+
+/// Размер буфера фигур под `used` байт: следующая степень двойки, не меньше [`MIN_ARENA`].
+fn arena_capacity(used: u64) -> u64 {
+    used.max(MIN_ARENA).next_power_of_two()
+}
 /// Байт констант векторных конвейеров.
 const PUSH_SIZE: usize = 48;
 /// Байт на букву текста: прямоугольник и его место в атласе (`Glyph` в `vector_text.slang`).
@@ -176,6 +187,16 @@ fn transform_bounds(t: &reyvec_vector::Affine, b: Bounds) -> Bounds {
     bounds_of(&corners)
 }
 
+/// Один буфер фигур на видеокарте: новые фигуры дописываются в конец, старые не
+/// двигаются. Когда место кончается, буфер заменяется вдвое большим (копию делает
+/// видеокарта внутри кадра).
+#[derive(Clone, Copy)]
+struct Arena {
+    id: BufferId,
+    capacity: u64,
+    used: u64,
+}
+
 /// Где в общем буфере букв лежит блок текста.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TextRange {
@@ -197,16 +218,157 @@ struct TextMeshes {
     revision: u64,
 }
 
-/// Треугольники всех фигур на видеокарте.
+/// Треугольники всех фигур на видеокарте: шесть буферов-копилок и где в них какая фигура.
 struct Meshes {
-    vertices: BufferId,
-    indices: BufferId,
-    curve_vertices: BufferId,
-    curve_indices: BufferId,
-    paints: BufferId,
-    stops: BufferId,
+    /// Точки, треугольники, точки веера и кривых, их треугольники, градиенты, точки цвета.
+    arenas: [Arena; 6],
     ranges: Vec<MeshRange>,
-    revision: u64,
+    counters: Counters,
+}
+
+/// Сколько уже записано в буферы фигур (в штуках): номера у новых фигур идут дальше.
+#[derive(Clone, Copy, Default)]
+struct Counters {
+    vertices: u32,
+    indices: u32,
+    curve_vertices: u32,
+    curve_indices: u32,
+    paints: u32,
+    stops: u32,
+}
+
+/// Фигуры, разложенные в байты для шести буферов фигур.
+#[derive(Default)]
+struct PackedShapes {
+    bytes: [Vec<u8>; 6],
+    ranges: Vec<MeshRange>,
+}
+
+/// Названия буферов фигур для лога и отладки.
+const ARENA_NAMES: [&str; 6] = [
+    "точки векторных фигур",
+    "треугольники векторных фигур",
+    "точки веера и кривых",
+    "треугольники веера и кривых",
+    "градиенты векторных фигур",
+    "точки цвета градиентов",
+];
+/// Сколько байт новых фигур загружать за кадр (не меньше одной фигуры): большая пачка
+/// растягивается на несколько кадров, а не задерживает один.
+const STREAM_BUDGET: usize = 2 * 1024 * 1024;
+/// Самый маленький буфер фигур.
+const MIN_ARENA: u64 = 64 * 1024;
+
+/// Копирования, которые надо выполнить в начале кадра, чтобы новые фигуры попали на
+/// видеокарту. Записывает их [`VectorRenderer::record_uploads`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Uploads {
+    copies: Vec<(vk::Buffer, vk::Buffer, vk::BufferCopy)>,
+    /// Сколько фигур и байт в этом кадре (для лога и панели).
+    pub shapes: usize,
+    pub bytes: u64,
+}
+
+impl Uploads {
+    pub fn is_empty(&self) -> bool {
+        self.copies.is_empty()
+    }
+}
+
+/// Раскладывает фигуры `ids` из набора в байты, продолжая номера с `counters`.
+fn pack_shapes(
+    library: &ShapeLibrary,
+    ids: std::ops::Range<usize>,
+    counters: &mut Counters,
+) -> PackedShapes {
+    let mut out = PackedShapes::default();
+    let [
+        vertices,
+        indices,
+        curve_vertices,
+        curve_indices,
+        paints,
+        stops,
+    ] = &mut out.bytes;
+    for (id, shape, mesh) in library.iter().skip(ids.start).take(ids.len()) {
+        for (v, e) in mesh.vertices.iter().zip(&mesh.edges) {
+            pack_vertex(vertices, *v, e);
+        }
+        // Номера точек сразу общие для всех фигур: шейдеру не нужно знать, где
+        // начинаются точки фигуры.
+        for &i in &mesh.indices {
+            indices.extend_from_slice(&(i + counters.vertices).to_ne_bytes());
+        }
+        let curves = library.curves(id);
+        let curve_first = counters.curve_indices;
+        let keyframes = library.morph_keyframes(id);
+        let mut morph_stride = 0;
+        let mut bounds = bounds_of(&mesh.vertices);
+        if let Some(c) = curves {
+            bounds = keyframes
+                .iter()
+                .fold(union(bounds, bounds_of(&c.vertices)), |b, k| {
+                    union(b, bounds_of(k))
+                });
+            // Точки первого ключевого контура, за ними остальных: номер точки в
+            // контуре k = номер в первом + k · stride.
+            for positions in std::iter::once(&c.vertices).chain(keyframes) {
+                for (p, uv) in positions.iter().zip(&c.uv) {
+                    for f in [p[0], p[1], uv[0], uv[1]] {
+                        curve_vertices.extend_from_slice(&f.to_ne_bytes());
+                    }
+                }
+            }
+            for &i in &c.indices {
+                curve_indices.extend_from_slice(&(i + counters.curve_vertices).to_ne_bytes());
+            }
+            morph_stride = c.vertices.len() as u32;
+            counters.curve_vertices += morph_stride * (1 + keyframes.len() as u32);
+            counters.curve_indices += c.indices.len() as u32;
+        }
+        let (color, paint) = match &shape.paint {
+            Paint::Solid(c) => (*c, NO_PAINT),
+            Paint::Gradient(g) => {
+                pack_gradient(paints, stops, &mut counters.stops, g);
+                counters.paints += 1;
+                (Color::WHITE, counters.paints - 1)
+            }
+        };
+        out.ranges.push(MeshRange {
+            first_index: counters.indices,
+            index_count: mesh.indices.len() as u32,
+            curve_first_index: curve_first,
+            curve_index_count: curves.map_or(0, |c| c.indices.len() as u32),
+            even_odd: matches!(shape.style, Style::Fill(FillRule::EvenOdd)),
+            color,
+            method: library.method(id).unwrap_or_default(),
+            paint,
+            morph_stride,
+            morph_last: keyframes.len() as u32,
+            bounds,
+        });
+        counters.vertices += mesh.vertices.len() as u32;
+        counters.indices += mesh.indices.len() as u32;
+    }
+    out
+}
+
+/// Сколько фигур, начиная с `start`, загрузить за кадр: пока байт не больше
+/// [`STREAM_BUDGET`], но хотя бы одну.
+fn stream_count(library: &ShapeLibrary, start: usize) -> usize {
+    let mut bytes = 0usize;
+    let mut count = 0usize;
+    for (id, _, mesh) in library.iter().skip(start) {
+        let curves = library.curves(id).map_or(0, |c| {
+            c.vertices.len() * 16 * (1 + library.morph_keyframes(id).len()) + c.indices.len() * 4
+        });
+        bytes += mesh.vertices.len() * VERTEX_SIZE + mesh.indices.len() * 4 + curves;
+        if count > 0 && bytes > STREAM_BUDGET {
+            break;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Что рисовать в кадре, по порядку.
@@ -255,6 +417,9 @@ impl LayerMask {
 struct FrameBuffers {
     instances: BufferId,
     commands: BufferId,
+    /// Временный буфер для новых фигур ([`VectorRenderer::stream`]) и его размер.
+    staging: Option<BufferId>,
+    staging_size: u64,
     /// Что рисовать в каждую цель: 0 — кадр сцены, остальные — слои.
     targets: Vec<Vec<Op>>,
     /// Слои в порядке рисования: вложенные раньше тех, в которые они вложены.
@@ -369,6 +534,8 @@ impl VectorRenderer {
                     BufferMemory::CpuToGpu,
                     &format!("векторные команды кадра {i}"),
                 )?,
+                staging: None,
+                staging_size: 0,
                 targets: Vec::new(),
                 layer_order: Vec::new(),
                 bounds: Vec::new(),
@@ -440,165 +607,219 @@ impl VectorRenderer {
         Ok(())
     }
 
-    /// Загружает треугольники фигур на видеокарту, если набор фигур изменился с прошлой
-    /// загрузки. Ждёт окончания загрузки: вызывать при загрузке сцены, а не каждый кадр.
+    /// Загружает на видеокарту все фигуры набора, которых там ещё нет, и ждёт окончания
+    /// загрузки. Для загрузки сцены; фигуры, добавленные во время игры, загружает
+    /// [`Self::stream`] без ожидания.
     pub fn upload(
         &mut self,
         ctx: &GpuContext,
         res: &mut GpuResources,
         library: &ShapeLibrary,
     ) -> Result<(), GpuError> {
-        if self
-            .meshes
-            .as_ref()
-            .is_some_and(|m| m.revision == library.revision())
-        {
+        let done = self.meshes.as_ref().map_or(0, |m| m.ranges.len());
+        if done == library.len() && self.meshes.is_some() {
             return Ok(());
         }
-        let mut vertices: Vec<u8> = Vec::new();
-        let mut indices: Vec<u8> = Vec::new();
-        let mut curve_vertices: Vec<u8> = Vec::new();
-        let mut curve_indices: Vec<u8> = Vec::new();
-        let mut paints: Vec<u8> = Vec::new();
-        let mut stops: Vec<u8> = Vec::new();
-        let mut paint_count = 0u32;
-        let mut stop_count = 0u32;
-        let mut ranges = Vec::with_capacity(library.len());
-        let mut vertex_count = 0u32;
-        let mut index_count = 0u32;
-        let mut curve_vertex_count = 0u32;
-        let mut curve_index_count = 0u32;
-        for (id, shape, mesh) in library.iter() {
-            for (v, e) in mesh.vertices.iter().zip(&mesh.edges) {
-                pack_vertex(&mut vertices, *v, e);
-            }
-            // Номера точек сразу общие для всех фигур: шейдеру не нужно знать, где
-            // начинаются точки фигуры.
-            for &i in &mesh.indices {
-                indices.extend_from_slice(&(i + vertex_count).to_ne_bytes());
-            }
-            let curves = library.curves(id);
-            let curve_first = curve_index_count;
-            let keyframes = library.morph_keyframes(id);
-            let mut morph_stride = 0;
-            let mut bounds = bounds_of(&mesh.vertices);
-            if let Some(c) = curves {
-                bounds = keyframes
-                    .iter()
-                    .fold(union(bounds, bounds_of(&c.vertices)), |b, k| {
-                        union(b, bounds_of(k))
-                    });
-                // Точки первого ключевого контура, за ними остальных: номер точки в
-                // контуре k = номер в первом + k · stride.
-                for positions in std::iter::once(&c.vertices).chain(keyframes) {
-                    for (p, uv) in positions.iter().zip(&c.uv) {
-                        for f in [p[0], p[1], uv[0], uv[1]] {
-                            curve_vertices.extend_from_slice(&f.to_ne_bytes());
-                        }
-                    }
-                }
-                for &i in &c.indices {
-                    curve_indices.extend_from_slice(&(i + curve_vertex_count).to_ne_bytes());
-                }
-                morph_stride = c.vertices.len() as u32;
-                curve_vertex_count += morph_stride * (1 + keyframes.len() as u32);
-                curve_index_count += c.indices.len() as u32;
-            }
-            let (color, paint) = match &shape.paint {
-                Paint::Solid(c) => (*c, NO_PAINT),
-                Paint::Gradient(g) => {
-                    pack_gradient(&mut paints, &mut stops, &mut stop_count, g);
-                    paint_count += 1;
-                    (Color::WHITE, paint_count - 1)
-                }
-            };
-            ranges.push(MeshRange {
-                first_index: index_count,
-                index_count: mesh.indices.len() as u32,
-                curve_first_index: curve_first,
-                curve_index_count: curves.map_or(0, |c| c.indices.len() as u32),
-                even_odd: matches!(shape.style, Style::Fill(FillRule::EvenOdd)),
-                color,
-                method: library.method(id).unwrap_or_default(),
-                paint,
-                morph_stride,
-                morph_last: keyframes.len() as u32,
-                bounds,
-            });
-            vertex_count += mesh.vertices.len() as u32;
-            index_count += mesh.indices.len() as u32;
-        }
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        let mut counters = self
+            .meshes
+            .as_ref()
+            .map_or_else(Counters::default, |m| m.counters);
+        let packed = pack_shapes(library, done..library.len(), &mut counters);
+        // Новые буферы с запасом: старые (если были) копируются в начало.
+        let old = self.meshes.take();
+        let mut arenas = [Arena {
+            id: BufferId(u32::MAX),
+            capacity: 0,
+            used: 0,
+        }; 6];
         let mut created: Vec<BufferId> = Vec::new();
-        let mut make = |res: &mut GpuResources, bytes: &mut Vec<u8>, name: &str| {
-            // Пустой буфер создать нельзя: оставляем место хотя бы под одну запись.
-            if bytes.is_empty() {
-                bytes.resize(PAINT_SIZE, 0);
-            }
-            let id =
-                res.create_buffer(ctx, bytes.len() as u64, usage, BufferMemory::GpuOnly, name)?;
-            created.push(id);
-            res.upload_buffer(ctx, id, bytes)?;
-            Ok::<BufferId, GpuError>(id)
-        };
-        let made = (|| {
-            Ok::<_, GpuError>((
-                make(res, &mut vertices, "точки векторных фигур")?,
-                make(res, &mut indices, "треугольники векторных фигур")?,
-                make(res, &mut curve_vertices, "точки веера и кривых")?,
-                make(res, &mut curve_indices, "треугольники веера и кривых")?,
-                make(res, &mut paints, "градиенты векторных фигур")?,
-                make(res, &mut stops, "точки цвета градиентов")?,
-            ))
-        })();
-        let (vertices_id, indices_id, curve_vertices_id, curve_indices_id, paints_id, stops_id) =
-            match made {
-                Ok(ids) => ids,
-                Err(e) => {
-                    for id in created {
-                        res.destroy_buffer(id);
-                    }
-                    return Err(e);
+        let result = (|| {
+            for (k, bytes) in packed.bytes.iter().enumerate() {
+                let old_used = old.as_ref().map_or(0, |m| m.arenas[k].used);
+                let used = old_used + bytes.len() as u64;
+                let capacity = arena_capacity(used);
+                let id = res.create_buffer(
+                    ctx,
+                    capacity,
+                    ARENA_USAGE,
+                    BufferMemory::GpuOnly,
+                    ARENA_NAMES[k],
+                )?;
+                created.push(id);
+                if let Some(m) = old.as_ref().filter(|_| old_used > 0) {
+                    res.copy_buffer(ctx, m.arenas[k].id, id, old_used)?;
                 }
-            };
-        // Старые буферы может ещё читать кадр в работе: они уходят в очередь отложенного удаления.
-        if let Some(old) = self.meshes.take() {
-            for id in [
-                old.vertices,
-                old.indices,
-                old.curve_vertices,
-                old.curve_indices,
-                old.paints,
-                old.stops,
-            ] {
+                if !bytes.is_empty() {
+                    res.upload_buffer_at(ctx, id, old_used, bytes)?;
+                }
+                arenas[k] = Arena { id, capacity, used };
+            }
+            Ok::<(), GpuError>(())
+        })();
+        if let Err(e) = result {
+            for id in created {
                 res.destroy_buffer(id);
             }
+            self.meshes = old;
+            return Err(e);
         }
+        let mut ranges = old.as_ref().map(|m| m.ranges.clone()).unwrap_or_default();
+        if let Some(m) = old {
+            // Старые буферы может ещё читать кадр в работе: они уходят в очередь
+            // отложенного удаления.
+            for a in m.arenas {
+                res.destroy_buffer(a.id);
+            }
+        }
+        ranges.extend(packed.ranges);
         tracing::info!(
             "Векторные фигуры на видеокарте: {} фигур, {} треугольников, для трафарета {} треугольников, градиентов {}, {} КБ",
-            library.len(),
-            index_count / 3,
-            curve_index_count / 3,
-            paint_count,
-            (vertices.len()
-                + indices.len()
-                + curve_vertices.len()
-                + curve_indices.len()
-                + paints.len()
-                + stops.len())
-                / 1024
+            ranges.len(),
+            counters.indices / 3,
+            counters.curve_indices / 3,
+            counters.paints,
+            arenas.iter().map(|a| a.used).sum::<u64>() / 1024
         );
         self.meshes = Some(Meshes {
-            vertices: vertices_id,
-            indices: indices_id,
-            curve_vertices: curve_vertices_id,
-            curve_indices: curve_indices_id,
-            paints: paints_id,
-            stops: stops_id,
+            arenas,
             ranges,
-            revision: library.revision(),
+            counters,
         });
         Ok(())
+    }
+
+    /// Готовит загрузку новых фигур набора (добавленных после прошлой загрузки) внутри
+    /// кадра, без ожидания: байты пишутся во временный буфер кадра `slot`, а копирование в
+    /// буферы фигур записывает [`Self::record_uploads`] в начало этого кадра. Новые
+    /// фигуры видны с этого же кадра. Большая пачка растягивается на несколько кадров
+    /// ([`STREAM_BUDGET`] байт за кадр); фигуры, которые ещё не загружены, просто не
+    /// рисуются. Если место в буферах кончилось, они заменяются вдвое большими (старое
+    /// содержимое копирует видеокарта в том же кадре).
+    pub fn stream(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        slot: usize,
+        library: &ShapeLibrary,
+    ) -> Result<Uploads, GpuError> {
+        let Some(meshes) = self.meshes.as_mut() else {
+            return Ok(Uploads::default());
+        };
+        let start = meshes.ranges.len();
+        if start >= library.len() {
+            return Ok(Uploads::default());
+        }
+        let count = stream_count(library, start);
+        let mut counters = meshes.counters;
+        let packed = pack_shapes(library, start..start + count, &mut counters);
+        let total: usize = packed.bytes.iter().map(Vec::len).sum();
+        // Временный буфер кадра: растёт по необходимости.
+        let frame = &mut self.frames[slot];
+        if frame.staging_size < total as u64 {
+            if let Some(old) = frame.staging.take() {
+                res.destroy_buffer(old);
+            }
+            let size = arena_capacity(total as u64);
+            frame.staging = Some(res.create_buffer(
+                ctx,
+                size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                BufferMemory::CpuToGpu,
+                &format!("загрузка векторных фигур кадра {slot}"),
+            )?);
+            frame.staging_size = size;
+        }
+        let staging = frame.staging.expect("создан выше");
+        let staging_raw = res.buffer_raw(staging).expect("буфер жив");
+        let mut uploads = Uploads {
+            shapes: count,
+            bytes: total as u64,
+            ..Uploads::default()
+        };
+        let mut offset = 0u64;
+        for (k, bytes) in packed.bytes.iter().enumerate() {
+            if bytes.is_empty() {
+                continue;
+            }
+            let arena = &mut meshes.arenas[k];
+            let used = arena.used + bytes.len() as u64;
+            if used > arena.capacity {
+                // Место кончилось: новый буфер вдвое больше, старое содержимое
+                // копирует видеокарта в начале этого кадра, старый буфер удалится, когда
+                // его перестанут читать кадры в работе.
+                let capacity = arena_capacity(used);
+                let id = res.create_buffer(
+                    ctx,
+                    capacity,
+                    ARENA_USAGE,
+                    BufferMemory::GpuOnly,
+                    ARENA_NAMES[k],
+                )?;
+                if arena.used > 0 {
+                    uploads.copies.push((
+                        res.buffer_raw(arena.id).expect("буфер жив"),
+                        res.buffer_raw(id).expect("буфер жив"),
+                        vk::BufferCopy::default().size(arena.used),
+                    ));
+                }
+                res.destroy_buffer(arena.id);
+                tracing::debug!("буфер «{}» вырос до {} КБ", ARENA_NAMES[k], capacity / 1024);
+                arena.id = id;
+                arena.capacity = capacity;
+            }
+            res.write_buffer(staging, offset as usize, bytes);
+            uploads.copies.push((
+                staging_raw,
+                res.buffer_raw(arena.id).expect("буфер жив"),
+                vk::BufferCopy::default()
+                    .src_offset(offset)
+                    .dst_offset(arena.used)
+                    .size(bytes.len() as u64),
+            ));
+            offset += bytes.len() as u64;
+            arena.used = used;
+        }
+        meshes.counters = counters;
+        meshes.ranges.extend(packed.ranges);
+        Ok(uploads)
+    }
+
+    /// Записывает копирования новых фигур из [`Self::stream`] и барьер: после него шейдеры
+    /// читают уже новые данные. Вызывать в начале кадра, до проходов с векторами.
+    ///
+    /// # Safety
+    /// `cmd` в состоянии записи вне прохода рисования; буферы из `uploads` живы, пока
+    /// видеокарта выполняет этот кадр (удаление старых отложено до его конца).
+    pub unsafe fn record_uploads(device: &ash::Device, cmd: vk::CommandBuffer, uploads: &Uploads) {
+        if uploads.is_empty() {
+            return;
+        }
+        // SAFETY: условия функции.
+        unsafe {
+            // Сначала копии старого содержимого в выросшие буферы, затем новые фигуры:
+            // команды копирования в одном буфере команд к разным участкам не мешают друг
+            // другу, кроме выросшего буфера, куда сначала пишется старое, потом новое.
+            for (src, dst, region) in &uploads.copies {
+                device.cmd_copy_buffer(cmd, *src, *dst, std::slice::from_ref(region));
+            }
+            let barrier = [vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(
+                    vk::PipelineStageFlags2::VERTEX_SHADER
+                        | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                )
+                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&barrier),
+            );
+        }
+    }
+
+    /// Сколько фигур уже на видеокарте.
+    pub fn uploaded_shapes(&self) -> usize {
+        self.meshes.as_ref().map_or(0, |m| m.ranges.len())
     }
 
     /// Загружает буквы всех блоков текста на видеокарту, если текст изменился с прошлой
@@ -748,12 +969,12 @@ impl VectorRenderer {
         frame.layer_order = packed.layer_order;
         frame.bounds = packed.bounds;
         Some(VectorData {
-            indices: res.buffer_address(meshes.indices),
-            vertices: res.buffer_address(meshes.vertices),
-            curve_indices: res.buffer_address(meshes.curve_indices),
-            curve_vertices: res.buffer_address(meshes.curve_vertices),
-            paints: res.buffer_address(meshes.paints),
-            stops: res.buffer_address(meshes.stops),
+            vertices: res.buffer_address(meshes.arenas[0].id),
+            indices: res.buffer_address(meshes.arenas[1].id),
+            curve_vertices: res.buffer_address(meshes.arenas[2].id),
+            curve_indices: res.buffer_address(meshes.arenas[3].id),
+            paints: res.buffer_address(meshes.arenas[4].id),
+            stops: res.buffer_address(meshes.arenas[5].id),
             instances: res.buffer_address(frame.instances),
             commands: res.buffer_raw(frame.commands)?,
             glyphs: self
@@ -1507,6 +1728,62 @@ fn pack_vertex(out: &mut Vec<u8>, position: [f32; 2], edge: &reyvec_vector::Edge
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arenas_grow_by_powers_of_two() {
+        assert_eq!(arena_capacity(0), MIN_ARENA);
+        assert_eq!(arena_capacity(MIN_ARENA + 1), MIN_ARENA * 2);
+        assert_eq!(arena_capacity(1_000_000), 1 << 20);
+    }
+
+    /// Фигуры, разложенные двумя пачками, дают те же байты, что и одной: номера точек
+    /// и градиентов во второй пачке продолжаются.
+    #[test]
+    fn packing_in_batches_matches_packing_at_once() {
+        let mut lib = ShapeLibrary::new(0.01);
+        let square = || {
+            let mut p = reyvec_vector::BezPath::new();
+            p.move_to((0.0, 0.0));
+            p.line_to((1.0, 0.0));
+            p.line_to((1.0, 1.0));
+            p.close_path();
+            p
+        };
+        let gradient = reyvec_vector::Gradient::linear((0.0, 0.0), (1.0, 0.0))
+            .stop(0.0, Color::WHITE)
+            .stop(1.0, Color::WHITE);
+        lib.add(reyvec_vector::Shape::fill(square(), Color::WHITE))
+            .unwrap();
+        lib.add(reyvec_vector::Shape::fill(square(), gradient.clone()))
+            .unwrap();
+        lib.add(reyvec_vector::Shape::stroke(
+            square(),
+            reyvec_vector::Stroke::new(0.1),
+            Color::WHITE,
+        ))
+        .unwrap();
+        lib.add(reyvec_vector::Shape::fill(square(), gradient))
+            .unwrap();
+        let mut c = Counters::default();
+        let all = pack_shapes(&lib, 0..4, &mut c);
+        let mut c2 = Counters::default();
+        let first = pack_shapes(&lib, 0..2, &mut c2);
+        let second = pack_shapes(&lib, 2..4, &mut c2);
+        for k in 0..6 {
+            assert_eq!(
+                all.bytes[k],
+                [first.bytes[k].clone(), second.bytes[k].clone()].concat()
+            );
+        }
+        assert_eq!(second.ranges[1].paint, 1);
+        assert_eq!(
+            second.ranges[0].first_index,
+            first.ranges[1].first_index + first.ranges[1].index_count
+        );
+        assert_eq!(c.paints, 2);
+        assert_eq!(stream_count(&lib, 0), 4);
+        assert_eq!(stream_count(&lib, 3), 1);
+    }
     use reyvec_vector::{Affine, Instance};
 
     const PLAIN: MeshRange = MeshRange {

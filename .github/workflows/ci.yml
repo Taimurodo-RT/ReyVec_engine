@@ -133,6 +133,8 @@ jobs:
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --svg assets/svg/illustration.svg --seconds 3
           # Сцена «Motif»: перетекающие фигуры из файла Motif (пример).
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --motif assets/motif/morph.reyvec.json --seconds 3
+          # Сцена «поток»: новые фигуры загружаются внутри кадра, буферы растут на ходу.
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --scene stream --seconds 12
           # Сцена «текст»: колонки, мелкие строки, текст в слое с маской.
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-sandbox --validation --scene text --seconds 3
       # Снимки кадра: без окна (--snapshot) и из окна по F12.

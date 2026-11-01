@@ -266,19 +266,50 @@ impl GpuResources {
         id: BufferId,
         bytes: &[u8],
     ) -> Result<(), GpuError> {
+        self.upload_buffer_at(ctx, id, 0, bytes)
+    }
+
+    /// Копирует первые `size` байт буфера `src` в начало `dst` и ждёт окончания.
+    /// Для загрузки сцены, а не каждый кадр.
+    pub fn copy_buffer(
+        &mut self,
+        ctx: &GpuContext,
+        src: BufferId,
+        dst: BufferId,
+        size: u64,
+    ) -> Result<(), GpuError> {
+        let (Some(src), Some(dst)) = (self.buffer_raw(src), self.buffer_raw(dst)) else {
+            return Ok(());
+        };
+        self.immediate(ctx, |d, cmd| {
+            let region = [vk::BufferCopy::default().size(size)];
+            // SAFETY: оба буфера живы до конца немедленной отправки.
+            unsafe { d.cmd_copy_buffer(cmd, src, dst, &region) };
+        })
+    }
+
+    /// Загружает данные в буфер [`BufferMemory::GpuOnly`] с байта `offset` через
+    /// временный буфер и ждёт окончания.
+    pub fn upload_buffer_at(
+        &mut self,
+        ctx: &GpuContext,
+        id: BufferId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), GpuError> {
         let Some((dst, size)) = self.buffers.get(id.0).map(|b| (b.raw, b.size)) else {
             return Ok(());
         };
-        if bytes.len() as u64 > size {
+        if offset + bytes.len() as u64 > size {
             return Err(GpuError::Memory(format!(
-                "в буфер на {size} байт не помещается {} байт",
+                "в буфер на {size} байт не помещается {} байт с {offset}",
                 bytes.len()
             )));
         }
         let staging = self.staging(ctx, bytes)?;
         let size = bytes.len() as u64;
         let result = self.immediate(ctx, |d, cmd| {
-            let region = [vk::BufferCopy::default().size(size)];
+            let region = [vk::BufferCopy::default().dst_offset(offset).size(size)];
             // SAFETY: оба буфера живы до конца немедленной отправки.
             unsafe { d.cmd_copy_buffer(cmd, staging.raw, dst, &region) };
         });
