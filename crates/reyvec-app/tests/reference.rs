@@ -235,6 +235,36 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// Печатает PNG в лог строками base64 между метками `--- PNG <имя> ---` и
+/// `--- конец PNG ---` (собрать обратно: `base64 -d`).
+fn print_png_text(name: &str, path: &Path) {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    let mut text = String::with_capacity(bytes.len() * 4 / 3 + 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                text.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                text.push('=');
+            }
+        }
+    }
+    println!("--- PNG {name} ---");
+    for line in text.as_bytes().chunks(4000) {
+        println!("{}", std::str::from_utf8(line).expect("base64 — ASCII"));
+    }
+    println!("--- конец PNG ---");
+}
+
 fn reference_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/reference")
 }
@@ -271,6 +301,8 @@ fn frames_match_references() {
                 // и, проверив глазами, сделать эталоном.
                 let actual = failures_dir().join(format!("{}-actual.png", case.name));
                 save_png(&actual, &frame.image).expect("запись кадра");
+                // И в лог текстом: не везде можно скачать артефакт CI, а лог читается всегда.
+                print_png_text(case.name, &actual);
                 problems.push(format!(
                     "{}: нет эталона ({e}). Снимите его с REYVEC_UPDATE_REFERENCES=1 \
                      или возьмите {}",
