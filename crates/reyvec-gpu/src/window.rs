@@ -462,6 +462,22 @@ impl WindowRenderer {
         }
     }
 
+    /// Новый текст файла сцены для сцены «из файла» (после сохранения файла). Если в нём
+    /// ошибка, рисуется прошлая сцена, а ошибка видна в [`WindowRenderer::scene_error`].
+    pub fn set_scene_file(&mut self, text: &str) {
+        self.files.scene = Some(text.into());
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_scene_file(text);
+        }
+    }
+
+    /// Ошибка в последнем сохранении файла сцены.
+    pub fn scene_error(&self) -> Option<String> {
+        self.demo
+            .as_ref()
+            .and_then(|d| d.scene_error().map(ToOwned::to_owned))
+    }
+
     /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
     pub fn shader_error(&self) -> Option<String> {
         self.shaders.error()

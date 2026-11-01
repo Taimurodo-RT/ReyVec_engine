@@ -18,6 +18,7 @@ reyvec-svg = { path = "crates/reyvec-svg" }
 reyvec-motif = { path = "crates/reyvec-motif" }
 reyvec-text = { path = "crates/reyvec-text" }
 reyvec-sdf = { path = "crates/reyvec-sdf" }
+reyvec-scene = { path = "crates/reyvec-scene" }
 ash = "0.38"
 ash-window = "0.13"
 notify = "8"
@@ -36,6 +37,8 @@ resvg = { version = "0.49", default-features = false }
 # Файлы перетекающих фигур от Motif (`*.reyvec.json`).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Файлы сцен (этап 5): RON читается и правится руками, как Rust, но без кода.
+ron = "0.12"
 # Текст: раскладка строк с переносами и выравниванием (parley, без системных шрифтов:
 # шрифты движок приносит с собой), контуры букв (skrifa, та же версия, что у parley и egui)
 # и поля расстояний MSDF для атласа букв (fdsm; картинки ему нужны из image).

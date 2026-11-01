@@ -1,0 +1,20 @@
+[package]
+name = "reyvec-scene"
+description = "ReyVec: сцена из файла (RON): фигуры, слои с тенью, источники света, SDF-объекты; слежка за файлом."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+notify.workspace = true
+ron.workspace = true
+reyvec-vector.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
