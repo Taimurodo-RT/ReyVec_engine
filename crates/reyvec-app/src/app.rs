@@ -426,6 +426,7 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::Digit0 | KeyCode::Numpad0 => Some(DemoScene::Stress),
         // Сцены этапа 4 и дальше — буквами: цифры заняты сценами этапов 2–3.
         KeyCode::KeyL => Some(DemoScene::Light),
+        KeyCode::KeyK => Some(DemoScene::Lamps),
         _ => None,
     }
 }

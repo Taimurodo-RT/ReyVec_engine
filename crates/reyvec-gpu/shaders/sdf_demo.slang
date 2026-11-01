@@ -14,8 +14,9 @@ struct Push
     float2 center; // точка сцены в центре экрана (камера)
     float zoom;    // приближение камеры
     float height;  // высота окна в пикселях
-    uint field_texture; // картинка поля расстояний (4.2), если use_field
-    uint use_field;     // 1: линии фона по полю из картинки (jump flooding), 0: точное поле
+    uint field_texture; // картинка поля расстояний (4.2), если flags & 1
+    uint flags;         // 1: линии фона по полю из картинки (jump flooding), а не точному;
+                        // 2: сцена «лампы и тени» (светлый пол, свет умножит вывод)
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -50,14 +51,15 @@ float4 fs_main(VertexOut input) : SV_Target
     DemoShapes all = demo_shapes(p, t);
 
     float field = 1e9;
-    float3 color = float3(0.02, 0.025, 0.035);
+    // Пол: в сцене с лампами светлый (его затемняет и красит свет), иначе тёмный.
+    float3 color = (pc.flags & 2) != 0 ? float3(0.32, 0.33, 0.36) : float3(0.02, 0.025, 0.035);
     // Сначала поле: считаем расстояние до ближайшей фигуры, потом рисуем линии.
     for (int i = 0; i < DEMO_SHAPES; i++)
         field = min(field, all.shapes[i].d);
     // Поле для линий фона: точное или из картинки, построенной jump flooding (задача 4.2).
     // Картинка в половинном разрешении, между её пикселями значения смешиваются.
     float lines_field = field;
-    if (pc.use_field != 0)
+    if ((pc.flags & 1) != 0)
     {
         float2 uv = input.position.xy / float2(pc.height * pc.aspect, pc.height);
         lines_field = textures[pc.field_texture].SampleLevel(samplers[0], uv, 0.0).r;

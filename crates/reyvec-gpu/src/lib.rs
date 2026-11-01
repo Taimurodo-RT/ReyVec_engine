@@ -35,6 +35,7 @@ mod demo;
 mod demo_vector;
 mod graph;
 mod headless;
+mod lights;
 mod pipeline;
 mod resources;
 mod shaders;
