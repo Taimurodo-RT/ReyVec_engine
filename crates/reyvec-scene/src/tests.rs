@@ -375,3 +375,102 @@ fn watcher_sees_saves() {
     assert!(text.contains("Lab"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn world(text: &str) -> SceneWorld {
+    let file = SceneFile::parse(text).unwrap();
+    let mut lib = library();
+    SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap()
+}
+
+#[test]
+fn motion_moves_children_over_time() {
+    // Маятник: точка подвеса в (0; 1), лампа на 0,5 ниже, качается на 30° за 4 с.
+    // Через 1 с (четверть периода) отклонение наибольшее: лампа уходит вправо.
+    let text = minimal(
+        r##"nodes: [(at: (0.0, 1.0), swing: (angle: 30, period: 4.0),
+            lights: [Point(at: (0.0, -0.5), color: "#fff", reach: 1.0)])]"##,
+    );
+    let mut w = world(&text);
+    w.update_at(0.0);
+    let a = w.snapshot().lights[0].a;
+    assert!(a[0].abs() < 1e-6 && (a[1] - 0.5).abs() < 1e-6, "{a:?}");
+    w.update_at(1.0);
+    let a = w.snapshot().lights[0].a;
+    assert!((a[0] - 0.25).abs() < 1e-5, "sin 30° · 0,5 = 0,25: {a:?}");
+    // Вращение и покачивание.
+    let text = minimal(
+        r##"nodes: [(spin: 90, bob: (by: (0.0, 0.1), period: 2.0),
+            shapes: [Circle(at: (0.5, 0.0), r: 0.05, color: "#fff")])]"##,
+    );
+    let mut w = world(&text);
+    w.update_at(0.5);
+    // Через 0,5 с: повернулся на 45°, поднялся на 0,1 (четверть периода покачивания).
+    let t = shape_at(&w.snapshot(), 0).transform.as_coeffs();
+    let r = 0.5 * std::f64::consts::FRAC_1_SQRT_2;
+    assert!(
+        (t[4] - r).abs() < 1e-6 && (t[5] - r - 0.1).abs() < 1e-6,
+        "{t:?}"
+    );
+}
+
+#[test]
+fn bad_motion_is_reported() {
+    let e = error(&minimal(
+        r##"nodes: [(name: "лампа", swing: (angle: 10, period: 0))]"##,
+    ));
+    assert!(
+        e.message.contains("«лампа»") && e.message.contains("period"),
+        "{e}"
+    );
+    let e = error(&minimal(r##"nodes: [(swing: (angle: 10))]"##));
+    assert!(e.message.contains("period"), "{e}");
+}
+
+#[test]
+fn lerp_goes_between_snapshots() {
+    let text = minimal(
+        r##"nodes: [(bob: (by: (1.0, 0.0), period: 4.0),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.05, color: "#fff")],
+            lights: [Point(at: (0.0, 0.0), color: "#fff", reach: 1.0)],
+            objects: [(parts: [Circle(at: (0.0, 0.0), r: 0.05)], color: "#fff")])]"##,
+    );
+    let mut w = world(&text);
+    w.update_at(0.0);
+    let a = w.snapshot();
+    w.update_at(1.0);
+    let b = w.snapshot();
+    let m = Scene::lerp(&a, &b, 0.25);
+    assert!((shape_at(&m, 0).transform.as_coeffs()[4] - 0.25).abs() < 1e-9);
+    assert!((m.lights[0].a[0] - 0.25).abs() < 1e-6);
+    assert!((m.objects[0].parts[0].a[0] - 0.25).abs() < 1e-6);
+    // Снимки разного устройства (сменился файл): берётся новый.
+    let other = build(&minimal(""));
+    assert_eq!(Scene::lerp(&a, &other, 0.5).shapes, 0);
+}
+
+#[test]
+fn logic_thread_steps_and_takes_new_worlds() {
+    let text = minimal(
+        r##"nodes: [(spin: 60, shapes: [Rect(at: (0.5, 0.0), size: (0.1, 0.1), color: "#fff")])]"##,
+    );
+    let logic = SceneLogic::start(world(&text), 0.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while logic.steps() < 6 {
+        assert!(Instant::now() < deadline, "логика не шагает");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Фигура повернулась: x уже не 0,5.
+    let t = shape_at(&logic.frame(Instant::now()), 0)
+        .transform
+        .as_coeffs();
+    assert!(t[4] < 0.4999, "{t:?}");
+    // Новый мир без фигур.
+    logic.replace(world(&minimal("")));
+    let steps = logic.steps();
+    while logic.steps() < steps + 3 {
+        assert!(Instant::now() < deadline, "логика не шагает");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(logic.frame(Instant::now()).shapes, 0);
+    assert!(logic.step_ms() < 50.0);
+}

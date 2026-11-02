@@ -118,6 +118,40 @@ pub struct SdfShape {
     pub order: u32,
 }
 
+/// Движение предмета (5.3): от исходного места `base` в момент времени сцены.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct Motion {
+    pub base: Placement,
+    /// Градусов в секунду.
+    pub spin: f64,
+    /// Размах (градусы) и период (секунды) качания.
+    pub swing: Option<(f64, f64)>,
+    /// Сдвиг и период покачивания.
+    pub bob: Option<([f64; 2], f64)>,
+}
+
+impl Motion {
+    /// Место в момент `t` секунд.
+    pub fn at(&self, t: f64) -> Placement {
+        let wave = |period: f64| (std::f64::consts::TAU * t / period).sin();
+        let mut p = self.base;
+        p.angle += self.spin * t;
+        if let Some((angle, period)) = self.swing {
+            p.angle += angle * wave(period);
+        }
+        if let Some((by, period)) = self.bob {
+            let k = wave(period);
+            p.at[0] += by[0] * k;
+            p.at[1] += by[1] * k;
+        }
+        p
+    }
+}
+
+/// Время сцены, секунды (движение считается от него).
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct SceneTime(pub f64);
+
 /// Фон и общий свет сцены.
 #[derive(Resource, Clone, Copy, Debug)]
 struct Settings {
@@ -170,11 +204,15 @@ impl SceneWorld {
             lights: file.lights.clone(),
             objects: file.objects.clone(),
             children: NodeDesc::all(file),
+            spin: 0.0,
+            swing: None,
+            bob: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
         let mut schedule = Schedule::default();
-        schedule.add_systems((propagate, collect).chain());
+        world.init_resource::<SceneTime>();
+        schedule.add_systems((animate, propagate, collect).chain());
         Ok(Self {
             world,
             schedule,
@@ -185,6 +223,13 @@ impl SceneWorld {
     /// Прогоняет системы мира: итоговые места и снимок.
     pub fn update(&mut self) {
         self.schedule.run(&mut self.world);
+    }
+
+    /// Прогоняет системы мира в момент `seconds` от начала сцены: движение предметов,
+    /// итоговые места и снимок.
+    pub fn update_at(&mut self, seconds: f64) {
+        self.world.resource_mut::<SceneTime>().0 = seconds;
+        self.update();
     }
 
     /// Снимок для рисования после последнего [`SceneWorld::update`].
@@ -254,6 +299,14 @@ impl Spawner<'_> {
             (Name::new(name.clone()), placement, GlobalPlacement::ROOT),
             parent,
         );
+        if n.spin != 0.0 || n.swing.is_some() || n.bob.is_some() {
+            self.world.entity_mut(me).insert(Motion {
+                base: placement,
+                spin: n.spin,
+                swing: n.swing.map(|w| (w.angle, w.period)),
+                bob: n.bob.map(|b| ([b.by.0, b.by.1], b.period)),
+            });
+        }
         for (j, shape) in n.shapes.iter().enumerate() {
             let id = shape
                 .shape_id(self.library, self.cache)
@@ -309,6 +362,13 @@ impl Spawner<'_> {
             self.node(child, Some(me), &format!("{name} → предмет {}", j + 1))?;
         }
         Ok(())
+    }
+}
+
+/// Движение: место предметов с [`Motion`] в текущий момент.
+fn animate(time: Res<SceneTime>, mut moving: Query<(&Motion, &mut Placement)>) {
+    for (motion, mut placement) in &mut moving {
+        *placement = motion.at(time.0);
     }
 }
 

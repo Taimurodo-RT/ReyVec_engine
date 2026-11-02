@@ -78,6 +78,8 @@ pub(crate) struct PanelInfo<'a> {
     /// Файл сцены «из файла» (если за ним следим) и ошибка последнего сохранения.
     pub scene_file: Option<&'a str>,
     pub scene_error: Option<String>,
+    /// Логика сцены из файла (5.3): шагов сделано и среднее время шага, мс.
+    pub logic: Option<(u64, f64)>,
     /// Имя файла последнего снимка кадра.
     pub last_snapshot: Option<&'a str>,
     /// Название сцены песочницы.
@@ -283,6 +285,11 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             (None, None) => {
                 ui.label("Файл сцены: встроенный пример (файл не найден)");
             }
+        }
+        if let Some((steps, ms)) = info.logic {
+            ui.label(mono(format!(
+                "Логика: свой поток, 60 шагов/с, шаг {ms:.3} мс (сделано {steps})"
+            )));
         }
     }
     if let Some(name) = info.last_snapshot {
@@ -580,6 +587,7 @@ mod tests {
             shader_error: None,
             scene_file: None,
             scene_error: None,
+            logic: Some((600, 0.012)),
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
             msaa: "MSAA 4×",

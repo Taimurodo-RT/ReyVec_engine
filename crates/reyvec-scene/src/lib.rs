@@ -217,6 +217,31 @@ pub struct NodeDesc {
     pub objects: Vec<ObjectDesc>,
     #[serde(default)]
     pub children: Vec<NodeDesc>,
+    /// Движение (5.3): вращение, градусов в секунду (больше 0 — против часовой).
+    #[serde(default)]
+    pub spin: f64,
+    /// Качание вокруг своего места, как у маятника.
+    #[serde(default)]
+    pub swing: Option<Swing>,
+    /// Покачивание туда-обратно на `by` от своего места.
+    #[serde(default)]
+    pub bob: Option<Bob>,
+}
+
+/// Качание: на `angle` градусов в обе стороны, полный взмах за `period` секунд.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Swing {
+    pub angle: f64,
+    pub period: f64,
+}
+
+/// Покачивание: сдвиг до `by` в обе стороны, туда и обратно за `period` секунд.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Bob {
+    pub by: P,
+    pub period: f64,
 }
 
 impl NodeDesc {
@@ -234,6 +259,9 @@ impl NodeDesc {
             lights: Vec::new(),
             objects: Vec::new(),
             children: Vec::new(),
+            spin: 0.0,
+            swing: None,
+            bob: None,
         }
     }
 
@@ -269,6 +297,25 @@ impl NodeDesc {
             return Err(fail(format!("angle {} — нужно число", self.angle)));
         }
         check_size("scale", self.scale).map_err(fail)?;
+        if !(self.spin.is_finite() && self.spin.abs() <= 36_000.0) {
+            return Err(fail(format!(
+                "spin {} — нужно от −36000 до 36000 градусов в секунду",
+                self.spin
+            )));
+        }
+        if let Some(w) = self.swing {
+            if !(w.angle.is_finite() && w.angle.abs() <= 360.0) {
+                return Err(fail(format!(
+                    "swing: angle {} — нужно от −360 до 360",
+                    w.angle
+                )));
+            }
+            check_period(w.period).map_err(fail)?;
+        }
+        if let Some(b) = self.bob {
+            check_point("bob: by", b.by).map_err(fail)?;
+            check_period(b.period).map_err(fail)?;
+        }
         if !(0.0..=1.0).contains(&self.opacity) {
             return Err(fail(format!("opacity {} — нужно от 0 до 1", self.opacity)));
         }
@@ -652,6 +699,14 @@ fn check_size(what: &str, v: f64) -> Result<(), String> {
         Err(format!(
             "{what} {v} — нужно больше 0 и не больше {MAX_COORD}"
         ))
+    }
+}
+
+fn check_period(period: f64) -> Result<(), String> {
+    if period.is_finite() && (0.01..=3600.0).contains(&period) {
+        Ok(())
+    } else {
+        Err(format!("period {period} — нужно от 0.01 до 3600 секунд"))
     }
 }
 
@@ -1115,8 +1170,12 @@ impl SceneWatcher {
     }
 }
 
+mod logic;
 mod world;
-pub use world::{GlobalPlacement, LightSource, Placement, SceneWorld, SdfShape, VectorShape};
+pub use logic::{STEP, SceneLogic};
+pub use world::{
+    GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, VectorShape,
+};
 
 #[cfg(test)]
 mod tests;
