@@ -17,8 +17,12 @@
 use bevy_ecs::hierarchy::{ChildOf, Children};
 use bevy_ecs::name::Name;
 use bevy_ecs::prelude::*;
+use std::sync::Arc;
+
+use reyvec_svg::SvgDrawing;
 use reyvec_vector::{Affine, BlendMode, Color, Instance, SceneItem, ShapeId, ShapeLibrary};
 
+use crate::assets::{self, MorphTrack};
 use crate::{
     Background, LightKind, NodeDesc, Scene, SceneError, SceneFile, SceneLight, SceneObject,
     ShapeCache,
@@ -96,11 +100,20 @@ impl GlobalPlacement {
     }
 }
 
-/// Векторная фигура: форма из библиотеки и цвет. `order` — порядок в файле.
-#[derive(Component, Clone, Copy, Debug)]
+/// Векторная фигура: форма из библиотеки и цвет. `order` — порядок в файле. У
+/// перетекающей фигуры Motif (5.5) ещё и то, как она перетекает.
+#[derive(Component, Clone, Debug)]
 pub struct VectorShape {
     pub id: ShapeId,
     pub tint: Color,
+    pub order: u32,
+    pub morph: Option<MorphTrack>,
+}
+
+/// Рисунок SVG (5.5): готовый список кадра в координатах рисунка.
+#[derive(Component, Clone, Debug)]
+pub struct SvgPicture {
+    pub drawing: Arc<SvgDrawing>,
     pub order: u32,
 }
 
@@ -188,6 +201,7 @@ impl SceneWorld {
             world: &mut world,
             library,
             cache,
+            dir: file.dir.as_deref(),
             order: 0,
             entities: 0,
         };
@@ -207,6 +221,8 @@ impl SceneWorld {
             spin: 0.0,
             swing: None,
             bob: None,
+            pictures: Vec::new(),
+            morphs: Vec::new(),
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
@@ -262,11 +278,33 @@ struct Spawner<'a> {
     world: &'a mut World,
     library: &'a mut ShapeLibrary,
     cache: &'a mut ShapeCache,
+    dir: Option<&'a std::path::Path>,
     order: u32,
     entities: usize,
 }
 
 impl Spawner<'_> {
+    /// Рисунок SVG: готовый из кэша или прочитанный и нарезанный здесь же.
+    fn picture(&mut self, p: &crate::PictureDesc) -> Result<Arc<SvgDrawing>, String> {
+        let file = assets::picture_file(self.dir, p)?;
+        if let Some(d) = self.cache.svgs.get(&file.key) {
+            return Ok(d.clone());
+        }
+        let d = Arc::new(assets::load_picture(&file, p.height, self.library)?);
+        self.cache.svgs.insert(file.key, d.clone());
+        Ok(d)
+    }
+
+    fn motif(&mut self, m: &crate::MorphDesc) -> Result<Arc<reyvec_motif::MorphFile>, String> {
+        let file = assets::motif_file(self.dir, m)?;
+        if let Some(f) = self.cache.motifs.get(&file.key) {
+            return Ok(f.clone());
+        }
+        let f = Arc::new(assets::load_motif(&file, self.library)?);
+        self.cache.motifs.insert(file.key, f.clone());
+        Ok(f)
+    }
+
     fn next(&mut self) -> u32 {
         self.order += 1;
         self.order
@@ -325,6 +363,51 @@ impl Spawner<'_> {
                         id,
                         tint: color.0,
                         order,
+                        morph: None,
+                    },
+                ),
+                Some(me),
+            );
+        }
+        for (j, p) in n.pictures.iter().enumerate() {
+            let fail =
+                |m: String| SceneError::new(format!("предмет «{name}», рисунок {}: {m}", j + 1));
+            let drawing = self.picture(p).map_err(fail)?;
+            let order = self.next();
+            self.spawn(
+                (
+                    Placement {
+                        at: [p.at.0, p.at.1],
+                        angle: p.angle,
+                        ..Placement::IDENTITY
+                    },
+                    GlobalPlacement::ROOT,
+                    SvgPicture { drawing, order },
+                ),
+                Some(me),
+            );
+        }
+        for (j, m) in n.morphs.iter().enumerate() {
+            let fail = |e: String| {
+                SceneError::new(format!("предмет «{name}», фигура Motif {}: {e}", j + 1))
+            };
+            let motif = self.motif(m).map_err(fail)?;
+            let (id, track) = assets::pick_morph(&motif, m).map_err(fail)?;
+            let order = self.next();
+            self.spawn(
+                (
+                    Placement {
+                        at: [m.at.0, m.at.1],
+                        angle: m.angle,
+                        scale: m.scale,
+                        ..Placement::IDENTITY
+                    },
+                    GlobalPlacement::ROOT,
+                    VectorShape {
+                        id,
+                        tint: m.color.map_or(Color::WHITE, |c| c.0),
+                        order,
+                        morph: Some(track),
                     },
                 ),
                 Some(me),
@@ -402,24 +485,47 @@ fn visit(
     }
 }
 
+/// Что рисуется в векторном слое: фигура или рисунок SVG.
+enum Drawn<'a> {
+    Shape(&'a VectorShape),
+    Picture(&'a SvgPicture),
+}
+
+impl Drawn<'_> {
+    fn order(&self) -> u32 {
+        match self {
+            Self::Shape(s) => s.order,
+            Self::Picture(p) => p.order,
+        }
+    }
+}
+
 /// Снимок для рисования.
+#[allow(clippy::too_many_arguments)]
 fn collect(
     shapes: Query<(&VectorShape, &GlobalPlacement)>,
+    pictures: Query<(&SvgPicture, &GlobalPlacement)>,
     lights: Query<(&LightSource, &GlobalPlacement)>,
     objects: Query<(&SdfShape, &GlobalPlacement)>,
     settings: Res<Settings>,
+    time: Res<SceneTime>,
     mut snapshot: ResMut<Snapshot>,
 ) {
-    let mut drawn: Vec<(&VectorShape, &GlobalPlacement)> = shapes.iter().collect();
+    let mut drawn: Vec<(Drawn, &GlobalPlacement)> = shapes
+        .iter()
+        .map(|(s, g)| (Drawn::Shape(s), g))
+        .chain(pictures.iter().map(|(p, g)| (Drawn::Picture(p), g)))
+        .collect();
     drawn.sort_by(|a, b| {
         a.1.depth
             .total_cmp(&b.1.depth)
-            .then(a.0.order.cmp(&b.0.order))
+            .then(a.0.order().cmp(&b.0.order()))
     });
     let mut items = Vec::with_capacity(drawn.len() + 8);
+    let mut shape_count = 0;
     // Слой: подряд идущие фигуры одной группы с одинаковой тенью и прозрачностью.
     let mut open: Option<(u64, bool, f32)> = None;
-    for (shape, g) in &drawn {
+    for (what, g) in &drawn {
         let key = (g.group, g.shadow, g.opacity);
         if open != Some(key) {
             if open.is_some() {
@@ -435,11 +541,20 @@ fn collect(
                 open = Some(key);
             }
         }
-        items.push(
-            Instance::new(shape.id, g.affine)
-                .with_tint(shape.tint)
-                .into(),
-        );
+        match what {
+            Drawn::Shape(shape) => {
+                shape_count += 1;
+                let mut instance = Instance::new(shape.id, g.affine).with_tint(shape.tint);
+                if let Some(track) = &shape.morph {
+                    instance = instance.with_morph(track.at(time.0));
+                }
+                items.push(instance.into());
+            }
+            Drawn::Picture(p) => {
+                shape_count += p.drawing.shape_count;
+                items.extend(p.drawing.placed(g.affine));
+            }
+        }
     }
     if open.is_some() {
         items.push(SceneItem::EndLayer);
@@ -459,7 +574,7 @@ fn collect(
     snapshot.0 = Scene {
         background: settings.background,
         ambient: settings.ambient,
-        shapes: drawn.len(),
+        shapes: shape_count,
         items,
         lights: lit.into_iter().map(|(_, l)| l).collect(),
         objects: sdf.into_iter().map(|(_, o)| o).collect(),

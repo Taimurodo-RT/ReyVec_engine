@@ -467,7 +467,7 @@ impl WindowRenderer {
     pub fn set_scene_file(&mut self, text: &str) {
         self.files.scene = Some(text.into());
         if let Some(demo) = self.demo.as_mut() {
-            demo.set_scene_file(text);
+            demo.set_scene_file(text, self.files.scene_dir.as_deref());
         }
     }
 

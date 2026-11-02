@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,10 @@ use serde::Deserialize;
 /// Пример сцены «первая комната» (`scenes/first-room.ron`): его показывает песочница,
 /// если своего файла нет рядом.
 pub const EXAMPLE: &str = include_str!("../../../scenes/first-room.ron");
+
+/// Папка примера в исходниках: от неё считаются пути к рисункам примера (5.5), когда
+/// пример берётся встроенным, а не из файла.
+pub const EXAMPLE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes");
 
 /// Отметка формата в начале файла.
 pub const FORMAT: &str = "reyvec-scene";
@@ -154,6 +159,9 @@ pub struct SceneFile {
     /// Объекты из SDF: рисуются под векторными фигурами.
     #[serde(default)]
     pub objects: Vec<ObjectDesc>,
+    /// Папка файла сцены: от неё считаются пути к рисункам (5.5). В файле не пишется.
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
 }
 
 fn default_ambient() -> Hex {
@@ -227,6 +235,12 @@ pub struct NodeDesc {
     /// Покачивание туда-обратно на `by` от своего места.
     #[serde(default)]
     pub bob: Option<Bob>,
+    /// Рисунки SVG из файлов (5.5).
+    #[serde(default)]
+    pub pictures: Vec<PictureDesc>,
+    /// Перетекающие фигуры из файлов Motif (5.5).
+    #[serde(default)]
+    pub morphs: Vec<MorphDesc>,
 }
 
 /// Качание: на `angle` градусов в обе стороны, полный взмах за `period` секунд.
@@ -263,6 +277,8 @@ impl NodeDesc {
             spin: 0.0,
             swing: None,
             bob: None,
+            pictures: Vec::new(),
+            morphs: Vec::new(),
         }
     }
 
@@ -334,6 +350,14 @@ impl NodeDesc {
             object.check().map_err(|m| {
                 SceneError::new(format!("{here}, {}: {m}", object_name(j, &object.name)))
             })?;
+        }
+        for (j, p) in self.pictures.iter().enumerate() {
+            p.check()
+                .map_err(|m| SceneError::new(format!("{here}, рисунок {}: {m}", j + 1)))?;
+        }
+        for (j, m) in self.morphs.iter().enumerate() {
+            m.check()
+                .map_err(|e| SceneError::new(format!("{here}, фигура Motif {}: {e}", j + 1)))?;
         }
         for (j, child) in self.children.iter().enumerate() {
             child.check(&format!("{here} → предмет {}", j + 1))?;
@@ -541,6 +565,9 @@ pub struct Scene {
 #[derive(Debug, Default)]
 pub struct ShapeCache {
     shapes: HashMap<String, ShapeId>,
+    /// Рисунки SVG и файлы Motif (5.5) по пути, размеру и времени изменения файла.
+    svgs: HashMap<String, Arc<SvgDrawing>>,
+    motifs: HashMap<String, Arc<MorphFile>>,
 }
 
 impl ShapeCache {
@@ -560,7 +587,17 @@ impl ShapeCache {
     /// Ключи готовых форм: загрузчику в фоне, чтобы не резать их снова
     /// ([`SceneFile::prepare`]).
     pub fn keys(&self) -> HashSet<String> {
-        self.shapes.keys().cloned().collect()
+        self.shapes
+            .keys()
+            .chain(self.svgs.keys())
+            .chain(self.motifs.keys())
+            .cloned()
+            .collect()
+    }
+
+    /// Сколько разных рисунков SVG и файлов Motif уже загружено.
+    pub fn files(&self) -> usize {
+        self.svgs.len() + self.motifs.len()
     }
 }
 
@@ -569,13 +606,21 @@ impl ShapeCache {
 pub struct PreparedScene {
     file: SceneFile,
     batch: ShapeBatch,
-    keys: Vec<String>,
+    /// Ключ формы и её номер в пачке.
+    keys: Vec<(String, ShapeId)>,
+    svgs: Vec<(String, SvgDrawing)>,
+    motifs: Vec<(String, MorphFile)>,
 }
 
 impl PreparedScene {
     /// Сколько новых форм нарезано.
     pub fn new_shapes(&self) -> usize {
-        self.keys.len()
+        self.batch.len()
+    }
+
+    /// Сколько рисунков SVG и файлов Motif прочитано.
+    pub fn new_files(&self) -> usize {
+        self.svgs.len() + self.motifs.len()
     }
 
     /// Кладёт нарезанные формы в `library` и строит мир сцены. Резать уже нечего:
@@ -587,8 +632,16 @@ impl PreparedScene {
         cache: &mut ShapeCache,
     ) -> Result<SceneWorld, SceneError> {
         let first = library.append(self.batch);
-        for (i, key) in self.keys.into_iter().enumerate() {
-            cache.shapes.entry(key).or_insert(ShapeId(first + i as u32));
+        for (key, id) in self.keys {
+            cache.shapes.entry(key).or_insert(id.offset(first));
+        }
+        for (key, mut drawing) in self.svgs {
+            drawing.offset_shapes(first);
+            cache.svgs.entry(key).or_insert_with(|| Arc::new(drawing));
+        }
+        for (key, mut motif) in self.motifs {
+            motif.offset_shapes(first);
+            cache.motifs.entry(key).or_insert_with(|| Arc::new(motif));
         }
         SceneWorld::new(&self.file, library, cache)
     }
@@ -600,32 +653,74 @@ impl SceneFile {
     /// фонового потока; потом [`PreparedScene::finish`] в потоке кадра.
     pub fn prepare(
         text: &str,
+        dir: Option<&Path>,
         tessellator: Tessellator,
         known: &HashSet<String>,
     ) -> Result<PreparedScene, SceneError> {
-        let file = Self::parse(text)?;
+        let file = Self::parse_in(text, dir)?;
         let mut batch = ShapeBatch::new(tessellator);
         let mut keys = Vec::new();
+        let mut svgs = Vec::new();
+        let mut motifs = Vec::new();
         let mut seen = HashSet::new();
-        fn walk(node: &NodeDesc, f: &mut dyn FnMut(&ShapeDesc)) {
-            node.shapes.iter().for_each(&mut *f);
+        fn walk(node: &NodeDesc, f: &mut dyn FnMut(&NodeDesc)) {
+            f(node);
             for child in &node.children {
                 walk(child, f);
             }
         }
+        // Что не удалось (нет файла, не разбилась форма), не страшно: `finish` попробует
+        // ещё раз и скажет, где ошибка.
         for node in NodeDesc::all(&file) {
-            walk(&node, &mut |shape| {
-                let (key, path, stroke) = shape.geometry();
-                if known.contains(&key) || !seen.insert(key.clone()) {
-                    return;
+            walk(&node, &mut |n| {
+                for shape in &n.shapes {
+                    let (key, path, stroke) = shape.geometry();
+                    if known.contains(&key) || !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    if let Ok(id) = batch.add(white_shape(path, stroke)) {
+                        keys.push((key, id));
+                    }
                 }
-                // Не разбилась — не страшно: `finish` попробует ещё раз и скажет, где ошибка.
-                if batch.add(white_shape(path, stroke)).is_ok() {
-                    keys.push(key);
+                for p in &n.pictures {
+                    let Ok(f) = assets::picture_file(file.dir.as_deref(), p) else {
+                        continue;
+                    };
+                    if known.contains(&f.key) || !seen.insert(f.key.clone()) {
+                        continue;
+                    }
+                    if let Ok(d) = assets::load_picture(&f, p.height, &mut batch) {
+                        svgs.push((f.key, d));
+                    }
+                }
+                for m in &n.morphs {
+                    let Ok(f) = assets::motif_file(file.dir.as_deref(), m) else {
+                        continue;
+                    };
+                    if known.contains(&f.key) || !seen.insert(f.key.clone()) {
+                        continue;
+                    }
+                    if let Ok(motif) = assets::load_motif(&f, &mut batch) {
+                        motifs.push((f.key, motif));
+                    }
                 }
             });
         }
-        Ok(PreparedScene { file, batch, keys })
+        Ok(PreparedScene {
+            file,
+            batch,
+            keys,
+            svgs,
+            motifs,
+        })
+    }
+
+    /// Как [`Self::parse`], но для файла из папки `dir`: от неё считаются пути к
+    /// рисункам (5.5).
+    pub fn parse_in(text: &str, dir: Option<&Path>) -> Result<Self, SceneError> {
+        let mut file = Self::parse(text)?;
+        file.dir = dir.map(Path::to_path_buf);
+        Ok(file)
     }
 
     /// Читает и проверяет текст файла сцены.
@@ -1245,13 +1340,18 @@ impl SceneWatcher {
     }
 }
 
+mod assets;
 mod loader;
 mod logic;
+pub use assets::{MorphDesc, MorphTrack, PictureDesc};
+use reyvec_motif::MorphFile;
+use reyvec_svg::SvgDrawing;
 mod world;
 pub use loader::{LoadJob, LoadResult, Loaded, Loader};
 pub use logic::{STEP, SceneLogic};
 pub use world::{
-    GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, VectorShape,
+    GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, SvgPicture,
+    VectorShape,
 };
 
 #[cfg(test)]

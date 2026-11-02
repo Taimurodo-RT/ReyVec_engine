@@ -98,12 +98,18 @@ impl DemoLoading {
     }
 
     /// Отдаёт файл сцены в фон. `false`, если фона нет (грузить в кадре).
-    pub fn submit_scene(&mut self, text: &str, cache: &ShapeCache) -> bool {
+    pub fn submit_scene(
+        &mut self,
+        text: &str,
+        dir: Option<&std::path::Path>,
+        cache: &ShapeCache,
+    ) -> bool {
         let Some(loader) = self.loader.as_mut() else {
             return false;
         };
         self.scene_job = Some(loader.submit(LoadJob::Scene {
             text: text.to_owned(),
+            dir: dir.map(std::path::Path::to_path_buf),
             known: cache.keys(),
         }));
         true
@@ -367,7 +373,11 @@ mod tests {
         loading.start(&lib);
         loading.load_picture(&mut lib, true);
         assert!(lib.is_empty(), "в фоне набор не трогается");
-        assert!(loading.submit_scene(reyvec_scene::EXAMPLE, &cache));
+        assert!(loading.submit_scene(
+            reyvec_scene::EXAMPLE,
+            Some(std::path::Path::new(reyvec_scene::EXAMPLE_DIR)),
+            &cache
+        ));
         let mut scene = None;
         let started = Instant::now();
         while loading.stats().pending > 0 || scene.is_none() {

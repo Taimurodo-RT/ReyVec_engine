@@ -12,6 +12,7 @@
 //! фигуры для уровня детализации), назад приходят готовые пачки.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
@@ -29,6 +30,8 @@ pub enum LoadJob {
     /// (`ShapeCache::keys`).
     Scene {
         text: String,
+        /// Папка файла сцены: от неё считаются пути к рисункам.
+        dir: Option<PathBuf>,
         known: HashSet<String>,
     },
     /// Рисунок SVG.
@@ -158,9 +161,12 @@ impl Drop for Loader {
 
 fn run(job: LoadJob, tessellator: Tessellator) -> LoadResult {
     match job {
-        LoadJob::Scene { text, known } => {
-            LoadResult::Scene(SceneFile::prepare(&text, tessellator, &known))
-        }
+        LoadJob::Scene { text, dir, known } => LoadResult::Scene(SceneFile::prepare(
+            &text,
+            dir.as_deref(),
+            tessellator,
+            &known,
+        )),
         LoadJob::Svg {
             name,
             data,
