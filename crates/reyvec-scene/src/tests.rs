@@ -23,10 +23,11 @@ fn example_scene_parses_and_builds() {
     assert!(scene.shapes > 20);
     // В комнате 4 источника и 3 объекта, в коридоре (5.5в) 16 бра с огоньками и 4 лужи:
     // больше, чем видеокарта берёт за кадр, в кадр идут только те, что на экране.
-    assert_eq!(scene.lights.len(), 4 + 16);
-    assert_eq!(scene.objects.len(), 3 + 16 + 4);
-    // Шар, неон и огоньки светятся, слизь отбрасывает тень.
-    assert_eq!(scene.objects.iter().filter(|o| o.glow).count(), 2 + 16);
+    // С 6.2 ещё награда на столбе в конце коридора: свет и светящийся шар.
+    assert_eq!(scene.lights.len(), 4 + 16 + 1);
+    assert_eq!(scene.objects.len(), 3 + 16 + 4 + 1);
+    // Шар, неон, огоньки и награда светятся, слизь отбрасывает тень.
+    assert_eq!(scene.objects.iter().filter(|o| o.glow).count(), 2 + 16 + 1);
     assert_eq!(scene.objects.iter().filter(|o| o.shadow).count(), 1 + 4);
     let shadow_layers = scene
         .items
@@ -41,13 +42,13 @@ fn example_scene_parses_and_builds() {
             )
         })
         .count();
-    // Слои с тенью: стол, полка, герой, ящики под полкой и 6 препятствий коридора
-    // (6.1); окно без слоя.
-    assert_eq!(shadow_layers, 10);
+    // Слои с тенью: стол, полка, герой, ящики под полкой, 6 препятствий коридора (6.1),
+    // подъёмник и столб (6.2); окно без слоя.
+    assert_eq!(shadow_layers, 12);
     // Герой (6.1) и твёрдое: пол, стена слева, столешница, 6 банок с крышками, 3 книги,
-    // полка, 2 ящика, 6 препятствий коридора.
+    // полка, 2 ящика, 6 препятствий коридора, подъёмник и столб.
     let player = scene.player.expect("в примере есть герой");
-    assert_eq!(player.solids, 2 + 1 + 6 + 3 + 1 + 2 + 6);
+    assert_eq!(player.solids, 2 + 1 + 6 + 3 + 1 + 2 + 6 + 2);
     // Сущности: предметы, фигуры, рисунки, источники, объекты и общий корень.
     assert!(scene.entities > 40, "{}", scene.entities);
     // Рисунки из файлов (5.5): фото SVG на полке и клякса Motif за окном.
@@ -997,4 +998,97 @@ fn hero_of_the_example_climbs_crates_onto_the_shelf() {
     // В конце коридора — стена: дальше x ≈ 11,2 не пройти.
     let p = walk_to(&mut w, &mut t, 12.0, 3000);
     assert!(p.at[0] < 11.21 && p.at[0] > 10.5, "у стены: {p:?}");
+}
+
+#[test]
+fn platforms_hold_from_above_and_lifts_carry() {
+    use reyvec_game::{Action, InputFrame};
+    let text = minimal(
+        r##"nodes: [
+        (solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+        (name: "доска", at: (0.0, -0.45), shapes: [Rect(at: (0.0, 0.0), size: (1.0, 0.04), color: "#fff", oneway: true)]),
+        (name: "лифт", at: (1.5, -0.3), bob: (by: (0.0, 0.25), period: 2.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.5, 0.04), color: "#fff", solid: true)]),
+        (name: "герой", at: (0.0, -0.7), player: (size: (0.1, 0.2))),
+    ]"##,
+    );
+    let mut w = world(&text);
+    let mut t = steps(&mut w, 0, 30);
+    // Прыжок с пола сквозь доску снизу — и на ней стоим (верх доски -0,43).
+    w.set_input(InputFrame::new(&[], &[Action::Jump]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[Action::Jump], &[]));
+    t = steps(&mut w, t, 60);
+    let p = w.snapshot().player.unwrap();
+    assert!(p.on_ground && (p.at[1] - -0.33).abs() < 1e-3, "{p:?}");
+    // Вниз + прыжок — обратно на пол.
+    w.set_input(InputFrame::new(&[Action::Down], &[Action::Jump]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 60);
+    let p = w.snapshot().player.unwrap();
+    assert!(p.on_ground && (p.at[1] - -0.7).abs() < 1e-3, "{p:?}");
+    // Ставим героя над лифтом: встаёт на него и ездит с ним вверх-вниз.
+    let mut body = w.player_body().unwrap();
+    body.pos = [1.5, 0.2];
+    w.set_player_body(body);
+    t = steps(&mut w, t, 60);
+    assert!(w.snapshot().player.unwrap().on_ground);
+    let mut ys = Vec::new();
+    for _ in 0..120 {
+        t = steps(&mut w, t, 1);
+        let p = w.snapshot().player.unwrap();
+        assert!(p.on_ground, "упал с лифта: {p:?}");
+        ys.push(p.at[1]);
+    }
+    let (lo, hi) = ys
+        .iter()
+        .fold((f32::MAX, f32::MIN), |(a, b), &y| (a.min(y), b.max(y)));
+    assert!(hi - lo > 0.4, "лифт возит героя: {lo}..{hi}");
+}
+
+#[test]
+fn hero_of_the_example_wall_jumps_up_to_the_reward() {
+    use reyvec_game::{Action, InputFrame};
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let mut t = steps(&mut w, 0, 30);
+    // Ставим героя у колодца и забегаем в щель под столбом.
+    let mut body = w.player_body().unwrap();
+    body.pos = [10.4, -0.64];
+    w.set_player_body(body);
+    let p = walk_to(&mut w, &mut t, 11.15, 600);
+    assert!(p.on_ground && p.at[0] > 11.0, "в щели: {p:?}");
+    // Прыжки от стены: к правой стене, оттолкнулись, к левой, оттолкнулись...
+    let mut dir = Action::Right;
+    w.set_input(InputFrame::new(&[dir], &[Action::Jump]));
+    t = steps(&mut w, t, 1);
+    let mut top = p.at[1];
+    for _ in 0..600 {
+        let p = w.snapshot().player.unwrap();
+        top = top.max(p.at[1]);
+        if p.at[1] > 0.95 {
+            break;
+        }
+        let at_wall = !p.on_ground && p.vel[0] == 0.0;
+        if at_wall {
+            dir = if dir == Action::Right {
+                Action::Left
+            } else {
+                Action::Right
+            };
+            w.set_input(InputFrame::new(&[dir], &[Action::Jump]));
+        } else {
+            w.set_input(InputFrame::new(&[dir, Action::Jump], &[]));
+        }
+        t = steps(&mut w, t, 1);
+    }
+    assert!(top > 0.95, "выше столба не забрался: {top}");
+    // Наверху — влево на столб, к награде (верх столба 0,75).
+    let p = walk_to(&mut w, &mut t, 10.9, 300);
+    assert!(
+        p.on_ground && (p.at[1] - 0.89).abs() < 1e-3,
+        "на столбе: {p:?}"
+    );
 }

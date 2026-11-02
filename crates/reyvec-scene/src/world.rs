@@ -22,7 +22,7 @@ use std::sync::Arc;
 use reyvec_svg::SvgDrawing;
 use reyvec_vector::{Affine, BlendMode, Color, Instance, SceneItem, ShapeId, ShapeLibrary};
 
-use reyvec_game::{Aabb, Body, InputFrame, Intent, Tuning};
+use reyvec_game::{Aabb, Action, Body, Collider, InputFrame, Intent, Tuning};
 
 use crate::assets::{self, MorphTrack};
 use crate::{
@@ -171,6 +171,10 @@ impl Motion {
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct Solid {
     pub half: [f64; 2],
+    /// Платформа: держит только сверху (6.2).
+    pub oneway: bool,
+    /// Середина на прошлом шаге: по ней видно, что предмет едет (6.2).
+    pub last: Option<[f64; 2]>,
 }
 
 /// Персонаж игрока (6.1): настройки, состояние и место появления.
@@ -183,7 +187,7 @@ pub struct Player {
 
 /// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест).
 #[derive(Resource, Default)]
-struct Solids(Vec<Aabb>);
+struct Solids(Vec<Collider>);
 
 /// Ввод игрока на этот шаг логики.
 #[derive(Resource, Default, Clone, Copy)]
@@ -272,7 +276,19 @@ impl SceneWorld {
         let entities = spawner.entities;
         let mut schedule = Schedule::default();
         world.init_resource::<SceneTime>();
-        schedule.add_systems((animate, play, propagate, gather_solids, collect).chain());
+        // Места считаются дважды: сначала для всего, что движется само (платформы едут
+        // до того, как шагает персонаж, и везут его в том же шаге), потом для персонажа.
+        schedule.add_systems(
+            (
+                animate,
+                propagate,
+                gather_solids,
+                play,
+                propagate_again,
+                collect,
+            )
+                .chain(),
+        );
         Ok(Self {
             world,
             schedule,
@@ -429,6 +445,8 @@ impl Spawner<'_> {
                     GlobalPlacement::ROOT,
                     Solid {
                         half: [s.size.0 * 0.5, s.size.1 * 0.5],
+                        oneway: s.oneway,
+                        last: None,
                     },
                 ),
                 Some(me),
@@ -466,11 +484,17 @@ impl Spawner<'_> {
                 Some(me),
             );
             if let ShapeDesc::Rect {
-                size, solid: true, ..
+                size,
+                solid,
+                oneway,
+                ..
             } = shape
+                && (*solid || *oneway)
             {
                 self.world.entity_mut(e).insert(Solid {
                     half: [size.0 * 0.5, size.1 * 0.5],
+                    oneway: *oneway,
+                    last: None,
                 });
             }
         }
@@ -573,15 +597,30 @@ fn play(
     let input = input.0;
     for (mut player, mut place) in &mut players {
         let p = &mut *player;
-        let steps = (dt / PLAYER_STEP).ceil() as usize;
+        // Запас на неточность дробей: ровно один шаг логики — один шаг персонажа.
+        let steps = (dt / PLAYER_STEP - 1e-6).ceil() as usize;
+        // Платформы сдвинулись один раз за шаг логики: везут персонажа только в первом
+        // из нескольких его шагов.
+        let still: Vec<Collider> = solids
+            .0
+            .iter()
+            .map(|c| Collider {
+                moved: [0.0, 0.0],
+                ..*c
+            })
+            .collect();
         for i in 0..steps {
+            // Нажатие — только на первом из нескольких шагов.
+            let first = i == 0;
             let intent = Intent {
                 x: input.x(),
-                // Нажатие — только на первом из нескольких шагов.
-                jump_pressed: i == 0 && input.pressed(reyvec_game::Action::Jump),
-                jump_held: input.held(reyvec_game::Action::Jump),
+                jump_pressed: first && input.pressed(Action::Jump),
+                jump_held: input.held(Action::Jump),
+                down: input.held(Action::Down),
+                dash_pressed: first && input.pressed(Action::Dash),
             };
-            p.body.step(&p.tuning, intent, &solids.0, dt / steps as f64);
+            let colliders = if first { &solids.0 } else { &still };
+            p.body.step(&p.tuning, intent, colliders, dt / steps as f64);
         }
         if p.body.pos[1] < p.spawn[1] - FALL_OUT {
             p.body = Body::new(p.spawn);
@@ -591,19 +630,36 @@ fn play(
     }
 }
 
-/// Твёрдые прямоугольники в координатах сцены.
-fn gather_solids(q: Query<(&Solid, &GlobalPlacement)>, mut solids: ResMut<Solids>) {
+/// Твёрдые прямоугольники в координатах сцены и на сколько каждый сдвинулся за шаг.
+fn gather_solids(mut q: Query<(Entity, &mut Solid, &GlobalPlacement)>, mut solids: ResMut<Solids>) {
     solids.0.clear();
-    for (s, g) in &q {
+    for (e, mut s, g) in &mut q {
         let [hx, hy] = s.half;
         let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[x, y]| {
             let p = g.affine * reyvec_vector::Point::new(x, y);
             [p.x, p.y]
         });
-        if let Some(b) = Aabb::of_points(corners) {
-            solids.0.push(b);
-        }
+        let Some(aabb) = Aabb::of_points(corners) else {
+            continue;
+        };
+        let c = g.affine.translation();
+        let center = [c.x, c.y];
+        let moved = s
+            .last
+            .map_or([0.0, 0.0], |l| [center[0] - l[0], center[1] - l[1]]);
+        s.last = Some(center);
+        solids.0.push(Collider {
+            aabb,
+            oneway: s.oneway,
+            id: e.to_bits(),
+            moved,
+        });
     }
+}
+
+/// Второй расчёт мест: после шага персонажа.
+fn propagate_again(roots: Roots, nodes: Nodes, out: Query<&mut GlobalPlacement>) {
+    propagate(roots, nodes, out);
 }
 
 type Roots<'w, 's> = Query<'w, 's, Entity, (With<Placement>, Without<ChildOf>)>;
