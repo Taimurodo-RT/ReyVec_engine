@@ -62,12 +62,38 @@ const NO_DETAILS: [u32; DETAIL_LEVELS] = [NO_DETAIL; DETAIL_LEVELS];
 pub struct ShapeLibrary {
     tolerance: f64,
     /// `None` — фигура удалена (номер остаётся занятым).
-    entries: Vec<Option<Entry>>,
+    /// Записи в коробках: удаление переносит указатель, а не всю запись.
+    entries: Vec<Option<Box<Entry>>>,
     revision: u64,
     /// Номера удалённых фигур по порядку удаления: видеокарта по ним освобождает место
     /// ([`Self::removed_since`]).
     removed: Vec<u32>,
     live: usize,
+    /// Удалённые фигуры, ждущие освобождения памяти в другом потоке
+    /// ([`Self::defer_drops`], [`Self::take_trash`]).
+    // Коробки нарочно: запись большая, переносить в мусор дешевле указатель.
+    #[allow(clippy::vec_box)]
+    trash: Option<Vec<Box<Entry>>>,
+    /// Номера фигур, у которых поменялась таблица уровней детализации (добавлен или
+    /// удалён уровень, удалена сама фигура): видеокарта обновляет только эти строки
+    /// ([`Self::detail_changes_since`]).
+    detail_changes: Vec<u32>,
+}
+
+/// Память удалённых фигур ([`ShapeLibrary::take_trash`]): её можно отдать другому потоку
+/// и освободить там, чтобы не тратить на это время кадра.
+#[allow(clippy::vec_box)]
+pub struct ShapeTrash(Vec<Box<Entry>>);
+
+impl ShapeTrash {
+    /// Сколько фигур в мусоре.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 impl ShapeLibrary {
@@ -80,6 +106,8 @@ impl ShapeLibrary {
             revision: 0,
             removed: Vec::new(),
             live: 0,
+            trash: None,
+            detail_changes: Vec::new(),
         }
     }
 
@@ -218,6 +246,7 @@ impl ShapeLibrary {
         if let Some(base) = self.entries[id.0 as usize].as_mut() {
             base.details[(level - DETAIL_FINEST) as usize] = new.0;
         }
+        self.detail_changes.push(id.0);
         Some(new)
     }
 
@@ -231,11 +260,13 @@ impl ShapeLibrary {
         };
         self.forget(id);
         let mut count = 1;
+        let mut levels = Vec::new();
         match entry.detail_of {
             // Уровень: вычеркнуть его из таблицы исходной фигуры.
             Some((base, level)) => {
                 if let Some(Some(b)) = self.entries.get_mut(base.0 as usize) {
                     b.details[(level - DETAIL_FINEST) as usize] = NO_DETAIL;
+                    self.detail_changes.push(base.0);
                 }
             }
             None => {
@@ -243,20 +274,55 @@ impl ShapeLibrary {
                     if d == NO_DETAIL || k == (-DETAIL_FINEST) as usize {
                         continue;
                     }
-                    if self.entries[d as usize].take().is_some() {
+                    if let Some(level) = self.entries[d as usize].take() {
                         self.forget(ShapeId(d));
+                        levels.push(level);
                         count += 1;
                     }
                 }
             }
         }
+        if let Some(trash) = self.trash.as_mut() {
+            trash.push(entry);
+            trash.append(&mut levels);
+        }
         self.revision += 1;
         count
     }
 
+    /// Не освобождать память удалённых фигур сразу, а копить её до [`Self::take_trash`]:
+    /// освобождение тысяч фигур стоит миллисекунды (картина из 3900 фигур с уровнями —
+    /// около 5 мс), и его лучше делать в другом потоке. Кто включил — тот обязан
+    /// забирать мусор, иначе память не освободится.
+    pub fn defer_drops(&mut self, on: bool) {
+        if !on {
+            self.trash = None;
+        } else if self.trash.is_none() {
+            self.trash = Some(Vec::new());
+        }
+    }
+
+    /// Память удалённых с прошлого раза фигур (пусто, если [`Self::defer_drops`] не
+    /// включён).
+    pub fn take_trash(&mut self) -> ShapeTrash {
+        ShapeTrash(self.trash.as_mut().map(std::mem::take).unwrap_or_default())
+    }
+
     fn forget(&mut self, id: ShapeId) {
         self.removed.push(id.0);
+        self.detail_changes.push(id.0);
         self.live -= 1;
+    }
+
+    /// Номера фигур, чья таблица уровней ([`Self::detail_table`]) поменялась после первых
+    /// `seen` изменений. Новые фигуры сюда не попадают: их видно по [`Self::len`].
+    pub fn detail_changes_since(&self, seen: usize) -> &[u32] {
+        self.detail_changes.get(seen..).unwrap_or(&[])
+    }
+
+    /// Сколько изменений таблиц уровней было за всё время.
+    pub fn detail_change_count(&self) -> usize {
+        self.detail_changes.len()
     }
 
     /// Номера фигур, удалённых после первых `seen` удалений (по порядку). Видеокарта
@@ -281,7 +347,7 @@ impl ShapeLibrary {
     }
 
     fn entry(&self, id: ShapeId) -> Option<&Entry> {
-        self.entries.get(id.0 as usize)?.as_ref()
+        self.entries.get(id.0 as usize)?.as_deref()
     }
 
     fn push(&mut self, mut entry: Entry) -> ShapeId {
@@ -290,7 +356,7 @@ impl ShapeLibrary {
             // Уровень 0 — сама фигура.
             entry.details[(-DETAIL_FINEST) as usize] = id;
         }
-        self.entries.push(Some(entry));
+        self.entries.push(Some(Box::new(entry)));
         self.live += 1;
         self.revision += 1;
         ShapeId(id)
@@ -722,6 +788,19 @@ mod tests {
         assert_eq!(lib.insert_detail(job.run().unwrap()), None);
         assert_eq!(lib.len(), 5);
         assert!(lib.detail_job(b, 2).is_err());
+        // Таблицы уровней: какие строки поменялись (для видеокарты).
+        assert_eq!(
+            lib.detail_changes_since(0),
+            [a.0, a.0, coarse.0, a.0, a.0, fine.0, b.0]
+        );
+        // Мусор копится, только если попросить.
+        assert!(lib.take_trash().is_empty());
+        lib.defer_drops(true);
+        let d = lib.add(square(4.0)).unwrap();
+        lib.build_detail(d, 1).unwrap();
+        assert_eq!(lib.remove(d), 2);
+        assert_eq!(lib.take_trash().len(), 2);
+        assert!(lib.take_trash().is_empty());
     }
 
     #[test]

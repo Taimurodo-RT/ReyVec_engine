@@ -339,6 +339,10 @@ const ARENA_NAMES: [&str; 6] = [
 /// Сколько байт новых фигур загружать за кадр (не меньше одной фигуры): большая пачка
 /// растягивается на несколько кадров, а не задерживает один.
 const STREAM_BUDGET: usize = 2 * 1024 * 1024;
+/// Сколько номеров фигур проходить за кадр, даже если они ничего не весят (удалённые):
+/// после сотен удалённых картин номеров сотни тысяч, и переписывание без дыр не должно
+/// пройти их все в одном кадре.
+const STREAM_IDS: usize = 16 * 1024;
 /// Самый маленький буфер фигур.
 const MIN_ARENA: u64 = 64 * 1024;
 /// Меньше этого мусора от удалённых фигур не переписывать: дыры в пару сотен КБ не
@@ -466,7 +470,7 @@ fn stream_count(library: &ShapeLibrary, start: usize, end: usize, budget: usize)
             });
             mesh.vertices.len() * VERTEX_SIZE + mesh.indices.len() * 4 + curves
         });
-        if count > 0 && bytes + size > budget {
+        if count > 0 && (bytes + size > budget || count >= STREAM_IDS) {
             break;
         }
         bytes += size;
@@ -743,6 +747,8 @@ pub(crate) struct VectorRenderer {
 struct Details {
     table: Vec<[u32; DETAIL_LEVELS]>,
     revision: Option<u64>,
+    /// Сколько изменений таблиц набора уже учтено ([`ShapeLibrary::detail_changes_since`]).
+    changes_seen: usize,
     tolerance: f32,
     /// (допустимая ошибка / ошибка уровня 0 при масштабе 1)² в этом кадре; ошибка
     /// уровня 0 = допуск × пикселей на единицу экрана.
@@ -763,12 +769,28 @@ impl Details {
         }
         self.revision = Some(library.revision());
         self.tolerance = library.tolerance() as f32;
-        self.table.clear();
-        self.table.extend((0..library.len() as u32).map(|i| {
+        // Только новые фигуры и строки, которые поменялись: номера не переиспользуются,
+        // поэтому таблица растёт с набором, а целиком её переписывать незачем (после
+        // сотен удалённых картин в ней сотни тысяч строк).
+        let row = |i: u32| {
             *library
                 .detail_table(ShapeId(i))
                 .expect("номер в пределах набора")
-        }));
+        };
+        if self.table.len() > library.len() {
+            // Другой набор: всё заново.
+            self.table.clear();
+            self.changes_seen = 0;
+        }
+        let old = self.table.len();
+        for &id in library.detail_changes_since(self.changes_seen) {
+            if (id as usize) < old {
+                self.table[id as usize] = row(id);
+            }
+        }
+        self.changes_seen = library.detail_change_count();
+        self.table
+            .extend((old as u32..library.len() as u32).map(row));
         self.requested.resize(self.table.len(), 0);
     }
 

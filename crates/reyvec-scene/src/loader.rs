@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use reyvec_motif::{MorphFile, load_morph_file};
 use reyvec_svg::{SvgDrawing, SvgOptions, load_svg};
-use reyvec_vector::{DetailJob, PreparedDetail, ShapeBatch, Tessellator};
+use reyvec_vector::{DetailJob, PreparedDetail, ShapeBatch, ShapeTrash, Tessellator};
 
 use crate::{PreparedScene, SceneError, SceneFile};
 
@@ -44,6 +44,8 @@ pub enum LoadJob {
     Motif { name: String, data: Arc<[u8]> },
     /// Уровни детализации (`ShapeLibrary::detail_job`).
     Details(Vec<DetailJob>),
+    /// Память удалённых фигур (5.5б): освободить здесь, а не в кадре.
+    Discard(ShapeTrash),
 }
 
 /// Что получилось.
@@ -62,6 +64,8 @@ pub enum LoadResult {
     },
     /// Готовые уровни (не получившиеся пропущены и записаны в журнал).
     Details(Vec<PreparedDetail>),
+    /// Сколько удалённых фигур освобождено.
+    Discarded(usize),
 }
 
 /// Готовое задание.
@@ -185,6 +189,7 @@ fn run(job: LoadJob, tessellator: Tessellator) -> LoadResult {
                 .map_err(|e| e.to_string());
             LoadResult::Motif { name, result }
         }
+        LoadJob::Discard(trash) => LoadResult::Discarded(trash.len()),
         LoadJob::Details(jobs) => LoadResult::Details(
             jobs.into_iter()
                 .filter_map(|job| {

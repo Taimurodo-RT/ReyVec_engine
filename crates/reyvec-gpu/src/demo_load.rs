@@ -84,8 +84,10 @@ pub(crate) struct DemoLoading {
 
 impl DemoLoading {
     /// Включает поток загрузки (окно). Без него всё грузится прямо в кадре.
-    pub fn start(&mut self, library: &ShapeLibrary) {
+    pub fn start(&mut self, library: &mut ShapeLibrary) {
         if self.loader.is_none() {
+            // Память удалённых фигур освобождается в потоке загрузки ([`Self::discard`]).
+            library.defer_drops(true);
             self.loader = Some(Loader::start(library.tessellator()));
             self.stats.background = true;
             tracing::info!("Загрузка: свой поток (файл сцены, картина, уровни детализации)");
@@ -126,6 +128,15 @@ impl DemoLoading {
             known: cache.keys(),
         }));
         true
+    }
+
+    /// Отдаёт память удалённых с прошлого раза фигур потоку загрузки: освобождение
+    /// тысяч фигур стоит миллисекунды, кадру их тратить незачем.
+    pub fn discard(&mut self, library: &mut ShapeLibrary) {
+        let trash = library.take_trash();
+        if let Some(loader) = self.loader.as_mut().filter(|_| !trash.is_empty()) {
+            loader.submit(LoadJob::Discard(trash));
+        }
     }
 
     /// Новая картина вместо старой: фигуры старой (с уровнями детализации) удаляются из
@@ -234,7 +245,9 @@ impl DemoLoading {
                         }
                     }
                 }
-                LoadResult::Svg { .. } | LoadResult::Motif { .. } => continue,
+                LoadResult::Svg { .. } | LoadResult::Motif { .. } | LoadResult::Discarded(_) => {
+                    continue;
+                }
                 LoadResult::Details(details) => {
                     let shapes = details.len();
                     for d in details {
@@ -391,7 +404,7 @@ mod tests {
         let mut lib = ShapeLibrary::new(0.0005);
         let mut cache = ShapeCache::new();
         let mut loading = DemoLoading::default();
-        loading.start(&lib);
+        loading.start(&mut lib);
         loading.load_picture(&mut lib, true);
         assert!(lib.is_empty(), "в фоне набор не трогается");
         assert!(loading.submit_scene(
