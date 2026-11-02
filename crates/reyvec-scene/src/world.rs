@@ -22,10 +22,12 @@ use std::sync::Arc;
 use reyvec_svg::SvgDrawing;
 use reyvec_vector::{Affine, BlendMode, Color, Instance, SceneItem, ShapeId, ShapeLibrary};
 
+use reyvec_game::{Aabb, Body, InputFrame, Intent, Tuning};
+
 use crate::assets::{self, MorphTrack};
 use crate::{
-    Background, LightKind, NodeDesc, Scene, SceneError, SceneFile, SceneLight, SceneObject,
-    ShapeCache,
+    Background, LightKind, NodeDesc, PlayerView, Scene, SceneError, SceneFile, SceneLight,
+    SceneObject, ShapeCache, ShapeDesc,
 };
 
 /// Место сущности относительно родителя.
@@ -40,6 +42,8 @@ pub struct Placement {
     /// Отбрасывает тень; `None` — как у родителя.
     pub shadow: Option<bool>,
     pub opacity: f32,
+    /// Отражено слева направо (персонаж смотрит влево, 6.1).
+    pub flip: bool,
 }
 
 impl Placement {
@@ -51,6 +55,7 @@ impl Placement {
         scale: 1.0,
         shadow: None,
         opacity: 1.0,
+        flip: false,
     };
 }
 
@@ -85,7 +90,7 @@ impl GlobalPlacement {
             affine: self.affine
                 * Affine::translate((p.at[0], p.at[1]))
                 * Affine::rotate(p.angle.to_radians())
-                * Affine::scale(p.scale),
+                * Affine::scale_non_uniform(if p.flip { -p.scale } else { p.scale }, p.scale),
             depth: self.depth + p.depth,
             scale: self.scale * p.scale,
             shadow: p.shadow.unwrap_or(self.shadow),
@@ -161,6 +166,39 @@ impl Motion {
     }
 }
 
+/// Твёрдый прямоугольник (6.1) с серединой в месте сущности и половинами сторон `half`.
+/// Если сущность повёрнута, твёрдым становится описанный вокруг неё прямоугольник.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct Solid {
+    pub half: [f64; 2],
+}
+
+/// Персонаж игрока (6.1): настройки, состояние и место появления.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+pub struct Player {
+    pub tuning: Tuning,
+    pub body: Body,
+    pub spawn: [f64; 2],
+}
+
+/// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест).
+#[derive(Resource, Default)]
+struct Solids(Vec<Aabb>);
+
+/// Ввод игрока на этот шаг логики.
+#[derive(Resource, Default, Clone, Copy)]
+struct GameInput(InputFrame);
+
+/// Время сцены на прошлом шаге: от него считается, сколько шагать персонажу. Новый мир
+/// начинает с нуля (время сцены с начала).
+#[derive(Resource)]
+struct LastStep(f64);
+
+/// Насколько ниже места появления персонаж считается упавшим из уровня.
+const FALL_OUT: f64 = 5.0;
+/// Самый длинный шаг персонажа; если времени прошло больше, шагов делается несколько.
+const PLAYER_STEP: f64 = 1.0 / 60.0;
+
 /// Время сцены, секунды (движение считается от него).
 #[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct SceneTime(pub f64);
@@ -198,6 +236,9 @@ impl SceneWorld {
             ambient: [a.r, a.g, a.b],
         });
         world.init_resource::<Snapshot>();
+        world.init_resource::<Solids>();
+        world.init_resource::<GameInput>();
+        world.insert_resource(LastStep(0.0));
         let mut spawner = Spawner {
             world: &mut world,
             library,
@@ -224,12 +265,14 @@ impl SceneWorld {
             bob: None,
             pictures: Vec::new(),
             morphs: Vec::new(),
+            solids: Vec::new(),
+            player: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
         let mut schedule = Schedule::default();
         world.init_resource::<SceneTime>();
-        schedule.add_systems((animate, propagate, collect).chain());
+        schedule.add_systems((animate, play, propagate, gather_solids, collect).chain());
         Ok(Self {
             world,
             schedule,
@@ -254,6 +297,34 @@ impl SceneWorld {
         let mut scene = self.world.resource::<Snapshot>().0.clone();
         scene.entities = self.entities;
         scene
+    }
+
+    /// Мир продолжает уже идущее время сцены: следующий [`SceneWorld::update_at`] шагает
+    /// персонажа от момента `seconds`, а не от начала сцены.
+    pub fn continue_from(&mut self, seconds: f64) {
+        self.world.resource_mut::<LastStep>().0 = seconds;
+    }
+
+    /// Ввод игрока для следующих [`SceneWorld::update_at`].
+    pub fn set_input(&mut self, input: InputFrame) {
+        self.world.resource_mut::<GameInput>().0 = input;
+    }
+
+    /// Состояние персонажа игрока, если он есть.
+    pub fn player_body(&mut self) -> Option<Body> {
+        let mut q = self.world.query::<&Player>();
+        q.iter(&self.world).next().map(|p| p.body)
+    }
+
+    /// Ставит персонажа в состояние `body` (после сохранения файла сцены персонаж
+    /// остаётся там, где был, и с той же скоростью).
+    pub fn set_player_body(&mut self, body: Body) {
+        let mut q = self.world.query::<(&mut Player, &mut Placement)>();
+        if let Some((mut p, mut place)) = q.iter_mut(&mut self.world).next() {
+            p.body = body;
+            place.at = body.pos;
+            place.flip = body.facing < 0.0;
+        }
     }
 
     /// Сколько сущностей в мире.
@@ -330,6 +401,7 @@ impl Spawner<'_> {
             scale: n.scale,
             shadow: n.shadow,
             opacity: n.opacity,
+            flip: false,
         };
         let name = if n.name.is_empty() {
             path.to_string()
@@ -340,6 +412,28 @@ impl Spawner<'_> {
             (Name::new(name.clone()), placement, GlobalPlacement::ROOT),
             parent,
         );
+        if let Some(p) = &n.player {
+            self.world.entity_mut(me).insert(Player {
+                tuning: p.tuning(),
+                body: Body::new(placement.at),
+                spawn: placement.at,
+            });
+        }
+        for s in &n.solids {
+            self.spawn(
+                (
+                    Placement {
+                        at: [s.at.0, s.at.1],
+                        ..Placement::IDENTITY
+                    },
+                    GlobalPlacement::ROOT,
+                    Solid {
+                        half: [s.size.0 * 0.5, s.size.1 * 0.5],
+                    },
+                ),
+                Some(me),
+            );
+        }
         if n.spin != 0.0 || n.swing.is_some() || n.bob.is_some() {
             self.world.entity_mut(me).insert(Motion {
                 base: placement,
@@ -354,7 +448,7 @@ impl Spawner<'_> {
                 .map_err(|m| SceneError::new(format!("предмет «{name}», фигура {}: {m}", j + 1)))?;
             let (at, angle, color) = shape.placement();
             let order = self.next();
-            self.spawn(
+            let e = self.spawn(
                 (
                     Placement {
                         at: [at.0, at.1],
@@ -371,6 +465,14 @@ impl Spawner<'_> {
                 ),
                 Some(me),
             );
+            if let ShapeDesc::Rect {
+                size, solid: true, ..
+            } = shape
+            {
+                self.world.entity_mut(e).insert(Solid {
+                    half: [size.0 * 0.5, size.1 * 0.5],
+                });
+            }
         }
         for (j, p) in n.pictures.iter().enumerate() {
             let fail =
@@ -458,6 +560,52 @@ fn animate(time: Res<SceneTime>, mut moving: Query<(&Motion, &mut Placement)>) {
     }
 }
 
+/// Персонаж игрока: шаги контроллера за время с прошлого шага логики.
+fn play(
+    time: Res<SceneTime>,
+    input: Res<GameInput>,
+    solids: Res<Solids>,
+    mut last: ResMut<LastStep>,
+    mut players: Query<(&mut Player, &mut Placement)>,
+) {
+    let dt = (time.0 - last.0).clamp(0.0, 0.25);
+    last.0 = time.0;
+    let input = input.0;
+    for (mut player, mut place) in &mut players {
+        let p = &mut *player;
+        let steps = (dt / PLAYER_STEP).ceil() as usize;
+        for i in 0..steps {
+            let intent = Intent {
+                x: input.x(),
+                // Нажатие — только на первом из нескольких шагов.
+                jump_pressed: i == 0 && input.pressed(reyvec_game::Action::Jump),
+                jump_held: input.held(reyvec_game::Action::Jump),
+            };
+            p.body.step(&p.tuning, intent, &solids.0, dt / steps as f64);
+        }
+        if p.body.pos[1] < p.spawn[1] - FALL_OUT {
+            p.body = Body::new(p.spawn);
+        }
+        place.at = p.body.pos;
+        place.flip = p.body.facing < 0.0;
+    }
+}
+
+/// Твёрдые прямоугольники в координатах сцены.
+fn gather_solids(q: Query<(&Solid, &GlobalPlacement)>, mut solids: ResMut<Solids>) {
+    solids.0.clear();
+    for (s, g) in &q {
+        let [hx, hy] = s.half;
+        let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[x, y]| {
+            let p = g.affine * reyvec_vector::Point::new(x, y);
+            [p.x, p.y]
+        });
+        if let Some(b) = Aabb::of_points(corners) {
+            solids.0.push(b);
+        }
+    }
+}
+
 type Roots<'w, 's> = Query<'w, 's, Entity, (With<Placement>, Without<ChildOf>)>;
 type Nodes<'w, 's> = Query<'w, 's, (&'static Placement, Option<&'static Children>)>;
 
@@ -512,6 +660,8 @@ fn collect(
     objects: Query<(&SdfShape, &GlobalPlacement)>,
     settings: Res<Settings>,
     time: Res<SceneTime>,
+    players: Query<&Player>,
+    solids: Res<Solids>,
     mut snapshot: ResMut<Snapshot>,
 ) {
     let mut drawn: Vec<(Drawn, &GlobalPlacement)> = shapes
@@ -582,6 +732,12 @@ fn collect(
         lights: lit.into_iter().map(|(_, l)| l).collect(),
         objects: sdf.into_iter().map(|(_, o)| o).collect(),
         entities: 0,
+        player: players.iter().next().map(|p| PlayerView {
+            at: [p.body.pos[0] as f32, p.body.pos[1] as f32],
+            vel: [p.body.vel[0] as f32, p.body.vel[1] as f32],
+            on_ground: p.body.on_ground,
+            solids: solids.0.len(),
+        }),
     };
 }
 

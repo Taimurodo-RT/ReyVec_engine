@@ -489,6 +489,37 @@ impl WindowRenderer {
         }
     }
 
+    /// Действие игрока нажато или отпущено (6.1, сцена «из файла»).
+    pub fn game_action(&mut self, action: reyvec_scene::game::Action, down: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.game_action(action, down);
+        }
+    }
+
+    /// Всё отпущено (окно потеряло фокус).
+    pub fn release_game_input(&mut self) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.release_game_input();
+        }
+    }
+
+    /// Камера идёт за персонажем игрока.
+    pub fn follow(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::follow)
+    }
+
+    /// Включает или выключает камеру за персонажем.
+    pub fn set_follow(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_follow(on);
+        }
+    }
+
+    /// Персонаж игрока и сколько нажатие ждёт шага логики, мс.
+    pub fn player_stats(&self) -> Option<(reyvec_scene::PlayerView, Option<f64>)> {
+        self.demo.as_ref().and_then(Demo::player_stats)
+    }
+
     /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
     pub fn logic_stats(&self) -> Option<(u64, f64)> {
         self.demo.as_ref().and_then(Demo::logic_stats)

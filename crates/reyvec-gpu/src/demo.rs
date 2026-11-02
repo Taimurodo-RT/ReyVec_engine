@@ -433,7 +433,19 @@ pub(crate) struct Demo {
     logic_thread: bool,
     /// Загрузка в фоне (5.4): файл сцены, уровни детализации, проверочная картина.
     loading: crate::demo_load::DemoLoading,
+    /// Камера идёт за персонажем игрока (6.1). Мышь выключает, R включает снова.
+    follow: bool,
+    /// Время прошлого кадра, когда камера шла за персонажем.
+    follow_time: Option<f32>,
 }
+
+/// Рамка камеры за персонажем (в высотах экрана от середины, экран от -1 до 1): по
+/// бокам, снизу и сверху. Персонаж обычно ниже середины: впереди видно больше.
+const FOLLOW_X: f64 = 0.3;
+const FOLLOW_BELOW: f64 = 0.75;
+const FOLLOW_ABOVE: f64 = 0.3;
+/// Как быстро камера догоняет (за 0,1 с проходит 63% пути).
+const FOLLOW_RATE: f64 = 10.0;
 
 /// Во сколько раз увеличивает лупа векторной сцены.
 pub(crate) const ZOOM: f64 = 8.0;
@@ -548,6 +560,8 @@ impl Demo {
             file_logic: None,
             logic_thread: false,
             loading: crate::demo_load::DemoLoading::default(),
+            follow: true,
+            follow_time: None,
             field_downscale: field_downscale_for(ctx.adapter.kind),
             light: vk::Pipeline::null(),
             light_buffers,
@@ -697,6 +711,10 @@ impl Demo {
         // просто пропустит.
         self.file_shapes
             .release_unused(&mut self.vector_demo.library);
+        let mut world = world;
+        if let Some(body) = self.file_world.as_mut().and_then(|w| w.player_body()) {
+            world.set_player_body(body);
+        }
         match &self.file_logic {
             Some(logic) => logic.replace(world),
             None if self.logic_thread => {
@@ -771,6 +789,68 @@ impl Demo {
             },
             ..self.loading.stats()
         }
+    }
+
+    /// Действие игрока нажато или отпущено (6.1): уходит в поток логики сцены из файла.
+    pub fn game_action(&mut self, action: reyvec_scene::game::Action, down: bool) {
+        if let Some(logic) = &self.file_logic {
+            logic.set_action(action, down);
+        }
+    }
+
+    /// Всё отпущено (окно потеряло фокус).
+    pub fn release_game_input(&mut self) {
+        if let Some(logic) = &self.file_logic {
+            logic.release_all();
+        }
+    }
+
+    /// Камера идёт за персонажем игрока.
+    pub fn follow(&self) -> bool {
+        self.follow
+    }
+
+    /// Включает или выключает камеру за персонажем.
+    pub fn set_follow(&mut self, on: bool) {
+        self.follow = on;
+        self.follow_time = None;
+    }
+
+    /// Персонаж игрока сцены из файла и сколько нажатие ждёт шага логики, мс.
+    pub fn player_stats(&self) -> Option<(reyvec_scene::PlayerView, Option<f64>)> {
+        let p = self.file_scene.player?;
+        Some((p, self.file_logic.as_ref().and_then(|l| l.input_ms())))
+    }
+
+    /// Камера за персонажем: пока он в рамке посередине экрана, камера стоит; вышел —
+    /// камера плавно догоняет, чтобы он снова был у края рамки.
+    fn follow_player(&mut self, time: f32) {
+        let Some(p) = self.file_scene.player.filter(|_| self.follow) else {
+            self.follow_time = None;
+            return;
+        };
+        // В первом кадре камера сразу встаёт на место.
+        let dt = self
+            .follow_time
+            .map_or(1.0, |t| f64::from((time - t).clamp(0.0, 0.1)));
+        self.follow_time = Some(time);
+        let z = self.camera.zoom;
+        let c = self.camera.center;
+        let (px, py) = (f64::from(p.at[0]), f64::from(p.at[1]));
+        let target = |c: f64, p: f64, below: f64, above: f64| {
+            if p < c - below / z {
+                p + below / z
+            } else if p > c + above / z {
+                p - above / z
+            } else {
+                c
+            }
+        };
+        let tx = target(c.x, px, FOLLOW_X, FOLLOW_X);
+        let ty = target(c.y, py, FOLLOW_BELOW, FOLLOW_ABOVE);
+        let k = 1.0 - (-FOLLOW_RATE * dt).exp();
+        self.camera.center.x += (tx - c.x) * k;
+        self.camera.center.y += (ty - c.y) * k;
     }
 
     /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
@@ -1264,6 +1344,7 @@ impl Demo {
                 world.update_at(f64::from(time));
                 self.file_scene = world.snapshot();
             }
+            self.follow_player(time);
         }
         let vector = match scene {
             DemoScene::Gpu => {

@@ -82,6 +82,9 @@ pub(crate) struct PanelInfo<'a> {
     pub scene_error: Option<String>,
     /// Логика сцены из файла (5.3): шагов сделано и среднее время шага, мс.
     pub logic: Option<(u64, f64)>,
+    /// Персонаж игрока (6.1) и сколько нажатие ждёт шага логики, мс; камера идёт за ним.
+    pub player: Option<(reyvec_scene::PlayerView, Option<f64>)>,
+    pub follow: bool,
     /// Загрузка в фоне (5.4).
     pub loading: reyvec_gpu::LoadStats,
     /// Свет и SDF-объекты: сколько в сцене и сколько на экране (5.5в).
@@ -297,6 +300,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 "Логика: свой поток, 60 шагов/с, шаг {ms:.3} мс (сделано {steps})"
             )));
         }
+        if let Some((p, input)) = info.player {
+            ui.label(mono(player_text(&p, input, info.follow)));
+        }
         ui.label(mono(loading_text(&info.loading)));
         if let Some(d) = &info.loading.details {
             ui.label(mono(format!(
@@ -507,6 +513,29 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
     });
 }
 
+/// Строка «Герой»: где стоит, скорость, сколько нажатие ждёт логику, идёт ли камера.
+fn player_text(p: &reyvec_scene::PlayerView, input_ms: Option<f64>, follow: bool) -> String {
+    let state = if p.on_ground {
+        "на земле"
+    } else {
+        "в воздухе"
+    };
+    let speed = p.vel[0].hypot(p.vel[1]);
+    let input = input_ms.map_or_else(
+        || "нажми стрелку или пробел".to_string(),
+        |ms| format!("нажатие ждёт логику {ms:.1} мс"),
+    );
+    let camera = if follow {
+        "камера за героем"
+    } else {
+        "камера свободна (R — за героем)"
+    };
+    format!(
+        "Герой: {state}, x {:.2} y {:.2}, скорость {speed:.2}; {input}; {camera}; твёрдых {}",
+        p.at[0], p.at[1], p.solids
+    )
+}
+
 /// Строка «Загрузка» сцены «из файла».
 fn loading_text(stats: &reyvec_gpu::LoadStats) -> String {
     let mut text = if stats.background {
@@ -690,6 +719,16 @@ mod tests {
             scene_file: None,
             scene_error: None,
             logic: Some((600, 0.012)),
+            player: Some((
+                reyvec_scene::PlayerView {
+                    at: [0.5, -0.64],
+                    vel: [1.6, 0.0],
+                    on_ground: true,
+                    solids: 14,
+                },
+                Some(8.3),
+            )),
+            follow: true,
             loading: reyvec_gpu::LoadStats {
                 background: true,
                 pending: 1,

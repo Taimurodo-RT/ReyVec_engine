@@ -336,6 +336,7 @@ impl App {
             }
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
+                r.set_follow(true);
                 tracing::info!("Камера в начале");
             }
             PanelAction::Snapshot => {
@@ -397,6 +398,8 @@ impl App {
                 scene_file: self.scene_file_label.as_deref(),
                 scene_error: renderer.scene_error(),
                 logic: renderer.logic_stats(),
+                player: renderer.player_stats(),
+                follow: renderer.follow(),
                 loading: renderer.load_stats(),
                 cull: renderer.cull_stats(),
                 last_snapshot: self.last_snapshot.as_deref(),
@@ -488,6 +491,20 @@ fn to_screen(p: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> Vec2 {
     Vec2::new((2.0 * p.x - w) / h, (h - 2.0 * p.y) / h)
 }
 
+/// Клавиша управления персонажем (6.1): стрелки и пробел. Буквы заняты переключателями
+/// песочницы; настройка клавиш и геймпад — в следующих задачах этапа 6.
+fn game_action(code: KeyCode) -> Option<reyvec_scene::game::Action> {
+    use reyvec_scene::game::Action;
+    match code {
+        KeyCode::ArrowLeft => Some(Action::Left),
+        KeyCode::ArrowRight => Some(Action::Right),
+        KeyCode::ArrowUp => Some(Action::Up),
+        KeyCode::ArrowDown => Some(Action::Down),
+        KeyCode::Space => Some(Action::Jump),
+        _ => None,
+    }
+}
+
 /// Клавиша выбора сцены песочницы. Клавиши по месту на клавиатуре, поэтому раскладка
 /// не важна.
 fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
@@ -538,6 +555,30 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => self.close(event_loop),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state,
+                        ..
+                    },
+                ..
+            } if game_action(code).is_some()
+                && self
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|r| r.scene() == DemoScene::File) =>
+            {
+                if let (Some(action), Some(r)) = (game_action(code), self.renderer.as_mut()) {
+                    r.game_action(action, state == ElementState::Pressed);
+                }
+            }
+            WindowEvent::Focused(false) => {
+                // Отпускание клавиш, пока окно не в фокусе, оно не узнает.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.release_game_input();
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -764,6 +805,10 @@ impl ApplicationHandler for App {
                     let mut camera = r.camera();
                     camera.pan_screen(delta);
                     r.set_camera(camera);
+                    // Камеру тащат мышью: за персонажем она больше не идёт (R вернёт).
+                    if delta != Vec2::ZERO {
+                        r.set_follow(false);
+                    }
                 }
                 self.cursor = Some(position);
             }

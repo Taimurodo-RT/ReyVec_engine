@@ -245,8 +245,9 @@ fn cases() -> Vec<Case> {
         },
         // Этап 5: сцена из файла `scenes/first-room.ron` (встроенная копия примера): предметы
         // с вложенностью (5.2) и движением (5.3): через 1 с лампа отклонилась, стрелки ушли.
+        // С 6.1 в комнате герой (уже стоит на полу) и ящики под полкой.
         Case {
-            name: "file-first-room-1s-msaa4",
+            name: "file-first-room-hero-1s-msaa4",
             scene: HeadlessScene {
                 msaa: Msaa::X4,
                 ..at(DemoScene::File, 1.0, false)
