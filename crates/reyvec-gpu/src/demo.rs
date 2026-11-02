@@ -422,6 +422,8 @@ pub(crate) struct Demo {
     /// Сцена «из файла» (5.1): последняя сцена, которая прочиталась без ошибок, готовые
     /// формы её фигур и ошибка последнего сохранения файла (если была).
     file_scene: reyvec_scene::Scene,
+    /// Отсечение света и объектов в прошлом кадре (5.5в).
+    cull: crate::CullStats,
     file_shapes: reyvec_scene::ShapeCache,
     scene_error: Option<String>,
     /// Мир сцены из файла (5.3): в окне он шагает в своём потоке логики, без окна
@@ -539,6 +541,7 @@ impl Demo {
             field: FieldPipelines::default(),
             light_field: false,
             file_scene: reyvec_scene::Scene::default(),
+            cull: crate::CullStats::default(),
             file_shapes: reyvec_scene::ShapeCache::new(),
             scene_error: None,
             file_world: None,
@@ -750,6 +753,11 @@ impl Demo {
     pub fn load_picture(&mut self, background: bool) {
         self.loading
             .load_picture(&mut self.vector_demo.library, background);
+    }
+
+    /// Свет и SDF-объекты прошлого кадра: сколько в сцене и сколько ушло в кадр (5.5в).
+    pub fn cull_stats(&self) -> crate::CullStats {
+        self.cull
     }
 
     /// Что показывает строка «Загрузка» на панели.
@@ -1320,6 +1328,14 @@ impl Demo {
             DemoScene::File => self.file_scene.lights.iter().map(Into::into).collect(),
             _ => Vec::new(),
         };
+        // Отсечение (5.5в): в кадр только свет и объекты, которые что-то меняют на экране.
+        let view = crate::cull::ViewRect::new(
+            [self.camera.center.x as f32, self.camera.center.y as f32],
+            self.camera.zoom as f32,
+            aspect,
+        );
+        let mut cull = crate::cull::CullStats::default();
+        let lights = crate::cull::lights(lights, &view, &mut cull);
         let light_count = lights.len().min(MAX_LIGHTS);
         let light_bytes: Vec<u8> = lights[..light_count]
             .iter()
@@ -1333,6 +1349,8 @@ impl Demo {
             DemoScene::File => self.file_scene.objects.iter().map(Into::into).collect(),
             _ => Vec::new(),
         };
+        let objects = crate::cull::objects(objects, &view, &mut cull);
+        self.cull = cull;
         let (object_bytes, blob_bytes, object_count) = crate::blobs::pack(&objects);
         let (object_buffer, blob_buffer) = (self.object_buffers[slot], self.blob_buffers[slot]);
         res.write_buffer(object_buffer, 0, &object_bytes);

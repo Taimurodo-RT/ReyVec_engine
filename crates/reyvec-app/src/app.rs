@@ -398,6 +398,7 @@ impl App {
                 scene_error: renderer.scene_error(),
                 logic: renderer.logic_stats(),
                 loading: renderer.load_stats(),
+                cull: renderer.cull_stats(),
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),
