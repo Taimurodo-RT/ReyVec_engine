@@ -36,7 +36,8 @@ pub use kurbo::{Affine, BezPath, Circle, PathEl, Point, Rect, Vec2};
 pub use layer::{BlendMode, MaskMode, SceneItem, TextId, TextInstance};
 pub use library::{
     DETAIL_COARSEST, DETAIL_FINEST, DETAIL_LEVELS, DetailError, DetailJob, Instance,
-    PreparedDetail, PreparedShape, ShapeBatch, ShapeId, ShapeLibrary, ShapeSink, Tessellator,
+    PreparedDetail, PreparedShape, ShapeBatch, ShapeId, ShapeLibrary, ShapeSink, ShapeTrash,
+    Tessellator,
 };
 pub use morph::{MorphError, MorphMesh, morph_mesh};
 pub use paint::{Gradient, GradientKind, GradientStop, Paint, Spread};

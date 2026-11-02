@@ -727,6 +727,9 @@ impl Demo {
             Some(crate::demo_load::SceneLoad::Error(e)) => self.reject_scene(e),
             None => {}
         }
+        // Память удалённых фигур (старая картина, ненужные формы сцены) освобождается
+        // в потоке загрузки.
+        self.loading.discard(&mut self.vector_demo.library);
     }
 
     /// Окно: логика сцены из файла шагает в своём потоке 60 раз в секунду, а кадр
@@ -739,7 +742,7 @@ impl Demo {
             self.file_logic = Some(reyvec_scene::SceneLogic::start(world, 0.0));
             tracing::info!("Логика сцены из файла: свой поток, 60 шагов в секунду");
         }
-        self.loading.start(&self.vector_demo.library);
+        self.loading.start(&mut self.vector_demo.library);
     }
 
     /// Проверка загрузки (5.4): новая тяжёлая картина на стене сцены «из файла». В фоне

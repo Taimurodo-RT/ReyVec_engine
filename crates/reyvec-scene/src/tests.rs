@@ -714,7 +714,18 @@ fn loader_cuts_in_background_and_frame_only_appends() {
     loader.submit(LoadJob::Details(vec![
         lib.detail_job(base, DETAIL_FINEST).unwrap(),
     ]));
-    assert_eq!(loader.pending(), 4);
+    // Память удалённой фигуры освобождается в фоне.
+    lib.defer_drops(true);
+    let gone = lib
+        .add(Shape::fill(
+            kurbo::Rect::new(0.0, 0.0, 1.0, 1.0).to_path(1e-3),
+            Color::WHITE,
+        ))
+        .unwrap();
+    lib.remove(gone);
+    loader.submit(LoadJob::Discard(lib.take_trash()));
+    assert!(lib.take_trash().is_empty());
+    assert_eq!(loader.pending(), 5);
     let mut kinds = Vec::new();
     while let Some(done) = loader.wait() {
         match done.result {
@@ -759,10 +770,14 @@ fn loader_cuts_in_background_and_frame_only_appends() {
                 }
                 kinds.push("details");
             }
+            LoadResult::Discarded(n) => {
+                assert_eq!(n, 1);
+                kinds.push("discard");
+            }
         }
     }
     // По порядку заданий.
-    assert_eq!(kinds, ["svg", "motif", "scene", "details"]);
+    assert_eq!(kinds, ["svg", "motif", "scene", "details", "discard"]);
     assert_eq!(loader.pending(), 0);
     assert!(loader.poll().is_none());
 }
