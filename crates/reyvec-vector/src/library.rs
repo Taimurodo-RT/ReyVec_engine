@@ -50,13 +50,24 @@ struct Entry {
 }
 
 const NO_DETAIL: u32 = u32::MAX;
+/// Таблица уровней у удалённой фигуры: ни одного.
+const NO_DETAILS: [u32; DETAIL_LEVELS] = [NO_DETAIL; DETAIL_LEVELS];
 
 /// Фигуры, уже разбитые на треугольники. Разбиение делается один раз в [`Self::add`],
 /// поэтому показывать фигуру в каждом кадре процессору почти ничего не стоит.
+///
+/// Ненужную фигуру можно удалить ([`Self::remove`], этап 5.5б). Её номер больше никому
+/// не достаётся: экземпляр с удалённым номером (например, в снимке сцены, собранном до
+/// удаления) просто ничего не рисует, а не рисует чужую фигуру.
 pub struct ShapeLibrary {
     tolerance: f64,
-    entries: Vec<Entry>,
+    /// `None` — фигура удалена (номер остаётся занятым).
+    entries: Vec<Option<Entry>>,
     revision: u64,
+    /// Номера удалённых фигур по порядку удаления: видеокарта по ним освобождает место
+    /// ([`Self::removed_since`]).
+    removed: Vec<u32>,
+    live: usize,
 }
 
 impl ShapeLibrary {
@@ -67,6 +78,8 @@ impl ShapeLibrary {
             tolerance,
             entries: Vec::new(),
             revision: 0,
+            removed: Vec::new(),
+            live: 0,
         }
     }
 
@@ -136,19 +149,23 @@ impl ShapeLibrary {
     /// построен.
     pub fn detail(&self, id: ShapeId, level: i32) -> Option<ShapeId> {
         let k = usize::try_from(level - DETAIL_FINEST).ok()?;
-        let d = *self.entries.get(id.0 as usize)?.details.get(k)?;
+        let d = *self.entry(id)?.details.get(k)?;
         (d != NO_DETAIL).then_some(ShapeId(d))
     }
 
     /// Все уровни детализации фигуры `id`: номер готовой фигуры-уровня или `u32::MAX`
     /// (индекс = уровень − [`DETAIL_FINEST`]). Для таблицы на стороне видеокарты.
+    /// У удалённой фигуры все уровни пустые.
     pub fn detail_table(&self, id: ShapeId) -> Option<&[u32; DETAIL_LEVELS]> {
-        self.entries.get(id.0 as usize).map(|e| &e.details)
+        match self.entries.get(id.0 as usize)? {
+            Some(e) => Some(&e.details),
+            None => Some(&NO_DETAILS),
+        }
     }
 
     /// Исходная фигура и уровень, если `id` — уровень детализации другой фигуры.
     pub fn detail_of(&self, id: ShapeId) -> Option<(ShapeId, i32)> {
-        self.entries.get(id.0 as usize)?.detail_of
+        self.entry(id)?.detail_of
     }
 
     /// Строит уровень детализации `level` фигуры `id`: та же фигура, разбитая с допуском
@@ -162,7 +179,8 @@ impl ShapeLibrary {
         if let Some(done) = self.detail(id, level) {
             return Ok(done);
         }
-        Ok(self.insert_detail(job.run()?))
+        self.insert_detail(job.run()?)
+            .ok_or(DetailError::UnknownShape(id.0))
     }
 
     /// Задание на уровень детализации `level` фигуры `id`: копия всего, что нужно для
@@ -172,10 +190,7 @@ impl ShapeLibrary {
         if !(DETAIL_FINEST..=DETAIL_COARSEST).contains(&level) {
             return Err(DetailError::BadLevel(level));
         }
-        let base = self
-            .entries
-            .get(id.0 as usize)
-            .ok_or(DetailError::UnknownShape(id.0))?;
+        let base = self.entry(id).ok_or(DetailError::UnknownShape(id.0))?;
         if let Some((original, _)) = base.detail_of {
             return Err(DetailError::UnknownShape(original.0));
         }
@@ -191,15 +206,82 @@ impl ShapeLibrary {
     }
 
     /// Кладёт готовый уровень детализации. Если такой уровень уже успели положить,
-    /// возвращает его, а готовое выбрасывает.
-    pub fn insert_detail(&mut self, detail: PreparedDetail) -> ShapeId {
+    /// возвращает его, а готовое выбрасывает. `None`, если исходную фигуру, пока уровень
+    /// резался, удалили: тогда уровень тоже не нужен.
+    pub fn insert_detail(&mut self, detail: PreparedDetail) -> Option<ShapeId> {
         let PreparedDetail { id, level, entry } = detail;
+        self.entry(id)?;
         if let Some(done) = self.detail(id, level) {
-            return done;
+            return Some(done);
         }
         let new = self.push(entry);
-        self.entries[id.0 as usize].details[(level - DETAIL_FINEST) as usize] = new.0;
-        new
+        if let Some(base) = self.entries[id.0 as usize].as_mut() {
+            base.details[(level - DETAIL_FINEST) as usize] = new.0;
+        }
+        Some(new)
+    }
+
+    /// Удаляет фигуру вместе с её уровнями детализации (у уровня — только сам уровень).
+    /// Память процессора освобождается сразу, место на видеокарте — когда его перестанут
+    /// читать кадры в работе. Номер больше не выдаётся. Сколько фигур удалено (вместе с
+    /// уровнями); 0, если фигуры нет или она уже удалена.
+    pub fn remove(&mut self, id: ShapeId) -> usize {
+        let Some(entry) = self.entries.get_mut(id.0 as usize).and_then(Option::take) else {
+            return 0;
+        };
+        self.forget(id);
+        let mut count = 1;
+        match entry.detail_of {
+            // Уровень: вычеркнуть его из таблицы исходной фигуры.
+            Some((base, level)) => {
+                if let Some(Some(b)) = self.entries.get_mut(base.0 as usize) {
+                    b.details[(level - DETAIL_FINEST) as usize] = NO_DETAIL;
+                }
+            }
+            None => {
+                for (k, &d) in entry.details.iter().enumerate() {
+                    if d == NO_DETAIL || k == (-DETAIL_FINEST) as usize {
+                        continue;
+                    }
+                    if self.entries[d as usize].take().is_some() {
+                        self.forget(ShapeId(d));
+                        count += 1;
+                    }
+                }
+            }
+        }
+        self.revision += 1;
+        count
+    }
+
+    fn forget(&mut self, id: ShapeId) {
+        self.removed.push(id.0);
+        self.live -= 1;
+    }
+
+    /// Номера фигур, удалённых после первых `seen` удалений (по порядку). Видеокарта
+    /// помнит, сколько удалений уже учла, и спрашивает только новые.
+    pub fn removed_since(&self, seen: usize) -> &[u32] {
+        self.removed.get(seen..).unwrap_or(&[])
+    }
+
+    /// Сколько фигур удалено за всё время.
+    pub fn removed_count(&self) -> usize {
+        self.removed.len()
+    }
+
+    /// Сколько фигур в наборе сейчас (без удалённых).
+    pub fn live(&self) -> usize {
+        self.live
+    }
+
+    /// Есть ли фигура (не удалена ли).
+    pub fn contains(&self, id: ShapeId) -> bool {
+        self.entry(id).is_some()
+    }
+
+    fn entry(&self, id: ShapeId) -> Option<&Entry> {
+        self.entries.get(id.0 as usize)?.as_ref()
     }
 
     fn push(&mut self, mut entry: Entry) -> ShapeId {
@@ -208,48 +290,47 @@ impl ShapeLibrary {
             // Уровень 0 — сама фигура.
             entry.details[(-DETAIL_FINEST) as usize] = id;
         }
-        self.entries.push(entry);
+        self.entries.push(Some(entry));
+        self.live += 1;
         self.revision += 1;
         ShapeId(id)
     }
 
     /// Способ рисования заливки фигуры (у перетекающих всегда трафарет).
     pub fn method(&self, id: ShapeId) -> Option<FillMethod> {
-        self.entries.get(id.0 as usize).map(|e| e.method)
+        self.entry(id).map(|e| e.method)
     }
 
     /// Положения точек [`Self::curves`] у ключевых контуров перетекающей фигуры, кроме
     /// первого (его точки в самих `curves`). Пусто у обычных фигур.
     pub fn morph_keyframes(&self, id: ShapeId) -> &[Vec<[f32; 2]>] {
-        self.entries
-            .get(id.0 as usize)
-            .map_or(&[], |e| e.morph.as_slice())
+        self.entry(id).map_or(&[], |e| e.morph.as_slice())
     }
 
     /// Фигура по номеру.
     pub fn shape(&self, id: ShapeId) -> Option<&Shape> {
-        self.entries.get(id.0 as usize).map(|e| &e.shape)
+        self.entry(id).map(|e| &e.shape)
     }
 
     /// Треугольники фигуры по номеру.
     pub fn mesh(&self, id: ShapeId) -> Option<&Mesh> {
-        self.entries.get(id.0 as usize).map(|e| &e.mesh)
+        self.entry(id).map(|e| &e.mesh)
     }
 
     /// Треугольники заливки через трафарет (`None` у обводок и неизвестных номеров).
     pub fn curves(&self, id: ShapeId) -> Option<&CurveMesh> {
-        self.entries.get(id.0 as usize)?.curves.as_ref()
+        self.entry(id)?.curves.as_ref()
     }
 
-    /// Все фигуры по порядку номеров.
+    /// Все фигуры по порядку номеров (без удалённых).
     pub fn iter(&self) -> impl Iterator<Item = (ShapeId, &Shape, &Mesh)> {
         self.entries
             .iter()
             .enumerate()
-            .map(|(i, e)| (ShapeId(i as u32), &e.shape, &e.mesh))
+            .filter_map(|(i, e)| e.as_ref().map(|e| (ShapeId(i as u32), &e.shape, &e.mesh)))
     }
 
-    /// Сколько фигур.
+    /// Сколько номеров выдано (вместе с удалёнными фигурами): номер следующей фигуры.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -259,7 +340,7 @@ impl ShapeLibrary {
         self.entries.is_empty()
     }
 
-    /// Счётчик изменений: растёт при каждом добавлении. По нему видеокарта узнаёт, что
+    /// Счётчик изменений: растёт при каждом добавлении и удалении. По нему видеокарта узнаёт, что
     /// треугольники пора загрузить заново.
     pub fn revision(&self) -> u64 {
         self.revision
@@ -525,6 +606,18 @@ pub struct PreparedDetail {
     entry: Entry,
 }
 
+impl PreparedDetail {
+    /// Фигура, чей это уровень.
+    pub fn id(&self) -> ShapeId {
+        self.id
+    }
+
+    /// Номер уровня.
+    pub fn level(&self) -> i32 {
+        self.level
+    }
+}
+
 /// Фигура на сцене в этом кадре. Порядок в списке экземпляров = порядок рисования:
 /// следующие рисуются поверх предыдущих.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -591,6 +684,44 @@ mod tests {
         assert_eq!(lib.iter().count(), 2);
         assert_eq!(lib.method(a), Some(FillMethod::Triangles));
         assert!(lib.morph_keyframes(a).is_empty());
+    }
+
+    #[test]
+    fn removed_shapes_free_their_number_for_nobody() {
+        let mut lib = ShapeLibrary::new(0.01);
+        let square = |w: f64| Shape::fill(Rect::new(0.0, 0.0, w, 1.0).to_path(0.1), Color::WHITE);
+        let a = lib.add(square(1.0)).unwrap();
+        let b = lib.add(square(2.0)).unwrap();
+        let fine = lib.build_detail(a, -2).unwrap();
+        let coarse = lib.build_detail(a, 1).unwrap();
+        assert_eq!(lib.live(), 4);
+        // Уровень удаляется отдельно: из таблицы исходной фигуры он пропадает.
+        assert_eq!(lib.remove(coarse), 1);
+        assert_eq!(lib.detail(a, 1), None);
+        assert_eq!(lib.detail(a, -2), Some(fine));
+        // Фигура уходит вместе с оставшимися уровнями.
+        let rev = lib.revision();
+        assert_eq!(lib.remove(a), 2);
+        assert!(lib.revision() > rev);
+        assert_eq!(lib.remove(a), 0, "второй раз нечего удалять");
+        assert!(!lib.contains(a) && !lib.contains(fine) && lib.contains(b));
+        assert!(lib.mesh(a).is_none() && lib.shape(fine).is_none());
+        assert_eq!(lib.detail_table(a), Some(&NO_DETAILS));
+        assert_eq!(lib.live(), 1);
+        assert_eq!(lib.iter().map(|(id, ..)| id).collect::<Vec<_>>(), [b]);
+        // Номера не переиспользуются, удаления видны по порядку.
+        let c = lib.add(square(3.0)).unwrap();
+        assert_eq!(c, ShapeId(4));
+        assert_eq!(lib.len(), 5);
+        assert_eq!(lib.removed_since(0), [coarse.0, a.0, fine.0]);
+        assert_eq!(lib.removed_since(1), [a.0, fine.0]);
+        assert!(lib.removed_since(9).is_empty());
+        // Уровень, нарезанный в фоне для уже удалённой фигуры, не кладётся.
+        let job = lib.detail_job(b, 2).unwrap();
+        lib.remove(b);
+        assert_eq!(lib.insert_detail(job.run().unwrap()), None);
+        assert_eq!(lib.len(), 5);
+        assert!(lib.detail_job(b, 2).is_err());
     }
 
     #[test]

@@ -302,6 +302,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 d.shapes, d.background_ms, d.frame_ms
             )));
         }
+        ui.label(mono(memory_text(&info.loading.memory)));
     }
     if let Some(name) = info.last_snapshot {
         ui.label(mono(format!("Снимок: {name}")));
@@ -525,6 +526,26 @@ fn loading_text(stats: &reyvec_gpu::LoadStats) -> String {
     text
 }
 
+/// Строка «Фигуры» сцены «из файла» (5.5б): сколько фигур живо и удалено, сколько места
+/// на видеокарте и сколько из него дыры от удалённых.
+fn memory_text(m: &reyvec_gpu::ShapeMemory) -> String {
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    let mut text = format!(
+        "Фигуры: в наборе {}, удалено {}; на видеокарте {:.1} МБ, из них дыры {:.1} МБ",
+        m.live,
+        m.removed,
+        mb(m.gpu.used),
+        mb(m.gpu.garbage)
+    );
+    if m.gpu.compacting {
+        text += ", переписываю без дыр";
+    }
+    if m.gpu.compactions > 0 {
+        text += &format!(" (переписано {} раз)", m.gpu.compactions);
+    }
+    text
+}
+
 /// Приближение для панели: «2.5», «0.25», «128».
 fn zoom_text(zoom: f64) -> String {
     if zoom >= 10.0 {
@@ -657,6 +678,16 @@ mod tests {
                     frame_ms: 0.31,
                 }),
                 details: None,
+                memory: reyvec_gpu::ShapeMemory {
+                    live: 6100,
+                    removed: 7780,
+                    gpu: reyvec_gpu::MeshMemory {
+                        used: 12 << 20,
+                        garbage: 4 << 20,
+                        compacting: true,
+                        compactions: 2,
+                    },
+                },
             },
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",

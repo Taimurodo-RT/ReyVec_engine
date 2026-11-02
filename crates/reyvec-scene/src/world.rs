@@ -190,6 +190,7 @@ impl SceneWorld {
         library: &mut ShapeLibrary,
         cache: &mut ShapeCache,
     ) -> Result<Self, SceneError> {
+        cache.begin_use();
         let a = file.ambient.0;
         let mut world = World::new();
         world.insert_resource(Settings {
@@ -287,6 +288,7 @@ impl Spawner<'_> {
     /// Рисунок SVG: готовый из кэша или прочитанный и нарезанный здесь же.
     fn picture(&mut self, p: &crate::PictureDesc) -> Result<Arc<SvgDrawing>, String> {
         let file = assets::picture_file(self.dir, p)?;
+        self.cache.mark_used(&file.key);
         if let Some(d) = self.cache.svgs.get(&file.key) {
             return Ok(d.clone());
         }
@@ -297,6 +299,7 @@ impl Spawner<'_> {
 
     fn motif(&mut self, m: &crate::MorphDesc) -> Result<Arc<reyvec_motif::MorphFile>, String> {
         let file = assets::motif_file(self.dir, m)?;
+        self.cache.mark_used(&file.key);
         if let Some(f) = self.cache.motifs.get(&file.key) {
             return Ok(f.clone());
         }

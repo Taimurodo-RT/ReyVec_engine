@@ -72,6 +72,69 @@ fn example_scene_parses_and_builds() {
 }
 
 #[test]
+fn unused_shapes_and_files_are_released_after_a_new_world() {
+    let dir = std::env::temp_dir().join(format!("reyvec-release-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("pic.svg"),
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+            <rect width="20" height="10" fill="#f00"/><circle cx="5" cy="5" r="3"/></svg>"##,
+    )
+    .unwrap();
+    let mut lib = library();
+    let mut cache = ShapeCache::new();
+    let world = |text: &str, lib: &mut ShapeLibrary, cache: &mut ShapeCache| {
+        let file = SceneFile::parse_in(&minimal(text), Some(&dir)).unwrap();
+        SceneWorld::new(&file, lib, cache)
+    };
+    let full = r##"nodes: [(
+        shapes: [
+            Circle(at: (0, 0), r: 0.1, color: "#fff"),
+            Rect(at: (1, 0), size: (0.2, 0.2), color: "#fff"),
+        ],
+        pictures: [(svg: "pic.svg", height: 0.5)],
+    )]"##;
+    world(full, &mut lib, &mut cache).unwrap();
+    cache.release_unused(&mut lib);
+    assert_eq!(lib.live(), 4, "две формы и две фигуры рисунка");
+    let circle = *cache.shapes.values().min_by_key(|id| id.0).unwrap();
+    // Ошибка в файле: мир не построен, ничего не выбрасываем (старый мир ещё рисуется).
+    assert!(
+        world(
+            r#"nodes: [(pictures: [(svg: "нет.svg", height: 0.5)])]"#,
+            &mut lib,
+            &mut cache
+        )
+        .is_err()
+    );
+    // Сохранили без квадрата и без рисунка.
+    world(
+        r##"nodes: [(shapes: [Circle(at: (0.5, 0), r: 0.1, color: "#f00")])]"##,
+        &mut lib,
+        &mut cache,
+    )
+    .unwrap();
+    let released = cache.release_unused(&mut lib);
+    assert_eq!(
+        released,
+        Released {
+            shapes: 3,
+            files: 1
+        }
+    );
+    assert_eq!(lib.live(), 1);
+    assert!(lib.contains(circle), "круг остался под тем же номером");
+    assert_eq!((cache.len(), cache.files()), (1, 0));
+    assert_eq!(cache.release_unused(&mut lib), Released::default());
+    // Вернули квадрат и рисунок: режутся заново под новыми номерами.
+    let before = lib.len();
+    world(full, &mut lib, &mut cache).unwrap();
+    assert_eq!(lib.len(), before + 3);
+    assert_eq!(lib.live(), 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn pictures_and_morphs_come_from_files_next_to_the_scene() {
     let dir = std::env::temp_dir().join(format!("reyvec-assets-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -692,7 +755,7 @@ fn loader_cuts_in_background_and_frame_only_appends() {
                 assert_eq!(details.len(), 1);
                 for d in details {
                     let id = lib.insert_detail(d);
-                    assert_eq!(lib.detail(base, DETAIL_FINEST), Some(id));
+                    assert_eq!(lib.detail(base, DETAIL_FINEST), id);
                 }
                 kinds.push("details");
             }

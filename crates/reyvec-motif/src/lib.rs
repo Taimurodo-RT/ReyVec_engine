@@ -48,6 +48,12 @@ impl MorphFile {
             s.shape = s.shape.offset(first);
         }
     }
+
+    /// Номера всех фигур файла в наборе: чтобы удалить их, когда файл больше не нужен
+    /// (`ShapeLibrary::remove`).
+    pub fn shape_ids(&self) -> impl Iterator<Item = ShapeId> + '_ {
+        self.shapes.iter().map(|s| s.shape)
+    }
 }
 
 /// Перетекающая фигура из файла, уже добавленная в набор фигур.
