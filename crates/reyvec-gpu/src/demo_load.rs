@@ -27,8 +27,11 @@ pub struct LoadStats {
     pub background: bool,
     /// Заданий в работе.
     pub pending: usize,
-    /// Последняя законченная загрузка.
+    /// Последняя законченная загрузка файла или рисунка (картина, файл сцены).
     pub last: Option<LastLoad>,
+    /// Последняя пачка уровней детализации (своя строка: они догружаются после
+    /// каждой картины и при приближении камеры и не должны прятать цифры картины).
+    pub details: Option<LastLoad>,
 }
 
 /// Последняя законченная загрузка.
@@ -219,17 +222,20 @@ impl DemoLoading {
             tracing::debug!(
                 "Загружено в фоне: {what}, фигур {shapes}, в фоне {background_ms:.2} мс, в кадре {frame_ms:.3} мс"
             );
-            if what != "уровни детализации" {
-                tracing::info!(
-                    "Загружено в фоне: {what}, фигур {shapes}, в фоне {background_ms:.1} мс, в кадре {frame_ms:.2} мс"
-                );
-            }
-            self.stats.last = Some(LastLoad {
+            let load = LastLoad {
                 what,
                 shapes,
                 background_ms,
                 frame_ms,
-            });
+            };
+            if what == "уровни детализации" {
+                self.stats.details = Some(load);
+            } else {
+                tracing::info!(
+                    "Загружено в фоне: {what}, фигур {shapes}, в фоне {background_ms:.1} мс, в кадре {frame_ms:.2} мс"
+                );
+                self.stats.last = Some(load);
+            }
         }
         scene
     }

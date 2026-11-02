@@ -296,6 +296,12 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             )));
         }
         ui.label(mono(loading_text(&info.loading)));
+        if let Some(d) = &info.loading.details {
+            ui.label(mono(format!(
+                "Уровни детализации: {} фигур, в фоне {:.1} мс, в кадре {:.2} мс",
+                d.shapes, d.background_ms, d.frame_ms
+            )));
+        }
     }
     if let Some(name) = info.last_snapshot {
         ui.label(mono(format!("Снимок: {name}")));
@@ -650,6 +656,7 @@ mod tests {
                     background_ms: 41.5,
                     frame_ms: 0.31,
                 }),
+                details: None,
             },
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
