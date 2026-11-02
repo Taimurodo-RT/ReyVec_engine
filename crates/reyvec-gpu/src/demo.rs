@@ -413,6 +413,8 @@ pub(crate) struct Demo {
     file_world: Option<reyvec_scene::SceneWorld>,
     file_logic: Option<reyvec_scene::SceneLogic>,
     logic_thread: bool,
+    /// Загрузка в фоне (5.4): файл сцены, уровни детализации, проверочная картина.
+    loading: crate::demo_load::DemoLoading,
 }
 
 /// Во сколько раз увеличивает лупа векторной сцены.
@@ -526,6 +528,7 @@ impl Demo {
             file_world: None,
             file_logic: None,
             logic_thread: false,
+            loading: crate::demo_load::DemoLoading::default(),
             field_downscale: field_downscale_for(ctx.adapter.kind),
             light: vk::Pipeline::null(),
             light_buffers,
@@ -644,6 +647,11 @@ impl Demo {
     /// сцена, а ошибка видна через [`Demo::scene_error`]. Новые формы фигур нарезаются
     /// здесь же и едут на видеокарту в следующем кадре.
     pub fn set_scene_file(&mut self, text: &str) {
+        // В окне файл разбирается и режется в фоне, а мир придёт в одном из следующих
+        // кадров ([`Self::poll_loading`]).
+        if self.loading.submit_scene(text, &self.file_shapes) {
+            return;
+        }
         let _zone = crate::cpu_zone!("файл сцены");
         let started = std::time::Instant::now();
         let built = reyvec_scene::SceneFile::parse(text).and_then(|f| {
@@ -657,30 +665,71 @@ impl Demo {
                     self.file_shapes.len(),
                     started.elapsed().as_secs_f64() * 1000.0
                 );
-                match &self.file_logic {
-                    Some(logic) => logic.replace(world),
-                    None if self.logic_thread => {
-                        self.file_logic = Some(reyvec_scene::SceneLogic::start(world, 0.0));
-                    }
-                    None => self.file_world = Some(world),
-                }
-                self.scene_error = None;
+                self.accept_world(world);
             }
-            Err(e) => {
-                tracing::warn!("Файл сцены не принят: {e}");
-                self.scene_error = Some(e.to_string());
-            }
+            Err(e) => self.reject_scene(e.to_string()),
         }
     }
 
-    /// Сцена из файла шагает в своём потоке логики 60 раз в секунду, а кадр сглаживает
-    /// движение между шагами (для окна). Без этого мир шагает прямо в кадре.
-    pub fn use_logic_thread(&mut self) {
+    fn accept_world(&mut self, world: reyvec_scene::SceneWorld) {
+        match &self.file_logic {
+            Some(logic) => logic.replace(world),
+            None if self.logic_thread => {
+                self.file_logic = Some(reyvec_scene::SceneLogic::start(world, 0.0));
+            }
+            None => self.file_world = Some(world),
+        }
+        self.scene_error = None;
+    }
+
+    fn reject_scene(&mut self, error: String) {
+        tracing::warn!("Файл сцены не принят: {error}");
+        self.scene_error = Some(error);
+    }
+
+    /// Забирает готовое из потока загрузки: кладёт фигуры в набор, принимает новый мир
+    /// сцены из файла.
+    fn poll_loading(&mut self) {
+        let loaded = self
+            .loading
+            .poll(&mut self.vector_demo.library, &mut self.file_shapes);
+        match loaded {
+            Some(crate::demo_load::SceneLoad::World(world)) => {
+                tracing::info!(
+                    "Сцена из файла: сущностей {}, разных форм {}",
+                    world.entity_count(),
+                    self.file_shapes.len()
+                );
+                self.accept_world(*world);
+            }
+            Some(crate::demo_load::SceneLoad::Error(e)) => self.reject_scene(e),
+            None => {}
+        }
+    }
+
+    /// Окно: логика сцены из файла шагает в своём потоке 60 раз в секунду, а кадр
+    /// сглаживает движение между шагами; файл сцены, картина и уровни детализации
+    /// режутся в потоке загрузки. Без этого (снимки, тесты) всё делается прямо в кадре,
+    /// чтобы кадр был повторяемым.
+    pub fn use_threads(&mut self) {
         self.logic_thread = true;
         if let Some(world) = self.file_world.take() {
             self.file_logic = Some(reyvec_scene::SceneLogic::start(world, 0.0));
             tracing::info!("Логика сцены из файла: свой поток, 60 шагов в секунду");
         }
+        self.loading.start(&self.vector_demo.library);
+    }
+
+    /// Проверка загрузки (5.4): новая тяжёлая картина на стене сцены «из файла». В фоне
+    /// (`background`) или, для сравнения, прямо в кадре.
+    pub fn load_picture(&mut self, background: bool) {
+        self.loading
+            .load_picture(&mut self.vector_demo.library, background);
+    }
+
+    /// Что показывает строка «Загрузка» на панели.
+    pub fn load_stats(&self) -> crate::demo_load::LoadStats {
+        self.loading.stats()
     }
 
     /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
@@ -1083,7 +1132,11 @@ impl Demo {
                 self.vector_demo.light_items(time)
             }
             DemoScene::Lab => self.vector_demo.lab.items(time),
-            DemoScene::File => self.file_scene.items.clone(),
+            DemoScene::File => {
+                let mut items = self.file_scene.items.clone();
+                items.extend(self.loading.picture_items());
+                items
+            }
             DemoScene::Stress | DemoScene::StressMorph => self
                 .vector_demo
                 .stress_instances(time, aspect, scene == DemoScene::StressMorph)
@@ -1104,7 +1157,11 @@ impl Demo {
     /// фигура рисуется ближайшим готовым уровнем.
     fn build_details(&mut self, budget_ms: f64) {
         let requests = self.vector.detail_requests().to_vec();
-        if requests.is_empty() {
+        if requests.is_empty()
+            || self
+                .loading
+                .submit_details(&self.vector_demo.library, &requests)
+        {
             return;
         }
         let _zone = crate::cpu_zone!("уровни детализации");
@@ -1155,6 +1212,10 @@ impl Demo {
         scene: DemoScene,
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
+        if self.loading.is_background() {
+            let _zone = crate::cpu_zone!("готовое из загрузки");
+            self.poll_loading();
+        }
         if scene == DemoScene::File {
             if let Some(logic) = &self.file_logic {
                 self.file_scene = logic.frame(std::time::Instant::now());

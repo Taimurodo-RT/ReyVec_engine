@@ -471,6 +471,19 @@ impl WindowRenderer {
         }
     }
 
+    /// Загрузка в фоне (5.4): что сейчас грузится и сколько стоила последняя загрузка.
+    pub fn load_stats(&self) -> crate::LoadStats {
+        self.demo.as_ref().map(Demo::load_stats).unwrap_or_default()
+    }
+
+    /// Проверка загрузки (5.4): новая тяжёлая картина на стене сцены «из файла», в фоне
+    /// или (`background == false`) прямо в кадре.
+    pub fn load_picture(&mut self, background: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.load_picture(background);
+        }
+    }
+
     /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
     pub fn logic_stats(&self) -> Option<(u64, f64)> {
         self.demo.as_ref().and_then(Demo::logic_stats)
@@ -1002,7 +1015,7 @@ impl WindowRenderer {
                         &self.files,
                     )?);
                     if let Some(demo) = self.demo.as_mut() {
-                        demo.use_logic_thread();
+                        demo.use_threads();
                     }
                     self.ui = Some(UiRenderer::new(
                         &self.ctx,

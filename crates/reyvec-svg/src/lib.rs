@@ -2,7 +2,7 @@
 //!
 //! SVG разбирает и упрощает `usvg`: стили, `use`, единицы, `viewBox`, проценты и
 //! `objectBoundingBox` он уже раскрывает, остаётся дерево групп и контуров. Здесь это
-//! дерево один раз превращается в фигуры [`ShapeLibrary`] и список кадра
+//! дерево один раз превращается в фигуры [`reyvec_vector::ShapeLibrary`] и список кадра
 //! [`SceneItem`]: контур с заливкой и обводкой даёт одну или две фигуры, группа с
 //! прозрачностью, режимом смешивания, обрезкой или маской становится слоем
 //! (`BeginLayer`… `EndLayer`), обрезка и маска становятся масками слоя.
@@ -19,7 +19,7 @@ use std::collections::BTreeSet;
 use kurbo::{Affine, BezPath, PathEl, Point};
 use reyvec_vector::{
     BlendMode, Color, FillRule, Gradient, LineCap, LineJoin, MaskMode, Paint, SceneItem, Shape,
-    ShapeLibrary, Spread, Stroke,
+    ShapeSink, Spread, Stroke,
 };
 
 /// Ошибка загрузки SVG.
@@ -59,6 +59,14 @@ pub struct SvgDrawing {
 }
 
 impl SvgDrawing {
+    /// Сдвигает номера фигур на `first`: рисунок грузили в пачку, а пачку положили в
+    /// набор начиная с номера `first` (`ShapeLibrary::append`).
+    pub fn offset_shapes(&mut self, first: u32) {
+        for item in &mut self.items {
+            item.offset_shapes(first);
+        }
+    }
+
     /// Элементы кадра для рисунка, поставленного преобразованием `place` (из координат
     /// рисунка в координаты сцены).
     pub fn placed(&self, place: Affine) -> impl Iterator<Item = SceneItem> + '_ {
@@ -67,9 +75,11 @@ impl SvgDrawing {
 }
 
 /// Разбирает SVG `data`, добавляет его фигуры в `library` и возвращает список кадра.
+/// `library` — сам набор фигур или пачка (`ShapeBatch`), чтобы резать в фоновом потоке;
+/// тогда номера фигур в рисунке сдвигаются через [`SvgDrawing::offset_shapes`].
 pub fn load_svg(
     data: &[u8],
-    library: &mut ShapeLibrary,
+    library: &mut dyn ShapeSink,
     options: SvgOptions,
 ) -> Result<SvgDrawing, SvgError> {
     let tree = usvg::Tree::from_data(data, &usvg::Options::default())?;
@@ -94,7 +104,7 @@ pub fn load_svg(
 }
 
 struct Builder<'a> {
-    library: &'a mut ShapeLibrary,
+    library: &'a mut dyn ShapeSink,
     items: Vec<SceneItem>,
     warnings: BTreeSet<String>,
     shape_count: usize,
@@ -474,6 +484,7 @@ fn path(p: &usvg::Path) -> BezPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reyvec_vector::ShapeLibrary;
 
     fn load(svg: &str) -> (SvgDrawing, ShapeLibrary) {
         let mut library = ShapeLibrary::new(0.0005);

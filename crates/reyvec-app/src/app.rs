@@ -12,7 +12,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::panel::{Panel, PanelAction, PanelInfo};
@@ -110,6 +110,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         dragging: false,
         scene_watcher: None,
         scene_file_label: None,
+        modifiers: ModifiersState::empty(),
     };
     event_loop
         .run_app(&mut app)
@@ -163,6 +164,8 @@ struct App {
     /// Слежка за файлом сцены (5.1) и его путь для панели.
     scene_watcher: Option<reyvec_scene::SceneWatcher>,
     scene_file_label: Option<String>,
+    /// Зажатые Shift, Ctrl и другие (для Shift+U).
+    modifiers: ModifiersState,
 }
 
 impl App {
@@ -261,6 +264,17 @@ impl App {
                 tracing::info!("Сцена: {}", scene.title());
             }
             PanelAction::Msaa(msaa) => r.set_msaa(msaa),
+            PanelAction::LoadPicture(background) => {
+                tracing::info!(
+                    "Картина: {}",
+                    if background {
+                        "в фоне"
+                    } else {
+                        "в кадре"
+                    }
+                );
+                r.load_picture(background);
+            }
             PanelAction::CompactScene(on) => {
                 if r.compact_scene_supported() {
                     r.set_compact_scene(on);
@@ -383,6 +397,7 @@ impl App {
                 scene_file: self.scene_file_label.as_deref(),
                 scene_error: renderer.scene_error(),
                 logic: renderer.logic_stats(),
+                loading: renderer.load_stats(),
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),
@@ -706,6 +721,23 @@ impl ApplicationHandler for App {
                 {
                     self.apply(PanelAction::Scene(next));
                 }
+            }
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyU),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if self
+                .renderer
+                .as_ref()
+                .is_some_and(|r| r.scene() == DemoScene::File) =>
+            {
+                self.apply(PanelAction::LoadPicture(!self.modifiers.shift_key()));
             }
             WindowEvent::KeyboardInput {
                 event:

@@ -29,6 +29,8 @@ pub(crate) enum PanelAction {
     Dither(bool),
     ResetCamera,
     Snapshot,
+    /// Проверка загрузки (5.4): новая тяжёлая картина в фоне (`true`) или в кадре.
+    LoadPicture(bool),
 }
 
 /// Сцены песочницы по этапам и клавиши, которые их включают.
@@ -80,6 +82,8 @@ pub(crate) struct PanelInfo<'a> {
     pub scene_error: Option<String>,
     /// Логика сцены из файла (5.3): шагов сделано и среднее время шага, мс.
     pub logic: Option<(u64, f64)>,
+    /// Загрузка в фоне (5.4).
+    pub loading: reyvec_gpu::LoadStats,
     /// Имя файла последнего снимка кадра.
     pub last_snapshot: Option<&'a str>,
     /// Название сцены песочницы.
@@ -291,6 +295,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 "Логика: свой поток, 60 шагов/с, шаг {ms:.3} мс (сделано {steps})"
             )));
         }
+        ui.label(mono(loading_text(&info.loading)));
     }
     if let Some(name) = info.last_snapshot {
         ui.label(mono(format!("Снимок: {name}")));
@@ -456,6 +461,30 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
     {
         actions.push(PanelAction::Dither(dither));
     }
+    if info.scene_id == DemoScene::File {
+        ui.horizontal(|ui| {
+            if ui
+                .button("Картина в фоне (U)")
+                .on_hover_text(
+                    "Новая тяжёлая картина на стене: несколько тысяч фигур режутся \
+                     в потоке загрузки, кадр только забирает готовое",
+                )
+                .clicked()
+            {
+                actions.push(PanelAction::LoadPicture(true));
+            }
+            if ui
+                .button("в кадре (Shift+U)")
+                .on_hover_text(
+                    "То же по-старому, прямо в кадре: для сравнения, на графике \
+                     времени кадра будет пик",
+                )
+                .clicked()
+            {
+                actions.push(PanelAction::LoadPicture(false));
+            }
+        });
+    }
     ui.horizontal(|ui| {
         if ui.button("Камера в начало (R)").clicked() {
             actions.push(PanelAction::ResetCamera);
@@ -464,6 +493,30 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::Snapshot);
         }
     });
+}
+
+/// Строка «Загрузка» сцены «из файла».
+fn loading_text(stats: &reyvec_gpu::LoadStats) -> String {
+    let mut text = if stats.background {
+        "Загрузка: свой поток".to_string()
+    } else {
+        "Загрузка: в кадре".to_string()
+    };
+    if stats.pending > 0 {
+        text += &format!(", в работе {}", stats.pending);
+    }
+    if let Some(last) = &stats.last {
+        text += &format!(", последняя — {} ({} фигур): ", last.what, last.shapes);
+        if last.background_ms > 0.0 {
+            text += &format!(
+                "в фоне {:.1} мс, в кадре {:.2} мс",
+                last.background_ms, last.frame_ms
+            );
+        } else {
+            text += &format!("в кадре {:.1} мс", last.frame_ms);
+        }
+    }
+    text
 }
 
 /// Приближение для панели: «2.5», «0.25», «128».
@@ -588,6 +641,16 @@ mod tests {
             scene_file: None,
             scene_error: None,
             logic: Some((600, 0.012)),
+            loading: reyvec_gpu::LoadStats {
+                background: true,
+                pending: 1,
+                last: Some(reyvec_gpu::LastLoad {
+                    what: "картина",
+                    shapes: 3890,
+                    background_ms: 41.5,
+                    frame_ms: 0.31,
+                }),
+            },
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",
             msaa: "MSAA 4×",
