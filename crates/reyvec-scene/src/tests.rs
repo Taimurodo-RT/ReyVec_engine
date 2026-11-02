@@ -132,19 +132,23 @@ fn pictures_and_morphs_come_from_files_next_to_the_scene() {
         None,
     );
     assert!(e.contains("путь не от чего считать"), "{e}");
-    let motif = format!("{EXAMPLE_DIR}/../assets/motif/morph.reyvec.json");
+    // Полный путь в кавычках RON: `{:?}` удваивает обратные косые черты Windows.
+    let motif = format!(
+        "{:?}",
+        format!("{EXAMPLE_DIR}/../assets/motif/morph.reyvec.json")
+    );
     let e = err(
-        &format!(r#"nodes: [(morphs: [(motif: "{motif}", shape: "нет")])]"#),
+        &format!(r#"nodes: [(morphs: [(motif: {motif}, shape: "нет")])]"#),
         None,
     );
     assert!(
         e.contains("нет фигуры «нет»") && e.contains("«blob»"),
         "{e}"
     );
-    let e = err(&format!(r#"nodes: [(morphs: [(motif: "{motif}")])]"#), None);
+    let e = err(&format!(r#"nodes: [(morphs: [(motif: {motif})])]"#), None);
     assert!(e.contains("несколько фигур"), "{e}");
     let e = err(
-        &format!(r#"nodes: [(morphs: [(motif: "{motif}", shape: "blob", animation: "Прыг")])]"#),
+        &format!(r#"nodes: [(morphs: [(motif: {motif}, shape: "blob", animation: "Прыг")])]"#),
         None,
     );
     assert!(
