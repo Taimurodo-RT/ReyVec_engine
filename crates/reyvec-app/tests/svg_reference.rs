@@ -138,7 +138,7 @@ fn svg_matches_resvg() {
             files: reyvec_app::UserFiles {
                 svg: Some(data),
                 motif: None,
-                scene: None,
+                ..Default::default()
             },
             cascades: false,
         };

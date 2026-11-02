@@ -103,6 +103,22 @@ pub struct UserFiles {
     pub motif: Option<std::sync::Arc<[u8]>>,
     /// Текст файла сцены (RON) для сцены «из файла». Без него — пример «первая комната».
     pub scene: Option<std::sync::Arc<str>>,
+    /// Папка файла сцены: от неё считаются пути к рисункам SVG и файлам Motif в сцене.
+    /// Для встроенного примера не нужна (берётся `reyvec_scene::EXAMPLE_DIR`).
+    pub scene_dir: Option<std::path::PathBuf>,
+}
+
+impl UserFiles {
+    /// Текст сцены «из файла» и папка, от которой считать пути в нём.
+    pub fn scene_text(&self) -> (&str, Option<&std::path::Path>) {
+        match &self.scene {
+            Some(text) => (text, self.scene_dir.as_deref()),
+            None => (
+                reyvec_scene::EXAMPLE,
+                Some(std::path::Path::new(reyvec_scene::EXAMPLE_DIR)),
+            ),
+        }
+    }
 }
 
 impl DemoScene {
@@ -566,7 +582,8 @@ impl Demo {
             vector_items: 0,
             vector_drawn: 0,
         };
-        demo.set_scene_file(files.scene.as_deref().unwrap_or(reyvec_scene::EXAMPLE));
+        let (text, dir) = files.scene_text();
+        demo.set_scene_file(text, dir);
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
             demo.triangle = build(
@@ -646,15 +663,15 @@ impl Demo {
     /// Читает текст файла сцены для сцены «из файла». Если в нём ошибка, остаётся прошлая
     /// сцена, а ошибка видна через [`Demo::scene_error`]. Новые формы фигур нарезаются
     /// здесь же и едут на видеокарту в следующем кадре.
-    pub fn set_scene_file(&mut self, text: &str) {
+    pub fn set_scene_file(&mut self, text: &str, dir: Option<&std::path::Path>) {
         // В окне файл разбирается и режется в фоне, а мир придёт в одном из следующих
         // кадров ([`Self::poll_loading`]).
-        if self.loading.submit_scene(text, &self.file_shapes) {
+        if self.loading.submit_scene(text, dir, &self.file_shapes) {
             return;
         }
         let _zone = crate::cpu_zone!("файл сцены");
         let started = std::time::Instant::now();
-        let built = reyvec_scene::SceneFile::parse(text).and_then(|f| {
+        let built = reyvec_scene::SceneFile::parse_in(text, dir).and_then(|f| {
             reyvec_scene::SceneWorld::new(&f, &mut self.vector_demo.library, &mut self.file_shapes)
         });
         match built {

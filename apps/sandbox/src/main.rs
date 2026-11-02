@@ -378,6 +378,10 @@ fn main() -> ExitCode {
             svg,
             motif,
             scene: scene_text,
+            scene_dir: scene_file
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf),
         },
         (Err(code), _) | (_, Err(code)) => return code,
     };

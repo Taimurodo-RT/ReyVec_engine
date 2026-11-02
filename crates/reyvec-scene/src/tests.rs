@@ -5,13 +5,17 @@ fn library() -> ShapeLibrary {
     ShapeLibrary::new(0.001)
 }
 
+fn example_dir() -> Option<&'static std::path::Path> {
+    Some(std::path::Path::new(EXAMPLE_DIR))
+}
+
 fn minimal(body: &str) -> String {
     format!("(format: \"reyvec-scene\", version: 1, {body})")
 }
 
 #[test]
 fn example_scene_parses_and_builds() {
-    let file = SceneFile::parse(EXAMPLE).expect("пример сцены корректен");
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).expect("пример сцены корректен");
     assert_eq!(file.background, Background::Lab);
     let mut lib = library();
     let mut cache = ShapeCache::new();
@@ -37,11 +41,121 @@ fn example_scene_parses_and_builds() {
         })
         .count();
     assert_eq!(shadow_layers, 2);
-    // Сущности: предметы, фигуры, источники, объекты и общий корень.
-    assert!(scene.entities > scene.shapes + 7);
-    // Одинаковые формы (ножки стола, крышки) нарезаются один раз.
+    // Сущности: предметы, фигуры, рисунки, источники, объекты и общий корень.
+    assert!(scene.entities > 40, "{}", scene.entities);
+    // Рисунки из файлов (5.5): фото SVG на полке и клякса Motif за окном.
+    assert_eq!(cache.files(), 2);
+    let mut morphs_at = |t: f64| {
+        let mut w = SceneWorld::new(&file, &mut lib, &mut cache).unwrap();
+        w.update_at(t);
+        w.snapshot()
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                SceneItem::Shape(s)
+                    if lib.method(s.shape) == Some(reyvec_vector::FillMethod::Stencil)
+                        && !lib.morph_keyframes(s.shape).is_empty() =>
+                {
+                    Some(s.morph)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let (a, b) = (morphs_at(0.5), morphs_at(1.5));
+    assert_eq!(a.len(), 1, "одна перетекающая клякса");
+    assert_ne!(a, b, "клякса перетекает со временем");
+    // Одинаковые формы (ножки стола, крышки) нарезаются один раз; остальное в наборе —
+    // фигуры рисунков.
     assert!(cache.len() < scene.shapes);
-    assert_eq!(lib.len(), cache.len());
+    assert!(lib.len() > cache.len());
+}
+
+#[test]
+fn pictures_and_morphs_come_from_files_next_to_the_scene() {
+    let dir = std::env::temp_dir().join(format!("reyvec-assets-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let svg = dir.join("pic.svg");
+    std::fs::write(
+        &svg,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+            <rect width="20" height="10" fill="#f00"/></svg>"##,
+    )
+    .unwrap();
+    let text = minimal(r#"nodes: [(at: (0.5, 0), pictures: [(svg: "pic.svg", height: 0.5)])]"#);
+    let mut lib = library();
+    let mut cache = ShapeCache::new();
+    let file = SceneFile::parse_in(&text, Some(&dir)).unwrap();
+    let scene = file.build(&mut lib, &mut cache).unwrap();
+    assert_eq!(scene.shapes, 1);
+    assert_eq!(lib.len(), 1);
+    // Пересохранили сцену, рисунок тот же: не режется снова.
+    file.build(&mut lib, &mut cache).unwrap();
+    assert_eq!(lib.len(), 1);
+    // Поменяли рисунок: перечитывается (другой размер файла — другой ключ).
+    std::fs::write(
+        &svg,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+            <rect width="20" height="10" fill="#f00"/><circle cx="5" cy="5" r="3"/></svg>"##,
+    )
+    .unwrap();
+    let scene = file.build(&mut lib, &mut cache).unwrap();
+    assert_eq!(scene.shapes, 2);
+    // Рисунок стоит в предмете: сдвинут на at предмета.
+    let first_x = |scene: &Scene| match scene.items[0] {
+        SceneItem::Shape(s) => s.transform.translation().x,
+        other => panic!("{other:?}"),
+    };
+    let at_zero = SceneFile::parse_in(
+        &minimal(r#"nodes: [(pictures: [(svg: "pic.svg", height: 0.5)])]"#),
+        Some(&dir),
+    )
+    .unwrap()
+    .build(&mut lib, &mut cache)
+    .unwrap();
+    assert!((first_x(&scene) - first_x(&at_zero) - 0.5).abs() < 1e-9);
+    // Ошибки по-русски: нет файла, нет фигуры, нет папки.
+    let err = |t: &str, dir: Option<&std::path::Path>| {
+        SceneFile::parse_in(&minimal(t), dir)
+            .unwrap()
+            .build(&mut library(), &mut ShapeCache::new())
+            .unwrap_err()
+            .message
+    };
+    let e = err(
+        r#"nodes: [(pictures: [(svg: "нет.svg", height: 0.5)])]"#,
+        Some(&dir),
+    );
+    assert!(e.contains("рисунок 1") && e.contains("не открыть"), "{e}");
+    let e = err(
+        r#"nodes: [(pictures: [(svg: "pic.svg", height: 0.5)])]"#,
+        None,
+    );
+    assert!(e.contains("путь не от чего считать"), "{e}");
+    // Полный путь в кавычках RON: `{:?}` удваивает обратные косые черты Windows.
+    let motif = format!(
+        "{:?}",
+        format!("{EXAMPLE_DIR}/../assets/motif/morph.reyvec.json")
+    );
+    let e = err(
+        &format!(r#"nodes: [(morphs: [(motif: {motif}, shape: "нет")])]"#),
+        None,
+    );
+    assert!(
+        e.contains("нет фигуры «нет»") && e.contains("«blob»"),
+        "{e}"
+    );
+    let e = err(&format!(r#"nodes: [(morphs: [(motif: {motif})])]"#), None);
+    assert!(e.contains("несколько фигур"), "{e}");
+    let e = err(
+        &format!(r#"nodes: [(morphs: [(motif: {motif}, shape: "blob", animation: "Прыг")])]"#),
+        None,
+    );
+    assert!(
+        e.contains("нет анимации «Прыг»") && e.contains("«Flow»"),
+        "{e}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn build(text: &str) -> Scene {
@@ -480,27 +594,30 @@ fn prepared_scene_needs_no_cutting_on_the_frame_thread() {
     // Сразу: эталон.
     let mut lib = library();
     let mut cache = ShapeCache::new();
-    let direct = SceneFile::parse(EXAMPLE)
+    let direct = SceneFile::parse_in(EXAMPLE, example_dir())
         .unwrap()
         .build(&mut lib, &mut cache)
         .unwrap();
     // В фоне: нарезка в пачку, потом только положить.
     let mut lib2 = library();
     let mut cache2 = ShapeCache::new();
-    let prepared = SceneFile::prepare(EXAMPLE, lib2.tessellator(), &cache2.keys()).unwrap();
-    assert_eq!(prepared.new_shapes(), cache.len());
+    let prepared =
+        SceneFile::prepare(EXAMPLE, example_dir(), lib2.tessellator(), &cache2.keys()).unwrap();
+    assert_eq!(prepared.new_shapes(), lib.len());
+    assert_eq!(prepared.new_files(), cache.files());
     assert!(lib2.is_empty(), "prepare не трогает набор");
     let mut world = prepared.finish(&mut lib2, &mut cache2).unwrap();
     assert_eq!(lib2.len(), lib.len(), "finish ничего не режет сверх пачки");
     world.update();
     assert_eq!(world.snapshot().items, direct.items);
     // Второй раз знакомые формы не режутся вовсе.
-    let again = SceneFile::prepare(EXAMPLE, lib2.tessellator(), &cache2.keys()).unwrap();
+    let again =
+        SceneFile::prepare(EXAMPLE, example_dir(), lib2.tessellator(), &cache2.keys()).unwrap();
     assert_eq!(again.new_shapes(), 0);
     again.finish(&mut lib2, &mut cache2).unwrap();
     assert_eq!(lib2.len(), lib.len());
     // Ошибка разбора приходит из фона с той же строкой.
-    let err = SceneFile::prepare("(format: 1", lib2.tessellator(), &HashSet::new())
+    let err = SceneFile::prepare("(format: 1", None, lib2.tessellator(), &HashSet::new())
         .err()
         .unwrap();
     assert_eq!(err.line, Some(1));
@@ -528,6 +645,7 @@ fn loader_cuts_in_background_and_frame_only_appends() {
     });
     loader.submit(LoadJob::Scene {
         text: EXAMPLE.into(),
+        dir: example_dir().map(Into::into),
         known: HashSet::new(),
     });
     loader.submit(LoadJob::Details(vec![
