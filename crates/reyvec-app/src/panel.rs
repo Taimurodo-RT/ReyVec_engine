@@ -84,6 +84,8 @@ pub(crate) struct PanelInfo<'a> {
     pub logic: Option<(u64, f64)>,
     /// Загрузка в фоне (5.4).
     pub loading: reyvec_gpu::LoadStats,
+    /// Свет и SDF-объекты: сколько в сцене и сколько на экране (5.5в).
+    pub cull: reyvec_gpu::CullStats,
     /// Имя файла последнего снимка кадра.
     pub last_snapshot: Option<&'a str>,
     /// Название сцены песочницы.
@@ -303,6 +305,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             )));
         }
         ui.label(mono(memory_text(&info.loading.memory)));
+    }
+    if info.cull.lights + info.cull.objects > 0 {
+        ui.label(mono(cull_text(&info.cull)));
     }
     if let Some(name) = info.last_snapshot {
         ui.label(mono(format!("Снимок: {name}")));
@@ -546,6 +551,23 @@ fn memory_text(m: &reyvec_gpu::ShapeMemory) -> String {
     text
 }
 
+/// Строка «Свет» (5.5в): сколько источников и SDF-объектов в сцене и сколько из них ушло
+/// в кадр (остальные за экраном или не влезли в пределы видеокарты).
+fn cull_text(c: &reyvec_gpu::CullStats) -> String {
+    let part = |total: usize, drawn: usize, over: usize| {
+        let mut t = format!("в сцене {total}, в кадре {drawn}");
+        if over > 0 {
+            t += &format!(" (ещё {over} на экране не влезли)");
+        }
+        t
+    };
+    format!(
+        "Свет: {}; SDF-объекты: {}",
+        part(c.lights, c.lights_drawn, c.lights_over),
+        part(c.objects, c.objects_drawn, c.objects_over)
+    )
+}
+
 /// Приближение для панели: «2.5», «0.25», «128».
 fn zoom_text(zoom: f64) -> String {
     if zoom >= 10.0 {
@@ -688,6 +710,14 @@ mod tests {
                         compactions: 2,
                     },
                 },
+            },
+            cull: reyvec_gpu::CullStats {
+                lights: 30,
+                lights_drawn: 16,
+                lights_over: 2,
+                objects: 20,
+                objects_drawn: 5,
+                objects_over: 0,
             },
             last_snapshot: Some("кадр-001.png"),
             scene: "векторы",

@@ -208,9 +208,40 @@
                 ),
             ],
         ),
+        (
+            // Коридор справа от комнаты (этап 5.5в): 16 бра и лужи слизи. Его не видно,
+            // пока не потащишь камеру мышью влево. Видеокарта берёт за кадр до 16
+            // источников и 16 SDF-объектов, а в сцене их может быть до 1024: в кадр идут
+            // только те, что на экране (строка «Свет» на панели).
+            name: "коридор",
+            at: (2.6, 0.0),
+            children: [
+                (name: "бра 1", at: (0.0, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffb060", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffb060", power: 3.0, glow: true)]),
+                (name: "бра 2", at: (0.55, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff8a50", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff8a50", power: 3.0, glow: true)]),
+                (name: "бра 3", at: (1.1, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffd080", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffd080", power: 3.0, glow: true)]),
+                (name: "бра 4", at: (1.65, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff9ad0", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff9ad0", power: 3.0, glow: true)]),
+                (name: "бра 5", at: (2.2, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffb060", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffb060", power: 3.0, glow: true)]),
+                (name: "бра 6", at: (2.75, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff8a50", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff8a50", power: 3.0, glow: true)]),
+                (name: "бра 7", at: (3.3, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffd080", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffd080", power: 3.0, glow: true)]),
+                (name: "бра 8", at: (3.85, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff9ad0", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff9ad0", power: 3.0, glow: true)]),
+                (name: "бра 9", at: (4.4, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffb060", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffb060", power: 3.0, glow: true)]),
+                (name: "бра 10", at: (4.95, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff8a50", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff8a50", power: 3.0, glow: true)]),
+                (name: "бра 11", at: (5.5, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffd080", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffd080", power: 3.0, glow: true)]),
+                (name: "бра 12", at: (6.05, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff9ad0", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff9ad0", power: 3.0, glow: true)]),
+                (name: "бра 13", at: (6.6, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffb060", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffb060", power: 3.0, glow: true)]),
+                (name: "бра 14", at: (7.15, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff8a50", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff8a50", power: 3.0, glow: true)]),
+                (name: "бра 15", at: (7.7, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ffd080", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ffd080", power: 3.0, glow: true)]),
+                (name: "бра 16", at: (8.25, 0.35), shapes: [Rect(at: (0.0, -0.05), size: (0.03, 0.1), color: "#3a3a40")], lights: [Point(at: (0.0, 0.03), color: "#ff9ad0", power: 1.4, reach: 0.6, size: 0.02)], objects: [(parts: [Capsule(from: (0.0, 0.01), to: (0.0, 0.05), r: 0.018)], color: "#ff9ad0", power: 3.0, glow: true)]),
+                (name: "лужа 1", at: (0.8, -0.81), objects: [(parts: [Capsule(from: (-0.12, -0.02), to: (0.12, -0.02), r: 0.03), Circle(at: (0.03, 0.02), r: 0.04)], blend: 0.05, color: "#7bd34a", shadow: true)]),
+                (name: "лужа 2", at: (3.0, -0.81), objects: [(parts: [Capsule(from: (-0.12, -0.02), to: (0.12, -0.02), r: 0.03), Circle(at: (0.03, 0.02), r: 0.04)], blend: 0.05, color: "#7bd34a", shadow: true)]),
+                (name: "лужа 3", at: (5.4, -0.81), objects: [(parts: [Capsule(from: (-0.12, -0.02), to: (0.12, -0.02), r: 0.03), Circle(at: (0.03, 0.02), r: 0.04)], blend: 0.05, color: "#7bd34a", shadow: true)]),
+                (name: "лужа 4", at: (7.7, -0.81), objects: [(parts: [Capsule(from: (-0.12, -0.02), to: (0.12, -0.02), r: 0.03), Circle(at: (0.03, 0.02), r: 0.04)], blend: 0.05, color: "#7bd34a", shadow: true)]),
+            ],
+        ),
     ],
 
-    // Источники света всей комнаты (до 16 на сцену вместе с источниками в предметах).
+    // Источники света всей комнаты (в сцене до 1024 вместе с источниками в предметах; в
+    // кадр идут до 16 тех, что светят на экран).
     // Лампа — в предмете «лампа» выше: она качается.
     // Point — лампа, Tube — светящаяся трубка, Sun — свет издалека. power — яркость,
     // reach — докуда достаёт свет (у Sun — длина теней), size — размер источника: чем

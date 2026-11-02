@@ -21,11 +21,13 @@ fn example_scene_parses_and_builds() {
     let mut cache = ShapeCache::new();
     let scene = file.build(&mut lib, &mut cache).unwrap();
     assert!(scene.shapes > 20);
-    assert_eq!(scene.lights.len(), 4);
-    assert_eq!(scene.objects.len(), 3);
-    // Шар светится, слизь отбрасывает тень.
-    assert_eq!(scene.objects.iter().filter(|o| o.glow).count(), 2);
-    assert_eq!(scene.objects.iter().filter(|o| o.shadow).count(), 1);
+    // В комнате 4 источника и 3 объекта, в коридоре (5.5в) 16 бра с огоньками и 4 лужи:
+    // больше, чем видеокарта берёт за кадр, в кадр идут только те, что на экране.
+    assert_eq!(scene.lights.len(), 4 + 16);
+    assert_eq!(scene.objects.len(), 3 + 16 + 4);
+    // Шар, неон и огоньки светятся, слизь отбрасывает тень.
+    assert_eq!(scene.objects.iter().filter(|o| o.glow).count(), 2 + 16);
+    assert_eq!(scene.objects.iter().filter(|o| o.shadow).count(), 1 + 4);
     // Стол и полка — два отдельных слоя с тенью, окно без слоя.
     let shadow_layers = scene
         .items
@@ -372,12 +374,15 @@ fn old_layers_still_work() {
 #[test]
 fn limits_count_lights_inside_nodes() {
     let lamp = r##"Point(at: (0, 0), color: "#fff", reach: 1.0)"##;
-    let some = [lamp; 10].join(", ");
+    let some = vec![lamp; MAX_SCENE_LIGHTS / 2 + 1].join(", ");
     let text = minimal(&format!(
         "lights: [{some}], nodes: [(children: [(lights: [{some}])])]"
     ));
     let e = error(&text);
-    assert!(e.message.contains("20"), "{e}");
+    assert!(
+        e.message.contains(&format!("{}", MAX_SCENE_LIGHTS + 2)),
+        "{e}"
+    );
     let e = error(&minimal(
         r##"nodes: [(children: [(name: "свеча", scale: 0.0)])]"##,
     ));
@@ -524,9 +529,19 @@ fn checks_catch_bad_numbers() {
     ));
     assert!(e.message.contains("svg"), "{e}");
     let lamp = r##"Point(at: (0, 0), color: "#fff", reach: 1.0)"##;
+    // Больше 16 источников в сцене можно (в кадр идут только те, что на экране, 5.5в),
+    // больше MAX_SCENE_LIGHTS — нет.
     let many = vec![lamp; MAX_LIGHTS + 1].join(", ");
+    assert!(SceneFile::parse(&minimal(&format!("lights: [{many}]"))).is_ok());
+    let many = vec![lamp; MAX_SCENE_LIGHTS + 1].join(", ");
     let e = error(&minimal(&format!("lights: [{many}]")));
-    assert!(e.message.contains("16"), "{e}");
+    assert!(e.message.contains("1024"), "{e}");
+    let circle = "Circle(at: (0, 0), r: 0.1)";
+    let parts = vec![circle; MAX_PARTS + 1].join(", ");
+    let e = error(&minimal(&format!(
+        r##"objects: [(parts: [{parts}], color: "#fff")]"##
+    )));
+    assert!(e.message.contains("128"), "{e}");
     let e = error(&minimal(r##"objects: [(parts: [], color: "#fff")]"##));
     assert!(e.message.contains("SDF-объект 1"), "{e}");
 }

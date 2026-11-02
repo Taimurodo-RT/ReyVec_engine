@@ -476,6 +476,11 @@ impl WindowRenderer {
         self.demo.as_ref().map(Demo::load_stats).unwrap_or_default()
     }
 
+    /// Свет и SDF-объекты: сколько в сцене и сколько на экране (5.5в).
+    pub fn cull_stats(&self) -> crate::CullStats {
+        self.demo.as_ref().map(Demo::cull_stats).unwrap_or_default()
+    }
+
     /// Проверка загрузки (5.4): новая тяжёлая картина на стене сцены «из файла», в фоне
     /// или (`background == false`) прямо в кадре.
     pub fn load_picture(&mut self, background: bool) {

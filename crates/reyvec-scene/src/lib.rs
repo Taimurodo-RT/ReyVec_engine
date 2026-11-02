@@ -50,6 +50,11 @@ pub const VERSION: u32 = 1;
 pub const MAX_LIGHTS: usize = 16;
 pub const MAX_OBJECTS: usize = 16;
 pub const MAX_PARTS: usize = 128;
+/// Сколько источников и объектов можно задать во всей сцене: в кадр идут только те, что
+/// на экране (5.5в), не больше [`MAX_LIGHTS`] и [`MAX_OBJECTS`]. Предел всей сцены — от
+/// опечаток (времени процессора на тысячу источников уходит немного).
+pub const MAX_SCENE_LIGHTS: usize = 1024;
+pub const MAX_SCENE_OBJECTS: usize = 1024;
 /// Самая большая координата и размер: сцена 2D в единицах камеры (кадр — 2 единицы по
 /// высоте), дальше почти наверняка опечатка.
 const MAX_COORD: f64 = 1000.0;
@@ -294,6 +299,14 @@ impl NodeDesc {
 
     fn count(&self, f: &dyn Fn(&NodeDesc) -> usize) -> usize {
         f(self) + self.children.iter().map(|c| c.count(f)).sum::<usize>()
+    }
+
+    /// Наибольшее `f` по предмету и всем вложенным.
+    fn count_max(&self, f: &dyn Fn(&NodeDesc) -> usize) -> usize {
+        self.children
+            .iter()
+            .map(|c| c.count_max(f))
+            .fold(f(self), usize::max)
     }
 
     fn check(&self, path: &str) -> Result<(), SceneError> {
@@ -834,9 +847,9 @@ impl SceneFile {
             .map(|n| n.count(&|n| n.lights.len()))
             .sum();
         let lights = self.lights.len() + nodes;
-        if lights > MAX_LIGHTS {
+        if lights > MAX_SCENE_LIGHTS {
             return Err(SceneError::new(format!(
-                "источников света {lights}, а видеокарта берёт не больше {MAX_LIGHTS}"
+                "источников света {lights}, а в сцене можно не больше {MAX_SCENE_LIGHTS}"
             )));
         }
         let nodes: usize = self
@@ -845,21 +858,23 @@ impl SceneFile {
             .map(|n| n.count(&|n| n.objects.len()))
             .sum();
         let objects = self.objects.len() + nodes;
-        if objects > MAX_OBJECTS {
+        if objects > MAX_SCENE_OBJECTS {
             return Err(SceneError::new(format!(
-                "SDF-объектов {objects}, а видеокарта берёт не больше {MAX_OBJECTS}"
+                "SDF-объектов {objects}, а в сцене можно не больше {MAX_SCENE_OBJECTS}"
             )));
         }
-        let parts_of = |os: &[ObjectDesc]| os.iter().map(|o| o.parts.len()).sum::<usize>();
-        let parts: usize = parts_of(&self.objects)
-            + self
-                .nodes
+        // Частей у одного объекта не больше, чем видеокарта берёт за кадр на все объекты.
+        let parts_of = |os: &[ObjectDesc]| os.iter().map(|o| o.parts.len()).max().unwrap_or(0);
+        let parts: usize = parts_of(&self.objects).max(
+            self.nodes
                 .iter()
-                .map(|n| n.count(&|n| parts_of(&n.objects)))
-                .sum::<usize>();
+                .map(|n| n.count_max(&|n| parts_of(&n.objects)))
+                .max()
+                .unwrap_or(0),
+        );
         if parts > MAX_PARTS {
             return Err(SceneError::new(format!(
-                "частей у SDF-объектов всего {parts}, а видеокарта берёт не больше {MAX_PARTS}"
+                "частей у SDF-объекта {parts}, а видеокарта берёт за кадр не больше {MAX_PARTS}"
             )));
         }
         for (i, layer) in self.layers.iter().enumerate() {
