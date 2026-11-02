@@ -568,6 +568,18 @@ pub struct ShapeCache {
     /// Рисунки SVG и файлы Motif (5.5) по пути, размеру и времени изменения файла.
     svgs: HashMap<String, Arc<SvgDrawing>>,
     motifs: HashMap<String, Arc<MorphFile>>,
+    /// Ключи, которые спросил последний построенный мир ([`SceneWorld::new`]): всё
+    /// остальное можно выбросить ([`Self::release_unused`], 5.5б).
+    used: HashSet<String>,
+}
+
+/// Что выброшено из библиотеки ([`ShapeCache::release_unused`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Released {
+    /// Фигур (вместе с уровнями детализации).
+    pub shapes: usize,
+    /// Рисунков SVG и файлов Motif.
+    pub files: usize,
 }
 
 impl ShapeCache {
@@ -598,6 +610,58 @@ impl ShapeCache {
     /// Сколько разных рисунков SVG и файлов Motif уже загружено.
     pub fn files(&self) -> usize {
         self.svgs.len() + self.motifs.len()
+    }
+
+    /// Начало постройки мира: отметки «нужно» сбрасываются, мир ставит их заново.
+    pub(crate) fn begin_use(&mut self) {
+        self.used.clear();
+    }
+
+    /// Отметка: форма или файл с ключом `key` нужны строящемуся миру.
+    pub(crate) fn mark_used(&mut self, key: &str) {
+        if !self.used.contains(key) {
+            self.used.insert(key.to_owned());
+        }
+    }
+
+    /// Удаляет из кэша и из `library` формы, рисунки и файлы Motif, которые не спросил
+    /// последний построенный мир. Звать после того, как этот мир принят (стал рисоваться):
+    /// пока рисуется старый мир, его формы нужны. Если постройка не удалась, отметки
+    /// неполные — тогда не звать, а дождаться следующего удачного мира.
+    pub fn release_unused(&mut self, library: &mut ShapeLibrary) -> Released {
+        let mut released = Released::default();
+        let used = &self.used;
+        self.shapes.retain(|key, id| {
+            let keep = used.contains(key);
+            if !keep {
+                released.shapes += library.remove(*id);
+            }
+            keep
+        });
+        self.svgs.retain(|key, drawing| {
+            let keep = used.contains(key);
+            if !keep {
+                released.files += 1;
+                released.shapes += drawing.shapes().map(|id| library.remove(id)).sum::<usize>();
+            }
+            keep
+        });
+        self.motifs.retain(|key, file| {
+            let keep = used.contains(key);
+            if !keep {
+                released.files += 1;
+                released.shapes += file.shape_ids().map(|id| library.remove(id)).sum::<usize>();
+            }
+            keep
+        });
+        if released != Released::default() {
+            tracing::info!(
+                "Сцена: выброшено ненужное — {} фигур, {} файлов",
+                released.shapes,
+                released.files
+            );
+        }
+        released
     }
 }
 
@@ -631,17 +695,30 @@ impl PreparedScene {
         library: &mut ShapeLibrary,
         cache: &mut ShapeCache,
     ) -> Result<SceneWorld, SceneError> {
+        use std::collections::hash_map::Entry;
         let first = library.append(self.batch);
+        // Если такую форму успели положить раньше (сцену сохранили дважды подряд),
+        // лишняя копия сразу удаляется.
         for (key, id) in self.keys {
-            cache.shapes.entry(key).or_insert(id.offset(first));
+            let id = id.offset(first);
+            match cache.shapes.entry(key) {
+                Entry::Occupied(_) => _ = library.remove(id),
+                Entry::Vacant(v) => _ = v.insert(id),
+            }
         }
         for (key, mut drawing) in self.svgs {
             drawing.offset_shapes(first);
-            cache.svgs.entry(key).or_insert_with(|| Arc::new(drawing));
+            match cache.svgs.entry(key) {
+                Entry::Occupied(_) => drawing.shapes().for_each(|id| _ = library.remove(id)),
+                Entry::Vacant(v) => _ = v.insert(Arc::new(drawing)),
+            }
         }
         for (key, mut motif) in self.motifs {
             motif.offset_shapes(first);
-            cache.motifs.entry(key).or_insert_with(|| Arc::new(motif));
+            match cache.motifs.entry(key) {
+                Entry::Occupied(_) => motif.shape_ids().for_each(|id| _ = library.remove(id)),
+                Entry::Vacant(v) => _ = v.insert(Arc::new(motif)),
+            }
         }
         SceneWorld::new(&self.file, library, cache)
     }
@@ -1008,6 +1085,7 @@ impl ShapeDesc {
         cache: &mut ShapeCache,
     ) -> Result<ShapeId, String> {
         let (key, path, stroke) = self.geometry();
+        cache.mark_used(&key);
         let id = match cache.shapes.get(&key) {
             Some(id) => *id,
             None => {

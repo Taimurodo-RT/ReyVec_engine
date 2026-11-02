@@ -32,6 +32,19 @@ pub struct LoadStats {
     /// Последняя пачка уровней детализации (своя строка: они догружаются после
     /// каждой картины и при приближении камеры и не должны прятать цифры картины).
     pub details: Option<LastLoad>,
+    /// Сколько фигур в наборе и сколько они занимают на видеокарте (5.5б).
+    pub memory: ShapeMemory,
+}
+
+/// Фигуры в наборе и их место на видеокарте: видно, что ненужные удаляются (5.5б).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShapeMemory {
+    /// Фигур в наборе сейчас.
+    pub live: usize,
+    /// Удалено за всё время.
+    pub removed: usize,
+    /// Место на видеокарте.
+    pub gpu: crate::vector::MeshMemory,
 }
 
 /// Последняя законченная загрузка.
@@ -115,6 +128,15 @@ impl DemoLoading {
         true
     }
 
+    /// Новая картина вместо старой: фигуры старой (с уровнями детализации) удаляются из
+    /// набора (5.5б), иначе каждая картина навсегда оставалась бы в памяти.
+    fn replace_picture(&mut self, library: &mut ShapeLibrary, drawing: SvgDrawing) {
+        if let Some(old) = self.picture.replace(drawing) {
+            let removed: usize = old.shapes().map(|id| library.remove(id)).sum();
+            tracing::debug!("старая картина удалена: {removed} фигур");
+        }
+    }
+
     /// Новая картина: в фоне (`background`, если есть поток) или прямо здесь.
     pub fn load_picture(&mut self, library: &mut ShapeLibrary, background: bool) {
         self.pictures += 1;
@@ -147,7 +169,7 @@ impl DemoLoading {
                             background_ms: 0.0,
                             frame_ms: ms,
                         });
-                        self.picture = Some(d);
+                        self.replace_picture(library, d);
                     }
                     Err(e) => tracing::warn!("картина: {e}"),
                 }
@@ -203,7 +225,7 @@ impl DemoLoading {
                             let first = library.append(batch);
                             drawing.offset_shapes(first);
                             let shapes = drawing.shape_count;
-                            self.picture = Some(drawing);
+                            self.replace_picture(library, drawing);
                             ("картина", shapes)
                         }
                         Err(e) => {
@@ -216,10 +238,9 @@ impl DemoLoading {
                 LoadResult::Details(details) => {
                     let shapes = details.len();
                     for d in details {
-                        let id = library.insert_detail(d);
-                        if let Some(key) = library.detail_of(id) {
-                            self.details.remove(&key);
-                        }
+                        // Если фигуру, пока резался уровень, удалили, уровень не нужен.
+                        self.details.remove(&(d.id(), d.level()));
+                        library.insert_detail(d);
                     }
                     ("уровни детализации", shapes)
                 }

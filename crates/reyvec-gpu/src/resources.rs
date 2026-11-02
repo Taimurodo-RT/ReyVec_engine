@@ -461,7 +461,7 @@ impl GpuResources {
     }
 
     /// Записывает команды и сразу ждёт их выполнения. Только для загрузки при старте.
-    fn immediate(
+    pub(crate) fn immediate(
         &self,
         ctx: &GpuContext,
         record: impl FnOnce(&ash::Device, vk::CommandBuffer),

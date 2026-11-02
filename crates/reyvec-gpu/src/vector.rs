@@ -138,6 +138,23 @@ struct MeshRange {
     bounds: Bounds,
 }
 
+impl MeshRange {
+    /// Удалённая фигура: ни треугольников, ни рамки — отсечение её всегда пропускает.
+    const EMPTY: Self = Self {
+        first_index: 0,
+        index_count: 0,
+        curve_first_index: 0,
+        curve_index_count: 0,
+        even_odd: false,
+        color: Color::WHITE,
+        method: FillMethod::Triangles,
+        paint: NO_PAINT,
+        morph_stride: 0,
+        morph_last: 0,
+        bounds: EMPTY_BOUNDS,
+    };
+}
+
 /// Прямоугольник: мин. x, мин. y, макс. x, макс. y.
 type Bounds = [f32; 4];
 const EMPTY_BOUNDS: Bounds = [
@@ -233,6 +250,56 @@ struct Meshes {
     arenas: [Arena; 6],
     ranges: Vec<MeshRange>,
     counters: Counters,
+    /// Сколько байт занимает каждая фигура во всех буферах (0 у удалённых).
+    sizes: Vec<u32>,
+    /// Байт удалённых фигур: место занято, но больше никем не читается (5.5б). Когда
+    /// его становится больше половины, фигуры переписываются в новые буферы без дыр.
+    garbage: u64,
+}
+
+impl Meshes {
+    /// Сколько байт записано во все буферы (вместе с местом удалённых фигур).
+    fn used(&self) -> u64 {
+        self.arenas.iter().map(|a| a.used).sum()
+    }
+
+    /// Пора ли переписать фигуры без дыр: удалённых больше, чем живых, и их хотя бы
+    /// [`COMPACT_MIN`] байт.
+    fn wants_compaction(&self) -> bool {
+        self.garbage >= COMPACT_MIN && self.garbage * 2 >= self.used()
+    }
+
+    /// Фигура удалена из набора: её место становится мусором, рисовать её нечем.
+    fn forget(&mut self, id: u32) {
+        let i = id as usize;
+        if i < self.ranges.len() {
+            self.garbage += u64::from(std::mem::take(&mut self.sizes[i]));
+            self.ranges[i] = MeshRange::EMPTY;
+        }
+    }
+
+    fn destroy(self, res: &mut GpuResources) {
+        // Старые буферы может ещё читать кадр в работе: они уходят в очередь
+        // отложенного удаления.
+        for a in self.arenas {
+            if a.capacity > 0 {
+                res.destroy_buffer(a.id);
+            }
+        }
+    }
+}
+
+/// Сколько памяти видеокарты под фигурами (для панели, 5.5б).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshMemory {
+    /// Байт во всех буферах фигур (вместе с местом удалённых).
+    pub used: u64,
+    /// Из них байт удалённых фигур (освободится при следующем сжатии).
+    pub garbage: u64,
+    /// Идёт ли сейчас переписывание без дыр (по кусочку за кадр).
+    pub compacting: bool,
+    /// Сколько раз переписывали.
+    pub compactions: u32,
 }
 
 /// Сколько уже записано в буферы фигур (в штуках): номера у новых фигур идут дальше.
@@ -251,6 +318,13 @@ struct Counters {
 struct PackedShapes {
     bytes: [Vec<u8>; 6],
     ranges: Vec<MeshRange>,
+    sizes: Vec<u32>,
+}
+
+impl PackedShapes {
+    fn total(&self) -> usize {
+        self.bytes.iter().map(Vec::len).sum()
+    }
 }
 
 /// Названия буферов фигур для лога и отладки.
@@ -267,6 +341,9 @@ const ARENA_NAMES: [&str; 6] = [
 const STREAM_BUDGET: usize = 2 * 1024 * 1024;
 /// Самый маленький буфер фигур.
 const MIN_ARENA: u64 = 64 * 1024;
+/// Меньше этого мусора от удалённых фигур не переписывать: дыры в пару сотен КБ не
+/// стоят работы.
+const COMPACT_MIN: u64 = 1024 * 1024;
 
 /// Копирования, которые надо выполнить в начале кадра, чтобы новые фигуры попали на
 /// видеокарту. Записывает их [`VectorRenderer::record_uploads`].
@@ -291,15 +368,23 @@ fn pack_shapes(
     counters: &mut Counters,
 ) -> PackedShapes {
     let mut out = PackedShapes::default();
-    let [
-        vertices,
-        indices,
-        curve_vertices,
-        curve_indices,
-        paints,
-        stops,
-    ] = &mut out.bytes;
-    for (id, shape, mesh) in library.iter().skip(ids.start).take(ids.len()) {
+    for i in ids {
+        let id = ShapeId(i as u32);
+        let (Some(shape), Some(mesh)) = (library.shape(id), library.mesh(id)) else {
+            // Удалённая фигура: номер занят, рисовать нечего.
+            out.ranges.push(MeshRange::EMPTY);
+            out.sizes.push(0);
+            continue;
+        };
+        let before: usize = out.total();
+        let [
+            vertices,
+            indices,
+            curve_vertices,
+            curve_indices,
+            paints,
+            stops,
+        ] = &mut out.bytes;
         for (v, e) in mesh.vertices.iter().zip(&mesh.edges) {
             pack_vertex(vertices, *v, e);
         }
@@ -358,26 +443,146 @@ fn pack_shapes(
         });
         counters.vertices += mesh.vertices.len() as u32;
         counters.indices += mesh.indices.len() as u32;
+        out.sizes.push((out.total() - before) as u32);
     }
     out
 }
 
-/// Сколько фигур, начиная с `start`, загрузить за кадр: пока байт не больше
-/// [`STREAM_BUDGET`], но хотя бы одну.
-fn stream_count(library: &ShapeLibrary, start: usize) -> usize {
+/// Сколько фигур из `start..end` загрузить за кадр: пока байт не больше `budget`, но
+/// хотя бы одну (если `budget` не нулевой). Удалённые фигуры места не занимают. Второе
+/// число — сколько байт это примерно займёт.
+fn stream_count(library: &ShapeLibrary, start: usize, end: usize, budget: usize) -> (usize, usize) {
     let mut bytes = 0usize;
     let mut count = 0usize;
-    for (id, _, mesh) in library.iter().skip(start) {
-        let curves = library.curves(id).map_or(0, |c| {
-            c.vertices.len() * 16 * (1 + library.morph_keyframes(id).len()) + c.indices.len() * 4
+    if budget == 0 {
+        return (0, 0);
+    }
+    for i in start..end {
+        let id = ShapeId(i as u32);
+        let size = library.mesh(id).map_or(0, |mesh| {
+            let curves = library.curves(id).map_or(0, |c| {
+                c.vertices.len() * 16 * (1 + library.morph_keyframes(id).len())
+                    + c.indices.len() * 4
+            });
+            mesh.vertices.len() * VERTEX_SIZE + mesh.indices.len() * 4 + curves
         });
-        bytes += mesh.vertices.len() * VERTEX_SIZE + mesh.indices.len() * 4 + curves;
-        if count > 0 && bytes > STREAM_BUDGET {
+        if count > 0 && bytes + size > budget {
             break;
         }
+        bytes += size;
         count += 1;
     }
-    count
+    (count, bytes)
+}
+
+/// Пустые буферы для фигур без дыр (5.5б): каждый сразу размером под живые фигуры
+/// старого (по доле живых байт), чтобы не расти по дороге.
+fn compaction_target(
+    ctx: &GpuContext,
+    res: &mut GpuResources,
+    old: &Meshes,
+) -> Result<Meshes, GpuError> {
+    let used = old.used().max(1);
+    let live = used - old.garbage.min(used);
+    let mut arenas = [Arena {
+        id: BufferId(u32::MAX),
+        capacity: 0,
+        used: 0,
+    }; 6];
+    for (k, arena) in arenas.iter_mut().enumerate() {
+        let want = (u128::from(old.arenas[k].used) * u128::from(live) / u128::from(used)) as u64;
+        let capacity = arena_capacity(want);
+        let id = match res.create_buffer(
+            ctx,
+            capacity,
+            ARENA_USAGE,
+            BufferMemory::GpuOnly,
+            ARENA_NAMES[k],
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                for a in &arenas[..k] {
+                    res.destroy_buffer(a.id);
+                }
+                return Err(e);
+            }
+        };
+        *arena = Arena {
+            id,
+            capacity,
+            used: 0,
+        };
+    }
+    Ok(Meshes {
+        arenas,
+        ranges: Vec::new(),
+        counters: Counters::default(),
+        sizes: Vec::new(),
+        garbage: 0,
+    })
+}
+
+/// Дописывает разложенные фигуры в конец буферов `meshes`: байты во временный буфер
+/// кадра `staging` (с места `offset`), копирования — в `uploads`. Если в буфере не
+/// хватает места, он заменяется вдвое большим, старое содержимое копирует видеокарта в
+/// начале кадра, а старый буфер удалится, когда его перестанут читать кадры в работе.
+#[allow(clippy::too_many_arguments)]
+fn write_packed(
+    ctx: &GpuContext,
+    res: &mut GpuResources,
+    meshes: &mut Meshes,
+    packed: PackedShapes,
+    counters: Counters,
+    staging: Option<(BufferId, vk::Buffer)>,
+    offset: &mut u64,
+    uploads: &mut Uploads,
+) -> Result<(), GpuError> {
+    for (k, bytes) in packed.bytes.iter().enumerate() {
+        if bytes.is_empty() {
+            continue;
+        }
+        let (staging, staging_raw) = staging.expect("есть байты — есть временный буфер");
+        let arena = &mut meshes.arenas[k];
+        let used = arena.used + bytes.len() as u64;
+        if used > arena.capacity {
+            let capacity = arena_capacity(used);
+            let id = res.create_buffer(
+                ctx,
+                capacity,
+                ARENA_USAGE,
+                BufferMemory::GpuOnly,
+                ARENA_NAMES[k],
+            )?;
+            if arena.used > 0 {
+                uploads.copies.push((
+                    res.buffer_raw(arena.id).expect("буфер жив"),
+                    res.buffer_raw(id).expect("буфер жив"),
+                    vk::BufferCopy::default().size(arena.used),
+                ));
+            }
+            if arena.capacity > 0 {
+                res.destroy_buffer(arena.id);
+            }
+            tracing::debug!("буфер «{}» вырос до {} КБ", ARENA_NAMES[k], capacity / 1024);
+            arena.id = id;
+            arena.capacity = capacity;
+        }
+        res.write_buffer(staging, *offset as usize, bytes);
+        uploads.copies.push((
+            staging_raw,
+            res.buffer_raw(arena.id).expect("буфер жив"),
+            vk::BufferCopy::default()
+                .src_offset(*offset)
+                .dst_offset(arena.used)
+                .size(bytes.len() as u64),
+        ));
+        *offset += bytes.len() as u64;
+        arena.used = used;
+    }
+    meshes.counters = counters;
+    meshes.ranges.extend(packed.ranges);
+    meshes.sizes.extend(packed.sizes);
+    Ok(())
 }
 
 /// Что рисовать в кадре, по порядку.
@@ -513,6 +718,12 @@ pub(crate) struct VectorRenderer {
     stencil_format: vk::Format,
     fill: FillMode,
     meshes: Option<Meshes>,
+    /// Новые буферы без дыр, в которые по кусочку за кадр переписываются живые фигуры
+    /// (5.5б). Когда догонят `meshes`, заменят их.
+    compacted: Option<Meshes>,
+    /// Сколько удалений из набора уже учтено ([`ShapeLibrary::removed_since`]).
+    removed_seen: usize,
+    compactions: u32,
     text: Option<TextMeshes>,
     frames: Vec<FrameBuffers>,
     /// Предупреждение о переполнении уже было в логе.
@@ -678,6 +889,9 @@ impl VectorRenderer {
             stencil_format,
             fill: FillMode::default(),
             meshes: None,
+            compacted: None,
+            removed_seen: 0,
+            compactions: 0,
             text: None,
             frames,
             warned_overflow: false,
@@ -757,7 +971,8 @@ impl VectorRenderer {
 
     /// Загружает на видеокарту все фигуры набора, которых там ещё нет, и ждёт окончания
     /// загрузки. Для загрузки сцены; фигуры, добавленные во время игры, загружает
-    /// [`Self::stream`] без ожидания.
+    /// [`Self::stream`] без ожидания. Если удалённых фигур набралось много, все живые
+    /// сразу переписываются в новые буферы без дыр (всё равно ждём).
     pub fn upload(
         &mut self,
         ctx: &GpuContext,
@@ -765,17 +980,20 @@ impl VectorRenderer {
         library: &ShapeLibrary,
     ) -> Result<(), GpuError> {
         self.details.sync(library);
-        let done = self.meshes.as_ref().map_or(0, |m| m.ranges.len());
-        if done == library.len() && self.meshes.is_some() {
+        self.apply_removals(library);
+        let fresh = self.meshes.as_ref().is_some_and(Meshes::wants_compaction);
+        if fresh && let Some(c) = self.compacted.take() {
+            c.destroy(res);
+        }
+        let keep = if fresh { None } else { self.meshes.as_ref() };
+        let done = keep.map_or(0, |m| m.ranges.len());
+        if !fresh && done == library.len() && self.meshes.is_some() {
             return Ok(());
         }
-        let mut counters = self
-            .meshes
-            .as_ref()
-            .map_or_else(Counters::default, |m| m.counters);
+        let mut counters = keep.map_or_else(Counters::default, |m| m.counters);
         let packed = pack_shapes(library, done..library.len(), &mut counters);
-        // Новые буферы с запасом: старые (если были) копируются в начало.
-        let old = self.meshes.take();
+        // Новые буферы с запасом: старые (если были и не переписываются заново)
+        // копируются в начало.
         let mut arenas = [Arena {
             id: BufferId(u32::MAX),
             capacity: 0,
@@ -784,7 +1002,7 @@ impl VectorRenderer {
         let mut created: Vec<BufferId> = Vec::new();
         let result = (|| {
             for (k, bytes) in packed.bytes.iter().enumerate() {
-                let old_used = old.as_ref().map_or(0, |m| m.arenas[k].used);
+                let old_used = keep.map_or(0, |m| m.arenas[k].used);
                 let used = old_used + bytes.len() as u64;
                 let capacity = arena_capacity(used);
                 let id = res.create_buffer(
@@ -795,7 +1013,7 @@ impl VectorRenderer {
                     ARENA_NAMES[k],
                 )?;
                 created.push(id);
-                if let Some(m) = old.as_ref().filter(|_| old_used > 0) {
+                if let Some(m) = keep.filter(|_| old_used > 0) {
                     res.copy_buffer(ctx, m.arenas[k].id, id, old_used)?;
                 }
                 if !bytes.is_empty() {
@@ -809,21 +1027,28 @@ impl VectorRenderer {
             for id in created {
                 res.destroy_buffer(id);
             }
-            self.meshes = old;
             return Err(e);
         }
-        let mut ranges = old.as_ref().map(|m| m.ranges.clone()).unwrap_or_default();
-        if let Some(m) = old {
-            // Старые буферы может ещё читать кадр в работе: они уходят в очередь
-            // отложенного удаления.
-            for a in m.arenas {
-                res.destroy_buffer(a.id);
+        let (mut ranges, mut sizes, garbage) = keep.map_or_else(
+            || (Vec::new(), Vec::new(), 0),
+            |m| (m.ranges.clone(), m.sizes.clone(), m.garbage),
+        );
+        if let Some(m) = self.meshes.take() {
+            if fresh {
+                self.compactions += 1;
+                tracing::info!(
+                    "Векторные фигуры переписаны без дыр: было {} КБ, из них удалённых {} КБ",
+                    m.used() / 1024,
+                    m.garbage / 1024
+                );
             }
+            m.destroy(res);
         }
         ranges.extend(packed.ranges);
+        sizes.extend(packed.sizes);
         tracing::info!(
             "Векторные фигуры на видеокарте: {} фигур, {} треугольников, для трафарета {} треугольников, градиентов {}, {} КБ",
-            ranges.len(),
+            library.live(),
             counters.indices / 3,
             counters.curve_indices / 3,
             counters.paints,
@@ -833,8 +1058,25 @@ impl VectorRenderer {
             arenas,
             ranges,
             counters,
+            sizes,
+            garbage,
         });
         Ok(())
+    }
+
+    /// Учитывает фигуры, удалённые из набора после прошлого раза: их место становится
+    /// мусором, а рисовать их больше нечем (5.5б).
+    fn apply_removals(&mut self, library: &ShapeLibrary) {
+        let removed = library.removed_since(self.removed_seen);
+        if removed.is_empty() {
+            return;
+        }
+        for &id in removed {
+            for m in self.meshes.iter_mut().chain(self.compacted.iter_mut()) {
+                m.forget(id);
+            }
+        }
+        self.removed_seen = library.removed_count();
     }
 
     /// Готовит загрузку новых фигур набора (добавленных после прошлой загрузки) внутри
@@ -844,6 +1086,10 @@ impl VectorRenderer {
     /// ([`STREAM_BUDGET`] байт за кадр); фигуры, которые ещё не загружены, просто не
     /// рисуются. Если место в буферах кончилось, они заменяются вдвое большими (старое
     /// содержимое копирует видеокарта в том же кадре).
+    ///
+    /// Удалённые фигуры (5.5б) оставляют дыры. Когда дыр больше, чем живых фигур, живые
+    /// переписываются в новые буферы тем же способом — на остаток бюджета кадра, по
+    /// кусочку за кадр, — а когда новые буферы догонят старые, старые удаляются.
     pub fn stream(
         &mut self,
         ctx: &GpuContext,
@@ -852,86 +1098,105 @@ impl VectorRenderer {
         library: &ShapeLibrary,
     ) -> Result<Uploads, GpuError> {
         self.details.sync(library);
+        self.apply_removals(library);
         let Some(meshes) = self.meshes.as_mut() else {
             return Ok(Uploads::default());
         };
         let start = meshes.ranges.len();
-        if start >= library.len() {
-            return Ok(Uploads::default());
-        }
-        let count = stream_count(library, start);
+        let (count, bytes) = stream_count(library, start, library.len(), STREAM_BUDGET);
         let mut counters = meshes.counters;
-        let packed = pack_shapes(library, start..start + count, &mut counters);
-        let total: usize = packed.bytes.iter().map(Vec::len).sum();
-        // Временный буфер кадра: растёт по необходимости.
-        let frame = &mut self.frames[slot];
-        if frame.staging_size < total as u64 {
-            if let Some(old) = frame.staging.take() {
-                res.destroy_buffer(old);
-            }
-            let size = arena_capacity(total as u64);
-            frame.staging = Some(res.create_buffer(
-                ctx,
-                size,
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                BufferMemory::CpuToGpu,
-                &format!("загрузка векторных фигур кадра {slot}"),
-            )?);
-            frame.staging_size = size;
+        let fresh = pack_shapes(library, start..start + count, &mut counters);
+        if self.compacted.is_none() && meshes.wants_compaction() {
+            self.compacted = Some(compaction_target(ctx, res, meshes)?);
+            tracing::info!(
+                "Векторные фигуры: удалённых {} КБ из {} КБ — переписываю живые без дыр",
+                meshes.garbage / 1024,
+                meshes.used() / 1024
+            );
         }
-        let staging = frame.staging.expect("создан выше");
-        let staging_raw = res.buffer_raw(staging).expect("буфер жив");
+        // Живые фигуры в новые буферы — на то, что осталось от бюджета кадра.
+        let rewrite = self.compacted.as_ref().map(|c| {
+            let from = c.ranges.len();
+            let (n, _) = stream_count(
+                library,
+                from,
+                start + count,
+                STREAM_BUDGET.saturating_sub(bytes),
+            );
+            let mut cc = c.counters;
+            (pack_shapes(library, from..from + n, &mut cc), cc, n)
+        });
+        let total = fresh.total() + rewrite.as_ref().map_or(0, |(p, ..)| p.total());
+        let staging = if total > 0 {
+            // Временный буфер кадра: растёт по необходимости.
+            let frame = &mut self.frames[slot];
+            if frame.staging_size < total as u64 {
+                if let Some(old) = frame.staging.take() {
+                    res.destroy_buffer(old);
+                }
+                let size = arena_capacity(total as u64);
+                frame.staging = Some(res.create_buffer(
+                    ctx,
+                    size,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    BufferMemory::CpuToGpu,
+                    &format!("загрузка векторных фигур кадра {slot}"),
+                )?);
+                frame.staging_size = size;
+            }
+            let staging = frame.staging.expect("создан выше");
+            Some((staging, res.buffer_raw(staging).expect("буфер жив")))
+        } else {
+            None
+        };
         let mut uploads = Uploads {
-            shapes: count,
+            shapes: count + rewrite.as_ref().map_or(0, |r| r.2),
             bytes: total as u64,
             ..Uploads::default()
         };
         let mut offset = 0u64;
-        for (k, bytes) in packed.bytes.iter().enumerate() {
-            if bytes.is_empty() {
-                continue;
-            }
-            let arena = &mut meshes.arenas[k];
-            let used = arena.used + bytes.len() as u64;
-            if used > arena.capacity {
-                // Место кончилось: новый буфер вдвое больше, старое содержимое
-                // копирует видеокарта в начале этого кадра, старый буфер удалится, когда
-                // его перестанут читать кадры в работе.
-                let capacity = arena_capacity(used);
-                let id = res.create_buffer(
-                    ctx,
-                    capacity,
-                    ARENA_USAGE,
-                    BufferMemory::GpuOnly,
-                    ARENA_NAMES[k],
-                )?;
-                if arena.used > 0 {
-                    uploads.copies.push((
-                        res.buffer_raw(arena.id).expect("буфер жив"),
-                        res.buffer_raw(id).expect("буфер жив"),
-                        vk::BufferCopy::default().size(arena.used),
-                    ));
-                }
-                res.destroy_buffer(arena.id);
-                tracing::debug!("буфер «{}» вырос до {} КБ", ARENA_NAMES[k], capacity / 1024);
-                arena.id = id;
-                arena.capacity = capacity;
-            }
-            res.write_buffer(staging, offset as usize, bytes);
-            uploads.copies.push((
-                staging_raw,
-                res.buffer_raw(arena.id).expect("буфер жив"),
-                vk::BufferCopy::default()
-                    .src_offset(offset)
-                    .dst_offset(arena.used)
-                    .size(bytes.len() as u64),
-            ));
-            offset += bytes.len() as u64;
-            arena.used = used;
+        write_packed(
+            ctx,
+            res,
+            meshes,
+            fresh,
+            counters,
+            staging,
+            &mut offset,
+            &mut uploads,
+        )?;
+        if let (Some((packed, cc, _)), Some(c)) = (rewrite, self.compacted.as_mut()) {
+            write_packed(ctx, res, c, packed, cc, staging, &mut offset, &mut uploads)?;
         }
-        meshes.counters = counters;
-        meshes.ranges.extend(packed.ranges);
+        // Новые буферы догнали старые: со следующих команд этого кадра рисуется из них.
+        if self
+            .compacted
+            .as_ref()
+            .is_some_and(|c| c.ranges.len() >= meshes.ranges.len())
+        {
+            let new = self.compacted.take().expect("проверено выше");
+            let old = std::mem::replace(meshes, new);
+            self.compactions += 1;
+            tracing::info!(
+                "Векторные фигуры переписаны без дыр: было {} КБ, стало {} КБ",
+                old.used() / 1024,
+                meshes.used() / 1024
+            );
+            old.destroy(res);
+        }
         Ok(uploads)
+    }
+
+    /// Память видеокарты под фигурами (для панели).
+    pub fn mesh_memory(&self) -> MeshMemory {
+        self.meshes
+            .as_ref()
+            .map_or_else(MeshMemory::default, |m| MeshMemory {
+                used: m.used(),
+                garbage: m.garbage,
+                compacting: self.compacted.is_some(),
+                compactions: self.compactions,
+            })
     }
 
     /// Записывает копирования новых фигур из [`Self::stream`] и барьер: после него шейдеры
@@ -957,9 +1222,14 @@ impl VectorRenderer {
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                 .dst_stage_mask(
                     vk::PipelineStageFlags2::VERTEX_SHADER
-                        | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        | vk::PipelineStageFlags2::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags2::COPY,
                 )
-                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)];
+                // Копирование тоже: в следующих кадрах выросший или переписанный буфер
+                // читается копированием.
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::TRANSFER_READ,
+                )];
             device.cmd_pipeline_barrier2(
                 cmd,
                 &vk::DependencyInfo::default().memory_barriers(&barrier),
@@ -2393,8 +2663,204 @@ mod tests {
             first.ranges[1].first_index + first.ranges[1].index_count
         );
         assert_eq!(c.paints, 2);
-        assert_eq!(stream_count(&lib, 0), 4);
-        assert_eq!(stream_count(&lib, 3), 1);
+        assert_eq!(stream_count(&lib, 0, 4, STREAM_BUDGET).0, 4);
+        assert_eq!(stream_count(&lib, 3, 4, STREAM_BUDGET).0, 1);
+        assert_eq!(stream_count(&lib, 0, 4, 1).0, 1, "хотя бы одна фигура");
+        assert_eq!(stream_count(&lib, 0, 4, 0).0, 0, "бюджет кончился");
+        assert_eq!(all.sizes.iter().sum::<u32>() as usize, all.total());
+
+        // Удалённая фигура (5.5б): номер занят, байтов нет, рамка пустая.
+        let size_1 = all.sizes[1];
+        assert!(size_1 > 0);
+        lib.remove(ShapeId(1));
+        let mut c3 = Counters::default();
+        let holes = pack_shapes(&lib, 0..4, &mut c3);
+        assert_eq!(holes.ranges.len(), 4);
+        assert_eq!(holes.sizes[1], 0);
+        assert_eq!(holes.ranges[1].index_count, 0);
+        assert_eq!(holes.ranges[1].bounds, EMPTY_BOUNDS);
+        assert_eq!(holes.total(), all.total() - size_1 as usize);
+        assert_eq!(c3.paints, 1, "градиент удалённой фигуры не записан");
+        let (n, bytes) = stream_count(&lib, 1, 2, STREAM_BUDGET);
+        assert_eq!((n, bytes), (1, 0));
+    }
+
+    /// Удаление и переписывание без дыр на настоящей видеокарте (5.5б): после того как
+    /// новые буферы догнали старые, в них ровно то, что дала бы раскладка с нуля живых
+    /// фигур, байт в байт. Нужен драйвер Vulkan (в CI — программный lavapipe).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn compaction_on_gpu_matches_fresh_packing() {
+        use crate::context::{Core, GpuOptions};
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let core = Core::new(true, None).expect("Vulkan");
+        let ctx = GpuContext::new(core, &options, None)
+            .map_err(|f| f.0)
+            .expect("устройство");
+        let mut res = GpuResources::new(&ctx).expect("ресурсы");
+        let stencil = crate::demo::pick_stencil_format(&ctx).expect("трафарет");
+        let mut vr = VectorRenderer::new(
+            &ctx,
+            &mut res,
+            &ShaderLibrary::new(false),
+            1,
+            stencil,
+            LAYER_FORMAT,
+        )
+        .expect("векторы");
+        // Подробные круги: каждый — десятки КБ, всего около 9 МБ.
+        const N: usize = 360;
+        let mut lib = ShapeLibrary::new(0.00002);
+        let circle = |i: usize| {
+            use reyvec_vector::kurbo::Shape as _;
+            reyvec_vector::kurbo::Circle::new((0.0, 0.0), 0.5 + (i % 30) as f64 * 0.01)
+                .to_path(0.0001)
+        };
+        let gradient = reyvec_vector::Gradient::linear((0.0, -1.0), (0.0, 1.0))
+            .stop(0.0, Color::WHITE)
+            .stop(1.0, Color::linear(0.0, 0.0, 0.0, 1.0));
+        let add = |lib: &mut ShapeLibrary, i: usize| match i % 3 {
+            0 => lib
+                .add_with(
+                    reyvec_vector::Shape::fill(circle(i), gradient.clone()),
+                    FillMethod::Stencil,
+                )
+                .unwrap(),
+            1 => lib
+                .add(reyvec_vector::Shape::stroke(
+                    circle(i),
+                    reyvec_vector::Stroke::new(0.01),
+                    Color::WHITE,
+                ))
+                .unwrap(),
+            _ => lib
+                .add(reyvec_vector::Shape::fill(circle(i), Color::WHITE))
+                .unwrap(),
+        };
+        // Двойник набора: те же фигуры и удаления, кроме одного (см. ниже).
+        let mut twin = ShapeLibrary::new(0.00002);
+        for i in 0..N {
+            add(&mut lib, i);
+            add(&mut twin, i);
+        }
+        vr.upload(&ctx, &mut res, &lib).expect("загрузка");
+        let mut frame = 0u64;
+        let mut step = |vr: &mut VectorRenderer, res: &mut GpuResources, lib: &ShapeLibrary| {
+            frame += 1;
+            res.begin_frame(&ctx, frame, Some(frame - 1));
+            let uploads = vr.stream(&ctx, res, 0, lib).expect("кадр");
+            res.immediate(&ctx, |d, cmd| {
+                // SAFETY: буферы из uploads живы до конца немедленной отправки.
+                unsafe { VectorRenderer::record_uploads(d, cmd, &uploads) };
+            })
+            .expect("отправка");
+        };
+        // Удаляем две трети: дыр больше половины — начинается переписывание. Живых
+        // больше 2 МБ, поэтому оно идёт несколько кадров.
+        for i in (0..N).filter(|i| i % 3 != 2) {
+            lib.remove(ShapeId(i as u32));
+            twin.remove(ShapeId(i as u32));
+        }
+        step(&mut vr, &mut res, &lib);
+        let m = vr.mesh_memory();
+        assert_eq!((m.compacting, m.compactions), (true, 0), "{m:?}");
+        // Пока переписывается: новые фигуры и ещё удаления. Фигура 5 уже переписана —
+        // в новых буферах от неё остаётся дыра (у двойника она жива, чтобы раскладка с
+        // нуля совпала байт в байт). Последняя старая ещё не переписана — она просто
+        // пропускается.
+        for i in N..N + 6 {
+            add(&mut lib, i);
+            add(&mut twin, i);
+        }
+        lib.remove(ShapeId(5));
+        let last = ShapeId(N as u32 - 1);
+        lib.remove(last);
+        twin.remove(last);
+        for _ in 0..10 {
+            step(&mut vr, &mut res, &lib);
+        }
+        let m = vr.mesh_memory();
+        assert_eq!((m.compactions, m.compacting), (1, false), "{m:?}");
+        let fresh = pack_shapes(&twin, 0..twin.len(), &mut Counters::default());
+        assert_eq!(
+            m.garbage,
+            u64::from(fresh.sizes[5]),
+            "дыра только от фигуры 5"
+        );
+        let mut expected = fresh.ranges.clone();
+        expected[5] = MeshRange::EMPTY;
+        let meshes = vr.meshes.as_ref().expect("фигуры на видеокарте");
+        assert_eq!(meshes.ranges, expected);
+        assert_eq!(m.used, fresh.total() as u64);
+        for (k, (bytes, name)) in fresh.bytes.iter().zip(ARENA_NAMES).enumerate() {
+            let len = bytes.len();
+            if len == 0 {
+                continue;
+            }
+            let readback = res
+                .create_buffer(
+                    &ctx,
+                    len as u64,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    BufferMemory::GpuToCpu,
+                    "проверка",
+                )
+                .unwrap();
+            let (src, dst) = (
+                res.buffer_raw(meshes.arenas[k].id).unwrap(),
+                res.buffer_raw(readback).unwrap(),
+            );
+            res.immediate(&ctx, |d, cmd| {
+                let region = [vk::BufferCopy::default().size(len as u64)];
+                // SAFETY: оба буфера живы до конца немедленной отправки.
+                unsafe { d.cmd_copy_buffer(cmd, src, dst, &region) };
+            })
+            .unwrap();
+            let got = res.read_buffer(readback, len).unwrap();
+            assert!(&got == bytes, "буфер «{name}» отличается");
+            res.destroy_buffer(readback);
+        }
+        assert_eq!(
+            crate::validation_error_count(),
+            0,
+            "ошибки валидации Vulkan"
+        );
+        vr.destroy(&ctx);
+        res.destroy(&ctx);
+    }
+
+    #[test]
+    fn removed_shapes_become_garbage_until_compaction() {
+        let arena = |used| Arena {
+            id: BufferId(0),
+            capacity: 0,
+            used,
+        };
+        let mut m = Meshes {
+            arenas: [arena(0); 6],
+            ranges: vec![PLAIN; 3],
+            counters: Counters::default(),
+            sizes: vec![600_000, 600_000, 900_000],
+            garbage: 0,
+        };
+        m.arenas[0] = arena(2_100_000);
+        assert!(!m.wants_compaction());
+        m.forget(0);
+        assert_eq!(m.garbage, 600_000);
+        assert_eq!(m.ranges[0], MeshRange::EMPTY);
+        assert!(!m.wants_compaction(), "меньше мегабайта мусора — не стоит");
+        m.forget(0);
+        assert_eq!(
+            m.garbage, 600_000,
+            "второе удаление того же номера ничего не меняет"
+        );
+        m.forget(9);
+        m.forget(1);
+        assert_eq!(m.garbage, 1_200_000);
+        assert!(m.wants_compaction(), "мусора больше половины");
     }
     use reyvec_vector::{Affine, Instance};
 

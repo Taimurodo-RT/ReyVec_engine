@@ -67,6 +67,15 @@ impl SvgDrawing {
         }
     }
 
+    /// Номера фигур рисунка в наборе: чтобы удалить их, когда рисунок больше не нужен
+    /// (`ShapeLibrary::remove`).
+    pub fn shapes(&self) -> impl Iterator<Item = reyvec_vector::ShapeId> + '_ {
+        self.items.iter().filter_map(|item| match item {
+            SceneItem::Shape(inst) => Some(inst.shape),
+            _ => None,
+        })
+    }
+
     /// Элементы кадра для рисунка, поставленного преобразованием `place` (из координат
     /// рисунка в координаты сцены).
     pub fn placed(&self, place: Affine) -> impl Iterator<Item = SceneItem> + '_ {

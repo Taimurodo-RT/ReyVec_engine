@@ -689,6 +689,11 @@ impl Demo {
     }
 
     fn accept_world(&mut self, world: reyvec_scene::SceneWorld) {
+        // Новый мир принят: формы и рисунки, которые спрашивал только старый, больше не
+        // нужны (5.5б). Снимок старого мира, если он ещё рисуется, удалённые фигуры
+        // просто пропустит.
+        self.file_shapes
+            .release_unused(&mut self.vector_demo.library);
         match &self.file_logic {
             Some(logic) => logic.replace(world),
             None if self.logic_thread => {
@@ -746,7 +751,15 @@ impl Demo {
 
     /// Что показывает строка «Загрузка» на панели.
     pub fn load_stats(&self) -> crate::demo_load::LoadStats {
-        self.loading.stats()
+        let library = &self.vector_demo.library;
+        crate::demo_load::LoadStats {
+            memory: crate::demo_load::ShapeMemory {
+                live: library.live(),
+                removed: library.removed_count(),
+                gpu: self.vector.mesh_memory(),
+            },
+            ..self.loading.stats()
+        }
     }
 
     /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
@@ -2393,7 +2406,7 @@ fn pick_scene_format(ctx: &GpuContext, msaa_counts: vk::SampleCountFlags) -> vk:
     }
 }
 
-fn pick_stencil_format(ctx: &GpuContext) -> Result<vk::Format, GpuError> {
+pub(crate) fn pick_stencil_format(ctx: &GpuContext) -> Result<vk::Format, GpuError> {
     let candidates = [
         vk::Format::S8_UINT,
         vk::Format::D24_UNORM_S8_UINT,
