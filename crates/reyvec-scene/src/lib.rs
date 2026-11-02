@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 
 use reyvec_vector::kurbo::{self, Shape as _};
 use reyvec_vector::{
-    Affine, BezPath, BlendMode, Color, Instance, LineCap, LineJoin, SceneItem, Shape, ShapeId,
-    ShapeLibrary, Stroke,
+    Affine, BezPath, Color, LineCap, LineJoin, SceneItem, Shape, ShapeId, ShapeLibrary, Stroke,
 };
 use serde::Deserialize;
 
@@ -142,7 +141,11 @@ pub struct SceneFile {
     /// Общий тусклый свет, который есть везде, даже в тени.
     #[serde(default = "default_ambient")]
     pub ambient: Hex,
-    /// Слои векторных фигур снизу вверх.
+    /// Предметы сцены (5.2): у каждого место, глубина, поворот, размер, свои фигуры,
+    /// источники и SDF-объекты, а также вложенные предметы, которые двигаются вместе с ним.
+    #[serde(default)]
+    pub nodes: Vec<NodeDesc>,
+    /// Слои векторных фигур снизу вверх (способ 5.1; слой — это предмет без места).
     #[serde(default)]
     pub layers: Vec<LayerDesc>,
     #[serde(default)]
@@ -183,6 +186,113 @@ pub struct LayerDesc {
 }
 
 type P = (f64, f64);
+
+/// Предмет сцены. Место `at`, поворот `angle` и размер `scale` действуют на всё, что в
+/// нём: фигуры, источники, SDF-объекты и вложенные предметы (`children`). Глубина
+/// `depth` складывается с глубиной родителя: что глубже (больше), то рисуется поверх.
+/// `shadow` — фигуры отбрасывают тень; если не задано, берётся у родителя.
+/// `opacity` — общая прозрачность, умножается на прозрачность родителя.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeDesc {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub at: P,
+    #[serde(default)]
+    pub depth: f64,
+    #[serde(default)]
+    pub angle: f64,
+    #[serde(default = "one_f64")]
+    pub scale: f64,
+    #[serde(default)]
+    pub shadow: Option<bool>,
+    #[serde(default = "one")]
+    pub opacity: f32,
+    #[serde(default)]
+    pub shapes: Vec<ShapeDesc>,
+    #[serde(default)]
+    pub lights: Vec<LightDesc>,
+    #[serde(default)]
+    pub objects: Vec<ObjectDesc>,
+    #[serde(default)]
+    pub children: Vec<NodeDesc>,
+}
+
+impl NodeDesc {
+    /// Предмет из слоя способа 5.1: без места, на глубине по номеру слоя.
+    fn from_layer(i: usize, layer: &LayerDesc) -> Self {
+        Self {
+            name: layer.name.clone(),
+            at: (0.0, 0.0),
+            depth: i as f64,
+            angle: 0.0,
+            scale: 1.0,
+            shadow: Some(layer.shadow),
+            opacity: layer.opacity,
+            shapes: layer.shapes.clone(),
+            lights: Vec::new(),
+            objects: Vec::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// Все предметы файла: слои 5.1 (как предметы) и предметы 5.2.
+    pub(crate) fn all(file: &SceneFile) -> Vec<NodeDesc> {
+        file.layers
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Self::from_layer(i, l))
+            .chain(file.nodes.iter().cloned())
+            .collect()
+    }
+
+    fn count(&self, f: &dyn Fn(&NodeDesc) -> usize) -> usize {
+        f(self) + self.children.iter().map(|c| c.count(f)).sum::<usize>()
+    }
+
+    fn check(&self, path: &str) -> Result<(), SceneError> {
+        let here = if self.name.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path} «{}»", self.name)
+        };
+        let fail = |m: String| SceneError::new(format!("{here}: {m}"));
+        check_point("at", self.at).map_err(fail)?;
+        if !(self.depth.is_finite() && self.depth.abs() <= MAX_COORD) {
+            return Err(fail(format!(
+                "depth {} — нужно от −{MAX_COORD} до {MAX_COORD}",
+                self.depth
+            )));
+        }
+        if !self.angle.is_finite() {
+            return Err(fail(format!("angle {} — нужно число", self.angle)));
+        }
+        check_size("scale", self.scale).map_err(fail)?;
+        if !(0.0..=1.0).contains(&self.opacity) {
+            return Err(fail(format!("opacity {} — нужно от 0 до 1", self.opacity)));
+        }
+        for (j, shape) in self.shapes.iter().enumerate() {
+            shape
+                .check()
+                .map_err(|m| SceneError::new(format!("{here}, фигура {}: {m}", j + 1)))?;
+        }
+        for (j, light) in self.lights.iter().enumerate() {
+            light
+                .check()
+                .map_err(|m| SceneError::new(format!("{here}, источник света {}: {m}", j + 1)))?;
+        }
+        for (j, object) in self.objects.iter().enumerate() {
+            object.check().map_err(|m| {
+                SceneError::new(format!("{here}, {}: {m}", object_name(j, &object.name)))
+            })?;
+        }
+        for (j, child) in self.children.iter().enumerate() {
+            child.check(&format!("{here} → предмет {}", j + 1))?;
+        }
+        Ok(())
+    }
+}
 
 /// Векторная фигура. У всех: `at` — место, `angle` — поворот в градусах, `color`, и
 /// `stroke` — если задан, фигура рисуется контуром этой толщины, а не заливкой.
@@ -374,6 +484,8 @@ pub struct Scene {
     pub objects: Vec<SceneObject>,
     /// Сколько векторных фигур в сцене.
     pub shapes: usize,
+    /// Сколько сущностей в мире сцены (предметы, фигуры, источники, объекты).
+    pub entities: usize,
 }
 
 /// Готовые формы фигур: одна форма нарезается на треугольники один раз за работу
@@ -427,19 +539,35 @@ impl SceneFile {
                 self.version
             )));
         }
-        if self.lights.len() > MAX_LIGHTS {
+        let nodes: usize = self
+            .nodes
+            .iter()
+            .map(|n| n.count(&|n| n.lights.len()))
+            .sum();
+        let lights = self.lights.len() + nodes;
+        if lights > MAX_LIGHTS {
             return Err(SceneError::new(format!(
-                "источников света {}, а видеокарта берёт не больше {MAX_LIGHTS}",
-                self.lights.len()
+                "источников света {lights}, а видеокарта берёт не больше {MAX_LIGHTS}"
             )));
         }
-        if self.objects.len() > MAX_OBJECTS {
+        let nodes: usize = self
+            .nodes
+            .iter()
+            .map(|n| n.count(&|n| n.objects.len()))
+            .sum();
+        let objects = self.objects.len() + nodes;
+        if objects > MAX_OBJECTS {
             return Err(SceneError::new(format!(
-                "SDF-объектов {}, а видеокарта берёт не больше {MAX_OBJECTS}",
-                self.objects.len()
+                "SDF-объектов {objects}, а видеокарта берёт не больше {MAX_OBJECTS}"
             )));
         }
-        let parts: usize = self.objects.iter().map(|o| o.parts.len()).sum();
+        let parts_of = |os: &[ObjectDesc]| os.iter().map(|o| o.parts.len()).sum::<usize>();
+        let parts: usize = parts_of(&self.objects)
+            + self
+                .nodes
+                .iter()
+                .map(|n| n.count(&|n| parts_of(&n.objects)))
+                .sum::<usize>();
         if parts > MAX_PARTS {
             return Err(SceneError::new(format!(
                 "частей у SDF-объектов всего {parts}, а видеокарта берёт не больше {MAX_PARTS}"
@@ -470,51 +598,23 @@ impl SceneFile {
                 .check()
                 .map_err(|m| SceneError::new(format!("{}: {m}", object_name(i, &object.name))))?;
         }
+        for (i, node) in self.nodes.iter().enumerate() {
+            node.check(&format!("предмет {}", i + 1))?;
+        }
         Ok(())
     }
 
-    /// Превращает описание в сцену для рисования. Новые формы добавляются в `library`
+    /// Превращает описание в сцену для рисования: строит мир сцены ([`SceneWorld`]),
+    /// один раз прогоняет его системы и берёт снимок. Новые формы добавляются в `library`
     /// (там они нарезаются на треугольники), уже знакомые берутся из `cache`.
     pub fn build(
         &self,
         library: &mut ShapeLibrary,
         cache: &mut ShapeCache,
     ) -> Result<Scene, SceneError> {
-        let mut items = Vec::new();
-        let mut shapes = 0;
-        for (i, layer) in self.layers.iter().enumerate() {
-            let own_layer = layer.shadow || layer.opacity < 1.0;
-            if own_layer {
-                items.push(SceneItem::BeginLayer {
-                    opacity: layer.opacity,
-                    blend: BlendMode::Normal,
-                    casts_shadow: layer.shadow,
-                });
-            }
-            for (j, shape) in layer.shapes.iter().enumerate() {
-                let item = shape.build(library, cache).map_err(|m| {
-                    SceneError::new(format!(
-                        "{}, фигура {}: {m}",
-                        layer_name(i, &layer.name),
-                        j + 1
-                    ))
-                })?;
-                items.push(item);
-                shapes += 1;
-            }
-            if own_layer {
-                items.push(SceneItem::EndLayer);
-            }
-        }
-        let a = self.ambient.0;
-        Ok(Scene {
-            background: self.background,
-            ambient: [a.r, a.g, a.b],
-            items,
-            lights: self.lights.iter().map(LightDesc::build).collect(),
-            objects: self.objects.iter().map(ObjectDesc::build).collect(),
-            shapes,
-        })
+        let mut world = SceneWorld::new(self, library, cache)?;
+        world.update();
+        Ok(world.snapshot())
     }
 }
 
@@ -663,7 +763,7 @@ impl ShapeDesc {
         }
     }
 
-    fn placement(&self) -> (P, f64, Hex) {
+    pub(crate) fn placement(&self) -> (P, f64, Hex) {
         match self {
             Self::Rect {
                 at, angle, color, ..
@@ -681,11 +781,12 @@ impl ShapeDesc {
         }
     }
 
-    fn build(
+    /// Форма фигуры в библиотеке: знакомая из `cache` или новая (нарезается здесь).
+    pub(crate) fn shape_id(
         &self,
         library: &mut ShapeLibrary,
         cache: &mut ShapeCache,
-    ) -> Result<SceneItem, String> {
+    ) -> Result<ShapeId, String> {
         let (key, path, stroke) = self.geometry();
         let id = match cache.shapes.get(&key) {
             Some(id) => *id,
@@ -707,9 +808,7 @@ impl ShapeDesc {
                 id
             }
         };
-        let (at, angle, color) = self.placement();
-        let transform = Affine::translate(at) * Affine::rotate(angle.to_radians());
-        Ok(Instance::new(id, transform).with_tint(color.0).into())
+        Ok(id)
     }
 }
 
@@ -788,7 +887,7 @@ impl LightDesc {
         }
     }
 
-    fn build(&self) -> SceneLight {
+    pub(crate) fn build(&self) -> SceneLight {
         match *self {
             Self::Point {
                 at,
@@ -862,7 +961,7 @@ impl ObjectDesc {
         Ok(())
     }
 
-    fn build(&self) -> SceneObject {
+    pub(crate) fn build(&self) -> SceneObject {
         let c = self.color.0;
         let p = self.power;
         SceneObject {
@@ -1015,6 +1114,9 @@ impl SceneWatcher {
         )
     }
 }
+
+mod world;
+pub use world::{GlobalPlacement, LightSource, Placement, SceneWorld, SdfShape, VectorShape};
 
 #[cfg(test)]
 mod tests;

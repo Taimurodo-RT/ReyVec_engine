@@ -243,7 +243,8 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Lab, 2.0, false)
             },
         },
-        // Этап 5.1: сцена из файла `scenes/first-room.ron` (встроенная копия примера).
+        // Этап 5: сцена из файла `scenes/first-room.ron` (встроенная копия примера): предметы
+        // с вложенностью (5.2) дают ту же картинку, что слои 5.1.
         Case {
             name: "file-first-room-msaa4",
             scene: HeadlessScene {

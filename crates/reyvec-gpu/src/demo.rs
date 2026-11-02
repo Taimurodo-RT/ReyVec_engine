@@ -643,7 +643,8 @@ impl Demo {
         match built {
             Ok(scene) => {
                 tracing::info!(
-                    "Сцена из файла: фигур {}, источников света {}, SDF-объектов {}, разных форм {} ({:.2} мс)",
+                    "Сцена из файла: сущностей {}, фигур {}, источников света {}, SDF-объектов {}, разных форм {} ({:.2} мс)",
+                    scene.entities,
                     scene.shapes,
                     scene.lights.len(),
                     scene.objects.len(),
