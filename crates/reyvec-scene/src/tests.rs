@@ -474,3 +474,114 @@ fn logic_thread_steps_and_takes_new_worlds() {
     assert_eq!(logic.frame(Instant::now()).shapes, 0);
     assert!(logic.step_ms() < 50.0);
 }
+
+#[test]
+fn prepared_scene_needs_no_cutting_on_the_frame_thread() {
+    // Сразу: эталон.
+    let mut lib = library();
+    let mut cache = ShapeCache::new();
+    let direct = SceneFile::parse(EXAMPLE)
+        .unwrap()
+        .build(&mut lib, &mut cache)
+        .unwrap();
+    // В фоне: нарезка в пачку, потом только положить.
+    let mut lib2 = library();
+    let mut cache2 = ShapeCache::new();
+    let prepared = SceneFile::prepare(EXAMPLE, lib2.tessellator(), &cache2.keys()).unwrap();
+    assert_eq!(prepared.new_shapes(), cache.len());
+    assert!(lib2.is_empty(), "prepare не трогает набор");
+    let mut world = prepared.finish(&mut lib2, &mut cache2).unwrap();
+    assert_eq!(lib2.len(), lib.len(), "finish ничего не режет сверх пачки");
+    world.update();
+    assert_eq!(world.snapshot().items, direct.items);
+    // Второй раз знакомые формы не режутся вовсе.
+    let again = SceneFile::prepare(EXAMPLE, lib2.tessellator(), &cache2.keys()).unwrap();
+    assert_eq!(again.new_shapes(), 0);
+    again.finish(&mut lib2, &mut cache2).unwrap();
+    assert_eq!(lib2.len(), lib.len());
+    // Ошибка разбора приходит из фона с той же строкой.
+    let err = SceneFile::prepare("(format: 1", lib2.tessellator(), &HashSet::new())
+        .err()
+        .unwrap();
+    assert_eq!(err.line, Some(1));
+}
+
+#[test]
+fn loader_cuts_in_background_and_frame_only_appends() {
+    use reyvec_vector::DETAIL_FINEST;
+    let mut lib = library();
+    // Что-то уже лежит в наборе: номера пачки должны сдвинуться.
+    let circle = kurbo::Circle::new((0.0, 0.0), 0.3).to_path(1e-3);
+    let base = lib.add(Shape::fill(circle, Color::WHITE)).unwrap();
+    let mut loader = Loader::start(lib.tessellator());
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+        <rect width="10" height="10" fill="#f00"/><circle cx="5" cy="5" r="3" fill="#0f0"/></svg>"##;
+    let motif = include_bytes!("../../../assets/motif/morph.reyvec.json");
+    loader.submit(LoadJob::Svg {
+        name: "тест".into(),
+        data: svg.as_slice().into(),
+        options: reyvec_svg::SvgOptions::default(),
+    });
+    loader.submit(LoadJob::Motif {
+        name: "пример".into(),
+        data: motif.as_slice().into(),
+    });
+    loader.submit(LoadJob::Scene {
+        text: EXAMPLE.into(),
+        known: HashSet::new(),
+    });
+    loader.submit(LoadJob::Details(vec![
+        lib.detail_job(base, DETAIL_FINEST).unwrap(),
+    ]));
+    assert_eq!(loader.pending(), 4);
+    let mut kinds = Vec::new();
+    while let Some(done) = loader.wait() {
+        match done.result {
+            LoadResult::Svg { result, .. } => {
+                let (mut drawing, batch) = result.unwrap();
+                assert_eq!(batch.len(), 2);
+                let first = lib.append(batch);
+                drawing.offset_shapes(first);
+                let ids: Vec<u32> = drawing
+                    .items
+                    .iter()
+                    .filter_map(|i| match i {
+                        SceneItem::Shape(s) => Some(s.shape.0),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(ids, [first, first + 1]);
+                assert!(lib.mesh(ShapeId(first + 1)).unwrap().triangle_count() > 0);
+                kinds.push("svg");
+            }
+            LoadResult::Motif { result, .. } => {
+                let (mut file, batch) = result.unwrap();
+                let first = lib.append(batch);
+                file.offset_shapes(first);
+                assert!(file.shapes.iter().all(|s| s.shape.0 >= first));
+                kinds.push("motif");
+            }
+            LoadResult::Scene(result) => {
+                let mut cache = ShapeCache::new();
+                let before = lib.len();
+                let prepared = result.unwrap();
+                let n = prepared.new_shapes();
+                prepared.finish(&mut lib, &mut cache).unwrap();
+                assert_eq!(lib.len(), before + n);
+                kinds.push("scene");
+            }
+            LoadResult::Details(details) => {
+                assert_eq!(details.len(), 1);
+                for d in details {
+                    let id = lib.insert_detail(d);
+                    assert_eq!(lib.detail(base, DETAIL_FINEST), Some(id));
+                }
+                kinds.push("details");
+            }
+        }
+    }
+    // По порядку заданий.
+    assert_eq!(kinds, ["svg", "motif", "scene", "details"]);
+    assert_eq!(loader.pending(), 0);
+    assert!(loader.poll().is_none());
+}

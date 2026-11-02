@@ -2912,6 +2912,8 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "notify",
+ "reyvec-motif",
+ "reyvec-svg",
  "reyvec-vector",
  "ron",
  "serde",

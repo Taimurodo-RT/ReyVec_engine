@@ -2,7 +2,7 @@
 //!
 //! Движок не подключает код Motif: он читает только этот файл. Формат описан в
 //! `docs/motif-morph.md`, часть 6. [`load_morph_file`] разбирает файл, добавляет каждую
-//! фигуру в [`ShapeLibrary`] как перетекающую (контуры сводятся и режутся один раз здесь)
+//! фигуру в [`reyvec_vector::ShapeLibrary`] как перетекающую (контуры сводятся и режутся один раз здесь)
 //! и возвращает записанные в Motif анимации числа `morph`. Каждый кадр игре остаётся только
 //! взять значение анимации ([`MorphAnimation::sample`]) и записать его в экземпляр.
 //!
@@ -10,7 +10,7 @@
 //! единица сцены).
 
 use kurbo::{Affine, BezPath};
-use reyvec_vector::{Color, FillRule, Gradient, Paint, ShapeId, ShapeLibrary, Spread};
+use reyvec_vector::{Color, FillRule, Gradient, Paint, ShapeId, ShapeSink, Spread};
 use serde::Deserialize;
 
 /// Сколько пикселей Motif в одной единице сцены.
@@ -40,6 +40,16 @@ pub struct MorphFile {
     pub warnings: Vec<String>,
 }
 
+impl MorphFile {
+    /// Сдвигает номера фигур на `first`: файл грузили в пачку, а пачку положили в набор
+    /// начиная с номера `first` (`ShapeLibrary::append`).
+    pub fn offset_shapes(&mut self, first: u32) {
+        for s in &mut self.shapes {
+            s.shape = s.shape.offset(first);
+        }
+    }
+}
+
 /// Перетекающая фигура из файла, уже добавленная в набор фигур.
 #[derive(Clone, Debug)]
 pub struct MorphShape {
@@ -47,7 +57,7 @@ pub struct MorphShape {
     pub board: String,
     /// Имя фигуры в Motif.
     pub id: String,
-    /// Фигура в [`ShapeLibrary`].
+    /// Фигура в [`reyvec_vector::ShapeLibrary`].
     pub shape: ShapeId,
     /// Значение `morph` без анимации.
     pub morph: f32,
@@ -98,8 +108,9 @@ impl MorphAnimation {
     }
 }
 
-/// Читает файл `*.reyvec.json` и добавляет его фигуры в `library`.
-pub fn load_morph_file(data: &[u8], library: &mut ShapeLibrary) -> Result<MorphFile, MotifError> {
+/// Читает файл `*.reyvec.json` и добавляет его фигуры в `library` (набор фигур или пачку
+/// `ShapeBatch` для фонового потока, тогда см. [`MorphFile::offset_shapes`]).
+pub fn load_morph_file(data: &[u8], library: &mut dyn ShapeSink) -> Result<MorphFile, MotifError> {
     let file: FileJson = serde_json::from_slice(data)?;
     if file.format != "reyvec-morph" {
         return Err(MotifError::Format(file.format));
@@ -170,7 +181,7 @@ pub fn load_morph_file(data: &[u8], library: &mut ShapeLibrary) -> Result<MorphF
 fn shape(
     s: &ShapeJson,
     scale: Affine,
-    library: &mut ShapeLibrary,
+    library: &mut dyn ShapeSink,
 ) -> Result<(ShapeId, (f64, f64)), String> {
     let mut contours = Vec::with_capacity(s.contours.len());
     for (k, d) in s.contours.iter().enumerate() {
@@ -341,6 +352,7 @@ struct AnimationJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reyvec_vector::ShapeLibrary;
 
     const EXAMPLE: &[u8] = include_bytes!("../../../assets/motif/morph.reyvec.json");
 

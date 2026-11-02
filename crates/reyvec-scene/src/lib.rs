@@ -20,14 +20,15 @@
 //! против часовой стрелки. Цвета — строки `"#rrggbb"` или `"#rrggbbaa"` (sRGB, как в
 //! редакторах); яркость источников и светящихся объектов задаёт `power`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use reyvec_vector::kurbo::{self, Shape as _};
 use reyvec_vector::{
-    Affine, BezPath, Color, LineCap, LineJoin, SceneItem, Shape, ShapeId, ShapeLibrary, Stroke,
+    Affine, BezPath, Color, LineCap, LineJoin, SceneItem, Shape, ShapeBatch, ShapeId, ShapeLibrary,
+    ShapeSink, Stroke, Tessellator,
 };
 use serde::Deserialize;
 
@@ -555,9 +556,78 @@ impl ShapeCache {
     pub fn is_empty(&self) -> bool {
         self.shapes.is_empty()
     }
+
+    /// Ключи готовых форм: загрузчику в фоне, чтобы не резать их снова
+    /// ([`SceneFile::prepare`]).
+    pub fn keys(&self) -> HashSet<String> {
+        self.shapes.keys().cloned().collect()
+    }
+}
+
+/// Файл сцены, разобранный в фоне, с уже нарезанными новыми формами (этап 5.4). Потоку
+/// кадра остаётся положить формы в набор и построить мир ([`Self::finish`]).
+pub struct PreparedScene {
+    file: SceneFile,
+    batch: ShapeBatch,
+    keys: Vec<String>,
+}
+
+impl PreparedScene {
+    /// Сколько новых форм нарезано.
+    pub fn new_shapes(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Кладёт нарезанные формы в `library` и строит мир сцены. Резать уже нечего:
+    /// все формы найдутся в `cache` (кроме тех, что разбить не удалось — тогда ошибка
+    /// та же, что у [`SceneWorld::new`]).
+    pub fn finish(
+        self,
+        library: &mut ShapeLibrary,
+        cache: &mut ShapeCache,
+    ) -> Result<SceneWorld, SceneError> {
+        let first = library.append(self.batch);
+        for (i, key) in self.keys.into_iter().enumerate() {
+            cache.shapes.entry(key).or_insert(ShapeId(first + i as u32));
+        }
+        SceneWorld::new(&self.file, library, cache)
+    }
 }
 
 impl SceneFile {
+    /// Тяжёлая часть загрузки, которой не нужен набор фигур: разбор текста, проверка и
+    /// нарезка форм, которых нет среди `known` ([`ShapeCache::keys`]). Годится для
+    /// фонового потока; потом [`PreparedScene::finish`] в потоке кадра.
+    pub fn prepare(
+        text: &str,
+        tessellator: Tessellator,
+        known: &HashSet<String>,
+    ) -> Result<PreparedScene, SceneError> {
+        let file = Self::parse(text)?;
+        let mut batch = ShapeBatch::new(tessellator);
+        let mut keys = Vec::new();
+        let mut seen = HashSet::new();
+        fn walk(node: &NodeDesc, f: &mut dyn FnMut(&ShapeDesc)) {
+            node.shapes.iter().for_each(&mut *f);
+            for child in &node.children {
+                walk(child, f);
+            }
+        }
+        for node in NodeDesc::all(&file) {
+            walk(&node, &mut |shape| {
+                let (key, path, stroke) = shape.geometry();
+                if known.contains(&key) || !seen.insert(key.clone()) {
+                    return;
+                }
+                // Не разбилась — не страшно: `finish` попробует ещё раз и скажет, где ошибка.
+                if batch.add(white_shape(path, stroke)).is_ok() {
+                    keys.push(key);
+                }
+            });
+        }
+        Ok(PreparedScene { file, batch, keys })
+    }
+
     /// Читает и проверяет текст файла сцены.
     pub fn parse(text: &str) -> Result<Self, SceneError> {
         // Блокнот Windows может записать в начало файла отметку UTF-8 (BOM).
@@ -846,24 +916,29 @@ impl ShapeDesc {
         let id = match cache.shapes.get(&key) {
             Some(id) => *id,
             None => {
-                let shape = match stroke {
-                    Some(w) => Shape::stroke(
-                        path,
-                        Stroke::new(w)
-                            .with_cap(LineCap::Round)
-                            .with_join(LineJoin::Round),
-                        Color::WHITE,
-                    ),
-                    None => Shape::fill(path, Color::WHITE),
-                };
                 let id = library
-                    .add(shape)
+                    .add(white_shape(path, stroke))
                     .map_err(|e| format!("не удалось разбить на треугольники: {e}"))?;
                 cache.shapes.insert(key, id);
                 id
             }
         };
         Ok(id)
+    }
+}
+
+/// Форма фигуры сцены: белая (цвет даёт оттенок экземпляра), обводка с круглыми
+/// концами и углами.
+fn white_shape(path: BezPath, stroke: Option<f64>) -> Shape {
+    match stroke {
+        Some(w) => Shape::stroke(
+            path,
+            Stroke::new(w)
+                .with_cap(LineCap::Round)
+                .with_join(LineJoin::Round),
+            Color::WHITE,
+        ),
+        None => Shape::fill(path, Color::WHITE),
     }
 }
 
@@ -1170,8 +1245,10 @@ impl SceneWatcher {
     }
 }
 
+mod loader;
 mod logic;
 mod world;
+pub use loader::{LoadJob, LoadResult, Loaded, Loader};
 pub use logic::{STEP, SceneLogic};
 pub use world::{
     GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, VectorShape,

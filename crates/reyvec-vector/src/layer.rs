@@ -150,6 +150,14 @@ impl SceneItem {
         }
     }
 
+    /// Сдвигает номер фигуры на `first` (список кадра собран для пачки фигур, а пачку
+    /// положили в набор начиная с номера `first`, см. `ShapeLibrary::append`).
+    pub fn offset_shapes(&mut self, first: u32) {
+        if let Self::Shape(i) = self {
+            i.shape = i.shape.offset(first);
+        }
+    }
+
     /// Начало слоя с прозрачностью `opacity` и обычным наложением.
     pub fn layer(opacity: f32) -> Self {
         Self::BeginLayer {

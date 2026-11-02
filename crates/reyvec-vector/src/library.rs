@@ -70,6 +70,13 @@ impl ShapeLibrary {
         }
     }
 
+    /// Разбиение с допуском этого набора: им можно резать фигуры в другом потоке
+    /// ([`Tessellator::prepare`]), а в набор потом только положить готовое
+    /// ([`Self::insert`], [`Self::append`]).
+    pub fn tessellator(&self) -> Tessellator {
+        Tessellator::new(self.tolerance)
+    }
+
     /// Добавляет фигуру и сразу разбивает её на треугольники. Заливка рисуется
     /// треугольниками ([`FillMethod::Triangles`]). Обводки получают запас под
     /// сглаживание в шейдере: [`Self::aa_margin`].
@@ -83,19 +90,8 @@ impl ShapeLibrary {
         shape: Shape,
         method: FillMethod,
     ) -> Result<ShapeId, TessellationError> {
-        let mesh = tessellate_smooth(&shape, self.tolerance, self.aa_margin())?;
-        let curves =
-            matches!(shape.style, Style::Fill(_)).then(|| curve_mesh(&shape.path, self.tolerance));
-        Ok(self.push(Entry {
-            shape,
-            mesh,
-            curves,
-            morph: Vec::new(),
-            keyframes: Vec::new(),
-            method,
-            details: [NO_DETAIL; DETAIL_LEVELS],
-            detail_of: None,
-        }))
+        let prepared = self.tessellator().prepare(shape, method)?;
+        Ok(self.insert(prepared))
     }
 
     /// Добавляет перетекающую заливку: фигуру, которая меняет форму между контурами
@@ -108,20 +104,32 @@ impl ShapeLibrary {
         rule: FillRule,
         paint: impl Into<Paint>,
     ) -> Result<ShapeId, MorphError> {
-        let MorphMesh {
-            mesh,
-            keyframes: other,
-        } = morph_mesh(keyframes, self.tolerance)?;
-        Ok(self.push(Entry {
-            shape: Shape::fill_with(keyframes[0].clone(), rule, paint),
-            mesh: Mesh::default(),
-            curves: Some(mesh),
-            morph: other,
-            keyframes: keyframes.to_vec(),
-            method: FillMethod::Stencil,
-            details: [NO_DETAIL; DETAIL_LEVELS],
-            detail_of: None,
-        }))
+        let prepared = self
+            .tessellator()
+            .prepare_morph(keyframes, rule, paint.into())?;
+        Ok(self.insert(prepared))
+    }
+
+    /// Кладёт в набор уже разбитую фигуру. Резать ничего не нужно, поэтому это дёшево
+    /// и годится для потока кадра.
+    pub fn insert(&mut self, prepared: PreparedShape) -> ShapeId {
+        debug_assert!(
+            (prepared.tolerance - self.tolerance).abs() <= f64::EPSILON * self.tolerance,
+            "фигура разбита с другим допуском"
+        );
+        self.push(prepared.entry)
+    }
+
+    /// Кладёт в набор все фигуры пачки по порядку и возвращает номер первой. Фигура `i`
+    /// пачки (её [`ShapeSink`] выдал номер `ShapeId(i)`) получает номер `ShapeId(первая + i)`:
+    /// номера в готовом списке кадра сдвигаются через [`ShapeId::offset`] или
+    /// [`crate::SceneItem::offset_shapes`].
+    pub fn append(&mut self, batch: ShapeBatch) -> u32 {
+        let first = self.entries.len() as u32;
+        for prepared in batch.shapes {
+            self.insert(prepared);
+        }
+        first
     }
 
     /// Готовый уровень детализации `level` фигуры `id` (0 — сама фигура), если он уже
@@ -147,8 +155,20 @@ impl ShapeLibrary {
     /// `tolerance · 4^level` (меньше нуля — подробнее, под приближение камеры; больше —
     /// грубее, для мелких фигур). Разовая работа процессора: уровень становится новой
     /// фигурой набора и загружается на видеокарту как любая новая фигура. Если уровень уже
-    /// есть, просто возвращает его.
+    /// есть, просто возвращает его. То же по частям, чтобы резать в другом потоке:
+    /// [`Self::detail_job`], [`DetailJob::run`], [`Self::insert_detail`].
     pub fn build_detail(&mut self, id: ShapeId, level: i32) -> Result<ShapeId, DetailError> {
+        let job = self.detail_job(id, level)?;
+        if let Some(done) = self.detail(id, level) {
+            return Ok(done);
+        }
+        Ok(self.insert_detail(job.run()?))
+    }
+
+    /// Задание на уровень детализации `level` фигуры `id`: копия всего, что нужно для
+    /// разбиения. Само разбиение ([`DetailJob::run`]) набору не нужно и может идти в
+    /// другом потоке.
+    pub fn detail_job(&self, id: ShapeId, level: i32) -> Result<DetailJob, DetailError> {
         if !(DETAIL_FINEST..=DETAIL_COARSEST).contains(&level) {
             return Err(DetailError::BadLevel(level));
         }
@@ -159,45 +179,27 @@ impl ShapeLibrary {
         if let Some((original, _)) = base.detail_of {
             return Err(DetailError::UnknownShape(original.0));
         }
+        Ok(DetailJob {
+            id,
+            level,
+            shape: base.shape.clone(),
+            keyframes: base.keyframes.clone(),
+            curves: base.curves.is_some(),
+            method: base.method,
+            tolerance: self.tolerance * 4f64.powi(level),
+        })
+    }
+
+    /// Кладёт готовый уровень детализации. Если такой уровень уже успели положить,
+    /// возвращает его, а готовое выбрасывает.
+    pub fn insert_detail(&mut self, detail: PreparedDetail) -> ShapeId {
+        let PreparedDetail { id, level, entry } = detail;
         if let Some(done) = self.detail(id, level) {
-            return Ok(done);
+            return done;
         }
-        let tolerance = self.tolerance * 4f64.powi(level);
-        let entry = if base.keyframes.is_empty() {
-            let mesh = tessellate_smooth(&base.shape, tolerance, tolerance * 4.0)?;
-            let curves = base
-                .curves
-                .is_some()
-                .then(|| curve_mesh(&base.shape.path, tolerance));
-            Entry {
-                shape: base.shape.clone(),
-                mesh,
-                curves,
-                morph: Vec::new(),
-                keyframes: Vec::new(),
-                method: base.method,
-                details: [NO_DETAIL; DETAIL_LEVELS],
-                detail_of: Some((id, level)),
-            }
-        } else {
-            let MorphMesh {
-                mesh,
-                keyframes: other,
-            } = morph_mesh(&base.keyframes, tolerance)?;
-            Entry {
-                shape: base.shape.clone(),
-                mesh: Mesh::default(),
-                curves: Some(mesh),
-                morph: other,
-                keyframes: Vec::new(),
-                method: FillMethod::Stencil,
-                details: [NO_DETAIL; DETAIL_LEVELS],
-                detail_of: Some((id, level)),
-            }
-        };
         let new = self.push(entry);
         self.entries[id.0 as usize].details[(level - DETAIL_FINEST) as usize] = new.0;
-        Ok(new)
+        new
     }
 
     fn push(&mut self, mut entry: Entry) -> ShapeId {
@@ -274,6 +276,253 @@ impl ShapeLibrary {
     pub fn aa_margin(&self) -> f64 {
         self.tolerance * 4.0
     }
+}
+
+impl ShapeId {
+    /// Номер фигуры пачки ([`ShapeBatch`]) после того, как пачку положили в набор с
+    /// первым номером `first` ([`ShapeLibrary::append`]).
+    #[must_use]
+    pub fn offset(self, first: u32) -> Self {
+        Self(self.0 + first)
+    }
+}
+
+/// Фигура, уже разбитая на треугольники, но ещё не в наборе. Резать можно в любом потоке
+/// ([`Tessellator`]), класть в набор — в том, где набор ([`ShapeLibrary::insert`]).
+pub struct PreparedShape {
+    entry: Entry,
+    tolerance: f64,
+}
+
+/// Разбиение фигур на треугольники без набора: только допуск. Копируется в другой поток,
+/// чтобы тяжёлая работа (нарезка кривых) шла там, а поток кадра только клал готовое.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tessellator {
+    tolerance: f64,
+}
+
+impl Tessellator {
+    /// Разбиение с допуском `tolerance` (как у [`ShapeLibrary::new`]).
+    pub fn new(tolerance: f64) -> Self {
+        Self { tolerance }
+    }
+
+    /// Допуск разбиения кривых.
+    pub fn tolerance(&self) -> f64 {
+        self.tolerance
+    }
+
+    /// Запас вокруг обводок под мягкий край (см. [`ShapeLibrary::aa_margin`]).
+    pub fn aa_margin(&self) -> f64 {
+        self.tolerance * 4.0
+    }
+
+    /// Разбивает фигуру, как [`ShapeLibrary::add_with`], но в набор не кладёт.
+    pub fn prepare(
+        &self,
+        shape: Shape,
+        method: FillMethod,
+    ) -> Result<PreparedShape, TessellationError> {
+        let mesh = tessellate_smooth(&shape, self.tolerance, self.aa_margin())?;
+        let curves =
+            matches!(shape.style, Style::Fill(_)).then(|| curve_mesh(&shape.path, self.tolerance));
+        Ok(self.prepared(Entry {
+            shape,
+            mesh,
+            curves,
+            morph: Vec::new(),
+            keyframes: Vec::new(),
+            method,
+            details: [NO_DETAIL; DETAIL_LEVELS],
+            detail_of: None,
+        }))
+    }
+
+    /// Сводит контуры перетекающей фигуры, как [`ShapeLibrary::add_morph`], но в набор
+    /// не кладёт.
+    pub fn prepare_morph(
+        &self,
+        keyframes: &[kurbo::BezPath],
+        rule: FillRule,
+        paint: Paint,
+    ) -> Result<PreparedShape, MorphError> {
+        let MorphMesh {
+            mesh,
+            keyframes: other,
+        } = morph_mesh(keyframes, self.tolerance)?;
+        Ok(self.prepared(Entry {
+            shape: Shape::fill_with(keyframes[0].clone(), rule, paint),
+            mesh: Mesh::default(),
+            curves: Some(mesh),
+            morph: other,
+            keyframes: keyframes.to_vec(),
+            method: FillMethod::Stencil,
+            details: [NO_DETAIL; DETAIL_LEVELS],
+            detail_of: None,
+        }))
+    }
+
+    fn prepared(&self, entry: Entry) -> PreparedShape {
+        PreparedShape {
+            entry,
+            tolerance: self.tolerance,
+        }
+    }
+}
+
+/// Куда загрузчики (SVG, Motif, файл сцены) складывают фигуры: прямо в набор
+/// ([`ShapeLibrary`]) или в пачку ([`ShapeBatch`]), которую режут в другом потоке и
+/// потом целиком кладут в набор.
+pub trait ShapeSink {
+    /// Разбивает фигуру и возвращает её номер (у пачки — номер внутри пачки).
+    fn add_with(&mut self, shape: Shape, method: FillMethod) -> Result<ShapeId, TessellationError>;
+
+    /// Перетекающая заливка (см. [`ShapeLibrary::add_morph`]).
+    fn add_morph(
+        &mut self,
+        keyframes: &[kurbo::BezPath],
+        rule: FillRule,
+        paint: Paint,
+    ) -> Result<ShapeId, MorphError>;
+
+    /// Заливка треугольниками (см. [`ShapeLibrary::add`]).
+    fn add(&mut self, shape: Shape) -> Result<ShapeId, TessellationError> {
+        self.add_with(shape, FillMethod::Triangles)
+    }
+}
+
+impl ShapeSink for ShapeLibrary {
+    fn add_with(&mut self, shape: Shape, method: FillMethod) -> Result<ShapeId, TessellationError> {
+        ShapeLibrary::add_with(self, shape, method)
+    }
+
+    fn add_morph(
+        &mut self,
+        keyframes: &[kurbo::BezPath],
+        rule: FillRule,
+        paint: Paint,
+    ) -> Result<ShapeId, MorphError> {
+        ShapeLibrary::add_morph(self, keyframes, rule, paint)
+    }
+}
+
+/// Пачка разбитых фигур, ещё не в наборе. Номера фигур в ней свои, с нуля; в наборе они
+/// сдвигаются на номер первой ([`ShapeLibrary::append`], [`ShapeId::offset`]).
+pub struct ShapeBatch {
+    tessellator: Tessellator,
+    shapes: Vec<PreparedShape>,
+}
+
+impl ShapeBatch {
+    /// Пустая пачка с разбиением `tessellator` (возьмите [`ShapeLibrary::tessellator`]).
+    pub fn new(tessellator: Tessellator) -> Self {
+        Self {
+            tessellator,
+            shapes: Vec::new(),
+        }
+    }
+
+    /// Сколько фигур в пачке.
+    pub fn len(&self) -> usize {
+        self.shapes.len()
+    }
+
+    /// Пуста ли пачка.
+    pub fn is_empty(&self) -> bool {
+        self.shapes.is_empty()
+    }
+
+    fn push(&mut self, prepared: PreparedShape) -> ShapeId {
+        self.shapes.push(prepared);
+        ShapeId(self.shapes.len() as u32 - 1)
+    }
+}
+
+impl ShapeSink for ShapeBatch {
+    fn add_with(&mut self, shape: Shape, method: FillMethod) -> Result<ShapeId, TessellationError> {
+        let prepared = self.tessellator.prepare(shape, method)?;
+        Ok(self.push(prepared))
+    }
+
+    fn add_morph(
+        &mut self,
+        keyframes: &[kurbo::BezPath],
+        rule: FillRule,
+        paint: Paint,
+    ) -> Result<ShapeId, MorphError> {
+        let prepared = self.tessellator.prepare_morph(keyframes, rule, paint)?;
+        Ok(self.push(prepared))
+    }
+}
+
+/// Задание на уровень детализации ([`ShapeLibrary::detail_job`]): копия фигуры и допуск.
+#[derive(Clone, Debug)]
+pub struct DetailJob {
+    id: ShapeId,
+    level: i32,
+    shape: Shape,
+    keyframes: Vec<kurbo::BezPath>,
+    curves: bool,
+    method: FillMethod,
+    tolerance: f64,
+}
+
+impl DetailJob {
+    /// Для какой фигуры уровень.
+    pub fn id(&self) -> ShapeId {
+        self.id
+    }
+
+    /// Какой уровень.
+    pub fn level(&self) -> i32 {
+        self.level
+    }
+
+    /// Разбивает фигуру с допуском уровня. Набор не нужен: можно в другом потоке.
+    pub fn run(self) -> Result<PreparedDetail, DetailError> {
+        let tolerance = self.tolerance;
+        let entry = if self.keyframes.is_empty() {
+            let mesh = tessellate_smooth(&self.shape, tolerance, tolerance * 4.0)?;
+            let curves = self.curves.then(|| curve_mesh(&self.shape.path, tolerance));
+            Entry {
+                shape: self.shape,
+                mesh,
+                curves,
+                morph: Vec::new(),
+                keyframes: Vec::new(),
+                method: self.method,
+                details: [NO_DETAIL; DETAIL_LEVELS],
+                detail_of: Some((self.id, self.level)),
+            }
+        } else {
+            let MorphMesh {
+                mesh,
+                keyframes: other,
+            } = morph_mesh(&self.keyframes, tolerance)?;
+            Entry {
+                shape: self.shape,
+                mesh: Mesh::default(),
+                curves: Some(mesh),
+                morph: other,
+                keyframes: Vec::new(),
+                method: FillMethod::Stencil,
+                details: [NO_DETAIL; DETAIL_LEVELS],
+                detail_of: Some((self.id, self.level)),
+            }
+        };
+        Ok(PreparedDetail {
+            id: self.id,
+            level: self.level,
+            entry,
+        })
+    }
+}
+
+/// Готовый уровень детализации, ещё не в наборе ([`ShapeLibrary::insert_detail`]).
+pub struct PreparedDetail {
+    id: ShapeId,
+    level: i32,
+    entry: Entry,
 }
 
 /// Фигура на сцене в этом кадре. Порядок в списке экземпляров = порядок рисования:
