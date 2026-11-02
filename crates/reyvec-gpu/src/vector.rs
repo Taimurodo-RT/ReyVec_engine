@@ -2711,11 +2711,13 @@ mod tests {
             LAYER_FORMAT,
         )
         .expect("векторы");
-        // Подробные круги: каждый — десятки КБ, всего несколько МБ.
+        // Подробные круги: каждый — десятки КБ, всего около 9 МБ.
+        const N: usize = 360;
         let mut lib = ShapeLibrary::new(0.00002);
         let circle = |i: usize| {
             use reyvec_vector::kurbo::Shape as _;
-            reyvec_vector::kurbo::Circle::new((0.0, 0.0), 0.5 + i as f64 * 0.01).to_path(0.0001)
+            reyvec_vector::kurbo::Circle::new((0.0, 0.0), 0.5 + (i % 30) as f64 * 0.01)
+                .to_path(0.0001)
         };
         let gradient = reyvec_vector::Gradient::linear((0.0, -1.0), (0.0, 1.0))
             .stop(0.0, Color::WHITE)
@@ -2738,8 +2740,11 @@ mod tests {
                 .add(reyvec_vector::Shape::fill(circle(i), Color::WHITE))
                 .unwrap(),
         };
-        for i in 0..90 {
+        // Двойник набора: те же фигуры и удаления, кроме одного (см. ниже).
+        let mut twin = ShapeLibrary::new(0.00002);
+        for i in 0..N {
             add(&mut lib, i);
+            add(&mut twin, i);
         }
         vr.upload(&ctx, &mut res, &lib).expect("загрузка");
         let mut frame = 0u64;
@@ -2753,28 +2758,42 @@ mod tests {
             })
             .expect("отправка");
         };
-        // Удаляем две трети: дыр больше половины — начинается переписывание.
-        for i in (0..90).filter(|i| i % 3 != 2) {
-            lib.remove(ShapeId(i));
+        // Удаляем две трети: дыр больше половины — начинается переписывание. Живых
+        // больше 2 МБ, поэтому оно идёт несколько кадров.
+        for i in (0..N).filter(|i| i % 3 != 2) {
+            lib.remove(ShapeId(i as u32));
+            twin.remove(ShapeId(i as u32));
         }
         step(&mut vr, &mut res, &lib);
         let m = vr.mesh_memory();
-        assert!(m.garbage > COMPACT_MIN || m.compactions == 1, "{m:?}");
-        // Пока переписывается — новые фигуры и ещё удаления.
-        for i in 90..96 {
+        assert_eq!((m.compacting, m.compactions), (true, 0), "{m:?}");
+        // Пока переписывается: новые фигуры и ещё удаления. Фигура 5 уже переписана —
+        // в новых буферах от неё остаётся дыра (у двойника она жива, чтобы раскладка с
+        // нуля совпала байт в байт). Последняя старая ещё не переписана — она просто
+        // пропускается.
+        for i in N..N + 6 {
             add(&mut lib, i);
+            add(&mut twin, i);
         }
         lib.remove(ShapeId(5));
+        let last = ShapeId(N as u32 - 1);
+        lib.remove(last);
+        twin.remove(last);
         for _ in 0..10 {
             step(&mut vr, &mut res, &lib);
         }
         let m = vr.mesh_memory();
         assert_eq!((m.compactions, m.compacting), (1, false), "{m:?}");
-        assert_eq!(m.garbage, 0);
-        // Байт в байт с раскладкой живых фигур с нуля.
-        let fresh = pack_shapes(&lib, 0..lib.len(), &mut Counters::default());
+        let fresh = pack_shapes(&twin, 0..twin.len(), &mut Counters::default());
+        assert_eq!(
+            m.garbage,
+            u64::from(fresh.sizes[5]),
+            "дыра только от фигуры 5"
+        );
+        let mut expected = fresh.ranges.clone();
+        expected[5] = MeshRange::EMPTY;
         let meshes = vr.meshes.as_ref().expect("фигуры на видеокарте");
-        assert_eq!(meshes.ranges, fresh.ranges);
+        assert_eq!(meshes.ranges, expected);
         assert_eq!(m.used, fresh.total() as u64);
         for (k, (bytes, name)) in fresh.bytes.iter().zip(ARENA_NAMES).enumerate() {
             let len = bytes.len();
