@@ -15,6 +15,7 @@ ron.workspace = true
 reyvec-motif.workspace = true
 reyvec-svg.workspace = true
 reyvec-vector.workspace = true
+reyvec-game.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

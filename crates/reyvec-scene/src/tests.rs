@@ -28,7 +28,6 @@ fn example_scene_parses_and_builds() {
     // Шар, неон и огоньки светятся, слизь отбрасывает тень.
     assert_eq!(scene.objects.iter().filter(|o| o.glow).count(), 2 + 16);
     assert_eq!(scene.objects.iter().filter(|o| o.shadow).count(), 1 + 4);
-    // Стол и полка — два отдельных слоя с тенью, окно без слоя.
     let shadow_layers = scene
         .items
         .iter()
@@ -42,7 +41,13 @@ fn example_scene_parses_and_builds() {
             )
         })
         .count();
-    assert_eq!(shadow_layers, 2);
+    // Слои с тенью: стол, полка, герой, ящики под полкой и 6 препятствий коридора
+    // (6.1); окно без слоя.
+    assert_eq!(shadow_layers, 10);
+    // Герой (6.1) и твёрдое: пол, стена слева, столешница, 6 банок с крышками, 3 книги,
+    // полка, 2 ящика, 6 препятствий коридора.
+    let player = scene.player.expect("в примере есть герой");
+    assert_eq!(player.solids, 2 + 1 + 6 + 3 + 1 + 2 + 6);
     // Сущности: предметы, фигуры, рисунки, источники, объекты и общий корень.
     assert!(scene.entities > 40, "{}", scene.entities);
     // Рисунки из файлов (5.5): фото SVG на полке и клякса Motif за окном.
@@ -795,4 +800,201 @@ fn loader_cuts_in_background_and_frame_only_appends() {
     assert_eq!(kinds, ["svg", "motif", "scene", "details", "discard"]);
     assert_eq!(loader.pending(), 0);
     assert!(loader.poll().is_none());
+}
+
+const LEVEL: &str = r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "ящик", at: (0.6, -0.7), shapes: [Rect(at: (0.0, 0.0), size: (0.2, 0.2), color: "#a06030", solid: true)]),
+    (name: "герой", at: (0.0, 0.0), depth: 2, player: (size: (0.1, 0.2)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+]"##;
+
+/// Мир прогоняется шагами логики по 1/60 секунды.
+fn steps(w: &mut SceneWorld, from: usize, n: usize) -> usize {
+    for i in from..from + n {
+        w.update_at(i as f64 / 60.0);
+    }
+    from + n
+}
+
+#[test]
+fn player_falls_onto_floor_and_runs_into_a_solid_box() {
+    let mut w = world(&minimal(LEVEL));
+    let t = steps(&mut w, 0, 90);
+    let p = w.snapshot().player.expect("персонаж есть в снимке");
+    assert!(p.on_ground);
+    // Низ персонажа (половина высоты 0,1) на верху пола (-0,8).
+    assert!((p.at[1] - -0.7).abs() < 1e-4, "{:?}", p.at);
+    assert_eq!(p.solids, 2);
+    // Бежим вправо и упираемся в ящик: его левый край 0,5, половина ширины героя 0,05.
+    w.set_input(reyvec_game::InputFrame::new(
+        &[reyvec_game::Action::Right],
+        &[],
+    ));
+    steps(&mut w, t, 120);
+    let p = w.snapshot().player.unwrap();
+    assert!((p.at[0] - 0.45).abs() < 1e-4, "{:?}", p.at);
+    // Фигура героя едет вместе с ним.
+    let s = w.snapshot();
+    let hero = s
+        .items
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            SceneItem::Shape(s) => Some(s.transform.as_coeffs()),
+            _ => None,
+        })
+        .unwrap();
+    assert!((hero[4] - 0.45).abs() < 1e-4, "{hero:?}");
+}
+
+#[test]
+fn player_jumps_onto_the_box() {
+    let mut w = world(&minimal(LEVEL));
+    let mut t = steps(&mut w, 0, 60);
+    use reyvec_game::{Action, InputFrame};
+    // Прыжок с места, а над ящиком — вправо, пока не окажемся над его серединой.
+    w.set_input(InputFrame::new(&[], &[Action::Jump]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[Action::Jump], &[]));
+    t = steps(&mut w, t, 3);
+    w.set_input(InputFrame::new(&[Action::Right, Action::Jump], &[]));
+    while w.snapshot().player.unwrap().at[0] < 0.5 {
+        t = steps(&mut w, t, 1);
+        assert!(t < 400);
+    }
+    w.set_input(InputFrame::new(&[Action::Left], &[]));
+    t = steps(&mut w, t, 4);
+    w.set_input(InputFrame::new(&[], &[]));
+    steps(&mut w, t, 60);
+    let p = w.snapshot().player.unwrap();
+    assert!(p.on_ground);
+    // Стоит на ящике (верх -0,6) — на 0,2 выше пола.
+    assert!((p.at[1] - -0.5).abs() < 1e-4, "{:?}", p.at);
+}
+
+#[test]
+fn player_looks_left_by_mirroring() {
+    let mut w = world(&minimal(LEVEL));
+    let t = steps(&mut w, 0, 30);
+    w.set_input(reyvec_game::InputFrame::new(
+        &[reyvec_game::Action::Left],
+        &[],
+    ));
+    steps(&mut w, t, 5);
+    let s = w.snapshot();
+    let hero = s
+        .items
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            SceneItem::Shape(s) => Some(s.transform.as_coeffs()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(hero[0] < 0.0, "{hero:?}");
+}
+
+#[test]
+fn player_that_falls_out_comes_back_to_spawn() {
+    let mut w = world(&minimal(
+        r##"nodes: [(name: "герой", at: (0.3, 0.0), player: ())]"##,
+    ));
+    steps(&mut w, 0, 200);
+    let p = w.snapshot().player.unwrap();
+    assert!(p.at[1] > -5.0, "{:?}", p.at);
+}
+
+#[test]
+fn player_keeps_place_when_scene_file_is_saved() {
+    let mut w = world(&minimal(LEVEL));
+    let t = steps(&mut w, 0, 60);
+    w.set_input(reyvec_game::InputFrame::new(
+        &[reyvec_game::Action::Right],
+        &[],
+    ));
+    steps(&mut w, t, 10);
+    let body = w.player_body().unwrap();
+    let mut new = world(&minimal(LEVEL));
+    new.set_player_body(body);
+    new.update_at(0.0);
+    let p = new.snapshot().player.unwrap();
+    assert!((f64::from(p.at[0]) - body.pos[0]).abs() < 1e-6);
+    assert!(p.at[0] > 0.01);
+}
+
+#[test]
+fn player_errors_are_in_russian() {
+    let nested = minimal(r##"nodes: [(children: [(player: ())])]"##);
+    let e = SceneFile::parse(&nested).unwrap_err().to_string();
+    assert!(e.contains("верхнего уровня"), "{e}");
+    let two = minimal(r##"nodes: [(player: ()), (player: ())]"##);
+    let e = SceneFile::parse(&two).unwrap_err().to_string();
+    assert!(e.contains("персонаж игрока в сцене один"), "{e}");
+    let bad = minimal(r##"nodes: [(player: (speed: -1))]"##);
+    let e = SceneFile::parse(&bad).unwrap_err().to_string();
+    assert!(e.contains("speed"), "{e}");
+}
+
+#[test]
+fn logic_thread_takes_input() {
+    let mut text = minimal(LEVEL);
+    text = text.replace("at: (0.0, 0.0), depth: 2", "at: (-1.0, -0.7), depth: 2");
+    let logic = SceneLogic::start(world(&text), 0.0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    logic.set_action(reyvec_game::Action::Right, true);
+    while logic.frame(Instant::now()).player.unwrap().at[0] < -0.8 {
+        assert!(Instant::now() < deadline, "персонаж не бежит");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(logic.input_ms().is_some());
+    logic.set_action(reyvec_game::Action::Right, false);
+}
+
+/// Простой «игрок» для проверки уровня: бежит к `x`, прыгает, когда упёрся. Возвращает
+/// место героя, когда он остановился у цели (или после `limit` шагов).
+fn walk_to(w: &mut SceneWorld, t: &mut usize, x: f32, limit: usize) -> PlayerView {
+    use reyvec_game::{Action, InputFrame};
+    let mut last = w.snapshot().player.unwrap();
+    for _ in 0..limit {
+        let dir = if x > last.at[0] {
+            Action::Right
+        } else {
+            Action::Left
+        };
+        if (last.at[0] - x).abs() < 0.02 {
+            w.set_input(InputFrame::new(&[], &[]));
+            *t = steps(w, *t, 40);
+            return w.snapshot().player.unwrap();
+        }
+        let stuck = last.on_ground && last.vel[0].abs() < 0.01;
+        let input = if stuck {
+            InputFrame::new(&[dir], &[Action::Jump])
+        } else {
+            InputFrame::new(&[dir, Action::Jump], &[])
+        };
+        w.set_input(input);
+        *t = steps(w, *t, 1);
+        last = w.snapshot().player.unwrap();
+    }
+    last
+}
+
+#[test]
+fn hero_of_the_example_climbs_crates_onto_the_shelf() {
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let mut t = steps(&mut w, 0, 60);
+    let p = w.snapshot().player.unwrap();
+    assert!(p.on_ground && (p.at[1] - -0.64).abs() < 1e-3, "{p:?}");
+    // На высокий ящик (верх -0,28).
+    let p = walk_to(&mut w, &mut t, 1.85, 600);
+    assert!((p.at[1] - -0.14).abs() < 1e-3, "на ящике: {p:?}");
+    // С ящика на полку (верх 0,22).
+    let p = walk_to(&mut w, &mut t, 1.3, 600);
+    assert!((p.at[1] - 0.36).abs() < 1e-3, "на полке: {p:?}");
+    // В конце коридора — стена: дальше x ≈ 11,2 не пройти.
+    let p = walk_to(&mut w, &mut t, 12.0, 3000);
+    assert!(p.at[0] < 11.21 && p.at[0] > 10.5, "у стены: {p:?}");
 }

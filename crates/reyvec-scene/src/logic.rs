@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use reyvec_game::{Action, InputReader, InputShared};
 use reyvec_vector::{Affine, SceneItem};
 
 use crate::{Scene, SceneWorld};
@@ -44,6 +45,11 @@ struct Shared {
     steps: AtomicU64,
     /// Время одного шага логики (среднее, микросекунды).
     step_us: AtomicU64,
+    /// Ввод игрока: пишет окно, читает поток логики в начале шага (6.1).
+    input: InputShared,
+    /// Среднее время от нажатия до шага логики, который его взял (микросекунды; 0 —
+    /// нажатий ещё не было).
+    input_us: AtomicU64,
 }
 
 /// Поток логики сцены.
@@ -56,6 +62,7 @@ pub struct SceneLogic {
 impl SceneLogic {
     /// Запускает поток логики с миром `world`; время сцены начинается с `start` секунд.
     pub fn start(mut world: SceneWorld, start: f64) -> Self {
+        world.continue_from(start);
         world.update_at(start);
         let first = world.snapshot();
         let shared = Arc::new(Shared {
@@ -67,6 +74,8 @@ impl SceneLogic {
             stop: AtomicBool::new(false),
             steps: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
+            input: InputShared::new(),
+            input_us: AtomicU64::new(0),
         });
         let (tx, rx) = channel();
         let inner = shared.clone();
@@ -92,6 +101,24 @@ impl SceneLogic {
         let since = now.saturating_duration_since(frames.cur_at).as_secs_f64();
         let alpha = (since / STEP.as_secs_f64()).clamp(0.0, 1.0);
         Scene::lerp(&frames.prev, &frames.cur, alpha as f32)
+    }
+
+    /// Действие игрока нажато или отпущено. Поток логики возьмёт его в ближайший шаг.
+    pub fn set_action(&self, action: Action, down: bool) {
+        self.shared.input.set(action, down);
+    }
+
+    /// Всё отпущено (окно потеряло фокус).
+    pub fn release_all(&self) {
+        self.shared.input.release_all();
+    }
+
+    /// Сколько в среднем нажатие ждёт шага логики, мс (`None`, пока нажатий не было).
+    pub fn input_ms(&self) -> Option<f64> {
+        match self.shared.input_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(us as f64 / 1000.0),
+        }
     }
 
     /// Сколько шагов логики сделано.
@@ -120,6 +147,7 @@ fn run(mut world: SceneWorld, start: f64, commands: Receiver<Command>, shared: &
     let mut step_index: u64 = 0;
     let mut next = Instant::now() + STEP;
     let mut average_us = 0.0f64;
+    let mut input = InputReader::default();
     while !shared.stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         if now < next {
@@ -132,9 +160,21 @@ fn run(mut world: SceneWorld, start: f64, commands: Receiver<Command>, shared: &
             next = now;
         }
         while let Ok(Command::Replace(new)) = commands.try_recv() {
+            // Файл сцены сохранили: персонаж остаётся там, где был.
+            let body = world.player_body();
             world = *new;
+            world.continue_from(start + step_index as f64 * step);
+            if let Some(body) = body {
+                world.set_player_body(body);
+            }
         }
         let started = Instant::now();
+        world.set_input(input.read(&shared.input));
+        if let Some(ms) = input.latency_ms() {
+            shared
+                .input_us
+                .store(((ms * 1000.0) as u64).max(1), Ordering::Relaxed);
+        }
         step_index += 1;
         world.update_at(start + step_index as f64 * step);
         let snapshot = world.snapshot();
@@ -196,6 +236,9 @@ impl Scene {
                     }
                 }
             }
+        }
+        if let (Some(o), Some(p)) = (out.player.as_mut(), prev.player) {
+            o.at = lerp2(p.at, o.at, t);
         }
         out
     }

@@ -2866,6 +2866,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "reyvec-game"
+version = "0.1.0"
+
+[[package]]
 name = "reyvec-gpu"
 version = "0.1.0"
 dependencies = [
@@ -2912,6 +2916,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "notify",
+ "reyvec-game",
  "reyvec-motif",
  "reyvec-svg",
  "reyvec-vector",

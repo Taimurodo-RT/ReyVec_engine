@@ -246,6 +246,111 @@ pub struct NodeDesc {
     /// Перетекающие фигуры из файлов Motif (5.5).
     #[serde(default)]
     pub morphs: Vec<MorphDesc>,
+    /// Невидимые твёрдые прямоугольники (6.1): пол, стены, края уровня.
+    #[serde(default)]
+    pub solids: Vec<SolidDesc>,
+    /// Этот предмет — персонаж игрока (6.1): его двигает управление, `at` — середина
+    /// прямоугольника столкновений. Только у предмета верхнего уровня, один на сцену.
+    #[serde(default)]
+    pub player: Option<PlayerDesc>,
+}
+
+/// Невидимый твёрдый прямоугольник с серединой `at` и размером `size`.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SolidDesc {
+    pub at: P,
+    pub size: P,
+}
+
+/// Настройки персонажа игрока. Всё можно не писать: тогда берётся как в
+/// [`reyvec_game::Tuning::default`]. Расстояния в единицах сцены (высота кадра — 2),
+/// время в секундах.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PlayerDesc {
+    /// Ширина и высота прямоугольника столкновений.
+    pub size: P,
+    /// Скорость бега.
+    pub speed: f64,
+    /// Разгон и торможение на земле, разгон в воздухе (единиц в секунду за секунду).
+    pub accel: f64,
+    pub decel: f64,
+    pub air_accel: f64,
+    /// Высота прыжка с зажатой кнопкой и время до верхней точки.
+    pub jump: f64,
+    pub jump_time: f64,
+    /// Во сколько раз сильнее тянет вниз при падении или отпущенной кнопке.
+    pub fall: f64,
+    pub max_fall: f64,
+    /// Время койота и запоминание нажатия прыжка, секунды.
+    pub coyote: f64,
+    pub buffer: f64,
+}
+
+impl Default for PlayerDesc {
+    fn default() -> Self {
+        let t = reyvec_game::Tuning::default();
+        Self {
+            size: (t.size[0], t.size[1]),
+            speed: t.speed,
+            accel: t.accel,
+            decel: t.decel,
+            air_accel: t.air_accel,
+            jump: t.jump,
+            jump_time: t.jump_time,
+            fall: t.fall,
+            max_fall: t.max_fall,
+            coyote: t.coyote,
+            buffer: t.buffer,
+        }
+    }
+}
+
+impl PlayerDesc {
+    pub(crate) fn tuning(&self) -> reyvec_game::Tuning {
+        reyvec_game::Tuning {
+            size: [self.size.0, self.size.1],
+            speed: self.speed,
+            accel: self.accel,
+            decel: self.decel,
+            air_accel: self.air_accel,
+            jump: self.jump,
+            jump_time: self.jump_time,
+            fall: self.fall,
+            max_fall: self.max_fall,
+            coyote: self.coyote,
+            buffer: self.buffer,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        check_size("ширина size", self.size.0)?;
+        check_size("высота size", self.size.1)?;
+        let positive = [
+            ("speed", self.speed),
+            ("accel", self.accel),
+            ("decel", self.decel),
+            ("air_accel", self.air_accel),
+            ("jump", self.jump),
+            ("jump_time", self.jump_time),
+            ("max_fall", self.max_fall),
+        ];
+        for (name, v) in positive {
+            if !(v.is_finite() && v > 0.0 && v <= 1000.0) {
+                return Err(format!("{name} {v} — нужно больше 0 и не больше 1000"));
+            }
+        }
+        if !(self.fall.is_finite() && (1.0..=10.0).contains(&self.fall)) {
+            return Err(format!("fall {} — нужно от 1 до 10", self.fall));
+        }
+        for (name, v) in [("coyote", self.coyote), ("buffer", self.buffer)] {
+            if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+                return Err(format!("{name} {v} — нужно от 0 до 1 секунды"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Качание: на `angle` градусов в обе стороны, полный взмах за `period` секунд.
@@ -284,6 +389,8 @@ impl NodeDesc {
             bob: None,
             pictures: Vec::new(),
             morphs: Vec::new(),
+            solids: Vec::new(),
+            player: None,
         }
     }
 
@@ -372,7 +479,24 @@ impl NodeDesc {
             m.check()
                 .map_err(|e| SceneError::new(format!("{here}, фигура Motif {}: {e}", j + 1)))?;
         }
+        for (j, solid) in self.solids.iter().enumerate() {
+            check_point("at", solid.at)
+                .and_then(|()| check_size("ширина size", solid.size.0))
+                .and_then(|()| check_size("высота size", solid.size.1))
+                .map_err(|m| SceneError::new(format!("{here}, твёрдое {}: {m}", j + 1)))?;
+        }
+        if let Some(p) = &self.player {
+            p.check()
+                .map_err(|m| SceneError::new(format!("{here}, player: {m}")))?;
+        }
         for (j, child) in self.children.iter().enumerate() {
+            if child.player.is_some() {
+                return Err(SceneError::new(format!(
+                    "{here} → предмет {}: player можно только у предмета верхнего уровня \
+                     (прямо в nodes), а не внутри другого",
+                    j + 1
+                )));
+            }
             child.check(&format!("{here} → предмет {}", j + 1))?;
         }
         Ok(())
@@ -385,6 +509,7 @@ impl NodeDesc {
 #[serde(deny_unknown_fields)]
 pub enum ShapeDesc {
     /// Прямоугольник с серединой в `at`, размером `size`, скруглением углов `corner`.
+    /// `solid: true` — твёрдый: персонаж на него встаёт и сквозь него не проходит (6.1).
     Rect {
         at: P,
         size: P,
@@ -395,6 +520,8 @@ pub enum ShapeDesc {
         color: Hex,
         #[serde(default)]
         stroke: Option<f64>,
+        #[serde(default)]
+        solid: bool,
     },
     /// Круг с центром `at` и радиусом `r`.
     Circle {
@@ -571,6 +698,19 @@ pub struct Scene {
     pub shapes: usize,
     /// Сколько сущностей в мире сцены (предметы, фигуры, источники, объекты).
     pub entities: usize,
+    /// Персонаж игрока, если он есть в сцене (6.1): за ним идёт камера.
+    pub player: Option<PlayerView>,
+}
+
+/// Что видно о персонаже игрока снаружи мира: для камеры и панели.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlayerView {
+    /// Середина прямоугольника столкновений.
+    pub at: [f32; 2],
+    pub vel: [f32; 2],
+    pub on_ground: bool,
+    /// Твёрдых прямоугольников в сцене.
+    pub solids: usize,
 }
 
 /// Готовые формы фигур: одна форма нарезается на треугольники один раз за работу
@@ -904,6 +1044,12 @@ impl SceneFile {
         }
         for (i, node) in self.nodes.iter().enumerate() {
             node.check(&format!("предмет {}", i + 1))?;
+        }
+        let players = self.nodes.iter().filter(|n| n.player.is_some()).count();
+        if players > 1 {
+            return Err(SceneError::new(format!(
+                "player задан у {players} предметов, а персонаж игрока в сцене один"
+            )));
         }
         Ok(())
     }
@@ -1442,6 +1588,8 @@ use reyvec_svg::SvgDrawing;
 mod world;
 pub use loader::{LoadJob, LoadResult, Loaded, Loader};
 pub use logic::{STEP, SceneLogic};
+/// Игровые системы (этап 6): ввод и контроллер персонажа.
+pub use reyvec_game as game;
 pub use world::{
     GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, SvgPicture,
     VectorShape,

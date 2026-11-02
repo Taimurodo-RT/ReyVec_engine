@@ -19,6 +19,7 @@ reyvec-motif = { path = "crates/reyvec-motif" }
 reyvec-text = { path = "crates/reyvec-text" }
 reyvec-sdf = { path = "crates/reyvec-sdf" }
 reyvec-scene = { path = "crates/reyvec-scene" }
+reyvec-game = { path = "crates/reyvec-game" }
 ash = "0.38"
 ash-window = "0.13"
 notify = "8"
