@@ -72,7 +72,7 @@ impl InputShared {
         if down {
             let was = self.held.fetch_or(bit, Ordering::AcqRel);
             if was & bit == 0 {
-                let ns = self.epoch.elapsed().as_nanos() as u64;
+                let ns = (self.epoch.elapsed().as_nanos() as u64).max(1);
                 self.last_press_ns.store(ns, Ordering::Release);
                 self.presses[action as usize].fetch_add(1, Ordering::AcqRel);
             }
@@ -89,6 +89,11 @@ impl InputShared {
     fn now_ns(&self) -> u64 {
         self.epoch.elapsed().as_nanos() as u64
     }
+
+    /// Сколько прошло с нажатия, отмеченного в [`InputFrame::stamp`], мс.
+    pub fn age_ms(&self, stamp: u64) -> f64 {
+        self.now_ns().saturating_sub(stamp) as f64 / 1e6
+    }
 }
 
 /// Ввод одного шага логики.
@@ -96,6 +101,9 @@ impl InputShared {
 pub struct InputFrame {
     held: u32,
     pressed: u32,
+    /// Когда было последнее нажатие, взятое в этот шаг (0 — нажатий не было): по нему
+    /// кадр узнаёт, сколько прошло от нажатия до ответа на экране.
+    stamp: u64,
 }
 
 impl InputFrame {
@@ -105,6 +113,7 @@ impl InputFrame {
         Self {
             held: bits(held) | bits(pressed),
             pressed: bits(pressed),
+            stamp: 0,
         }
     }
 
@@ -116,6 +125,11 @@ impl InputFrame {
     /// Действие нажато с прошлого шага.
     pub fn pressed(&self, action: Action) -> bool {
         self.pressed & action.bit() != 0
+    }
+
+    /// Когда было нажатие, взятое в этот шаг (0 — не было), см. [`InputShared::age_ms`].
+    pub fn stamp(&self) -> u64 {
+        self.stamp
     }
 
     /// Направление по горизонтали: -1, 0 или 1.
@@ -145,8 +159,10 @@ impl InputReader {
                 pressed |= a.bit();
             }
         }
+        let mut stamp = 0;
         if pressed != 0 {
             let at = shared.last_press_ns.load(Ordering::Acquire);
+            stamp = at;
             let ms = shared.now_ns().saturating_sub(at) as f64 / 1e6;
             self.samples += 1;
             self.latency_ms = if self.samples == 1 {
@@ -158,6 +174,7 @@ impl InputReader {
         InputFrame {
             held: shared.held.load(Ordering::Acquire) | pressed,
             pressed,
+            stamp,
         }
     }
 

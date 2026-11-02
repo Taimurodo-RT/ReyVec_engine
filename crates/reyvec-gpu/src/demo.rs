@@ -437,6 +437,21 @@ pub(crate) struct Demo {
     follow: bool,
     /// Время прошлого кадра, когда камера шла за персонажем.
     follow_time: Option<f32>,
+    /// Последнее нажатие, ответ на которое уже был в кадре, и сколько в среднем от
+    /// нажатия до такого кадра, мс (6.3).
+    seen_press: u64,
+    press_to_frame_ms: Option<f64>,
+}
+
+/// Персонаж игрока для панели (6.1, 6.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PlayerStats {
+    pub view: reyvec_scene::PlayerView,
+    /// Сколько нажатие в среднем ждёт шага логики, мс.
+    pub input_ms: Option<f64>,
+    /// Сколько от нажатия до кадра, в котором уже виден ответ (до отправки кадра
+    /// видеокарте; ещё до одного кадра добавляет очередь показа с VSync), мс.
+    pub frame_ms: Option<f64>,
 }
 
 /// Рамка камеры за персонажем (в высотах экрана от середины, экран от -1 до 1): по
@@ -562,6 +577,8 @@ impl Demo {
             loading: crate::demo_load::DemoLoading::default(),
             follow: true,
             follow_time: None,
+            seen_press: 0,
+            press_to_frame_ms: None,
             field_downscale: field_downscale_for(ctx.adapter.kind),
             light: vk::Pipeline::null(),
             light_buffers,
@@ -816,10 +833,13 @@ impl Demo {
         self.follow_time = None;
     }
 
-    /// Персонаж игрока сцены из файла и сколько нажатие ждёт шага логики, мс.
-    pub fn player_stats(&self) -> Option<(reyvec_scene::PlayerView, Option<f64>)> {
-        let p = self.file_scene.player?;
-        Some((p, self.file_logic.as_ref().and_then(|l| l.input_ms())))
+    /// Персонаж игрока сцены из файла и задержки ввода.
+    pub fn player_stats(&self) -> Option<PlayerStats> {
+        Some(PlayerStats {
+            view: self.file_scene.player?,
+            input_ms: self.file_logic.as_ref().and_then(|l| l.input_ms()),
+            frame_ms: self.press_to_frame_ms,
+        })
     }
 
     /// Камера за персонажем: пока он в рамке посередине экрана, камера стоит; вышел —
@@ -1340,6 +1360,16 @@ impl Demo {
         if scene == DemoScene::File {
             if let Some(logic) = &self.file_logic {
                 self.file_scene = logic.frame(std::time::Instant::now());
+                // Первый кадр со снимком, где логика уже взяла нажатие: замер задержки.
+                let stamp = self.file_scene.input_stamp;
+                if stamp != 0 && stamp != self.seen_press {
+                    self.seen_press = stamp;
+                    let ms = logic.press_age_ms(stamp);
+                    self.press_to_frame_ms = Some(
+                        self.press_to_frame_ms
+                            .map_or(ms, |old| old * 0.8 + ms * 0.2),
+                    );
+                }
             } else if let Some(world) = self.file_world.as_mut() {
                 world.update_at(f64::from(time));
                 self.file_scene = world.snapshot();

@@ -82,8 +82,9 @@ pub(crate) struct PanelInfo<'a> {
     pub scene_error: Option<String>,
     /// Логика сцены из файла (5.3): шагов сделано и среднее время шага, мс.
     pub logic: Option<(u64, f64)>,
-    /// Персонаж игрока (6.1) и сколько нажатие ждёт шага логики, мс; камера идёт за ним.
-    pub player: Option<(reyvec_scene::PlayerView, Option<f64>)>,
+    /// Персонаж игрока (6.1) и задержки ввода (6.3); камера идёт за ним; геймпад.
+    pub player: Option<reyvec_gpu::PlayerStats>,
+    pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Загрузка в фоне (5.4).
     pub loading: reyvec_gpu::LoadStats,
@@ -300,8 +301,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 "Логика: свой поток, 60 шагов/с, шаг {ms:.3} мс (сделано {steps})"
             )));
         }
-        if let Some((p, input)) = info.player {
-            ui.label(mono(player_text(&p, input, info.follow)));
+        if let Some(p) = info.player {
+            ui.label(mono(player_text(&p.view, info.follow)));
+            ui.label(mono(input_text(&p, info.gamepad)));
         }
         ui.label(mono(loading_text(&info.loading)));
         if let Some(d) = &info.loading.details {
@@ -513,27 +515,39 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
     });
 }
 
-/// Строка «Герой»: где стоит, скорость, сколько нажатие ждёт логику, идёт ли камера.
-fn player_text(p: &reyvec_scene::PlayerView, input_ms: Option<f64>, follow: bool) -> String {
+/// Строка «Герой»: где стоит, скорость, идёт ли камера.
+fn player_text(p: &reyvec_scene::PlayerView, follow: bool) -> String {
     let state = if p.on_ground {
         "на земле"
     } else {
         "в воздухе"
     };
     let speed = p.vel[0].hypot(p.vel[1]);
-    let input = input_ms.map_or_else(
-        || "нажми стрелку или пробел".to_string(),
-        |ms| format!("нажатие ждёт логику {ms:.1} мс"),
-    );
     let camera = if follow {
         "камера за героем"
     } else {
         "камера свободна (R — за героем)"
     };
     format!(
-        "Герой: {state}, x {:.2} y {:.2}, скорость {speed:.2}; {input}; {camera}; твёрдых {}",
+        "Герой: {state}, x {:.2} y {:.2}, скорость {speed:.2}; {camera}; твёрдых {}",
         p.at[0], p.at[1], p.solids
     )
+}
+
+/// Строка «Ввод»: задержки от нажатия и геймпад (6.3).
+fn input_text(p: &reyvec_gpu::PlayerStats, gamepad: Option<&str>) -> String {
+    let delays = match (p.input_ms, p.frame_ms) {
+        (Some(logic), Some(frame)) => {
+            format!("нажатие → логика {logic:.1} мс, → кадр {frame:.1} мс")
+        }
+        (Some(logic), None) => format!("нажатие → логика {logic:.1} мс"),
+        _ => "нажми стрелку или пробел".to_string(),
+    };
+    let pad = gamepad.map_or_else(
+        || "геймпада нет".to_string(),
+        |name| format!("геймпад: {name}"),
+    );
+    format!("Ввод: {delays}; {pad}")
 }
 
 /// Строка «Загрузка» сцены «из файла».
@@ -719,15 +733,17 @@ mod tests {
             scene_file: None,
             scene_error: None,
             logic: Some((600, 0.012)),
-            player: Some((
-                reyvec_scene::PlayerView {
+            player: Some(reyvec_gpu::PlayerStats {
+                view: reyvec_scene::PlayerView {
                     at: [0.5, -0.64],
                     vel: [1.6, 0.0],
                     on_ground: true,
                     solids: 14,
                 },
-                Some(8.3),
-            )),
+                input_ms: Some(8.3),
+                frame_ms: Some(17.5),
+            }),
+            gamepad: Some("Xbox Controller"),
             follow: true,
             loading: reyvec_gpu::LoadStats {
                 background: true,

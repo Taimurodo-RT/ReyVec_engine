@@ -49,6 +49,8 @@ parley = { version = "0.12", default-features = false, features = ["std"] }
 skrifa = "0.44"
 fdsm = "0.8"
 image = { version = "0.25", default-features = false }
+# Геймпады (6.3): Xbox, PlayStation и другие на Windows и Linux.
+gilrs = "0.11"
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 raw-window-handle = "0.6"
 thiserror = "2"

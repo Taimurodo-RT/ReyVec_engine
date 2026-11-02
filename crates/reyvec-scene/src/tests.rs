@@ -949,6 +949,10 @@ fn logic_thread_takes_input() {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(logic.input_ms().is_some());
+    // Снимок помнит, какое нажатие уже взято в шаг: по нему кадр меряет задержку (6.3).
+    let stamp = logic.frame(Instant::now()).input_stamp;
+    assert_ne!(stamp, 0);
+    assert!(logic.press_age_ms(stamp) > 0.0);
     logic.set_action(reyvec_game::Action::Right, false);
 }
 

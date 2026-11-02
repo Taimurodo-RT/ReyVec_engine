@@ -121,6 +121,11 @@ impl SceneLogic {
         }
     }
 
+    /// Сколько прошло с нажатия с отметкой `stamp` ([`Scene::input_stamp`]), мс.
+    pub fn press_age_ms(&self, stamp: u64) -> f64 {
+        self.shared.input.age_ms(stamp)
+    }
+
     /// Сколько шагов логики сделано.
     pub fn steps(&self) -> u64 {
         self.shared.steps.load(Ordering::Relaxed)

@@ -111,6 +111,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         scene_watcher: None,
         scene_file_label: None,
         modifiers: ModifiersState::empty(),
+        gamepads: crate::gamepad::Gamepads::new(),
     };
     event_loop
         .run_app(&mut app)
@@ -166,6 +167,8 @@ struct App {
     scene_file_label: Option<String>,
     /// Зажатые Shift, Ctrl и другие (для Shift+U).
     modifiers: ModifiersState,
+    /// Геймпады (6.3).
+    gamepads: crate::gamepad::Gamepads,
 }
 
 impl App {
@@ -366,6 +369,13 @@ impl App {
             return;
         };
         let _zone = reyvec_gpu::cpu_zone!("кадр");
+        // Геймпад: в игру, только пока открыта сцена с героем.
+        let playing = renderer.scene() == DemoScene::File;
+        self.gamepads.poll(|action, down| {
+            if playing {
+                renderer.game_action(action, down);
+            }
+        });
         if let Some(watcher) = self.scene_watcher.as_mut() {
             match watcher.poll() {
                 Some(Ok(text)) => {
@@ -399,6 +409,7 @@ impl App {
                 scene_error: renderer.scene_error(),
                 logic: renderer.logic_stats(),
                 player: renderer.player_stats(),
+                gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 loading: renderer.load_stats(),
                 cull: renderer.cull_stats(),

@@ -515,8 +515,8 @@ impl WindowRenderer {
         }
     }
 
-    /// Персонаж игрока и сколько нажатие ждёт шага логики, мс.
-    pub fn player_stats(&self) -> Option<(reyvec_scene::PlayerView, Option<f64>)> {
+    /// Персонаж игрока и задержки ввода.
+    pub fn player_stats(&self) -> Option<crate::PlayerStats> {
         self.demo.as_ref().and_then(Demo::player_stats)
     }
 

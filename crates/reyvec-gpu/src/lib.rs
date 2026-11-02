@@ -53,7 +53,7 @@ pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
 pub use bindless::{MAX_TEXTURES, SamplerKind};
 pub use context::{GpuOptions, list_adapters, validation_error_count};
 pub use cull::CullStats;
-pub use demo::{DemoScene, Msaa, UserFiles, VectorCpu};
+pub use demo::{DemoScene, Msaa, PlayerStats, UserFiles, VectorCpu};
 pub use demo_load::{LastLoad, LoadStats, ShapeMemory};
 pub use demo_vector::LIGHT_VECTOR_TOP;
 pub use graph::GraphReport;
