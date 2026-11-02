@@ -261,6 +261,9 @@ pub struct NodeDesc {
 pub struct SolidDesc {
     pub at: P,
     pub size: P,
+    /// Платформа: держит только сверху.
+    #[serde(default)]
+    pub oneway: bool,
 }
 
 /// Настройки персонажа игрока. Всё можно не писать: тогда берётся как в
@@ -286,6 +289,13 @@ pub struct PlayerDesc {
     /// Время койота и запоминание нажатия прыжка, секунды.
     pub coyote: f64,
     pub buffer: f64,
+    /// Рывок: скорость и длительность (секунды; 0 — без рывка).
+    pub dash_speed: f64,
+    pub dash_time: f64,
+    /// Скорость скольжения по стене вниз.
+    pub wall_slide: f64,
+    /// Прыжок от стены: во сколько раз скорости бега отталкивает вбок (0 — нельзя).
+    pub wall_jump: f64,
 }
 
 impl Default for PlayerDesc {
@@ -303,6 +313,10 @@ impl Default for PlayerDesc {
             max_fall: t.max_fall,
             coyote: t.coyote,
             buffer: t.buffer,
+            dash_speed: t.dash_speed,
+            dash_time: t.dash_time,
+            wall_slide: t.wall_slide,
+            wall_jump: t.wall_jump,
         }
     }
 }
@@ -321,6 +335,10 @@ impl PlayerDesc {
             max_fall: self.max_fall,
             coyote: self.coyote,
             buffer: self.buffer,
+            dash_speed: self.dash_speed,
+            dash_time: self.dash_time,
+            wall_slide: self.wall_slide,
+            wall_jump: self.wall_jump,
         }
     }
 
@@ -335,6 +353,8 @@ impl PlayerDesc {
             ("jump", self.jump),
             ("jump_time", self.jump_time),
             ("max_fall", self.max_fall),
+            ("dash_speed", self.dash_speed),
+            ("wall_slide", self.wall_slide),
         ];
         for (name, v) in positive {
             if !(v.is_finite() && v > 0.0 && v <= 1000.0) {
@@ -344,7 +364,14 @@ impl PlayerDesc {
         if !(self.fall.is_finite() && (1.0..=10.0).contains(&self.fall)) {
             return Err(format!("fall {} — нужно от 1 до 10", self.fall));
         }
-        for (name, v) in [("coyote", self.coyote), ("buffer", self.buffer)] {
+        if !(self.wall_jump.is_finite() && (0.0..=10.0).contains(&self.wall_jump)) {
+            return Err(format!("wall_jump {} — нужно от 0 до 10", self.wall_jump));
+        }
+        for (name, v) in [
+            ("coyote", self.coyote),
+            ("buffer", self.buffer),
+            ("dash_time", self.dash_time),
+        ] {
             if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
                 return Err(format!("{name} {v} — нужно от 0 до 1 секунды"));
             }
@@ -510,6 +537,7 @@ impl NodeDesc {
 pub enum ShapeDesc {
     /// Прямоугольник с серединой в `at`, размером `size`, скруглением углов `corner`.
     /// `solid: true` — твёрдый: персонаж на него встаёт и сквозь него не проходит (6.1).
+    /// `oneway: true` — платформа: держит только сверху, снизу и сбоку проходишь (6.2).
     Rect {
         at: P,
         size: P,
@@ -522,6 +550,8 @@ pub enum ShapeDesc {
         stroke: Option<f64>,
         #[serde(default)]
         solid: bool,
+        #[serde(default)]
+        oneway: bool,
     },
     /// Круг с центром `at` и радиусом `r`.
     Circle {

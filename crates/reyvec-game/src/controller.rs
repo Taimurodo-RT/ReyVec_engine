@@ -46,6 +46,13 @@ pub struct Tuning {
     pub coyote: f64,
     /// Сколько помнится нажатие прыжка до приземления.
     pub buffer: f64,
+    /// Скорость и длительность рывка (0 — рывка нет).
+    pub dash_speed: f64,
+    pub dash_time: f64,
+    /// Скорость скольжения по стене вниз, когда прижимаешься к ней.
+    pub wall_slide: f64,
+    /// Прыжок от стены: во сколько раз скорости бега отталкивает вбок (0 — нельзя).
+    pub wall_jump: f64,
 }
 
 impl Default for Tuning {
@@ -62,6 +69,10 @@ impl Default for Tuning {
             max_fall: 4.0,
             coyote: 0.1,
             buffer: 0.12,
+            dash_speed: 4.2,
+            dash_time: 0.16,
+            wall_slide: 0.5,
+            wall_jump: 1.1,
         }
     }
 }
@@ -91,6 +102,42 @@ pub struct Intent {
     pub jump_pressed: bool,
     /// Прыжок зажат.
     pub jump_held: bool,
+    /// Зажато «вниз»: вместе с прыжком — спрыгнуть с платформы вниз.
+    pub down: bool,
+    /// Рывок нажат на этом шаге.
+    pub dash_pressed: bool,
+}
+
+/// Твёрдый прямоугольник уровня.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Collider {
+    pub aabb: Aabb,
+    /// Платформа: держит только сверху, снизу и сбоку сквозь неё проходишь.
+    pub oneway: bool,
+    /// Номер, по которому персонаж узнаёт «свою» опору на следующем шаге.
+    pub id: u64,
+    /// На сколько сдвинулся за этот шаг (движущаяся платформа везёт стоящего на ней).
+    pub moved: [f64; 2],
+}
+
+impl Collider {
+    /// Неподвижная твёрдая стена или пол.
+    pub fn solid(aabb: Aabb) -> Self {
+        Self {
+            aabb,
+            oneway: false,
+            id: 0,
+            moved: [0.0, 0.0],
+        }
+    }
+
+    /// Неподвижная платформа, которая держит только сверху.
+    pub fn oneway(aabb: Aabb) -> Self {
+        Self {
+            oneway: true,
+            ..Self::solid(aabb)
+        }
+    }
 }
 
 /// Состояние персонажа.
@@ -102,8 +149,24 @@ pub struct Body {
     pub on_ground: bool,
     /// Куда смотрит: 1 — вправо, -1 — влево.
     pub facing: f64,
+    /// Прижат к стене в воздухе: -1 — стена слева, 1 — справа, 0 — нет.
+    pub wall: f64,
+    /// Идёт рывок.
+    pub dashing: bool,
     coyote_left: f64,
     buffer_left: f64,
+    /// На чём стоит (номер [`Collider::id`]) и платформа ли это.
+    ground: Option<u64>,
+    on_platform: bool,
+    dash_left: f64,
+    dash_dir: f64,
+    /// Рывок можно сделать (один в воздухе, снова — после касания земли или стены).
+    dash_ready: bool,
+    /// После прыжка от стены управление по горизонтали ненадолго выключено: иначе
+    /// игрок, зажавший кнопку к стене, тут же к ней вернётся.
+    wall_lock: f64,
+    /// Спрыгивает сквозь платформу: платформы не держат, пока не истечёт.
+    drop_left: f64,
 }
 
 /// Что случилось за шаг (для звука, частиц и анимации в следующих задачах).
@@ -115,7 +178,20 @@ pub struct StepEvents {
     pub hit_wall: bool,
     /// Ударился головой.
     pub hit_ceiling: bool,
+    /// Оттолкнулся от стены.
+    pub wall_jumped: bool,
+    /// Начал рывок.
+    pub dashed: bool,
+    /// Спрыгнул сквозь платформу.
+    pub dropped: bool,
 }
+
+/// Насколько близко к стене считается «прижат».
+const WALL_TOUCH: f64 = 0.002;
+/// Сколько после прыжка от стены не слушается управление по горизонтали, секунд.
+const WALL_LOCK: f64 = 0.14;
+/// Сколько спрыгивание не замечает платформ, секунд.
+const DROP_TIME: f64 = 0.2;
 
 impl Body {
     /// Персонаж стоит в `pos` без движения.
@@ -125,8 +201,17 @@ impl Body {
             vel: [0.0, 0.0],
             on_ground: false,
             facing: 1.0,
+            wall: 0.0,
+            dashing: false,
             coyote_left: 0.0,
             buffer_left: 0.0,
+            ground: None,
+            on_platform: false,
+            dash_left: 0.0,
+            dash_dir: 1.0,
+            dash_ready: true,
+            wall_lock: 0.0,
+            drop_left: 0.0,
         }
     }
 
@@ -140,29 +225,81 @@ impl Body {
         &mut self,
         tuning: &Tuning,
         intent: Intent,
-        solids: &[Aabb],
+        solids: &[Collider],
         dt: f64,
     ) -> StepEvents {
         let mut ev = StepEvents::default();
         if dt <= 0.0 {
             return ev;
         }
-        // Бег: скорость тянется к желаемой.
+        let half = tuning.half();
+        // Опора поехала — едем с ней (сначала, чтобы шаг считался уже от нового места).
+        if self.on_ground
+            && let Some(g) = self
+                .ground
+                .and_then(|id| solids.iter().find(|c| c.id == id))
+            && g.moved != [0.0, 0.0]
+        {
+            let others: Vec<Collider> = solids.iter().filter(|c| c.id != g.id).copied().collect();
+            self.pos[0] += sweep(self.bounds(tuning), 0, g.moved[0], &others, false).0;
+            self.pos[1] += g.moved[1];
+        }
+        self.wall_lock -= dt;
+        self.drop_left -= dt;
         let x = intent.x.clamp(-1.0, 1.0);
-        let target = x * tuning.speed;
-        let rate = if !self.on_ground {
-            tuning.air_accel
-        } else if x != 0.0 && target * self.vel[0] >= 0.0 {
-            tuning.accel
-        } else {
-            tuning.decel
-        };
-        self.vel[0] = approach(self.vel[0], target, rate * dt);
-        if x != 0.0 {
-            self.facing = x.signum();
+        // Прижат ли к стене (в воздухе, платформы не в счёт).
+        self.wall = 0.0;
+        if !self.on_ground {
+            for side in [-1.0, 1.0] {
+                if sweep(self.bounds(tuning), 0, side * WALL_TOUCH, solids, false)
+                    .0
+                    .abs()
+                    < WALL_TOUCH * 0.5
+                {
+                    self.wall = side;
+                }
+            }
+        }
+        if self.on_ground || self.wall != 0.0 {
+            self.dash_ready = true;
         }
 
-        // Прыжок: время койота и запомненное нажатие.
+        // Рывок: короткий быстрый бросок по горизонтали без тяжести.
+        if intent.dash_pressed && self.dash_ready && self.dash_left <= 0.0 && tuning.dash_time > 0.0
+        {
+            self.dash_left = tuning.dash_time;
+            self.dash_dir = if x != 0.0 { x.signum() } else { self.facing };
+            self.facing = self.dash_dir;
+            self.dash_ready = self.on_ground;
+            ev.dashed = true;
+        }
+        self.dashing = self.dash_left > 0.0;
+        if self.dashing {
+            self.dash_left -= dt;
+            self.vel = [self.dash_dir * tuning.dash_speed, 0.0];
+            if self.dash_left <= 0.0 {
+                // После рывка — обычная полная скорость, без рывка назад.
+                self.vel[0] = self.dash_dir * tuning.speed;
+            }
+        } else {
+            // Бег: скорость тянется к желаемой.
+            let target = x * tuning.speed;
+            let rate = if !self.on_ground {
+                tuning.air_accel
+            } else if x != 0.0 && target * self.vel[0] >= 0.0 {
+                tuning.accel
+            } else {
+                tuning.decel
+            };
+            if self.wall_lock <= 0.0 {
+                self.vel[0] = approach(self.vel[0], target, rate * dt);
+                if x != 0.0 {
+                    self.facing = x.signum();
+                }
+            }
+        }
+
+        // Прыжок: время койота, запомненное нажатие, от стены, вниз сквозь платформу.
         if self.on_ground {
             self.coyote_left = tuning.coyote;
         } else {
@@ -173,35 +310,64 @@ impl Body {
         } else {
             self.buffer_left -= dt;
         }
-        if self.buffer_left > 0.0 && self.coyote_left > 0.0 {
+        let on_platform = self.on_ground && self.on_platform;
+        if self.buffer_left > 0.0 && intent.down && on_platform {
+            self.drop_left = DROP_TIME;
+            self.buffer_left = 0.0;
+            self.coyote_left = 0.0;
+            self.on_ground = false;
+            ev.dropped = true;
+        } else if self.buffer_left > 0.0 && self.coyote_left > 0.0 {
             self.vel[1] = tuning.jump_speed();
             self.buffer_left = 0.0;
             self.coyote_left = 0.0;
             self.on_ground = false;
+            self.dash_left = 0.0;
             ev.jumped = true;
+        } else if self.buffer_left > 0.0 && self.wall != 0.0 && tuning.wall_jump > 0.0 {
+            self.vel = [
+                -self.wall * tuning.speed * tuning.wall_jump,
+                tuning.jump_speed() * 0.9,
+            ];
+            self.facing = -self.wall;
+            self.wall_lock = WALL_LOCK;
+            self.buffer_left = 0.0;
+            self.dash_left = 0.0;
+            ev.wall_jumped = true;
         }
 
-        // Тяжесть: вверх с зажатой кнопкой слабее, при падении сильнее.
-        let rising = self.vel[1] > 0.0 && intent.jump_held;
-        let g = tuning.gravity() * if rising { 1.0 } else { tuning.fall };
-        self.vel[1] = (self.vel[1] - g * dt).max(-tuning.max_fall);
+        if !self.dashing {
+            // Тяжесть: вверх с зажатой кнопкой слабее, при падении сильнее.
+            let rising = self.vel[1] > 0.0 && intent.jump_held;
+            let g = tuning.gravity() * if rising { 1.0 } else { tuning.fall };
+            self.vel[1] = (self.vel[1] - g * dt).max(-tuning.max_fall);
+            // Прижатый к стене скользит по ней медленно.
+            if self.wall != 0.0 && x == self.wall && self.vel[1] < -tuning.wall_slide {
+                self.vel[1] = -tuning.wall_slide;
+            }
+        }
 
         // Столкновения: сначала вбок, потом по вертикали.
-        let half = tuning.half();
         let dx = self.vel[0] * dt;
-        let moved = sweep(self.bounds(tuning), 0, dx, solids);
+        let (moved, _) = sweep(self.bounds(tuning), 0, dx, solids, false);
         if moved != dx {
             self.vel[0] = 0.0;
             ev.hit_wall = true;
+            self.dash_left = 0.0;
         }
         self.pos[0] += moved;
         let dy = self.vel[1] * dt;
-        let moved = sweep(Aabb::around(self.pos, half), 1, dy, solids);
+        let platforms = self.drop_left <= 0.0;
+        let (moved, by) = sweep(Aabb::around(self.pos, half), 1, dy, solids, platforms);
         let was_on_ground = self.on_ground;
         self.on_ground = false;
+        self.ground = None;
+        self.on_platform = false;
         if moved != dy {
             if dy < 0.0 {
                 self.on_ground = true;
+                self.ground = by.map(|i| solids[i].id);
+                self.on_platform = by.is_some_and(|i| solids[i].oneway);
                 ev.landed = !was_on_ground;
             } else {
                 ev.hit_ceiling = true;
@@ -209,6 +375,7 @@ impl Body {
             self.vel[1] = 0.0;
         }
         self.pos[1] += moved;
+        self.dashing = self.dash_left > 0.0;
         ev
     }
 }
@@ -221,24 +388,48 @@ fn approach(v: f64, target: f64, by: f64) -> f64 {
     }
 }
 
-/// Насколько можно сдвинуть `b` по оси `axis` на `d`, не войдя ни в один из `solids`.
-/// Прямоугольники, в которых `b` уже стоит (например, персонажа поставили внутрь стены),
-/// не держат: из них можно выйти.
-fn sweep(b: Aabb, axis: usize, d: f64, solids: &[Aabb]) -> f64 {
+/// Насколько можно сдвинуть `b` по оси `axis` на `d`, не войдя ни в один из `solids`, и
+/// какой из них остановил. Прямоугольники, в которых `b` уже стоит (например, персонажа
+/// поставили внутрь стены), не держат: из них можно выйти. Платформы держат, только если
+/// `platforms` и движение вниз начинается не ниже их верха.
+fn sweep(
+    b: Aabb,
+    axis: usize,
+    d: f64,
+    solids: &[Collider],
+    platforms: bool,
+) -> (f64, Option<usize>) {
     let other = 1 - axis;
     let mut d = d;
-    for s in solids {
+    let mut by = None;
+    for (i, c) in solids.iter().enumerate() {
+        let s = &c.aabb;
+        if c.oneway && !(platforms && axis == 1 && d < 0.0) {
+            continue;
+        }
         // Мимо по другой оси.
         if s.min[other] >= b.max[other] - EPS || s.max[other] <= b.min[other] + EPS {
             continue;
         }
-        if d > 0.0 && s.min[axis] >= b.max[axis] - EPS {
-            d = d.min((s.min[axis] - b.max[axis]).max(0.0));
-        } else if d < 0.0 && s.max[axis] <= b.min[axis] + EPS {
-            d = d.max((s.max[axis] - b.min[axis]).min(0.0));
+        // Где был край до того, как предмет сдвинулся в этом шаге: едущая навстречу
+        // платформа не должна проскочить сквозь персонажа.
+        let was_min = s.min[axis] - c.moved[axis].min(0.0);
+        let was_max = s.max[axis] - c.moved[axis].max(0.0);
+        if d > 0.0 && was_min >= b.max[axis] - EPS {
+            let limit = s.min[axis] - b.max[axis];
+            if limit < d {
+                d = limit;
+                by = Some(i);
+            }
+        } else if d < 0.0 && was_max <= b.min[axis] + EPS {
+            let limit = s.max[axis] - b.min[axis];
+            if limit > d {
+                d = limit;
+                by = Some(i);
+            }
         }
     }
-    d
+    (d, by)
 }
 
 #[cfg(test)]
@@ -247,14 +438,14 @@ mod tests {
 
     const DT: f64 = 1.0 / 60.0;
 
-    fn floor() -> Vec<Aabb> {
-        vec![Aabb {
+    fn floor() -> Vec<Collider> {
+        vec![Collider::solid(Aabb {
             min: [-10.0, -1.0],
             max: [10.0, 0.0],
-        }]
+        })]
     }
 
-    fn run(body: &mut Body, t: &Tuning, solids: &[Aabb], steps: usize, intent: Intent) {
+    fn run(body: &mut Body, t: &Tuning, solids: &[Collider], steps: usize, intent: Intent) {
         for _ in 0..steps {
             body.step(t, intent, solids, DT);
         }
@@ -330,10 +521,10 @@ mod tests {
     fn coyote_time_allows_late_jump() {
         let t = Tuning::default();
         // Узкий уступ: персонаж сходит с него вправо.
-        let ledge = vec![Aabb {
+        let ledge = vec![Collider::solid(Aabb {
             min: [-1.0, -1.0],
             max: [0.0, 0.0],
-        }];
+        })];
         let mut b = Body::new([-0.2, t.size[1] * 0.5]);
         b.vel[0] = t.speed;
         let right = Intent {
@@ -357,6 +548,7 @@ mod tests {
                 jump_pressed: true,
                 jump_held: true,
                 x: 1.0,
+                ..Intent::default()
             },
             &ledge,
             DT,
@@ -447,10 +639,10 @@ mod tests {
         let t = Tuning::default();
         let mut solids = floor();
         // Стена тоньше, чем путь за один шаг.
-        solids.push(Aabb {
+        solids.push(Collider::solid(Aabb {
             min: [0.5, 0.0],
             max: [0.501, 1.0],
-        });
+        }));
         let mut b = standing(&t);
         b.vel[0] = 0.0;
         let fast = Tuning {
@@ -476,10 +668,10 @@ mod tests {
     fn head_bump_stops_rise() {
         let t = Tuning::default();
         let mut solids = floor();
-        solids.push(Aabb {
+        solids.push(Collider::solid(Aabb {
             min: [-1.0, 0.4],
             max: [1.0, 0.5],
-        });
+        }));
         let mut b = standing(&t);
         b.step(
             &t,
@@ -513,10 +705,10 @@ mod tests {
     fn walks_out_of_wall_it_was_placed_in() {
         let t = Tuning::default();
         let mut solids = floor();
-        solids.push(Aabb {
+        solids.push(Collider::solid(Aabb {
             min: [-0.05, 0.0],
             max: [0.05, 1.0],
-        });
+        }));
         let mut b = standing(&t);
         run(
             &mut b,
@@ -529,5 +721,164 @@ mod tests {
             },
         );
         assert!(b.pos[0] > 0.5);
+    }
+
+    fn jump_now() -> Intent {
+        Intent {
+            jump_pressed: true,
+            jump_held: true,
+            ..Intent::default()
+        }
+    }
+
+    fn held_jump() -> Intent {
+        Intent {
+            jump_held: true,
+            ..Intent::default()
+        }
+    }
+
+    #[test]
+    fn platform_lets_through_from_below_and_holds_from_above() {
+        let t = Tuning::default();
+        let mut solids = floor();
+        // Платформа на высоте 0,35 над полом: снизу персонаж (0,28) пролетает сквозь неё.
+        solids.push(Collider::oneway(Aabb {
+            min: [-1.0, 0.33],
+            max: [1.0, 0.35],
+        }));
+        let mut b = standing(&t);
+        b.step(&t, jump_now(), &solids, DT);
+        let mut hit = false;
+        for _ in 0..90 {
+            hit |= b.step(&t, held_jump(), &solids, DT).hit_ceiling;
+        }
+        assert!(!hit, "головой о платформу биться не должен");
+        assert!(b.on_ground);
+        assert!((b.bounds(&t).min[1] - 0.35).abs() < 1e-9, "{:?}", b.pos);
+        // Вниз + прыжок — спрыгивает сквозь неё на пол.
+        let ev = b.step(
+            &t,
+            Intent {
+                down: true,
+                ..jump_now()
+            },
+            &solids,
+            DT,
+        );
+        assert!(ev.dropped && !ev.jumped);
+        run(&mut b, &t, &solids, 60, Intent::default());
+        assert!(b.on_ground);
+        assert!(b.bounds(&t).min[1].abs() < 1e-9, "{:?}", b.pos);
+        // Вбок сквозь платформу тоже проходишь.
+        assert!(
+            !b.step(
+                &t,
+                Intent {
+                    x: 1.0,
+                    ..Intent::default()
+                },
+                &solids,
+                DT
+            )
+            .hit_wall
+        );
+    }
+
+    #[test]
+    fn moving_platform_carries_the_body() {
+        let t = Tuning::default();
+        let mut lift = Collider {
+            id: 7,
+            ..Collider::solid(Aabb {
+                min: [-0.5, -0.1],
+                max: [0.5, 0.0],
+            })
+        };
+        let mut b = Body::new([0.0, t.size[1] * 0.5 + 0.05]);
+        run(&mut b, &t, &[lift], 30, Intent::default());
+        assert!(b.on_ground);
+        // Платформа едет вправо и вверх 30 шагов по 0,01.
+        for _ in 0..30 {
+            lift.aabb.min[0] += 0.01;
+            lift.aabb.max[0] += 0.01;
+            lift.aabb.min[1] += 0.005;
+            lift.aabb.max[1] += 0.005;
+            lift.moved = [0.01, 0.005];
+            b.step(&t, Intent::default(), &[lift], DT);
+            assert!(b.on_ground);
+        }
+        assert!((b.pos[0] - 0.3).abs() < 1e-9, "{:?}", b.pos);
+        assert!((b.bounds(&t).min[1] - lift.aabb.max[1]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dash_is_fast_short_and_once_in_the_air() {
+        let t = Tuning::default();
+        let mut b = standing(&t);
+        let dash = Intent {
+            dash_pressed: true,
+            x: 1.0,
+            ..Intent::default()
+        };
+        assert!(b.step(&t, dash, &floor(), DT).dashed);
+        assert!(b.dashing);
+        let x0 = b.pos[0];
+        run(&mut b, &t, &floor(), 20, Intent::default());
+        let dist = b.pos[0] - x0;
+        // Рывок проходит примерно dash_speed × dash_time (плюс торможение после).
+        assert!(dist > t.dash_speed * t.dash_time * 0.8, "{dist}");
+        assert!(!b.dashing);
+        // В воздухе — один рывок до касания земли.
+        b.step(&t, jump_now(), &floor(), DT);
+        run(&mut b, &t, &floor(), 5, held_jump());
+        assert!(b.step(&t, dash, &floor(), DT).dashed);
+        run(&mut b, &t, &floor(), 12, Intent::default());
+        assert!(!b.on_ground);
+        assert!(
+            !b.step(&t, dash, &floor(), DT).dashed,
+            "второй рывок в воздухе"
+        );
+        run(&mut b, &t, &floor(), 120, Intent::default());
+        assert!(b.on_ground);
+        assert!(b.step(&t, dash, &floor(), DT).dashed);
+    }
+
+    #[test]
+    fn wall_slide_and_wall_jump() {
+        let t = Tuning::default();
+        let mut solids = floor();
+        solids.push(Collider::solid(Aabb {
+            min: [0.3, 0.0],
+            max: [0.4, 3.0],
+        }));
+        let mut b = Body::new([0.3 - t.size[0] * 0.5, 1.5]);
+        let toward = Intent {
+            x: 1.0,
+            ..Intent::default()
+        };
+        run(&mut b, &t, &solids, 40, toward);
+        assert_eq!(b.wall, 1.0);
+        assert!(
+            b.vel[1] >= -t.wall_slide - 1e-9,
+            "скользит медленно: {:?}",
+            b.vel
+        );
+        let ev = b.step(
+            &t,
+            Intent {
+                x: 1.0,
+                ..jump_now()
+            },
+            &solids,
+            DT,
+        );
+        assert!(ev.wall_jumped);
+        assert!(b.vel[0] < 0.0 && b.vel[1] > 0.0, "{:?}", b.vel);
+        assert_eq!(b.facing, -1.0);
+        // Кнопка к стене ещё зажата, но персонаж отлетает от неё.
+        let x0 = b.pos[0];
+        run(&mut b, &t, &solids, 6, toward);
+        assert!(b.pos[0] < x0 - 0.05, "{} {x0}", b.pos[0]);
     }
 }

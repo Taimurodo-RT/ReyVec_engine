@@ -19,10 +19,18 @@ pub enum Action {
     Up,
     Down,
     Jump,
+    Dash,
 }
 
 impl Action {
-    pub const ALL: [Self; 5] = [Self::Left, Self::Right, Self::Up, Self::Down, Self::Jump];
+    pub const ALL: [Self; 6] = [
+        Self::Left,
+        Self::Right,
+        Self::Up,
+        Self::Down,
+        Self::Jump,
+        Self::Dash,
+    ];
 
     fn bit(self) -> u32 {
         1 << self as u32
