@@ -382,6 +382,7 @@ impl App {
                 shader_error: renderer.shader_error(),
                 scene_file: self.scene_file_label.as_deref(),
                 scene_error: renderer.scene_error(),
+                logic: renderer.logic_stats(),
                 last_snapshot: self.last_snapshot.as_deref(),
                 scene: renderer.scene().title(),
                 msaa: renderer.msaa().title(),

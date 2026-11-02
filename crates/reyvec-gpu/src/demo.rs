@@ -408,6 +408,11 @@ pub(crate) struct Demo {
     file_scene: reyvec_scene::Scene,
     file_shapes: reyvec_scene::ShapeCache,
     scene_error: Option<String>,
+    /// Мир сцены из файла (5.3): в окне он шагает в своём потоке логики, без окна
+    /// (снимки, тесты) — прямо в кадре в заданный момент, чтобы кадр был повторяемым.
+    file_world: Option<reyvec_scene::SceneWorld>,
+    file_logic: Option<reyvec_scene::SceneLogic>,
+    logic_thread: bool,
 }
 
 /// Во сколько раз увеличивает лупа векторной сцены.
@@ -518,6 +523,9 @@ impl Demo {
             file_scene: reyvec_scene::Scene::default(),
             file_shapes: reyvec_scene::ShapeCache::new(),
             scene_error: None,
+            file_world: None,
+            file_logic: None,
+            logic_thread: false,
             field_downscale: field_downscale_for(ctx.adapter.kind),
             light: vk::Pipeline::null(),
             light_buffers,
@@ -638,20 +646,24 @@ impl Demo {
     pub fn set_scene_file(&mut self, text: &str) {
         let _zone = crate::cpu_zone!("файл сцены");
         let started = std::time::Instant::now();
-        let built = reyvec_scene::SceneFile::parse(text)
-            .and_then(|f| f.build(&mut self.vector_demo.library, &mut self.file_shapes));
+        let built = reyvec_scene::SceneFile::parse(text).and_then(|f| {
+            reyvec_scene::SceneWorld::new(&f, &mut self.vector_demo.library, &mut self.file_shapes)
+        });
         match built {
-            Ok(scene) => {
+            Ok(world) => {
                 tracing::info!(
-                    "Сцена из файла: сущностей {}, фигур {}, источников света {}, SDF-объектов {}, разных форм {} ({:.2} мс)",
-                    scene.entities,
-                    scene.shapes,
-                    scene.lights.len(),
-                    scene.objects.len(),
+                    "Сцена из файла: сущностей {}, разных форм {} ({:.2} мс)",
+                    world.entity_count(),
                     self.file_shapes.len(),
                     started.elapsed().as_secs_f64() * 1000.0
                 );
-                self.file_scene = scene;
+                match &self.file_logic {
+                    Some(logic) => logic.replace(world),
+                    None if self.logic_thread => {
+                        self.file_logic = Some(reyvec_scene::SceneLogic::start(world, 0.0));
+                    }
+                    None => self.file_world = Some(world),
+                }
                 self.scene_error = None;
             }
             Err(e) => {
@@ -659,6 +671,21 @@ impl Demo {
                 self.scene_error = Some(e.to_string());
             }
         }
+    }
+
+    /// Сцена из файла шагает в своём потоке логики 60 раз в секунду, а кадр сглаживает
+    /// движение между шагами (для окна). Без этого мир шагает прямо в кадре.
+    pub fn use_logic_thread(&mut self) {
+        self.logic_thread = true;
+        if let Some(world) = self.file_world.take() {
+            self.file_logic = Some(reyvec_scene::SceneLogic::start(world, 0.0));
+            tracing::info!("Логика сцены из файла: свой поток, 60 шагов в секунду");
+        }
+    }
+
+    /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
+    pub fn logic_stats(&self) -> Option<(u64, f64)> {
+        self.file_logic.as_ref().map(|l| (l.steps(), l.step_ms()))
     }
 
     /// Ошибка в последнем сохранении файла сцены (рисуется прошлая сцена).
@@ -1128,6 +1155,14 @@ impl Demo {
         scene: DemoScene,
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
+        if scene == DemoScene::File {
+            if let Some(logic) = &self.file_logic {
+                self.file_scene = logic.frame(std::time::Instant::now());
+            } else if let Some(world) = self.file_world.as_mut() {
+                world.update_at(f64::from(time));
+                self.file_scene = world.snapshot();
+            }
+        }
         let vector = match scene {
             DemoScene::Gpu => {
                 self.vector_items = 0;

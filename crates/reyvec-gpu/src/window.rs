@@ -471,6 +471,11 @@ impl WindowRenderer {
         }
     }
 
+    /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
+    pub fn logic_stats(&self) -> Option<(u64, f64)> {
+        self.demo.as_ref().and_then(Demo::logic_stats)
+    }
+
     /// Ошибка в последнем сохранении файла сцены.
     pub fn scene_error(&self) -> Option<String> {
         self.demo
@@ -996,6 +1001,9 @@ impl WindowRenderer {
                         FRAMES_IN_FLIGHT,
                         &self.files,
                     )?);
+                    if let Some(demo) = self.demo.as_mut() {
+                        demo.use_logic_thread();
+                    }
                     self.ui = Some(UiRenderer::new(
                         &self.ctx,
                         res,
