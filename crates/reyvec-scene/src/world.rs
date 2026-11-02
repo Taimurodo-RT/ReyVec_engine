@@ -193,6 +193,10 @@ struct Solids(Vec<Collider>);
 #[derive(Resource, Default, Clone, Copy)]
 struct GameInput(InputFrame);
 
+/// Последнее нажатие, взятое логикой (для замера задержки, 6.3).
+#[derive(Resource, Default)]
+struct LastPress(u64);
+
 /// Время сцены на прошлом шаге: от него считается, сколько шагать персонажу. Новый мир
 /// начинает с нуля (время сцены с начала).
 #[derive(Resource)]
@@ -242,6 +246,7 @@ impl SceneWorld {
         world.init_resource::<Snapshot>();
         world.init_resource::<Solids>();
         world.init_resource::<GameInput>();
+        world.init_resource::<LastPress>();
         world.insert_resource(LastStep(0.0));
         let mut spawner = Spawner {
             world: &mut world,
@@ -324,6 +329,9 @@ impl SceneWorld {
     /// Ввод игрока для следующих [`SceneWorld::update_at`].
     pub fn set_input(&mut self, input: InputFrame) {
         self.world.resource_mut::<GameInput>().0 = input;
+        if input.stamp() != 0 {
+            self.world.resource_mut::<LastPress>().0 = input.stamp();
+        }
     }
 
     /// Состояние персонажа игрока, если он есть.
@@ -718,6 +726,7 @@ fn collect(
     time: Res<SceneTime>,
     players: Query<&Player>,
     solids: Res<Solids>,
+    press: Res<LastPress>,
     mut snapshot: ResMut<Snapshot>,
 ) {
     let mut drawn: Vec<(Drawn, &GlobalPlacement)> = shapes
@@ -794,6 +803,7 @@ fn collect(
             on_ground: p.body.on_ground,
             solids: solids.0.len(),
         }),
+        input_stamp: press.0,
     };
 }
 
