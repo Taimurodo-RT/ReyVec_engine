@@ -7,6 +7,8 @@ use std::sync::Arc;
 use egui::{Color32, FontData, FontDefinitions, FontFamily, RichText};
 use reyvec_gpu::{DemoScene, FillMode, GpuFrameTimings, GraphReport, Msaa, UiFrame};
 use winit::event::WindowEvent;
+
+use crate::game_ui::{GameUi, GameView};
 use winit::window::Window;
 
 /// Бюджет видеокарты на кадр, мс (`docs/decisions/0003-performance-targets.md`).
@@ -148,6 +150,8 @@ pub(crate) struct Panel {
     gpu_history: VecDeque<f32>,
     /// Что нажали мышкой с прошлого раза.
     actions: Vec<PanelAction>,
+    /// В прошлом кадре был открыт игровой интерфейс с меню (6.10б): мышь — ему.
+    menu: bool,
 }
 
 impl Panel {
@@ -169,6 +173,7 @@ impl Panel {
             visible: true,
             gpu_history: VecDeque::with_capacity(HISTORY),
             actions: Vec::new(),
+            menu: false,
         }
     }
 
@@ -182,7 +187,7 @@ impl Panel {
     /// показанном кадре, и иначе мышь там не двигала бы камеру.
     pub fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         let consumed = self.state.on_window_event(window, event).consumed;
-        consumed && self.visible
+        consumed && (self.visible || self.menu)
     }
 
     /// Что нажали мышкой на панели с прошлого вызова.
@@ -198,16 +203,31 @@ impl Panel {
         self.gpu_history.push_back(ms as f32);
     }
 
-    /// Раскладывает панель и превращает её в треугольники. `None`, если панель спрятана.
-    pub fn frame(&mut self, window: &Window, info: &PanelInfo) -> Option<UiFrame> {
-        if !self.visible {
+    /// Раскладывает панель и игровой интерфейс (`game`, 6.10б) и превращает их в
+    /// треугольники. `None`, если рисовать нечего.
+    pub fn frame(
+        &mut self,
+        window: &Window,
+        info: &PanelInfo,
+        game: Option<(&mut GameUi, &GameView)>,
+    ) -> Option<UiFrame> {
+        self.menu = game.as_ref().is_some_and(|(g, _)| g.menu_open());
+        if !self.visible && game.is_none() {
             return None;
         }
+        let visible = self.visible;
+        let mut game = game;
         let _zone = reyvec_gpu::cpu_zone!("панель");
         let input = self.state.take_egui_input(window);
         let history = &self.gpu_history;
         let actions = &mut self.actions;
         let out = self.ctx.run_ui(input, |ui| {
+            if let Some((g, view)) = game.as_mut() {
+                g.draw(ui.ctx(), view);
+            }
+            if !visible {
+                return;
+            }
             egui::Window::new("Счётчики")
                 .title_bar(false)
                 .resizable(false)
@@ -621,9 +641,9 @@ fn player_text(p: &reyvec_scene::PlayerView, follow: bool) -> String {
         format!(" ({})", p.anim)
     };
     format!(
-        "Герой: {state}{anim}, x {:.2} y {:.2}, скорость {speed:.2}; {camera}; твёрдых {}; \
-         ударов {}, попаданий {} (Ctrl или A — удар)",
-        p.at[0], p.at[1], p.solids, p.swings, p.hits
+        "Герой: {state}{anim}, здоровье {}/{}, x {:.2} y {:.2}, скорость {speed:.2}; {camera}; \
+         твёрдых {}; ударов {}, попаданий {} (клавиши: Esc → Управление)",
+        p.hp, p.max_hp, p.at[0], p.at[1], p.solids, p.swings, p.hits
     )
 }
 
@@ -837,6 +857,7 @@ mod tests {
                     swings: 3,
                     hits: 2,
                     anim: "бежит",
+                    ..Default::default()
                 },
                 input_ms: Some(8.3),
                 frame_ms: Some(17.5),

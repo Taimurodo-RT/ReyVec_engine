@@ -35,6 +35,37 @@ impl Action {
         Self::Attack,
     ];
 
+    /// Название для меню.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Влево",
+            Self::Right => "Вправо",
+            Self::Up => "Вверх",
+            Self::Down => "Вниз",
+            Self::Jump => "Прыжок",
+            Self::Dash => "Рывок",
+            Self::Attack => "Удар",
+        }
+    }
+
+    /// Имя в файле настроек управления.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Left => "влево",
+            Self::Right => "вправо",
+            Self::Up => "вверх",
+            Self::Down => "вниз",
+            Self::Jump => "прыжок",
+            Self::Dash => "рывок",
+            Self::Attack => "удар",
+        }
+    }
+
+    /// Действие по имени из файла настроек.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.key() == name)
+    }
+
     fn bit(self) -> u32 {
         1 << self as u32
     }

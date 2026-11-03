@@ -4,8 +4,9 @@ use reyvec_audio::Sound;
 use reyvec_scene::GameEvent;
 
 /// Звук события, громкость в децибелах и место в сцене (для положения слева направо).
-pub(crate) fn sound_for(event: &GameEvent) -> (Sound, f32, [f32; 2]) {
-    match *event {
+/// У числа урона своего звука нет: его слышно как попадание.
+pub(crate) fn sound_for(event: &GameEvent) -> Option<(Sound, f32, [f32; 2])> {
+    Some(match *event {
         GameEvent::Run { at, .. } => (Sound::Step, -12.0, at),
         GameEvent::Pickup { at } => (Sound::Pickup, -8.0, at),
         GameEvent::Jumped { at } => (Sound::Jump, -9.0, at),
@@ -14,7 +15,10 @@ pub(crate) fn sound_for(event: &GameEvent) -> (Sound, f32, [f32; 2]) {
         GameEvent::Dashed { at, .. } => (Sound::Dash, -8.0, at),
         GameEvent::Swing { at, .. } => (Sound::Swing, -9.0, at),
         GameEvent::Hit { at, .. } => (Sound::Hit, -2.0, at),
-    }
+        GameEvent::Hurt { at, .. } => (Sound::Hurt, -4.0, at),
+        GameEvent::Died { at } => (Sound::Land, 0.0, at),
+        GameEvent::Damage { .. } => return None,
+    })
 }
 
 /// Положение слева направо (-1…1) для точки сцены `x` при камере с серединой
@@ -34,21 +38,25 @@ mod tests {
         let soft = sound_for(&GameEvent::Landed {
             at: [0.0, 0.0],
             speed: 0.5,
-        });
+        })
+        .unwrap();
         let hard = sound_for(&GameEvent::Landed {
             at: [0.0, 0.0],
             speed: 6.0,
-        });
+        })
+        .unwrap();
         assert!(hard.1 > soft.1 && hard.1 <= 0.0);
         let hit = sound_for(&GameEvent::Hit {
             at: [0.0, 0.0],
             dir: 1.0,
-        });
+        })
+        .unwrap();
         assert_eq!(hit.0, Sound::Hit);
         let step = sound_for(&GameEvent::Run {
             at: [0.0, 0.0],
             dir: 1.0,
-        });
+        })
+        .unwrap();
         assert!(hit.1 > step.1, "удар громче шага");
     }
 

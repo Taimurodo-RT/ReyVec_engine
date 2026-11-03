@@ -31,6 +31,8 @@ pub enum Sound {
     Hit,
     /// Подобрал предмет (6.9).
     Pickup,
+    /// Героя ранили (6.10б).
+    Hurt,
 }
 
 /// Что видно о звуке на панели.
@@ -141,6 +143,7 @@ impl Audio {
             Sound::Swing => bank.swing.clone(),
             Sound::Hit => bank.hit.clone(),
             Sound::Pickup => bank.pickup.clone(),
+            Sound::Hurt => bank.hurt.clone(),
         };
         self.next_id += 1;
         let sent = commands.send(Command::Play {

@@ -25,8 +25,8 @@ use reyvec_vector::{Affine, BlendMode, Color, Instance, SceneItem, ShapeId, Shap
 use reyvec_game::anim::AnimInput;
 use reyvec_game::physics::{BodyId, Physics};
 use reyvec_game::{
-    Aabb, Action, Animator, AttackTuning, Body, Bone, Collider, Dummy, Fighter, InputFrame, Intent,
-    Tuning,
+    Aabb, Action, Animator, AttackTuning, Body, Bone, Collider, Dummy, Fighter, Health, Hurt,
+    InputFrame, Intent, Tuning,
 };
 
 use crate::assets::{self, MorphTrack};
@@ -203,6 +203,8 @@ pub struct Player {
     pub hits: u32,
     /// Анимация из костей (6.8).
     pub anim: Animator,
+    /// Здоровье (6.10б).
+    pub health: Health,
 }
 
 /// Предмет со скриптом (6.9): его таблица `me` в скрипте, прямоугольник касания героя
@@ -242,6 +244,8 @@ pub struct Target {
     pub opacity: f32,
     /// Цвет обломков, когда разбит (6.10): цвет самой большой фигуры.
     pub color: Color,
+    /// Урон герою от касания (6.10б).
+    pub contact: u32,
 }
 
 /// Физическое тело предмета (6.10) и его поворот из файла.
@@ -288,6 +292,9 @@ const PIECES: usize = 40;
 /// Сколько лежат обломки и сколько из этого времени гаснут, секунды.
 const PIECE_LIFE: f64 = 3.0;
 const PIECE_FADE: f64 = 0.6;
+/// Насколько шире прямоугольник героя для касания врага и как отбрасывает раненого.
+const CONTACT_REACH: f64 = 0.02;
+const HURT_PUSH: [f64; 2] = [2.2, 2.0];
 /// Номера платформ из физических тел для героя (не пересекаются с номерами сущностей).
 const PLATFORM_IDS: u64 = 1 << 62;
 
@@ -687,6 +694,7 @@ impl Spawner<'_> {
                 fighter: Fighter::default(),
                 hits: 0,
                 anim: Animator::default(),
+                health: Health::new(p.hp),
             });
         }
         if let Some(b) = &n.body {
@@ -742,6 +750,7 @@ impl Spawner<'_> {
                 dummy: Dummy::new(placement.at, [d.size.0, d.size.1], d.hp, d.respawn),
                 opacity: n.opacity,
                 color,
+                contact: d.contact,
             });
             self.debris_pool()?;
         }
@@ -1129,7 +1138,17 @@ fn play(
                             },
                         ));
                         let k = p.attack.knockback;
-                        if t.dummy.hurt(p.attack.damage, [dir * k[0], k[1]]) {
+                        let broken = t.dummy.hurt(p.attack.damage, [dir * k[0], k[1]]);
+                        let top = [b.center()[0] as f32, b.max[1] as f32 + 0.04];
+                        events.list.push_back((
+                            step,
+                            GameEvent::Damage {
+                                at: top,
+                                amount: p.attack.damage,
+                                left: t.dummy.hp,
+                            },
+                        ));
+                        if broken {
                             // Разбит: обломки разлетаются (6.10).
                             phys.breaks.push(Break {
                                 at: t.dummy.body.pos,
@@ -1157,8 +1176,52 @@ fn play(
         if p.body.pos[1] < p.spawn[1] - FALL_OUT {
             p.body = Body::new(p.spawn);
         }
+        // Враги ранят касанием (6.10б). Враг для героя твёрдый, поэтому вплотную они
+        // только касаются: прямоугольник героя чуть шире.
+        p.health.tick(dt);
+        let me = p.body.bounds(&p.tuning).grow(CONTACT_REACH);
+        let touch = targets
+            .iter()
+            .find(|(_, t)| t.contact > 0 && t.dummy.alive() && me.overlaps(&t.dummy.bounds()));
+        if let Some((_, t)) = touch {
+            let amount = t.contact;
+            let from = t.dummy.body.pos[0];
+            let at = [p.body.pos[0] as f32, p.body.pos[1] as f32];
+            match p.health.hurt(amount) {
+                Hurt::Ignored => {}
+                hurt => {
+                    // Отбрасывает от врага и чуть вверх.
+                    let dir = if p.body.pos[0] >= from { 1.0 } else { -1.0 };
+                    p.body.vel = [dir * HURT_PUSH[0], HURT_PUSH[1]];
+                    p.body.on_ground = false;
+                    events.list.push_back((
+                        step,
+                        GameEvent::Hurt {
+                            at,
+                            amount,
+                            dir: dir as f32,
+                        },
+                    ));
+                    combat.shake = 0.03;
+                    combat.shake_time = 0.25;
+                    combat.shake_left = 0.25;
+                    if hurt == Hurt::Died {
+                        events.list.push_back((step, GameEvent::Died { at }));
+                        p.body = Body::new(p.spawn);
+                        p.health.restore();
+                    }
+                }
+            }
+        }
         place.at = p.body.pos;
         place.flip = p.body.facing < 0.0;
+        // Неуязвимый мигает.
+        let inv = p.health.invulnerable;
+        place.opacity = if inv > 0.0 && (inv * 12.0) as i64 % 2 == 0 {
+            0.35
+        } else {
+            1.0
+        };
     }
     // Где герой теперь, после своего шага: в него упираются манекены.
     let heroes_now: Vec<Aabb> = players
@@ -1670,6 +1733,9 @@ fn collect(
             } else {
                 p.anim.clip().label()
             },
+            hp: p.health.hp,
+            max_hp: p.health.max,
+            invulnerable: p.health.invulnerable > 0.0,
         }),
         input_stamp: press.0,
         shake: if combat.shake_time > 0.0 {

@@ -503,6 +503,13 @@ impl WindowRenderer {
         }
     }
 
+    /// Пауза игры (6.10б, открыто меню).
+    pub fn set_game_paused(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_game_paused(on);
+        }
+    }
+
     /// Камера идёт за персонажем игрока.
     pub fn follow(&self) -> bool {
         self.demo.as_ref().is_some_and(Demo::follow)

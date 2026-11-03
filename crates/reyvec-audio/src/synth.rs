@@ -150,6 +150,21 @@ pub fn pickup(rate: f32) -> Vec<f32> {
     })
 }
 
+/// Героя ранили (6.10б): глухой удар и короткая нисходящая «жалоба» квадратной волной.
+pub fn hurt(rate: f32) -> Vec<f32> {
+    let mut noise = Noise::new(71);
+    let mut lp = LowPass { y: 0.0 };
+    let mut phase = 0.0f32;
+    render(0.34, rate, |t| {
+        let freq = 420.0 * (-t * 4.0).exp() + 140.0;
+        phase += freq / rate;
+        let square = if phase.fract() < 0.5 { 1.0 } else { -1.0 };
+        let tone = lp.step(square, 1800.0, rate) * envelope(t, 0.004, 0.12);
+        let thud = noise.next() * envelope(t, 0.001, 0.025);
+        0.45 * tone + 0.35 * thud
+    })
+}
+
 /// Частота ноты MIDI (69 — ля первой октавы, 440 Гц).
 fn note(midi: f32) -> f32 {
     440.0 * 2f32.powf((midi - 69.0) / 12.0)
@@ -206,6 +221,7 @@ pub struct Bank {
     pub swing: Arc<[f32]>,
     pub hit: Arc<[f32]>,
     pub pickup: Arc<[f32]>,
+    pub hurt: Arc<[f32]>,
     pub music: Arc<[f32]>,
 }
 
@@ -222,6 +238,7 @@ impl Bank {
             swing: swing(r).into(),
             hit: hit(r).into(),
             pickup: pickup(r).into(),
+            hurt: hurt(r).into(),
             music: music(r).into(),
         }
     }
@@ -246,6 +263,7 @@ mod tests {
             ("взмах", swing(rate)),
             ("попадание", hit(rate)),
             ("подобрал", pickup(rate)),
+            ("ранен", hurt(rate)),
         ];
         for (name, s) in &all {
             let seconds = s.len() as f32 / rate;

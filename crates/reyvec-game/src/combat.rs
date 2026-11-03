@@ -179,6 +179,66 @@ impl Fighter {
     }
 }
 
+/// Здоровье героя (6.10б): удары врагов отнимают его, после удара герой ненадолго
+/// неуязвим (мигает), чтобы враг не снял всё здоровье за одно касание.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Health {
+    pub hp: u32,
+    pub max: u32,
+    /// Сколько ещё неуязвим, секунды.
+    pub invulnerable: f64,
+}
+
+/// Сколько герой неуязвим после удара, секунды.
+pub const INVULNERABLE_TIME: f64 = 1.0;
+
+/// Что случилось от удара по герою.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hurt {
+    /// Неуязвим: удар не прошёл.
+    Ignored,
+    /// Ранен, здоровье ещё есть.
+    Wounded,
+    /// Здоровье кончилось.
+    Died,
+}
+
+impl Health {
+    pub fn new(max: u32) -> Self {
+        let max = max.max(1);
+        Self {
+            hp: max,
+            max,
+            invulnerable: 0.0,
+        }
+    }
+
+    /// Удар на `damage`.
+    pub fn hurt(&mut self, damage: u32) -> Hurt {
+        if self.invulnerable > 0.0 || damage == 0 {
+            return Hurt::Ignored;
+        }
+        self.hp = self.hp.saturating_sub(damage);
+        self.invulnerable = INVULNERABLE_TIME;
+        if self.hp == 0 {
+            Hurt::Died
+        } else {
+            Hurt::Wounded
+        }
+    }
+
+    /// Время неуязвимости идёт.
+    pub fn tick(&mut self, dt: f64) {
+        self.invulnerable = (self.invulnerable - dt).max(0.0);
+    }
+
+    /// Снова полное здоровье (герой появился заново).
+    pub fn restore(&mut self) {
+        self.hp = self.max;
+        self.invulnerable = INVULNERABLE_TIME;
+    }
+}
+
 /// Манекен: тело без управления со здоровьем.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Dummy {
@@ -474,5 +534,17 @@ mod tests {
             hero.pos[0]
         );
         assert!(!hero.bounds(&t).overlaps(&d.bounds()));
+    }
+
+    #[test]
+    fn health_ignores_hits_while_invulnerable_and_dies_at_zero() {
+        let mut h = Health::new(2);
+        assert_eq!(h.hurt(1), Hurt::Wounded);
+        assert_eq!(h.hurt(1), Hurt::Ignored, "сразу после удара неуязвим");
+        h.tick(INVULNERABLE_TIME + 0.01);
+        assert_eq!(h.hurt(5), Hurt::Died);
+        assert_eq!(h.hp, 0);
+        h.restore();
+        assert_eq!(h.hp, 2);
     }
 }
