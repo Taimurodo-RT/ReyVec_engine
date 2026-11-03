@@ -18,7 +18,7 @@ struct Particle
     float4 color;    // линейный цвет, может быть ярче 1 (искры светятся), альфа
     float drag;      // торможение о воздух, доля скорости за секунду
     float bounce;    // отскок: доля скорости поперёк поверхности (0 — прилипает)
-    uint flags;      // PARTICLE_COLLIDE, PARTICLE_SHRINK
+    uint flags;      // PARTICLE_COLLIDE, PARTICLE_SHRINK, PARTICLE_GLOW
     uint pad;
 };
 
@@ -35,6 +35,9 @@ struct Solid
 
 static const uint PARTICLE_COLLIDE = 1;
 static const uint PARTICLE_SHRINK = 2;
+// Светится сама (искры): рисуется не в кадр сцены, который потом умножается на свет
+// уровня, а поверх готового освещённого кадра при выводе.
+static const uint PARTICLE_GLOW = 4;
 
 struct Push
 {
@@ -53,6 +56,7 @@ struct Push
     float2 center;
     float aspect;
     float zoom;
+    uint glow_pass;      // 1 — рисуются только светящиеся, при выводе; 0 — остальные
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -176,7 +180,8 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
 {
     Particle p = pc.particles[(pc.start + instance) % pc.capacity];
     VertexOut o;
-    if (p.life <= 0.0)
+    bool glow = (p.flags & PARTICLE_GLOW) != 0;
+    if (p.life <= 0.0 || glow != (pc.glow_pass != 0))
     {
         o.position = float4(2.0, 2.0, 0.0, 1.0);
         o.local = float2(0.0, 0.0);
@@ -203,5 +208,10 @@ float4 fs_main(VertexOut input) : SV_Target
     // Без discard: в SPIR-V 1.6 он требует shaderDemoteToHelperInvocation, а при
     // смешивании прозрачный угол квадрата и так ничего не меняет.
     float a = input.color.a * saturate((1.0 - r) * 3.0);
-    return float4(input.color.rgb, a);
+    float3 c = input.color.rgb;
+    // При выводе кадр уже сведён к экрану: яркость выше белого сводится к белому,
+    // оттенок сохраняется (искра 3 : 0,9 : 0,15 остаётся оранжевой).
+    if (pc.glow_pass != 0)
+        c /= max(1.0, max(c.r, max(c.g, c.b)));
+    return float4(c, a);
 }

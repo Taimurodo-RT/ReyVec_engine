@@ -41,6 +41,10 @@ pub const GRAVITY: f32 = 8.0;
 pub const PARTICLE_COLLIDE: u32 = 1;
 /// К концу жизни уменьшается.
 pub const PARTICLE_SHRINK: u32 = 2;
+/// Светится сама: не освещается уровнем, рисуется поверх освещённого кадра.
+pub const PARTICLE_GLOW: u32 = 4;
+/// Размер постоянных шейдера частиц (как `struct Push` в шейдере).
+pub(crate) const PUSH_SIZE: usize = 76;
 
 /// Частица: где, куда летит, сколько живёт и как выглядит.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -353,8 +357,15 @@ impl ParticleSystem {
 }
 
 /// Постоянные шейдера частиц (как `struct Push` в `particles.slang`).
-pub(crate) fn push(f: &ParticleFrame, center: [f32; 2], aspect: f32, zoom: f32) -> [u8; 72] {
-    let mut b = [0u8; 72];
+pub(crate) fn push(
+    f: &ParticleFrame,
+    center: [f32; 2],
+    aspect: f32,
+    zoom: f32,
+    glow_pass: bool,
+) -> [u8; PUSH_SIZE] {
+    let mut b = [0u8; PUSH_SIZE];
+    b[72..76].copy_from_slice(&u32::from(glow_pass).to_ne_bytes());
     b[0..8].copy_from_slice(&f.ring.to_ne_bytes());
     b[8..16].copy_from_slice(&f.emitted.to_ne_bytes());
     b[16..24].copy_from_slice(&f.solids.to_ne_bytes());
@@ -386,7 +397,7 @@ pub(crate) unsafe fn record_update(
     cmd: vk::CommandBuffer,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    push: &[u8; 72],
+    push: &[u8; PUSH_SIZE],
     count: u32,
 ) {
     // До: прошлое рисование (или прошлый шаг расчёта) с кольцом закончило.
@@ -533,7 +544,7 @@ pub(crate) fn burst(event: &reyvec_scene::GameEvent, seed: u64) -> Vec<Particle>
                     },
                     drag: 2.0,
                     bounce: 0.45,
-                    flags: PARTICLE_COLLIDE | PARTICLE_SHRINK,
+                    flags: PARTICLE_COLLIDE | PARTICLE_SHRINK | PARTICLE_GLOW,
                 });
             }
         }

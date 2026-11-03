@@ -384,6 +384,8 @@ pub(crate) struct Demo {
     particles: crate::particles::ParticleSystem,
     particle_update: vk::Pipeline,
     particle_draw: vk::Pipeline,
+    /// Светящиеся частицы (искры) поверх освещённого кадра, в проходе «вывод».
+    particle_glow: vk::Pipeline,
     particle_steps: Vec<crate::particles::ParticleFrame>,
     /// Новые частицы по шагам логики, пока мир шагает по сценарию без окна.
     particle_queue: Vec<(f64, f32, Vec<crate::particles::Particle>)>,
@@ -618,6 +620,7 @@ impl Demo {
             particles,
             particle_update: vk::Pipeline::null(),
             particle_draw: vk::Pipeline::null(),
+            particle_glow: vk::Pipeline::null(),
             particle_steps: Vec::new(),
             particle_queue: Vec::new(),
             seen_event_step: 0,
@@ -1319,9 +1322,21 @@ impl Demo {
             return Ok(());
         }
         let present = build(ctx, res, shaders, "present", format, Msaa::Off, None)?;
+        let glow = match build(ctx, res, shaders, "particles", format, Msaa::Off, None) {
+            Ok(p) => p,
+            Err(e) => {
+                // SAFETY: конвейер только что создан и нигде не используется.
+                unsafe { ctx.device.destroy_pipeline(present, None) };
+                return Err(e);
+            }
+        };
         // SAFETY: условие функции; null допустим.
-        unsafe { ctx.device.destroy_pipeline(self.present, None) };
+        unsafe {
+            ctx.device.destroy_pipeline(self.present, None);
+            ctx.device.destroy_pipeline(self.particle_glow, None);
+        }
         self.present = present;
+        self.particle_glow = glow;
         self.format = format;
         Ok(())
     }
@@ -1345,12 +1360,22 @@ impl Demo {
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
-                "particles" => (
-                    &mut self.particle_draw,
-                    self.scene_format,
-                    self.msaa,
-                    stencil,
-                ),
+                "particles" => {
+                    match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
+                        Ok(new) => {
+                            let old = std::mem::replace(&mut self.particle_glow, new);
+                            // SAFETY: видеокарта простаивает (условие функции).
+                            unsafe { ctx.device.destroy_pipeline(old, None) };
+                        }
+                        Err(e) => shaders.set_error(name, e.to_string()),
+                    }
+                    (
+                        &mut self.particle_draw,
+                        self.scene_format,
+                        self.msaa,
+                        stencil,
+                    )
+                }
                 "light" => (&mut self.light, LIGHT_FORMAT, Msaa::Off, None),
                 "sdf_object" => {
                     match build_object_mask(ctx, res, shaders) {
@@ -1841,20 +1866,23 @@ impl Demo {
         // в нём поверх фигур.
         let center = [self.camera.center.x as f32, self.camera.center.y as f32];
         let zoom = self.camera.zoom as f32;
-        let particle_draw = self
-            .particle_steps
-            .last()
-            .filter(|f| f.span.count > 0)
-            .map(|f| {
-                (
-                    crate::particles::push(f, center, frame.aspect, zoom),
-                    f.span.count,
-                )
-            });
+        let particle_draw = |glow: bool| {
+            self.particle_steps
+                .last()
+                .filter(|f| f.span.count > 0)
+                .map(|f| {
+                    (
+                        crate::particles::push(f, center, frame.aspect, zoom, glow),
+                        f.span.count,
+                    )
+                })
+        };
+        let particle_glow = particle_draw(true);
+        let particle_draw = particle_draw(false);
         if self.particle_steps.iter().any(|f| f.span.count > 0) {
             graph.add_pass("частицы", &[], move |p| {
                 for f in &self.particle_steps {
-                    let push = crate::particles::push(f, center, frame.aspect, zoom);
+                    let push = crate::particles::push(f, center, frame.aspect, zoom, false);
                     // SAFETY: проход вне рисования; кольцо и буфер загрузки кадра живы,
                     // пока видеокарта выполняет кадр.
                     unsafe {
@@ -2023,6 +2051,12 @@ impl Demo {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.present);
                 d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                 d.cmd_draw(cmd, 3, 1, 0, 0);
+                // Искры светятся сами: поверх освещённого кадра, уровень их не затемняет.
+                if let Some((push, count)) = particle_glow {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.particle_glow);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 6, count, 0, 0);
+                }
                 d.cmd_end_rendering(cmd);
             }
         });
@@ -2423,6 +2457,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.rc_gather, None);
             ctx.device.destroy_pipeline(self.particle_update, None);
             ctx.device.destroy_pipeline(self.particle_draw, None);
+            ctx.device.destroy_pipeline(self.particle_glow, None);
             for name in FIELD_SHADERS {
                 ctx.device.destroy_pipeline(*self.field.slot(name), None);
             }
@@ -2438,6 +2473,7 @@ impl Demo {
         self.rc_gather = vk::Pipeline::null();
         self.particle_update = vk::Pipeline::null();
         self.particle_draw = vk::Pipeline::null();
+        self.particle_glow = vk::Pipeline::null();
         self.field = FieldPipelines::default();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
