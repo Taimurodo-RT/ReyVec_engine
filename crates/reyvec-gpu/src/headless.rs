@@ -65,6 +65,43 @@ pub struct HeadlessScene {
     pub cascades: bool,
 }
 
+/// Сценарий игры для кадра без окна (проверка в движении, 6.4): где герой сцены «из
+/// файла» встаёт в начале и что игрок нажимает. Мир шагает шагами логики (60 в секунду)
+/// от нуля до момента кадра, как в окне, только без потока.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HeadlessPlay {
+    /// Куда поставить героя в начале (середина его прямоугольника).
+    pub start: Option<[f64; 2]>,
+    /// Нажатия и отпускания по времени.
+    pub inputs: Vec<PlayInput>,
+}
+
+/// Нажатие (`down`) или отпускание действия в момент `at`, секунды.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlayInput {
+    pub at: f64,
+    pub action: reyvec_scene::game::Action,
+    pub down: bool,
+}
+
+impl PlayInput {
+    /// Держать `action` от `from` до `to`.
+    pub fn hold(action: reyvec_scene::game::Action, from: f64, to: f64) -> [Self; 2] {
+        [
+            Self {
+                at: from,
+                action,
+                down: true,
+            },
+            Self {
+                at: to,
+                action,
+                down: false,
+            },
+        ]
+    }
+}
+
 /// Кадр, нарисованный без окна.
 pub struct HeadlessImage {
     /// Сама картинка.
@@ -73,6 +110,25 @@ pub struct HeadlessImage {
     pub adapter: AdapterInfo,
     /// Сколько видеокарта потратила на кадр (нет, если видеокарта не умеет замерять).
     pub gpu_timings: Option<GpuFrameTimings>,
+    /// Камера кадра: середина и приближение.
+    pub camera: ([f64; 2], f64),
+    /// Герой сцены «из файла» в этом кадре.
+    pub player: Option<reyvec_scene::PlayerView>,
+}
+
+impl HeadlessImage {
+    /// Пиксель под точкой сцены `p` (с учётом камеры), если он в кадре.
+    pub fn scene_pixel(&self, p: [f64; 2]) -> Option<[u8; 4]> {
+        let (w, h) = (f64::from(self.image.width), f64::from(self.image.height));
+        let aspect = w / h;
+        let ([cx, cy], zoom) = self.camera;
+        let sx = (p[0] - cx) * zoom;
+        let sy = (p[1] - cy) * zoom;
+        let x = ((sx / aspect + 1.0) * 0.5 * w).floor();
+        let y = ((1.0 - sy) * 0.5 * h).floor();
+        ((0.0..w).contains(&x) && (0.0..h).contains(&y))
+            .then(|| self.image.pixel(x as u32, y as u32))
+    }
 }
 
 impl HeadlessImage {
@@ -154,24 +210,44 @@ pub fn render_headless(
     options: &GpuOptions,
     scene: &HeadlessScene,
 ) -> Result<HeadlessImage, GpuError> {
+    render_headless_play(options, scene, None)
+}
+
+/// Как [`render_headless`], но сцена «из файла» играется по сценарию `play` до момента
+/// кадра: так проверяется, как герой в движении выглядит со светом, тенями и уровнем.
+pub fn render_headless_play(
+    options: &GpuOptions,
+    scene: &HeadlessScene,
+    play: Option<&HeadlessPlay>,
+) -> Result<HeadlessImage, GpuError> {
     let core = Core::new(options.validation, None)?;
     let ctx = GpuContext::new(core, options, None).map_err(|failed| failed.0)?;
-    let (rgba, gpu_timings) = render(&ctx, scene)?;
+    let frame = render(&ctx, scene, play)?;
     Ok(HeadlessImage {
         image: FrameImage {
             width: scene.width,
             height: scene.height,
-            rgba,
+            rgba: frame.rgba,
         },
         adapter: ctx.adapter.clone(),
-        gpu_timings,
+        gpu_timings: frame.timings,
+        camera: frame.camera,
+        player: frame.player,
     })
+}
+
+struct Rendered {
+    rgba: Vec<u8>,
+    timings: Option<GpuFrameTimings>,
+    camera: ([f64; 2], f64),
+    player: Option<reyvec_scene::PlayerView>,
 }
 
 fn render(
     ctx: &GpuContext,
     scene: &HeadlessScene,
-) -> Result<(Vec<u8>, Option<GpuFrameTimings>), GpuError> {
+    play: Option<&HeadlessPlay>,
+) -> Result<Rendered, GpuError> {
     let (width, height) = (scene.width, scene.height);
     let d = &ctx.device;
     let mut r = Resources {
@@ -281,6 +357,9 @@ fn render(
         )?);
         // Шахматка меняет клетки со временем: загружаем ту, что нужна в момент scene.time.
         if let (Some(demo), Some(gpu)) = (r.demo.as_mut(), r.gpu.as_mut()) {
+            if let Some(play) = play {
+                demo.set_play(play.clone());
+            }
             demo.update(ctx, gpu, scene.time)?;
             demo.set_msaa(ctx, gpu, &ShaderLibrary::new(false), scene.msaa)?;
             demo.set_perceptual_edges(scene.perceptual_edges);
@@ -329,6 +408,8 @@ fn render(
             scene.scene,
         );
         let demo = &*demo;
+        let camera = demo.camera_view();
+        let player = demo.file_player();
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();
         let target = graph.import(
@@ -411,7 +492,12 @@ fn render(
             }
             None => None,
         };
-        Ok((pixels, timings))
+        Ok(Rendered {
+            rgba: pixels,
+            timings,
+            camera,
+            player,
+        })
     }
 }
 

@@ -180,6 +180,20 @@ impl Collider {
         b.max[1] - self.slope.abs() * (1.0 - t)
     }
 
+    /// Высота прямой склона над `x`: за нижним краем прямая продолжается вниз, за
+    /// верхним — высота верхнего края. Так видно, был ли персонаж над склоном, когда
+    /// шёл к нему снизу по соседнему склону.
+    fn surface_line(&self, x: f64) -> f64 {
+        let b = &self.aabb;
+        let k = self.steepness();
+        let toward_top = if self.slope > 0.0 {
+            x - b.min[0]
+        } else {
+            b.max[0] - x
+        };
+        (b.max[1] - self.slope.abs() + k * toward_top).min(b.max[1])
+    }
+
     /// Крутизна склона: подъём на единицу пути.
     fn steepness(&self) -> f64 {
         let b = &self.aabb;
@@ -216,6 +230,8 @@ pub struct Body {
     pub hanging: f64,
     /// Верх края, за который держится, и прямоугольник под ним.
     ledge: Option<Aabb>,
+    /// Забирается на край.
+    climb: Option<Climb>,
     /// Сколько ещё нельзя снова схватиться за край (только что отпустил).
     grab_cooldown: f64,
     coyote_left: f64,
@@ -265,6 +281,16 @@ const DROP_TIME: f64 = 0.2;
 const HANG_ABOVE: f64 = 0.02;
 /// Сколько после того, как отпустил край, за него нельзя схватиться, секунд.
 const GRAB_COOLDOWN: f64 = 0.25;
+/// Сколько забирается на край, секунд.
+const CLIMB_TIME: f64 = 0.2;
+
+/// Забирание на край: откуда, куда и сколько уже прошло.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Climb {
+    from: [f64; 2],
+    to: [f64; 2],
+    t: f64,
+}
 
 impl Body {
     /// Персонаж стоит в `pos` без движения.
@@ -278,6 +304,7 @@ impl Body {
             dashing: false,
             hanging: 0.0,
             ledge: None,
+            climb: None,
             grab_cooldown: 0.0,
             coyote_left: 0.0,
             buffer_left: 0.0,
@@ -320,10 +347,35 @@ impl Body {
             self.pos[0] += sweep(self.bounds(tuning), 0, g.moved[0], &others, false).0;
             self.pos[1] += g.moved[1];
         }
+        self.push_out(tuning, solids);
         self.wall_lock -= dt;
         self.drop_left -= dt;
         self.grab_cooldown -= dt;
         let x = intent.x.clamp(-1.0, 1.0);
+
+        // Забирается на край: движение по ходу, управление не слушается.
+        if let Some(mut climb) = self.climb {
+            climb.t += dt;
+            let k = (climb.t / CLIMB_TIME).min(1.0);
+            // Первые 60% времени — вверх, остальное — вбок на край.
+            let up = (k / 0.6).min(1.0);
+            let over = ((k - 0.6) / 0.4).clamp(0.0, 1.0);
+            self.pos = [
+                climb.from[0] + (climb.to[0] - climb.from[0]) * over,
+                climb.from[1] + (climb.to[1] - climb.from[1]) * up,
+            ];
+            self.vel = [0.0, 0.0];
+            if k >= 1.0 {
+                self.climb = None;
+                self.hanging = 0.0;
+                self.on_ground = true;
+                self.coyote_left = tuning.coyote;
+                ev.climbed = true;
+            } else {
+                self.climb = Some(climb);
+            }
+            return ev;
+        }
 
         // Висит на краю: стоит на месте, пока не нажмут.
         if let Some(ledge) = self.ledge {
@@ -344,13 +396,14 @@ impl Body {
                 if ledge.max[0] - ledge.min[0] >= tuning.size[0] {
                     stand = stand.clamp(ledge.min[0] + half[0], ledge.max[0] - half[0]);
                 }
-                self.let_go();
-                self.pos = [stand, ledge.max[1] + half[1]];
+                // Забирается за CLIMB_TIME: сначала вверх вдоль стены, потом на край.
+                self.climb = Some(Climb {
+                    from: self.pos,
+                    to: [stand, ledge.max[1] + half[1]],
+                    t: 0.0,
+                });
+                self.ledge = None;
                 self.vel = [0.0, 0.0];
-                self.on_ground = true;
-                self.coyote_left = tuning.coyote;
-                ev.climbed = true;
-                return ev;
             } else if intent.down || x * side < 0.0 {
                 self.let_go();
                 self.grab_cooldown = GRAB_COOLDOWN;
@@ -545,9 +598,76 @@ impl Body {
         ev
     }
 
+    /// Движущийся предмет въехал в персонажа (подъёмник опустился на голову, стена
+    /// поехала вбок): вытолкнуть его по ходу движения, а если там тесно — вбок из-под
+    /// предмета. Иначе персонаж оказался бы внутри и проходил бы сквозь предмет.
+    fn push_out(&mut self, tuning: &Tuning, solids: &[Collider]) {
+        for (i, c) in solids.iter().enumerate() {
+            if c.moved == [0.0, 0.0] || c.oneway || c.is_slope() {
+                continue;
+            }
+            let b = self.bounds(tuning);
+            if !c.aabb.overlaps(&b) {
+                continue;
+            }
+            let s = &c.aabb;
+            let before = Aabb {
+                min: [s.min[0] - c.moved[0], s.min[1] - c.moved[1]],
+                max: [s.max[0] - c.moved[0], s.max[1] - c.moved[1]],
+            };
+            if before.overlaps(&b) {
+                // Был внутри и раньше (поставили так): выйдет сам, как из стены.
+                continue;
+            }
+            let others: Vec<Collider> = solids
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, c)| *c)
+                .collect();
+            // По какой оси предмет подъехал: по ней и толкаем.
+            let apart_y = before.min[1] >= b.max[1] - EPS || before.max[1] <= b.min[1] + EPS;
+            let axis = if apart_y { 1 } else { 0 };
+            let push = if c.moved[axis] < 0.0 {
+                s.min[axis] - b.max[axis]
+            } else {
+                s.max[axis] - b.min[axis]
+            };
+            let done = sweep(b, axis, push, &others, false).0;
+            if (done - push).abs() < EPS {
+                self.pos[axis] += push;
+                if axis == 1 && push > 0.0 {
+                    self.on_ground = true;
+                    self.ground = Some(c.id);
+                    self.vel[1] = self.vel[1].max(0.0);
+                } else if axis == 1 {
+                    self.vel[1] = self.vel[1].min(0.0);
+                } else {
+                    self.vel[0] = 0.0;
+                }
+                continue;
+            }
+            // Зажало: вбок к ближнему краю предмета, если там свободно.
+            let other = 1 - axis;
+            let mut ways = [s.min[other] - b.max[other], s.max[other] - b.min[other]];
+            ways.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+            for way in ways {
+                if (sweep(b, other, way, &others, false).0 - way).abs() < EPS {
+                    self.pos[other] += way;
+                    break;
+                }
+            }
+        }
+    }
+
     fn let_go(&mut self) {
         self.hanging = 0.0;
         self.ledge = None;
+    }
+
+    /// Висит на краю или забирается на него.
+    pub fn on_ledge(&self) -> bool {
+        self.hanging != 0.0
     }
 
     /// Шагнул на низкую ступеньку: встать на её верх, если над головой есть место
@@ -594,9 +714,10 @@ impl Body {
         foot_before: [f64; 2],
         snap: f64,
     ) {
-        if self.vel[1] > 0.0 {
-            return;
-        }
+        // Взлетающий не встаёт на склон, но и не входит в него, если вбок движется
+        // быстрее, чем вверх (рывок в прыжке вверх по склону).
+        let rising = self.vel[1] > 0.0;
+        let snap = if rising { 0.0 } else { snap };
         let foot = [self.pos[0], self.pos[1] - tuning.half()[1]];
         let mut best: Option<(f64, &Collider)> = None;
         for c in solids.iter().filter(|c| c.is_slope()) {
@@ -606,7 +727,7 @@ impl Body {
             }
             let h = c.surface(foot[0]);
             // Сверху: до шага стоял не ниже склона (с запасом на подъём по нему).
-            let from_above = foot_before[1] >= c.surface(foot_before[0]) - 0.01;
+            let from_above = foot_before[1] >= c.surface_line(foot_before[0]) - 0.01;
             // Край прямоугольника мог стоять на углу соседнего блока выше склона.
             let reach = if snap > 0.0 {
                 (snap + tuning.half()[0]) * c.steepness() + 0.005
@@ -628,6 +749,9 @@ impl Body {
                 }
             }
             self.pos[1] += h - foot[1];
+            if rising {
+                return;
+            }
             self.vel[1] = 0.0;
             self.on_ground = true;
             self.ground = Some(c.id);
@@ -665,11 +789,6 @@ impl Body {
             .map(|c| c.aabb)
             .find(|s| {
                 let top = s.max[1];
-                // Голове есть куда подняться до виса.
-                let head = Aabb {
-                    min: [b.min[0], b.max[1]],
-                    max: [b.max[0], top + HANG_ABOVE + EPS * 10.0],
-                };
                 // Наверху есть место встать.
                 let edge = if side > 0.0 { s.min[0] } else { s.max[0] };
                 let x0 = if side > 0.0 {
@@ -681,7 +800,19 @@ impl Body {
                     min: [x0 + EPS * 10.0, top + EPS * 10.0],
                     max: [x0 + tuning.size[0] - EPS * 10.0, top + tuning.size[1]],
                 };
-                (head.max[1] <= head.min[1] || !blocked(head)) && !blocked(stand)
+                // Висящему самому есть место: край ниже головы опустит его, а снизу
+                // может быть пол (низкий ящик — на него просто встают).
+                // Путь забирания: вверх вдоль стены до роста над краем.
+                let rise = Aabb {
+                    min: [b.min[0], b.max[1]],
+                    max: [b.max[0], top + tuning.size[1]],
+                };
+                let shift = top + HANG_ABOVE - b.max[1];
+                let hang = Aabb {
+                    min: [b.min[0], b.min[1] + shift],
+                    max: [b.max[0], b.max[1] + shift],
+                };
+                !blocked(rise) && !blocked(stand) && !blocked(hang)
             })
     }
 }
@@ -1351,9 +1482,22 @@ mod tests {
         run(&mut b, &t, &solids, 120, hold);
         assert_eq!(b.hanging, 1.0);
         assert!((b.bounds(&t).max[1] - top).abs() < 1e-12);
-        // Вверх — стоит на краю.
-        let ev = b.step(&t, Intent { up: true, ..hold }, &solids, DT);
-        assert!(ev.climbed && b.on_ground && b.hanging == 0.0);
+        // Вверх — забирается (за 0,2 с, без скачков и сквозь блок) и стоит на краю.
+        let mut climbed = false;
+        for _ in 0..30 {
+            let before = b.pos;
+            let ev = b.step(&t, Intent { up: true, ..hold }, &solids, DT);
+            let moved = (b.pos[0] - before[0]).hypot(b.pos[1] - before[1]);
+            assert!(moved < 0.06, "скачок на {moved}");
+            for c in &solids {
+                assert!(!b.bounds(&t).overlaps(&c.aabb), "сквозь блок: {:?}", b.pos);
+            }
+            if ev.climbed {
+                climbed = true;
+                break;
+            }
+        }
+        assert!(climbed && b.on_ground && b.hanging == 0.0);
         run(&mut b, &t, &solids, 30, Intent::default());
         assert!(b.on_ground);
         assert!((b.bounds(&t).min[1] - 0.7).abs() < 1e-9, "{:?}", b.pos);
@@ -1437,6 +1581,92 @@ mod tests {
         );
         for _ in 0..120 {
             assert!(!b.step(&t, toward, &solids, DT).grabbed, "{:?}", b.pos);
+        }
+    }
+
+    #[test]
+    fn lift_coming_down_does_not_swallow_the_body() {
+        let t = Tuning::default();
+        let solids = floor();
+        let mut lift = Collider {
+            id: 9,
+            ..Collider::solid(Aabb {
+                min: [-0.3, 0.5],
+                max: [0.3, 0.56],
+            })
+        };
+        let mut b = standing(&t);
+        for i in 0..50 {
+            lift.aabb.min[1] -= 0.01;
+            lift.aabb.max[1] -= 0.01;
+            lift.moved = [0.0, -0.01];
+            let mut all = solids.clone();
+            all.push(lift);
+            b.step(&t, Intent::default(), &all, DT);
+            assert!(
+                !b.bounds(&t).overlaps(&lift.aabb),
+                "шаг {i}: внутри подъёмника {:?}",
+                b.pos
+            );
+        }
+        // Выдавило вбок, стоит на полу.
+        assert!(
+            b.on_ground && b.bounds(&t).min[1].abs() < 1e-9,
+            "{:?}",
+            b.pos
+        );
+        assert!(b.pos[0].abs() > 0.3, "{:?}", b.pos);
+    }
+
+    #[test]
+    fn wall_moving_sideways_pushes_the_body() {
+        let t = Tuning::default();
+        let solids = floor();
+        let mut wall = Collider {
+            id: 5,
+            ..Collider::solid(Aabb {
+                min: [0.2, 0.0],
+                max: [0.4, 1.0],
+            })
+        };
+        let mut b = standing(&t);
+        for _ in 0..30 {
+            wall.aabb.min[0] -= 0.01;
+            wall.aabb.max[0] -= 0.01;
+            wall.moved = [-0.01, 0.0];
+            let mut all = solids.clone();
+            all.push(wall);
+            b.step(&t, Intent::default(), &all, DT);
+            assert!(!b.bounds(&t).overlaps(&wall.aabb), "{:?}", b.pos);
+        }
+        assert!((b.bounds(&t).max[0] - wall.aabb.min[0]).abs() < 1e-9);
+        assert!(b.on_ground);
+    }
+
+    #[test]
+    fn no_grab_on_a_low_crate_next_to_the_floor() {
+        // Рывок вдоль пола в низкий ящик: висеть на нём значило бы уйти в пол.
+        let t = Tuning::default();
+        let mut solids = floor();
+        solids.push(Collider::solid(Aabb {
+            min: [1.0, 0.0],
+            max: [1.25, 0.25],
+        }));
+        let mut b = Body::new([0.0, t.size[1] * 0.5 + 0.005]);
+        b.step(
+            &t,
+            Intent {
+                x: 1.0,
+                dash_pressed: true,
+                ..Intent::default()
+            },
+            &solids,
+            DT,
+        );
+        for _ in 0..40 {
+            let ev = b.step(&t, walk(1.0), &solids, DT);
+            assert!(!ev.grabbed, "схватился у пола: {:?}", b.pos);
+            assert!(b.bounds(&t).min[1] > -1e-9, "в полу: {:?}", b.pos);
         }
     }
 }

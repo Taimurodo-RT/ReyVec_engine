@@ -703,3 +703,216 @@ fn file_scene_draws_what_the_text_says() {
         "нет тени: у лампы {lit:?}, за квадратом {shadow:?}"
     );
 }
+
+/// Кадр сцены из файла `text` в момент `time`, сыгранной по сценарию `play`. Без
+/// текста берётся встроенный пример со своей папкой (картинки и Motif по путям от неё).
+fn play_frame(
+    text: Option<&str>,
+    time: f32,
+    play: &reyvec_app::HeadlessPlay,
+    msaa: Msaa,
+) -> reyvec_app::HeadlessImage {
+    let scene = HeadlessScene {
+        width: 640,
+        height: 360,
+        time,
+        shader_error: false,
+        scene: DemoScene::File,
+        msaa,
+        perceptual_edges: false,
+        fill: FillMode::Triangles,
+        zoom: false,
+        files: reyvec_app::UserFiles {
+            scene: text.map(Into::into),
+            ..Default::default()
+        },
+        cascades: false,
+    };
+    let options = GpuOptions {
+        validation: true,
+        gpu: None,
+    };
+    let frame = reyvec_app::render_headless_play(&options, &scene, Some(play)).expect("кадр");
+    assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+    frame
+}
+
+/// Кадр в лог строками base64 (между `--- PNG имя ---` и `--- конец PNG ---`), даже
+/// если тест прошёл: так кадры проверки в движении видно глазами в логе CI.
+fn show_frame(name: &str, frame: &reyvec_app::HeadlessImage) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!("reyvec-{name}.png"));
+    save_png(&path, &frame.image).expect("PNG");
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = std::fs::read(&path).expect("PNG");
+    let mut text = String::with_capacity(bytes.len() * 4 / 3 + 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                text.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                text.push('=');
+            }
+        }
+    }
+    // Мимо перехвата вывода тестов: println! видно только у упавших.
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "--- PNG {name} ---");
+    for line in text.as_bytes().chunks(4000) {
+        let _ = err.write_all(line);
+        let _ = writeln!(err);
+    }
+    let _ = writeln!(err, "--- конец PNG ---");
+}
+
+fn brightness(c: [u8; 4]) -> u32 {
+    u32::from(c[0]) + u32::from(c[1]) + u32::from(c[2])
+}
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn hero_casts_shadow_and_is_drawn_where_logic_puts_him() {
+    use reyvec_app::{HeadlessPlay, PlayInput};
+    use reyvec_scene::game::Action;
+    // Синий герой на полу, лампа справа на высоте его середины. Стоит — за ним (слева)
+    // тень; прыгнул — тень ушла вместе с ним, там светло.
+    let text = r##"(
+        format: "reyvec-scene",
+        version: 1,
+        ambient: "#202428",
+        nodes: [
+            (name: "герой", at: (-0.25, -0.5), depth: 3, shadow: true, player: (),
+             shapes: [Rect(at: (0.0, 0.0), size: (0.14, 0.28), color: "#3060e0")]),
+            (name: "пол", solids: [(at: (0.0, -0.88), size: (6.0, 0.2))]),
+        ],
+        lights: [Point(at: (0.9, -0.64), color: "#ffffff", power: 2.0, reach: 3.0, size: 0.02)],
+    )"##;
+    let stand = HeadlessPlay::default();
+    let jump = HeadlessPlay {
+        start: None,
+        inputs: PlayInput::hold(Action::Jump, 1.0, 1.6).to_vec(),
+    };
+    let a = play_frame(Some(text), 1.0, &stand, Msaa::X4);
+    let b = play_frame(Some(text), 1.36, &jump, Msaa::X4);
+    show_frame("play-shadow-stand", &a);
+    show_frame("play-shadow-jump", &b);
+    let pa = a.player.expect("герой");
+    let pb = b.player.expect("герой");
+    eprintln!(
+        "стоит {pa:?}, прыжок {pb:?}, камера {:?} / {:?}",
+        a.camera, b.camera
+    );
+    assert!(pa.on_ground && (pa.at[1] - -0.64).abs() < 1e-3, "{pa:?}");
+    assert!(pb.at[1] > -0.2, "не подпрыгнул: {pb:?}");
+    // Герой нарисован там, где его поставила логика: середина синяя.
+    for (frame, p) in [(&a, pa), (&b, pb)] {
+        let c = frame
+            .scene_pixel([f64::from(p.at[0]), f64::from(p.at[1])])
+            .expect("герой в кадре");
+        assert!(
+            c[2] > c[0] + 40 && c[2] > c[1],
+            "герой не там: {c:?} в {p:?}"
+        );
+    }
+    // Тень: точка за героем (от лампы) темнее, пока он стоит, и светла в прыжке.
+    let behind = [-0.6, -0.64];
+    let lit_side = [0.45, -0.64];
+    let (sa, sb) = (
+        brightness(a.scene_pixel(behind).unwrap()),
+        brightness(b.scene_pixel(behind).unwrap()),
+    );
+    let (la, lb) = (
+        brightness(a.scene_pixel(lit_side).unwrap()),
+        brightness(b.scene_pixel(lit_side).unwrap()),
+    );
+    eprintln!("за героем: стоит {sa}, прыжок {sb}; у лампы: {la}, {lb}");
+    assert!(
+        sa * 3 < sb * 2,
+        "нет тени от героя: стоит {sa}, в прыжке {sb}"
+    );
+    assert!(
+        la.abs_diff(lb) * 10 < la.max(lb),
+        "у лампы свет поменялся: {la} / {lb}"
+    );
+}
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn hero_tours_the_example_level() {
+    use reyvec_app::{HeadlessPlay, PlayInput};
+    use reyvec_scene::game::Action;
+    // Каждый кадр — свой сценарий: где герой встаёт и что нажимают.
+    struct Shot {
+        name: &'static str,
+        time: f32,
+        play: HeadlessPlay,
+    }
+    let at = |x: f64, y: f64, inputs: Vec<PlayInput>| HeadlessPlay {
+        start: Some([x, y]),
+        inputs,
+    };
+    let shots = [
+        // У лампы над столом, бежит вправо.
+        Shot {
+            name: "tour-room-run",
+            time: 1.4,
+            play: at(
+                -0.6,
+                -0.5,
+                PlayInput::hold(Action::Right, 1.0, 2.0).to_vec(),
+            ),
+        },
+        // На подъёмнике в коридоре (везёт вверх-вниз).
+        Shot {
+            name: "tour-lift",
+            time: 3.0,
+            play: at(9.6, 0.6, Vec::new()),
+        },
+        // Висит на краю высокого блока у уступов.
+        Shot {
+            name: "tour-ledge-hang",
+            time: 2.0,
+            play: at(
+                13.75,
+                -0.6,
+                [
+                    PlayInput::hold(Action::Right, 0.5, 3.0),
+                    PlayInput::hold(Action::Jump, 1.0, 1.5),
+                ]
+                .concat(),
+            ),
+        },
+        // Бежит вниз по длинному склону.
+        Shot {
+            name: "tour-slope-run",
+            time: 1.35,
+            play: at(14.2, 0.2, PlayInput::hold(Action::Right, 1.0, 3.0).to_vec()),
+        },
+    ];
+    for shot in &shots {
+        let frame = play_frame(None, shot.time, &shot.play, Msaa::X4);
+        show_frame(shot.name, &frame);
+        let p = frame.player.expect("герой");
+        eprintln!("{}: {p:?}, камера {:?}", shot.name, frame.camera);
+        let c = frame
+            .scene_pixel([f64::from(p.at[0]), f64::from(p.at[1]) - 0.03])
+            .expect("герой в кадре");
+        // Плащ героя синий (#3b5f8a): синий канал больше красного.
+        assert!(c[2] > c[0], "{}: герой не там: {c:?} в {p:?}", shot.name);
+        match shot.name {
+            "tour-lift" => assert!(
+                p.on_ground && p.at[1] > -0.55 && (p.at[0] - 9.6).abs() < 0.2,
+                "не на подъёмнике: {p:?}"
+            ),
+            "tour-ledge-hang" => assert!(p.hanging, "не висит: {p:?}"),
+            "tour-slope-run" => assert!(p.on_ground && p.vel[0] > 1.0, "не бежит: {p:?}"),
+            _ => assert!(p.on_ground, "{p:?}"),
+        }
+    }
+}

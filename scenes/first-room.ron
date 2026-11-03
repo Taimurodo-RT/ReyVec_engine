@@ -313,9 +313,10 @@
                 (name: "доска 1", at: (4.3, -0.15), depth: 1, shadow: true, shapes: [Rect(at: (0.0, 0.0), size: (0.5, 0.05), corner: 0.01, color: "#764c2e", oneway: true)]),
                 (name: "доска 2", at: (5.1, 0.15), depth: 1, shadow: true, shapes: [Rect(at: (0.0, 0.0), size: (0.4, 0.05), corner: 0.01, color: "#764c2e", oneway: true)]),
                 (name: "доска 3", at: (6.0, -0.3), depth: 1, shadow: true, shapes: [Rect(at: (0.0, 0.0), size: (0.6, 0.05), corner: 0.01, color: "#764c2e", oneway: true)]),
-                // Подъёмник (6.2): ездит вверх-вниз и везёт героя.
+                // Подъёмник (6.2): ездит вверх-вниз и везёт героя. Внизу между ним и полом
+                // остаётся место выше героя: под ним можно пробежать, и он не давит.
                 (
-                    name: "подъёмник", at: (7.0, -0.3), depth: 1, shadow: true,
+                    name: "подъёмник", at: (7.0, -0.08), depth: 1, shadow: true,
                     bob: (by: (0.0, 0.35), period: 4.0),
                     shapes: [
                         Rect(at: (0.0, 0.0), size: (0.4, 0.06), corner: 0.01, color: "#5a5f66", solid: true),

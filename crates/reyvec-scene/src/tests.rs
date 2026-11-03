@@ -1178,7 +1178,7 @@ fn hero_of_the_example_crosses_the_ledges() {
     // Висит, пока не нажмёшь вверх.
     let p = hold_until(&mut w, &mut t, &[Right], &[], 60, |_| false);
     assert!(p.hanging);
-    let p = hold_until(&mut w, &mut t, &[Up], &[Up], 1, |_| true);
+    let p = hold_until(&mut w, &mut t, &[Up], &[Up], 30, |p| p.on_ground);
     assert!(
         p.on_ground && !p.hanging && (p.at[1] - on(ledge)).abs() < 1e-3,
         "наверху блока: {p:?}"
@@ -1204,9 +1204,124 @@ fn hero_of_the_example_crosses_the_ledges() {
     assert!(p.on_ground, "на доске: {p:?}");
     let p = hold_until(&mut w, &mut t, &[Left, Jump], &[Jump], 120, |p| p.hanging);
     assert!(p.hanging, "не повис на стене: {p:?}");
-    let p = hold_until(&mut w, &mut t, &[Up], &[Up], 1, |_| true);
+    let p = hold_until(&mut w, &mut t, &[Up], &[Up], 30, |p| p.on_ground);
     assert!(
         p.on_ground && (p.at[1] - on(0.9)).abs() < 1e-3,
         "на стене: {p:?}"
     );
+}
+
+#[test]
+fn lift_never_crushes_the_hero_standing_under_it() {
+    // Подъёмник в коридоре в нижней точке оставляет над полом место выше героя: стоящий
+    // под ним герой стоит, и подъёмник его не касается (наезд на героя всё равно
+    // выталкивает его, это проверяет контроллер).
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let mut t = steps(&mut w, 0, 10);
+    w.set_player_body(reyvec_game::Body::new([9.6, -0.64]));
+    w.set_input(reyvec_game::InputFrame::new(&[], &[]));
+    for _ in 0..300 {
+        t = steps(&mut w, t, 1);
+        let p = w.snapshot().player.unwrap();
+        assert!(
+            p.on_ground && (p.at[0] - 9.6).abs() < 1e-3 && (p.at[1] - -0.64).abs() < 1e-3,
+            "подъёмник задел героя: {p:?}"
+        );
+    }
+}
+
+#[test]
+fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
+    // «Обезьяна» жмёт случайные клавиши по минуте игры в разных местах примера. После
+    // каждого шага: герой не внутри твёрдого, не ниже склона, не телепортировался.
+    use reyvec_game::{Aabb, Action, InputFrame};
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let mut t = steps(&mut w, 0, 10);
+    let mut seed: u64 = 0x5eed_1234_abcd_0001;
+    let mut rand = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let starts = [
+        [0.4, -0.5],
+        [4.0, -0.5],
+        [9.6, 0.3],
+        [11.15, -0.6],
+        [12.8, 0.2],
+        [14.6, 0.5],
+    ];
+    let mut grabs = 0;
+    let mut slopes = 0;
+    for start in starts {
+        w.set_player_body(reyvec_game::Body::new(start));
+        let mut last = w.snapshot().player.unwrap();
+        last.at = [start[0] as f32, start[1] as f32];
+        last.hanging = false;
+        let mut held: Vec<Action> = Vec::new();
+        let mut history: Vec<String> = Vec::new();
+        let mut left = 0;
+        for i in 0..3600 {
+            let mut pressed = Vec::new();
+            if left == 0 {
+                left = 4 + rand(30);
+                held.clear();
+                match rand(3) {
+                    0 => held.push(Action::Left),
+                    1 => held.push(Action::Right),
+                    _ => {}
+                }
+                for a in [Action::Jump, Action::Dash, Action::Down, Action::Up] {
+                    if rand(4) == 0 {
+                        held.push(a);
+                        pressed.push(a);
+                    }
+                }
+            }
+            left -= 1;
+            w.set_input(InputFrame::new(&held, &pressed));
+            t = steps(&mut w, t, 1);
+            let p = w.snapshot().player.unwrap();
+            let (solids, tuning) = w.colliders();
+            let tuning = tuning.unwrap();
+            // Точное место (в снимке оно в f32).
+            let pos = w.player_body().unwrap().pos;
+            let b = Aabb::around(pos, [tuning.size[0] * 0.5, tuning.size[1] * 0.5]);
+            history.push(format!("{i}: {pos:?} {p:?} {held:?}/{pressed:?}"));
+            if history.len() > 8 {
+                history.remove(0);
+            }
+            let place = format!("старт {start:?}, шаг {i}: {p:?}\n{}", history.join("\n"));
+            assert!(p.at[0].is_finite() && p.at[1].is_finite(), "{place}");
+            let jump = (p.at[0] - last.at[0]).hypot(p.at[1] - last.at[1]);
+            assert!(jump < 0.2, "телепорт на {jump}: {place}");
+            grabs += usize::from(p.hanging && !last.hanging);
+            for c in &solids {
+                if c.oneway {
+                    continue;
+                }
+                let s = &c.aabb;
+                if c.slope != 0.0 {
+                    let x = pos[0];
+                    if x > s.min[0] + 1e-6 && x < s.max[0] - 1e-6 && b.min[1] > s.min[1] {
+                        let k = (x - s.min[0]) / (s.max[0] - s.min[0]);
+                        let k = if c.slope > 0.0 { k } else { 1.0 - k };
+                        let surface = s.max[1] - c.slope.abs() * (1.0 - k);
+                        assert!(b.min[1] > surface - 1e-6, "ниже склона {s:?}: {place}");
+                        slopes += usize::from(p.on_ground && (b.min[1] - surface).abs() < 1e-6);
+                    }
+                } else {
+                    assert!(!b.overlaps(s), "внутри твёрдого {s:?}: {place}");
+                }
+            }
+            last = p;
+        }
+    }
+    eprintln!("схватился за край {grabs} раз, шагов на склонах {slopes}");
+    assert!(slopes > 0, "обезьяна ни разу не постояла на склоне");
 }

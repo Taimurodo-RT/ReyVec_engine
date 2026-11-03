@@ -354,6 +354,15 @@ impl SceneWorld {
         }
     }
 
+    /// Твёрдое сцены на последнем шаге и настройки героя (для проверок).
+    #[cfg(test)]
+    pub(crate) fn colliders(&mut self) -> (Vec<Collider>, Option<Tuning>) {
+        let solids = self.world.resource::<Solids>().0.clone();
+        let mut q = self.world.query::<&Player>();
+        let tuning = q.iter(&self.world).next().map(|p| p.tuning);
+        (solids, tuning)
+    }
+
     /// Сколько сущностей в мире.
     pub fn entity_count(&self) -> usize {
         self.entities
@@ -860,7 +869,7 @@ fn collect(
             at: [p.body.pos[0] as f32, p.body.pos[1] as f32],
             vel: [p.body.vel[0] as f32, p.body.vel[1] as f32],
             on_ground: p.body.on_ground,
-            hanging: p.body.hanging != 0.0,
+            hanging: p.body.on_ledge(),
             solids: solids.0.len(),
         }),
         input_stamp: press.0,

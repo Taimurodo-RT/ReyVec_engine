@@ -13,8 +13,8 @@ pub use app::{AppConfig, AppError, RunSummary, run};
 pub use logging::{LogGuard, init_logging};
 pub use reyvec_gpu::{
     AdapterInfo, CLEAR_COLOR, DemoScene, FillMode, FrameImage, GpuOptions, HeadlessImage,
-    HeadlessScene, LIGHT_VECTOR_TOP, Msaa, UserFiles, list_adapters, render_headless,
-    validation_error_count,
+    HeadlessPlay, HeadlessScene, LIGHT_VECTOR_TOP, Msaa, PlayInput, UserFiles, list_adapters,
+    render_headless, render_headless_play, validation_error_count,
 };
 
 /// Название движка.
