@@ -704,9 +704,10 @@ fn file_scene_draws_what_the_text_says() {
     );
 }
 
-/// Кадр сцены из файла `text` в момент `time`, сыгранной по сценарию `play`.
+/// Кадр сцены из файла `text` в момент `time`, сыгранной по сценарию `play`. Без
+/// текста берётся встроенный пример со своей папкой (картинки и Motif по путям от неё).
 fn play_frame(
-    text: &str,
+    text: Option<&str>,
     time: f32,
     play: &reyvec_app::HeadlessPlay,
     msaa: Msaa,
@@ -722,7 +723,7 @@ fn play_frame(
         fill: FillMode::Triangles,
         zoom: false,
         files: reyvec_app::UserFiles {
-            scene: Some(text.into()),
+            scene: text.map(Into::into),
             ..Default::default()
         },
         cascades: false,
@@ -797,8 +798,8 @@ fn hero_casts_shadow_and_is_drawn_where_logic_puts_him() {
         start: None,
         inputs: PlayInput::hold(Action::Jump, 1.0, 1.6).to_vec(),
     };
-    let a = play_frame(text, 1.0, &stand, Msaa::X4);
-    let b = play_frame(text, 1.36, &jump, Msaa::X4);
+    let a = play_frame(Some(text), 1.0, &stand, Msaa::X4);
+    let b = play_frame(Some(text), 1.36, &jump, Msaa::X4);
     show_frame("play-shadow-stand", &a);
     show_frame("play-shadow-jump", &b);
     let pa = a.player.expect("герой");
@@ -846,7 +847,6 @@ fn hero_casts_shadow_and_is_drawn_where_logic_puts_him() {
 fn hero_tours_the_example_level() {
     use reyvec_app::{HeadlessPlay, PlayInput};
     use reyvec_scene::game::Action;
-    let text = include_str!("../../../scenes/first-room.ron");
     // Каждый кадр — свой сценарий: где герой встаёт и что нажимают.
     struct Shot {
         name: &'static str,
@@ -896,7 +896,7 @@ fn hero_tours_the_example_level() {
         },
     ];
     for shot in &shots {
-        let frame = play_frame(text, shot.time, &shot.play, Msaa::X4);
+        let frame = play_frame(None, shot.time, &shot.play, Msaa::X4);
         show_frame(shot.name, &frame);
         let p = frame.player.expect("герой");
         eprintln!("{}: {p:?}, камера {:?}", shot.name, frame.camera);
