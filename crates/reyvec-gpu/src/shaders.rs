@@ -71,6 +71,16 @@ impl ShaderLibrary {
             .unwrap_or_else(|| panic!("шейдер «{name}» не собран: нет файла shaders/{name}.slang"))
     }
 
+    /// SPIR-V вычислительного шейдера `cs_main` из файла `name` (собран при компиляции,
+    /// на лету не перезагружается).
+    pub fn compute(&self, name: &str) -> &'static [u8] {
+        BUILTIN_COMPUTE
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, spv)| *spv)
+            .unwrap_or_else(|| panic!("в shaders/{name}.slang нет [shader(\"compute\")] cs_main"))
+    }
+
     /// Следит ли библиотека за файлами шейдеров.
     pub fn is_watching(&self) -> bool {
         self.hot.is_some()
@@ -214,10 +224,13 @@ mod tests {
         for name in ["triangle", "sprite"] {
             let pair = lib.get(name);
             for spv in [&pair.vs, &pair.fs] {
-                assert!(spv.len() > 20 && spv.len() % 4 == 0, "{name}");
+                assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "{name}");
                 assert_eq!(&spv[..4], &0x0723_0203u32.to_le_bytes(), "{name}");
             }
         }
+        let spv = lib.compute("particles");
+        assert!(spv.len() > 20 && spv.len().is_multiple_of(4));
+        assert_eq!(&spv[..4], &0x0723_0203u32.to_le_bytes());
     }
 
     #[test]

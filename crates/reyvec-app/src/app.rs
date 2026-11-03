@@ -337,6 +337,10 @@ impl App {
                 r.set_dither(on);
                 tracing::info!("Шум против полос: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::Fountain(on) => {
+                r.set_fountain(on);
+                tracing::info!("Фонтан частиц: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
                 r.set_follow(true);
@@ -411,6 +415,7 @@ impl App {
                 player: renderer.player_stats(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
+                particles: renderer.particle_stats(),
                 loading: renderer.load_stats(),
                 cull: renderer.cull_stats(),
                 last_snapshot: self.last_snapshot.as_deref(),
@@ -794,6 +799,20 @@ impl ApplicationHandler for App {
                 .is_some_and(|r| r.scene() == DemoScene::File) =>
             {
                 self.apply(PanelAction::LoadPicture(!self.modifiers.shift_key()));
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyV),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some(on) = self.renderer.as_ref().and_then(|r| r.particle_stats()) {
+                    self.apply(PanelAction::Fountain(!on.fountain));
+                }
             }
             WindowEvent::KeyboardInput {
                 event:

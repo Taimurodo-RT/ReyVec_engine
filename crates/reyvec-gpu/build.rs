@@ -38,6 +38,12 @@ fn main() {
         "/// Шейдеры, собранные при компиляции: имя файла, SPIR-V вершинного и пиксельного шейдера.\n\
          pub(crate) const BUILTIN: &[(&str, &[u8], &[u8])] = &[\n",
     );
+    // Вычислительные шейдеры (6.6): в файле есть точка входа `cs_main` с пометкой
+    // `[shader("compute")]`. Такой файл может держать и пару для рисования.
+    let mut compute = String::from(
+        "/// Вычислительные шейдеры, собранные при компиляции: имя файла и SPIR-V.\n\
+         pub(crate) const BUILTIN_COMPUTE: &[(&str, &[u8])] = &[\n",
+    );
     let mut errors = Vec::new();
     for source in &sources {
         let name = source
@@ -60,8 +66,24 @@ fn main() {
             path_str(&paths[1])
         )
         .expect("запись в строку");
+        let text = std::fs::read_to_string(source).expect("исходник шейдера");
+        if text.contains("[shader(\"compute\")]") {
+            let out = out_dir.join(format!("{name}.cs.spv"));
+            match slangc::compile(&slangc, source, "cs_main", "compute") {
+                Ok(spv) => std::fs::write(&out, spv).expect("запись SPIR-V"),
+                Err(e) => errors.push(format!("{}:cs_main\n{e}", source.display())),
+            }
+            writeln!(
+                compute,
+                "    ({name:?}, include_bytes!({:?})),",
+                path_str(&out)
+            )
+            .expect("запись в строку");
+        }
     }
     generated.push_str("];\n");
+    compute.push_str("];\n");
+    generated.push_str(&compute);
     if !errors.is_empty() {
         panic!("\n\nОшибки в шейдерах:\n\n{}\n", errors.join("\n\n"));
     }

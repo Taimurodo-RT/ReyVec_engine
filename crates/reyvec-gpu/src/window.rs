@@ -515,6 +515,19 @@ impl WindowRenderer {
         }
     }
 
+    /// Частицы сцены «из файла» (6.6); нет в других сценах.
+    pub fn particle_stats(&self) -> Option<crate::ParticleStats> {
+        let demo = self.demo.as_ref()?;
+        (self.scene() == DemoScene::File).then(|| demo.particle_stats())
+    }
+
+    /// Включает фонтан частиц для замера.
+    pub fn set_fountain(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_fountain(on);
+        }
+    }
+
     /// Персонаж игрока и задержки ввода.
     pub fn player_stats(&self) -> Option<crate::PlayerStats> {
         self.demo.as_ref().and_then(Demo::player_stats)

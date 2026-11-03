@@ -74,6 +74,8 @@ pub struct HeadlessPlay {
     pub start: Option<[f64; 2]>,
     /// Нажатия и отпускания по времени.
     pub inputs: Vec<PlayInput>,
+    /// Фонтан частиц для замера (6.6) с начала сценария.
+    pub fountain: bool,
 }
 
 /// Нажатие (`down`) или отпускание действия в момент `at`, секунды.
@@ -114,6 +116,8 @@ pub struct HeadlessImage {
     pub camera: ([f64; 2], f64),
     /// Герой сцены «из файла» в этом кадре.
     pub player: Option<reyvec_scene::PlayerView>,
+    /// Частицы в этом кадре (6.6).
+    pub particles: crate::ParticleStats,
 }
 
 impl HeadlessImage {
@@ -233,6 +237,7 @@ pub fn render_headless_play(
         gpu_timings: frame.timings,
         camera: frame.camera,
         player: frame.player,
+        particles: frame.particles,
     })
 }
 
@@ -241,6 +246,7 @@ struct Rendered {
     timings: Option<GpuFrameTimings>,
     camera: ([f64; 2], f64),
     player: Option<reyvec_scene::PlayerView>,
+    particles: crate::ParticleStats,
 }
 
 fn render(
@@ -410,6 +416,7 @@ fn render(
         let demo = &*demo;
         let camera = demo.camera_view();
         let player = demo.file_player();
+        let particles = demo.particle_stats();
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();
         let target = graph.import(
@@ -497,6 +504,7 @@ fn render(
             timings,
             camera,
             player,
+            particles,
         })
     }
 }

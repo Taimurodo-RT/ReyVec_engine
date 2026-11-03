@@ -27,6 +27,8 @@ pub(crate) enum PanelAction {
     Glow(bool),
     Cascades(bool),
     Dither(bool),
+    /// Фонтан частиц для замера (6.6).
+    Fountain(bool),
     ResetCamera,
     Snapshot,
     /// Проверка загрузки (5.4): новая тяжёлая картина в фоне (`true`) или в кадре.
@@ -86,6 +88,8 @@ pub(crate) struct PanelInfo<'a> {
     pub player: Option<reyvec_gpu::PlayerStats>,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
+    /// Частицы сцены «из файла» (6.6).
+    pub particles: Option<reyvec_gpu::ParticleStats>,
     /// Загрузка в фоне (5.4).
     pub loading: reyvec_gpu::LoadStats,
     /// Свет и SDF-объекты: сколько в сцене и сколько на экране (5.5в).
@@ -305,6 +309,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             ui.label(mono(player_text(&p.view, info.follow)));
             ui.label(mono(input_text(&p, info.gamepad)));
         }
+        if let Some(stats) = info.particles {
+            ui.label(mono(particles_text(&stats)));
+        }
         ui.label(mono(loading_text(&info.loading)));
         if let Some(d) = &info.loading.details {
             ui.label(mono(format!(
@@ -470,6 +477,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::Cascades(cascades));
         }
     }
+    if let Some(stats) = info.particles {
+        let mut fountain = stats.fountain;
+        if ui
+            .checkbox(&mut fountain, "Фонтан частиц для замера (V)")
+            .on_hover_text(
+                "Около 100 000 частиц сразу: время прохода «частицы» в счётчиках \
+                 видеокарты показывает, сколько стоит их расчёт и рисование",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::Fountain(fountain));
+        }
+    }
     let mut dither = info.dither;
     if ui
         .checkbox(&mut dither, "Шум против полос (D)")
@@ -516,6 +536,14 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
 }
 
 /// Строка «Герой»: где стоит, скорость, идёт ли камера.
+fn particles_text(p: &reyvec_gpu::ParticleStats) -> String {
+    let mut text = format!("Частицы: {} в работе", p.live);
+    if p.dropped > 0 {
+        text.push_str(&format!(", не влезло {}", p.dropped));
+    }
+    text
+}
+
 fn player_text(p: &reyvec_scene::PlayerView, follow: bool) -> String {
     let state = if p.striking {
         "бьёт"
@@ -754,6 +782,11 @@ mod tests {
             }),
             gamepad: Some("Xbox Controller"),
             follow: true,
+            particles: Some(reyvec_gpu::ParticleStats {
+                live: 1200,
+                dropped: 0,
+                fountain: false,
+            }),
             loading: reyvec_gpu::LoadStats {
                 background: true,
                 pending: 1,
