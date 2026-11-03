@@ -249,6 +249,10 @@ pub struct NodeDesc {
     /// Невидимые твёрдые прямоугольники (6.1): пол, стены, края уровня.
     #[serde(default)]
     pub solids: Vec<SolidDesc>,
+    /// Уровень из тайлов (6.4): клетки буквами, левый верхний угол сетки — место
+    /// предмета.
+    #[serde(default)]
+    pub tiles: Option<TilesDesc>,
     /// Этот предмет — персонаж игрока (6.1): его двигает управление, `at` — середина
     /// прямоугольника столкновений. Только у предмета верхнего уровня, один на сцену.
     #[serde(default)]
@@ -296,6 +300,8 @@ pub struct PlayerDesc {
     pub wall_slide: f64,
     /// Прыжок от стены: во сколько раз скорости бега отталкивает вбок (0 — нельзя).
     pub wall_jump: f64,
+    /// Можно цепляться за край (6.4).
+    pub ledge: bool,
 }
 
 impl Default for PlayerDesc {
@@ -317,6 +323,7 @@ impl Default for PlayerDesc {
             dash_time: t.dash_time,
             wall_slide: t.wall_slide,
             wall_jump: t.wall_jump,
+            ledge: t.ledge,
         }
     }
 }
@@ -339,6 +346,7 @@ impl PlayerDesc {
             dash_time: self.dash_time,
             wall_slide: self.wall_slide,
             wall_jump: self.wall_jump,
+            ledge: self.ledge,
         }
     }
 
@@ -417,6 +425,7 @@ impl NodeDesc {
             pictures: Vec::new(),
             morphs: Vec::new(),
             solids: Vec::new(),
+            tiles: None,
             player: None,
         }
     }
@@ -511,6 +520,10 @@ impl NodeDesc {
                 .and_then(|()| check_size("ширина size", solid.size.0))
                 .and_then(|()| check_size("высота size", solid.size.1))
                 .map_err(|m| SceneError::new(format!("{here}, твёрдое {}: {m}", j + 1)))?;
+        }
+        if let Some(t) = &self.tiles {
+            t.check()
+                .map_err(|m| SceneError::new(format!("{here}, tiles: {m}")))?;
         }
         if let Some(p) = &self.player {
             p.check()
@@ -742,6 +755,8 @@ pub struct PlayerView {
     pub at: [f32; 2],
     pub vel: [f32; 2],
     pub on_ground: bool,
+    /// Висит на краю (6.4).
+    pub hanging: bool,
     /// Твёрдых прямоугольников в сцене.
     pub solids: usize,
 }
@@ -936,7 +951,13 @@ impl SceneFile {
         // ещё раз и скажет, где ошибка.
         for node in NodeDesc::all(&file) {
             walk(&node, &mut |n| {
-                for shape in &n.shapes {
+                let tiles = n
+                    .tiles
+                    .as_ref()
+                    .and_then(|t| t.build().ok())
+                    .map(|level| level.shapes)
+                    .unwrap_or_default();
+                for shape in n.shapes.iter().chain(&tiles) {
                     let (key, path, stroke) = shape.geometry();
                     if known.contains(&key) || !seen.insert(key.clone()) {
                         continue;
@@ -1618,11 +1639,13 @@ mod logic;
 pub use assets::{MorphDesc, MorphTrack, PictureDesc};
 use reyvec_motif::MorphFile;
 use reyvec_svg::SvgDrawing;
+mod tiles;
 mod world;
 pub use loader::{LoadJob, LoadResult, Loaded, Loader};
 pub use logic::{STEP, SceneLogic};
 /// Игровые системы (этап 6): ввод и контроллер персонажа.
 pub use reyvec_game as game;
+pub use tiles::TilesDesc;
 pub use world::{
     GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, SvgPicture,
     VectorShape,
