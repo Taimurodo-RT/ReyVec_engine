@@ -257,6 +257,131 @@ pub struct NodeDesc {
     /// прямоугольника столкновений. Только у предмета верхнего уровня, один на сцену.
     #[serde(default)]
     pub player: Option<PlayerDesc>,
+    /// Фигуры, видные только в фазе удара героя (6.5): взмах. Только у предмета с
+    /// `player`, в его координатах (смотрит влево — отражаются вместе с ним).
+    #[serde(default)]
+    pub strike: Vec<ShapeDesc>,
+    /// Этот предмет — манекен (6.5): его можно бить, от удара его отбрасывает. `at` —
+    /// середина его прямоугольника столкновений. Только у предмета верхнего уровня.
+    #[serde(default)]
+    pub dummy: Option<DummyDesc>,
+}
+
+/// Манекен: размер прямоугольника столкновений, здоровье (сколько попаданий выдержит)
+/// и через сколько секунд разбитый появляется снова.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DummyDesc {
+    pub size: P,
+    pub hp: u32,
+    pub respawn: f64,
+}
+
+impl Default for DummyDesc {
+    fn default() -> Self {
+        Self {
+            size: (0.16, 0.3),
+            hp: 5,
+            respawn: 2.0,
+        }
+    }
+}
+
+impl DummyDesc {
+    fn check(&self) -> Result<(), String> {
+        check_size("ширина size", self.size.0)?;
+        check_size("высота size", self.size.1)?;
+        if !(1..=1000).contains(&self.hp) {
+            return Err(format!("hp {} — нужно от 1 до 1000", self.hp));
+        }
+        if !(self.respawn.is_finite() && (0.1..=60.0).contains(&self.respawn)) {
+            return Err(format!(
+                "respawn {} — нужно от 0,1 до 60 секунд",
+                self.respawn
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Удар героя (6.5). Всё можно не писать: тогда берётся как в
+/// [`reyvec_game::AttackTuning::default`].
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AttackDesc {
+    /// Ширина и высота хитбокса перед героем.
+    pub reach: P,
+    /// Замах, удар, возврат (секунды).
+    pub windup: f64,
+    pub active: f64,
+    pub recover: f64,
+    pub damage: u32,
+    /// Скорость отброса цели: вбок и вверх.
+    pub knockback: P,
+    /// Стоп-кадр при попадании, секунды (0 — без него).
+    pub hit_stop: f64,
+    /// Тряска камеры: размах и длительность (0 — без неё).
+    pub shake: f64,
+    pub shake_time: f64,
+}
+
+impl Default for AttackDesc {
+    fn default() -> Self {
+        let t = reyvec_game::AttackTuning::default();
+        Self {
+            reach: (t.reach[0], t.reach[1]),
+            windup: t.windup,
+            active: t.active,
+            recover: t.recover,
+            damage: t.damage,
+            knockback: (t.knockback[0], t.knockback[1]),
+            hit_stop: t.hit_stop,
+            shake: t.shake,
+            shake_time: t.shake_time,
+        }
+    }
+}
+
+impl AttackDesc {
+    pub(crate) fn tuning(&self) -> reyvec_game::AttackTuning {
+        reyvec_game::AttackTuning {
+            reach: [self.reach.0, self.reach.1],
+            windup: self.windup,
+            active: self.active,
+            recover: self.recover,
+            damage: self.damage,
+            knockback: [self.knockback.0, self.knockback.1],
+            hit_stop: self.hit_stop,
+            shake: self.shake,
+            shake_time: self.shake_time,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        check_size("ширина reach", self.reach.0)?;
+        check_size("высота reach", self.reach.1)?;
+        for (name, v, lo) in [
+            ("windup", self.windup, 0.0),
+            ("active", self.active, 0.01),
+            ("recover", self.recover, 0.0),
+            ("hit_stop", self.hit_stop, 0.0),
+            ("shake_time", self.shake_time, 0.0),
+        ] {
+            if !(v.is_finite() && (lo..=1.0).contains(&v)) {
+                return Err(format!("attack: {name} {v} — нужно от {lo} до 1 секунды"));
+            }
+        }
+        for (name, v) in [
+            ("knockback", self.knockback.0),
+            ("knockback", self.knockback.1),
+            ("shake", self.shake),
+        ] {
+            if !(v.is_finite() && (0.0..=100.0).contains(&v)) {
+                return Err(format!("attack: {name} {v} — нужно от 0 до 100"));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Невидимый твёрдый прямоугольник с серединой `at` и размером `size`.
@@ -302,6 +427,8 @@ pub struct PlayerDesc {
     pub wall_jump: f64,
     /// Можно цепляться за край (6.4).
     pub ledge: bool,
+    /// Удар (6.5).
+    pub attack: AttackDesc,
 }
 
 impl Default for PlayerDesc {
@@ -324,6 +451,7 @@ impl Default for PlayerDesc {
             wall_slide: t.wall_slide,
             wall_jump: t.wall_jump,
             ledge: t.ledge,
+            attack: AttackDesc::default(),
         }
     }
 }
@@ -375,6 +503,7 @@ impl PlayerDesc {
         if !(self.wall_jump.is_finite() && (0.0..=10.0).contains(&self.wall_jump)) {
             return Err(format!("wall_jump {} — нужно от 0 до 10", self.wall_jump));
         }
+        self.attack.check()?;
         for (name, v) in [
             ("coyote", self.coyote),
             ("buffer", self.buffer),
@@ -427,6 +556,8 @@ impl NodeDesc {
             solids: Vec::new(),
             tiles: None,
             player: None,
+            strike: Vec::new(),
+            dummy: None,
         }
     }
 
@@ -529,13 +660,32 @@ impl NodeDesc {
             p.check()
                 .map_err(|m| SceneError::new(format!("{here}, player: {m}")))?;
         }
-        for (j, child) in self.children.iter().enumerate() {
-            if child.player.is_some() {
+        if !self.strike.is_empty() && self.player.is_none() {
+            return Err(SceneError::new(format!(
+                "{here}: strike (взмах удара) бывает только у предмета с player"
+            )));
+        }
+        if let Some(d) = &self.dummy {
+            if self.player.is_some() {
                 return Err(SceneError::new(format!(
-                    "{here} → предмет {}: player можно только у предмета верхнего уровня \
-                     (прямо в nodes), а не внутри другого",
-                    j + 1
+                    "{here}: предмет не может быть сразу героем (player) и манекеном (dummy)"
                 )));
+            }
+            d.check()
+                .map_err(|m| SceneError::new(format!("{here}, dummy: {m}")))?;
+        }
+        for (j, child) in self.children.iter().enumerate() {
+            for (what, set) in [
+                ("player", child.player.is_some()),
+                ("dummy", child.dummy.is_some()),
+            ] {
+                if set {
+                    return Err(SceneError::new(format!(
+                        "{here} → предмет {}: {what} можно только у предмета верхнего уровня \
+                         (прямо в nodes), а не внутри другого",
+                        j + 1
+                    )));
+                }
             }
             child.check(&format!("{here} → предмет {}", j + 1))?;
         }
@@ -746,6 +896,8 @@ pub struct Scene {
     /// Последнее нажатие, которое логика уже взяла в шаг (отметка времени ввода, 0 —
     /// не было): кадр с этим снимком — первый, где видно ответ на нажатие (6.3).
     pub input_stamp: u64,
+    /// Тряска камеры сейчас: размах в единицах сцены (6.5).
+    pub shake: f32,
 }
 
 /// Что видно о персонаже игрока снаружи мира: для камеры и панели.
@@ -759,6 +911,11 @@ pub struct PlayerView {
     pub hanging: bool,
     /// Твёрдых прямоугольников в сцене.
     pub solids: usize,
+    /// Бьёт (идёт фаза удара, 6.5).
+    pub striking: bool,
+    /// Сколько ударов начато и сколько из них попало (попаданий по целям).
+    pub swings: u32,
+    pub hits: u32,
 }
 
 /// Готовые формы фигур: одна форма нарезается на треугольники один раз за работу
@@ -957,7 +1114,7 @@ impl SceneFile {
                     .and_then(|t| t.build().ok())
                     .map(|level| level.shapes)
                     .unwrap_or_default();
-                for shape in n.shapes.iter().chain(&tiles) {
+                for shape in n.shapes.iter().chain(&tiles).chain(&n.strike) {
                     let (key, path, stroke) = shape.geometry();
                     if known.contains(&key) || !seen.insert(key.clone()) {
                         continue;

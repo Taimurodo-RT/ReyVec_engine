@@ -502,8 +502,9 @@ fn to_screen(p: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> Vec2 {
     Vec2::new((2.0 * p.x - w) / h, (h - 2.0 * p.y) / h)
 }
 
-/// Клавиша управления персонажем (6.1, 6.2): стрелки, пробел, Shift или X — рывок. Буквы заняты переключателями
-/// песочницы; настройка клавиш и геймпад — в следующих задачах этапа 6.
+/// Клавиша управления персонажем (6.1, 6.2, 6.5): стрелки, пробел, Shift или X — рывок,
+/// Ctrl или A — удар. Остальные буквы заняты переключателями песочницы; настройка клавиш
+/// — в меню (6.10).
 fn game_action(code: KeyCode) -> Option<reyvec_scene::game::Action> {
     use reyvec_scene::game::Action;
     match code {
@@ -513,6 +514,7 @@ fn game_action(code: KeyCode) -> Option<reyvec_scene::game::Action> {
         KeyCode::ArrowDown => Some(Action::Down),
         KeyCode::Space => Some(Action::Jump),
         KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::KeyX => Some(Action::Dash),
+        KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::KeyA => Some(Action::Attack),
         _ => None,
     }
 }

@@ -916,3 +916,56 @@ fn hero_tours_the_example_level() {
         }
     }
 }
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn hero_strikes_the_dummy_it_flashes_and_flies() {
+    use reyvec_app::{HeadlessPlay, PlayInput};
+    use reyvec_scene::game::Action;
+    // Герой справа от манекена 1 (между ними 0,16: взмах не заслоняет манекен, а
+    // хитбокс достаёт), поворачивается к нему и бьёт в 1,0 с.
+    let play = HeadlessPlay {
+        start: Some([-0.59, -0.64]),
+        inputs: [
+            PlayInput::hold(Action::Left, 0.5, 0.52),
+            PlayInput::hold(Action::Attack, 1.0, 1.05),
+        ]
+        .concat(),
+    };
+    let before = play_frame(None, 0.95, &play, Msaa::X4);
+    let hit = play_frame(None, 1.09, &play, Msaa::X4);
+    let after = play_frame(None, 1.5, &play, Msaa::X4);
+    show_frame("strike-before", &before);
+    show_frame("strike-hit", &hit);
+    show_frame("strike-after", &after);
+    let p = hit.player.expect("герой");
+    eprintln!("удар: {p:?}, камера {:?}", hit.camera);
+    assert!(p.striking && p.hits == 1, "в кадре удар и попадание: {p:?}");
+    // Мешок манекена (середина в -0,9; -0,63) во вспышке намного ярче.
+    let sack = [-0.9, -0.63];
+    let (a, b) = (
+        before.scene_pixel(sack).expect("манекен в кадре"),
+        hit.scene_pixel(sack).expect("манекен в кадре"),
+    );
+    eprintln!("мешок до {a:?}, во вспышке {b:?}");
+    assert!(
+        brightness(b) > brightness(a) * 3 / 2,
+        "нет вспышки: {a:?} → {b:?}"
+    );
+    // Взмах (светлый серп от 0,15 до 0,21 перед серединой героя) слева от героя.
+    let slash = [f64::from(p.at[0]) - 0.18, f64::from(p.at[1])];
+    let (a, b) = (
+        before.scene_pixel(slash).expect("в кадре"),
+        hit.scene_pixel(slash).expect("в кадре"),
+    );
+    eprintln!("место взмаха до {a:?}, в ударе {b:?}");
+    assert!(
+        brightness(b) > brightness(a) + 120,
+        "взмаха не видно: {a:?} → {b:?}"
+    );
+    // Через 0,4 с манекен отлетел: на его месте снова фон.
+    let c = after.scene_pixel(sack).expect("в кадре");
+    eprintln!("место манекена после отлёта {c:?}");
+    let p = after.player.expect("герой");
+    assert!(!p.striking && p.hits == 1, "{p:?}");
+}

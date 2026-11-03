@@ -437,6 +437,8 @@ pub(crate) struct Demo {
     follow: bool,
     /// Время прошлого кадра, когда камера шла за персонажем.
     follow_time: Option<f32>,
+    /// Сдвиг камеры от тряски в этом кадре (6.5): перед следующим кадром снимается.
+    shake_offset: [f64; 2],
     /// Сценарий игры для кадров без окна (проверка в движении): мир шагает по 1/60 с
     /// с этими нажатиями до момента кадра.
     play: Option<PlayState>,
@@ -580,6 +582,7 @@ impl Demo {
             loading: crate::demo_load::DemoLoading::default(),
             follow: true,
             follow_time: None,
+            shake_offset: [0.0, 0.0],
             play: None,
             seen_press: 0,
             press_to_frame_ms: None,
@@ -905,6 +908,10 @@ impl Demo {
     /// Камера за персонажем: пока он в рамке посередине экрана, камера стоит; вышел —
     /// камера плавно догоняет, чтобы он снова был у края рамки.
     fn follow_player(&mut self, time: f32) {
+        // Тряска прошлого кадра снимается: камера догоняет героя от своего места.
+        self.camera.center.x -= self.shake_offset[0];
+        self.camera.center.y -= self.shake_offset[1];
+        self.shake_offset = [0.0, 0.0];
         let Some(p) = self.file_scene.player.filter(|_| self.follow) else {
             self.follow_time = None;
             return;
@@ -931,6 +938,14 @@ impl Demo {
         let k = 1.0 - (-FOLLOW_RATE * dt).exp();
         self.camera.center.x += (tx - c.x) * k;
         self.camera.center.y += (ty - c.y) * k;
+        // Тряска от попадания (6.5): быстрые колебания с затухающим размахом.
+        let amp = f64::from(self.file_scene.shake);
+        if amp > 0.0 {
+            let t = f64::from(time);
+            self.shake_offset = [amp * (t * 71.0).sin(), amp * (t * 53.0 + 1.3).cos()];
+            self.camera.center.x += self.shake_offset[0];
+            self.camera.center.y += self.shake_offset[1];
+        }
     }
 
     /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
