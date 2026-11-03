@@ -437,6 +437,9 @@ pub(crate) struct Demo {
     follow: bool,
     /// Время прошлого кадра, когда камера шла за персонажем.
     follow_time: Option<f32>,
+    /// Сценарий игры для кадров без окна (проверка в движении): мир шагает по 1/60 с
+    /// с этими нажатиями до момента кадра.
+    play: Option<PlayState>,
     /// Последнее нажатие, ответ на которое уже был в кадре, и сколько в среднем от
     /// нажатия до такого кадра, мс (6.3).
     seen_press: u64,
@@ -577,6 +580,7 @@ impl Demo {
             loading: crate::demo_load::DemoLoading::default(),
             follow: true,
             follow_time: None,
+            play: None,
             seen_press: 0,
             press_to_frame_ms: None,
             field_downscale: field_downscale_for(ctx.adapter.kind),
@@ -840,6 +844,62 @@ impl Demo {
             input_ms: self.file_logic.as_ref().and_then(|l| l.input_ms()),
             frame_ms: self.press_to_frame_ms,
         })
+    }
+
+    /// Сценарий игры для кадров без окна: герой встаёт в `play.start`, нажатия идут по
+    /// времени, мир шагает шагами логики до момента кадра.
+    pub fn set_play(&mut self, play: crate::HeadlessPlay) {
+        self.play = Some(PlayState {
+            script: play,
+            time: 0.0,
+            held: Vec::new(),
+            started: false,
+        });
+    }
+
+    /// Мир по сценарию до момента `time` (только вперёд).
+    fn advance_play(&mut self, time: f32) {
+        let (Some(play), Some(world)) = (self.play.as_mut(), self.file_world.as_mut()) else {
+            return;
+        };
+        if !play.started {
+            play.started = true;
+            if let (Some(at), Some(_)) = (play.script.start, world.player_body()) {
+                world.set_player_body(reyvec_scene::game::Body::new(at));
+            }
+        }
+        let end = f64::from(time);
+        let step = reyvec_scene::STEP.as_secs_f64();
+        while play.time + step <= end + 1e-9 {
+            let next = play.time + step;
+            let mut pressed = Vec::new();
+            for input in &play.script.inputs {
+                if input.at > play.time - 1e-9 && input.at <= next - 1e-9 {
+                    play.held.retain(|a| *a != input.action);
+                    if input.down {
+                        play.held.push(input.action);
+                        pressed.push(input.action);
+                    }
+                }
+            }
+            world.set_input(reyvec_scene::game::InputFrame::new(&play.held, &pressed));
+            world.update_at(next);
+            play.time = next;
+        }
+        self.file_scene = world.snapshot();
+    }
+
+    /// Где камера: середина и приближение (для проверок кадров без окна).
+    pub fn camera_view(&self) -> ([f64; 2], f64) {
+        (
+            [self.camera.center.x, self.camera.center.y],
+            self.camera.zoom,
+        )
+    }
+
+    /// Снимок сцены из файла, который рисуется сейчас.
+    pub fn file_player(&self) -> Option<reyvec_scene::PlayerView> {
+        self.file_scene.player
     }
 
     /// Камера за персонажем: пока он в рамке посередине экрана, камера стоит; вышел —
@@ -1328,6 +1388,11 @@ impl Demo {
         scene: DemoScene,
     ) -> Result<(), GpuError> {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
+        if scene == DemoScene::File && self.play.is_some() {
+            // По сценарию: детали нужны там, где герой будет в момент кадра.
+            self.advance_play(time);
+            self.follow_player(time);
+        }
         let items = self.scene_items(scene, time, aspect);
         self.vector.upload(ctx, res, &self.vector_demo.library)?;
         let requests = self.vector.plan_details(&items, extent, self.camera.view());
@@ -1370,6 +1435,8 @@ impl Demo {
                             .map_or(ms, |old| old * 0.8 + ms * 0.2),
                     );
                 }
+            } else if self.play.is_some() {
+                self.advance_play(time);
             } else if let Some(world) = self.file_world.as_mut() {
                 world.update_at(f64::from(time));
                 self.file_scene = world.snapshot();
@@ -2627,6 +2694,14 @@ fn hue_to_rgb(h: f32) -> [f32; 3] {
         1.0 - (k.min(4.0 - k).clamp(0.0, 1.0))
     };
     [f(5.0), f(3.0), f(1.0)]
+}
+
+/// Сценарий игры для кадров без окна и докуда мир уже прошёл.
+struct PlayState {
+    script: crate::HeadlessPlay,
+    time: f64,
+    held: Vec<reyvec_scene::game::Action>,
+    started: bool,
 }
 
 #[cfg(test)]

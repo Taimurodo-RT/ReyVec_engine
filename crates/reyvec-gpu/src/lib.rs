@@ -58,7 +58,8 @@ pub use demo_load::{LastLoad, LoadStats, ShapeMemory};
 pub use demo_vector::LIGHT_VECTOR_TOP;
 pub use graph::GraphReport;
 pub use headless::{
-    FrameImage, HeadlessImage, HeadlessScene, render_headless, render_triangle_headless,
+    FrameImage, HeadlessImage, HeadlessPlay, HeadlessScene, PlayInput, render_headless,
+    render_headless_play, render_triangle_headless,
 };
 pub use pipeline::CLEAR_COLOR;
 pub use resources::{BufferId, BufferMemory, TextureId};
