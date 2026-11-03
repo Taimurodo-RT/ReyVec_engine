@@ -872,7 +872,7 @@ fn hero_tours_the_example_level() {
         Shot {
             name: "tour-lift",
             time: 3.0,
-            play: at(9.6, 0.3, Vec::new()),
+            play: at(9.6, 0.6, Vec::new()),
         },
         // Висит на краю высокого блока у уступов.
         Shot {
