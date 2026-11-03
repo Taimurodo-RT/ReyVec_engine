@@ -593,8 +593,13 @@ fn player_text(p: &reyvec_scene::PlayerView, follow: bool) -> String {
     } else {
         "камера свободна (R — за героем)"
     };
+    let anim = if p.anim.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", p.anim)
+    };
     format!(
-        "Герой: {state}, x {:.2} y {:.2}, скорость {speed:.2}; {camera}; твёрдых {}; \
+        "Герой: {state}{anim}, x {:.2} y {:.2}, скорость {speed:.2}; {camera}; твёрдых {}; \
          ударов {}, попаданий {} (Ctrl или A — удар)",
         p.at[0], p.at[1], p.solids, p.swings, p.hits
     )
@@ -809,6 +814,7 @@ mod tests {
                     striking: false,
                     swings: 3,
                     hits: 2,
+                    anim: "бежит",
                 },
                 input_ms: Some(8.3),
                 frame_ms: Some(17.5),

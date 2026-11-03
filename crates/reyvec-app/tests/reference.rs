@@ -1114,3 +1114,50 @@ fn fountain_of_particles_runs_on_the_gpu() {
     eprintln!("ярких пикселей фонтана: {lit}");
     assert!(lit > 200, "фонтана не видно: {lit}");
 }
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn hero_moves_in_poses_run_jump_fall_strike() {
+    use reyvec_app::{HeadlessPlay, PlayInput};
+    use reyvec_scene::game::Action;
+    // Герой из костей (6.8) в примере: кадры каждой позы видно в логе CI.
+    let at = |inputs: Vec<PlayInput>| HeadlessPlay {
+        start: Some([0.4, -0.64]),
+        inputs,
+        ..Default::default()
+    };
+    let shots: [(&str, f32, HeadlessPlay, &str); 5] = [
+        ("pose-idle", 1.0, at(Vec::new()), "стоит"),
+        (
+            "pose-run",
+            1.3,
+            at(PlayInput::hold(Action::Right, 0.8, 2.0).to_vec()),
+            "бежит",
+        ),
+        (
+            "pose-jump",
+            1.12,
+            at(PlayInput::hold(Action::Jump, 1.0, 1.4).to_vec()),
+            "прыгает",
+        ),
+        (
+            "pose-fall",
+            1.5,
+            at(PlayInput::hold(Action::Jump, 1.0, 1.4).to_vec()),
+            "падает",
+        ),
+        (
+            "pose-strike",
+            1.08,
+            at(PlayInput::hold(Action::Attack, 1.0, 1.05).to_vec()),
+            "бьёт",
+        ),
+    ];
+    for (name, time, play, anim) in &shots {
+        let frame = play_frame(None, *time, play, Msaa::X4);
+        show_frame(name, &frame);
+        let p = frame.player.expect("герой");
+        eprintln!("{name}: {p:?}");
+        assert_eq!(p.anim, *anim, "{name}: {p:?}");
+    }
+}

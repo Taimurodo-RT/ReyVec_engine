@@ -265,6 +265,11 @@ pub struct NodeDesc {
     /// середина его прямоугольника столкновений. Только у предмета верхнего уровня.
     #[serde(default)]
     pub dummy: Option<DummyDesc>,
+    /// Этот предмет — кость героя (6.8): «тело», «голова», «рука», «рука_сзади», «нога»,
+    /// «нога_сзади», «плащ». Только внутри предмета с `player`. `at` — точка крепления
+    /// (плечо, бедро, шея): вокруг неё кость поворачивается, фигуры кости рисуются от неё.
+    #[serde(default)]
+    pub bone: Option<String>,
 }
 
 /// Манекен: размер прямоугольника столкновений, здоровье (сколько попаданий выдержит)
@@ -558,6 +563,7 @@ impl NodeDesc {
             player: None,
             strike: Vec::new(),
             dummy: None,
+            bone: None,
         }
     }
 
@@ -581,6 +587,19 @@ impl NodeDesc {
             .iter()
             .map(|c| c.count_max(f))
             .fold(f(self), usize::max)
+    }
+
+    /// Кости бывают только внутри героя.
+    fn no_bones(&self, path: &str) -> Result<(), SceneError> {
+        if self.bone.is_some() {
+            return Err(SceneError::new(format!(
+                "{path}: bone (кость) бывает только внутри предмета с player"
+            )));
+        }
+        for (j, child) in self.children.iter().enumerate() {
+            child.no_bones(&format!("{path} → предмет {}", j + 1))?;
+        }
+        Ok(())
     }
 
     fn check(&self, path: &str) -> Result<(), SceneError> {
@@ -673,6 +692,14 @@ impl NodeDesc {
             }
             d.check()
                 .map_err(|m| SceneError::new(format!("{here}, dummy: {m}")))?;
+        }
+        if let Some(b) = &self.bone
+            && reyvec_game::Bone::parse(b).is_none()
+        {
+            return Err(SceneError::new(format!(
+                "{here}: кости «{b}» нет; бывают: {}",
+                reyvec_game::Bone::names()
+            )));
         }
         for (j, child) in self.children.iter().enumerate() {
             for (what, set) in [
@@ -939,6 +966,8 @@ pub struct PlayerView {
     /// Сколько ударов начато и сколько из них попало (попаданий по целям).
     pub swings: u32,
     pub hits: u32,
+    /// Что показывает анимация (6.8): «бежит», «прыгает»…
+    pub anim: &'static str,
 }
 
 /// Готовые формы фигур: одна форма нарезается на треугольники один раз за работу
@@ -1278,6 +1307,9 @@ impl SceneFile {
         }
         for (i, node) in self.nodes.iter().enumerate() {
             node.check(&format!("предмет {}", i + 1))?;
+            if node.player.is_none() {
+                node.no_bones(&format!("предмет {}", i + 1))?;
+            }
         }
         let players = self.nodes.iter().filter(|n| n.player.is_some()).count();
         if players > 1 {
