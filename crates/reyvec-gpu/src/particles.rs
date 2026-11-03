@@ -44,7 +44,13 @@ pub const PARTICLE_SHRINK: u32 = 2;
 /// Светится сама: не освещается уровнем, рисуется поверх освещённого кадра.
 pub const PARTICLE_GLOW: u32 = 4;
 /// Размер постоянных шейдера частиц (как `struct Push` в шейдере).
-pub(crate) const PUSH_SIZE: usize = 76;
+pub(crate) const PUSH_SIZE: usize = 88;
+/// Буфер списков для рисования: два набора параметров непрямого рисования (по 16 байт)
+/// и два списка номеров мест живых частиц (обычные и светящиеся).
+const DRAW_LIST_SIZE: u64 = 32 + 2 * 4 * CAPACITY as u64;
+/// Где в буфере списков параметры рисования обычных и светящихся частиц.
+pub(crate) const DRAW_ARGS_NORMAL: u64 = 0;
+pub(crate) const DRAW_ARGS_GLOW: u64 = 16;
 
 /// Частица: где, куда летит, сколько живёт и как выглядит.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -263,12 +269,18 @@ pub(crate) struct ParticleFrame {
     pub solid_count: u32,
     pub dt: f32,
     pub gravity: f32,
+    /// Списки живых для рисования (собираются на последнем шаге кадра).
+    pub draw: vk::DeviceAddress,
+    pub build_list: bool,
 }
 
 /// Частицы на видеокарте: кольцо и буферы загрузки по кадрам.
 pub(crate) struct ParticleSystem {
     ring_buffer: BufferId,
     uploads: Vec<BufferId>,
+    draw_list: BufferId,
+    /// Тот же буфер списков для непрямого рисования и очистки.
+    pub draw_buffer: vk::Buffer,
     ring: Ring,
     /// Сколько частиц не влезло в кадр (больше [`MAX_EMIT`]) за всё время.
     pub dropped: u64,
@@ -287,6 +299,16 @@ impl ParticleSystem {
             BufferMemory::GpuOnly,
             "частицы",
         )?;
+        let draw_list = res.create_buffer(
+            ctx,
+            DRAW_LIST_SIZE,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            BufferMemory::GpuOnly,
+            "списки частиц для рисования",
+        )?;
+        let draw_buffer = res.buffer_raw(draw_list).expect("буфер только что создан");
         let mut uploads = Vec::new();
         for i in 0..frames_in_flight {
             uploads.push(res.create_buffer(
@@ -300,6 +322,8 @@ impl ParticleSystem {
         Ok(Self {
             ring_buffer,
             uploads,
+            draw_list,
+            draw_buffer,
             ring: Ring::default(),
             dropped: 0,
         })
@@ -327,9 +351,11 @@ impl ParticleSystem {
             res.write_buffer(upload, SOLIDS_OFFSET, &bytes);
         }
         let ring = res.buffer_address(self.ring_buffer);
+        let draw = res.buffer_address(self.draw_list);
+        let last = steps.len().saturating_sub(1);
         let mut offset = 0usize;
         let mut frames = Vec::with_capacity(steps.len());
-        for (now, dt, mut emitted) in steps {
+        for (i, (now, dt, mut emitted)) in steps.into_iter().enumerate() {
             let room = MAX_EMIT - offset;
             if emitted.len() > room {
                 self.dropped += (emitted.len() - room) as u64;
@@ -349,6 +375,8 @@ impl ParticleSystem {
                 solid_count: solid_count as u32,
                 dt,
                 gravity,
+                draw,
+                build_list: i == last,
             });
             offset += emitted.len();
         }
@@ -366,6 +394,8 @@ pub(crate) fn push(
 ) -> [u8; PUSH_SIZE] {
     let mut b = [0u8; PUSH_SIZE];
     b[72..76].copy_from_slice(&u32::from(glow_pass).to_ne_bytes());
+    b[76..80].copy_from_slice(&u32::from(f.build_list).to_ne_bytes());
+    b[80..88].copy_from_slice(&f.draw.to_ne_bytes());
     b[0..8].copy_from_slice(&f.ring.to_ne_bytes());
     b[8..16].copy_from_slice(&f.emitted.to_ne_bytes());
     b[16..24].copy_from_slice(&f.solids.to_ne_bytes());
@@ -388,7 +418,8 @@ pub(crate) fn push(
 }
 
 /// Расчёт частиц: барьер после рисования прошлого кадра, шейдер `cs_main`, барьер
-/// перед рисованием.
+/// перед рисованием. `reset` — буфер списков: на последнем шаге кадра его счётчики
+/// обнуляются, и шейдер собирает в него живые частицы.
 ///
 /// # Safety
 /// `cmd` в состоянии записи вне прохода рисования; буферы кадра живы, пока он выполняется.
@@ -399,15 +430,30 @@ pub(crate) unsafe fn record_update(
     pipeline: vk::Pipeline,
     push: &[u8; PUSH_SIZE],
     count: u32,
+    reset: Option<vk::Buffer>,
 ) {
-    // До: прошлое рисование (или прошлый шаг расчёта) с кольцом закончило.
+    // До: прошлое рисование (вершины и непрямые параметры) и прошлый шаг закончили.
     let before = [vk::MemoryBarrier2::default()
         .src_stage_mask(
-            vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::PipelineStageFlags2::VERTEX_SHADER
+                | vk::PipelineStageFlags2::COMPUTE_SHADER
+                | vk::PipelineStageFlags2::DRAW_INDIRECT,
         )
         .src_access_mask(
-            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+            vk::AccessFlags2::SHADER_STORAGE_READ
+                | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                | vk::AccessFlags2::INDIRECT_COMMAND_READ,
         )
+        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::CLEAR)
+        .dst_access_mask(
+            vk::AccessFlags2::SHADER_STORAGE_READ
+                | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                | vk::AccessFlags2::TRANSFER_WRITE,
+        )];
+    // Обнулённые счётчики видны шейдеру.
+    let cleared = [vk::MemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
         .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
         .dst_access_mask(
             vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
@@ -415,11 +461,22 @@ pub(crate) unsafe fn record_update(
     let after = [vk::MemoryBarrier2::default()
         .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
         .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-        .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_SHADER)
-        .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)];
+        .dst_stage_mask(
+            vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::DRAW_INDIRECT,
+        )
+        .dst_access_mask(
+            vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+        )];
     // SAFETY: условие функции.
     unsafe {
         d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&before));
+        if let Some(buffer) = reset {
+            d.cmd_fill_buffer(cmd, buffer, 0, 32, 0);
+            d.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&cleared),
+            );
+        }
         if count > 0 {
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, push);

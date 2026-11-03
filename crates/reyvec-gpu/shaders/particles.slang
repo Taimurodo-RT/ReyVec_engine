@@ -57,7 +57,15 @@ struct Push
     float aspect;
     float zoom;
     uint glow_pass;      // 1 — рисуются только светящиеся, при выводе; 0 — остальные
+    uint build_list;     // 1 — последний шаг кадра: собрать списки живых для рисования
+    // Списки для рисования (6.6б): два набора параметров непрямого рисования (по 4
+    // числа: вершин, частиц, 0, 0), потом номера мест живых обычных частиц (capacity
+    // штук), потом номера мест живых светящихся. Рисуются только живые: мёртвые места
+    // кольца и чужой вид частиц не стоят ничего.
+    uint* draw;
 };
+
+static const uint LIST_NORMAL = 8;
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
 static const float EPS = 1e-4;
@@ -153,14 +161,27 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     uint k = id.x;
     if (k >= pc.count)
         return;
+    if (pc.build_list != 0 && k == 0)
+    {
+        // Вершин на частицу; число частиц набирается ниже (обнулено перед шагом).
+        pc.draw[0] = 6;
+        pc.draw[4] = 6;
+    }
     uint slot = (pc.start + k) % pc.capacity;
     uint fresh = (slot + pc.capacity - pc.head) % pc.capacity;
+    Particle p;
     if (fresh < pc.emit_count)
+        p = pc.emitted[fresh];
+    else
+        p = step_particle(pc.particles[slot], pc.dt);
+    pc.particles[slot] = p;
+    if (pc.build_list != 0 && p.life > 0.0)
     {
-        pc.particles[slot] = pc.emitted[fresh];
-        return;
+        bool glow = (p.flags & PARTICLE_GLOW) != 0;
+        uint index;
+        InterlockedAdd(pc.draw[glow ? 5 : 1], 1u, index);
+        pc.draw[LIST_NORMAL + (glow ? pc.capacity : 0) + index] = slot;
     }
-    pc.particles[slot] = step_particle(pc.particles[slot], pc.dt);
 }
 
 struct VertexOut
@@ -178,7 +199,8 @@ static const float2 CORNERS[6] = {
 [shader("vertex")]
 VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInstanceID)
 {
-    Particle p = pc.particles[(pc.start + instance) % pc.capacity];
+    uint slot = pc.draw[LIST_NORMAL + (pc.glow_pass != 0 ? pc.capacity : 0) + instance];
+    Particle p = pc.particles[slot];
     VertexOut o;
     bool glow = (p.flags & PARTICLE_GLOW) != 0;
     if (p.life <= 0.0 || glow != (pc.glow_pass != 0))
