@@ -1210,3 +1210,25 @@ fn hero_of_the_example_crosses_the_ledges() {
         "на стене: {p:?}"
     );
 }
+
+#[test]
+fn lift_coming_down_pushes_the_hero_out_from_under_it() {
+    // Подъёмник в коридоре опускается почти до пола (щель 0,1 ниже роста героя):
+    // стоящего под ним героя выдавливает вбок, а не заглатывает.
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let mut t = steps(&mut w, 0, 10);
+    let mut body = w.player_body().unwrap();
+    body.pos = [9.6, -0.64];
+    w.set_player_body(body);
+    w.set_input(reyvec_game::InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 300);
+    let p = w.snapshot().player.unwrap();
+    assert!(p.on_ground && (p.at[1] - -0.64).abs() < 1e-3, "{p:?}");
+    assert!(
+        (p.at[0] - 9.6).abs() >= 0.27 - 1e-3,
+        "остался под подъёмником: {p:?}"
+    );
+    let _ = t;
+}

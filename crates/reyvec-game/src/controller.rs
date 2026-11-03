@@ -320,6 +320,7 @@ impl Body {
             self.pos[0] += sweep(self.bounds(tuning), 0, g.moved[0], &others, false).0;
             self.pos[1] += g.moved[1];
         }
+        self.push_out(tuning, solids);
         self.wall_lock -= dt;
         self.drop_left -= dt;
         self.grab_cooldown -= dt;
@@ -543,6 +544,68 @@ impl Body {
             ev.grabbed = true;
         }
         ev
+    }
+
+    /// Движущийся предмет въехал в персонажа (подъёмник опустился на голову, стена
+    /// поехала вбок): вытолкнуть его по ходу движения, а если там тесно — вбок из-под
+    /// предмета. Иначе персонаж оказался бы внутри и проходил бы сквозь предмет.
+    fn push_out(&mut self, tuning: &Tuning, solids: &[Collider]) {
+        for (i, c) in solids.iter().enumerate() {
+            if c.moved == [0.0, 0.0] || c.oneway || c.is_slope() {
+                continue;
+            }
+            let b = self.bounds(tuning);
+            if !c.aabb.overlaps(&b) {
+                continue;
+            }
+            let s = &c.aabb;
+            let before = Aabb {
+                min: [s.min[0] - c.moved[0], s.min[1] - c.moved[1]],
+                max: [s.max[0] - c.moved[0], s.max[1] - c.moved[1]],
+            };
+            if before.overlaps(&b) {
+                // Был внутри и раньше (поставили так): выйдет сам, как из стены.
+                continue;
+            }
+            let others: Vec<Collider> = solids
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, c)| *c)
+                .collect();
+            // По какой оси предмет подъехал: по ней и толкаем.
+            let apart_y = before.min[1] >= b.max[1] - EPS || before.max[1] <= b.min[1] + EPS;
+            let axis = if apart_y { 1 } else { 0 };
+            let push = if c.moved[axis] < 0.0 {
+                s.min[axis] - b.max[axis]
+            } else {
+                s.max[axis] - b.min[axis]
+            };
+            let done = sweep(b, axis, push, &others, false).0;
+            if (done - push).abs() < EPS {
+                self.pos[axis] += push;
+                if axis == 1 && push > 0.0 {
+                    self.on_ground = true;
+                    self.ground = Some(c.id);
+                    self.vel[1] = self.vel[1].max(0.0);
+                } else if axis == 1 {
+                    self.vel[1] = self.vel[1].min(0.0);
+                } else {
+                    self.vel[0] = 0.0;
+                }
+                continue;
+            }
+            // Зажало: вбок к ближнему краю предмета, если там свободно.
+            let other = 1 - axis;
+            let mut ways = [s.min[other] - b.max[other], s.max[other] - b.min[other]];
+            ways.sort_by(|a, b| a.abs().total_cmp(&b.abs()));
+            for way in ways {
+                if (sweep(b, other, way, &others, false).0 - way).abs() < EPS {
+                    self.pos[other] += way;
+                    break;
+                }
+            }
+        }
     }
 
     fn let_go(&mut self) {
@@ -1438,5 +1501,64 @@ mod tests {
         for _ in 0..120 {
             assert!(!b.step(&t, toward, &solids, DT).grabbed, "{:?}", b.pos);
         }
+    }
+
+    #[test]
+    fn lift_coming_down_does_not_swallow_the_body() {
+        let t = Tuning::default();
+        let solids = floor();
+        let mut lift = Collider {
+            id: 9,
+            ..Collider::solid(Aabb {
+                min: [-0.3, 0.5],
+                max: [0.3, 0.56],
+            })
+        };
+        let mut b = standing(&t);
+        for i in 0..50 {
+            lift.aabb.min[1] -= 0.01;
+            lift.aabb.max[1] -= 0.01;
+            lift.moved = [0.0, -0.01];
+            let mut all = solids.clone();
+            all.push(lift);
+            b.step(&t, Intent::default(), &all, DT);
+            assert!(
+                !b.bounds(&t).overlaps(&lift.aabb),
+                "шаг {i}: внутри подъёмника {:?}",
+                b.pos
+            );
+        }
+        // Выдавило вбок, стоит на полу.
+        assert!(
+            b.on_ground && b.bounds(&t).min[1].abs() < 1e-9,
+            "{:?}",
+            b.pos
+        );
+        assert!(b.pos[0].abs() > 0.3, "{:?}", b.pos);
+    }
+
+    #[test]
+    fn wall_moving_sideways_pushes_the_body() {
+        let t = Tuning::default();
+        let solids = floor();
+        let mut wall = Collider {
+            id: 5,
+            ..Collider::solid(Aabb {
+                min: [0.2, 0.0],
+                max: [0.4, 1.0],
+            })
+        };
+        let mut b = standing(&t);
+        for _ in 0..30 {
+            wall.aabb.min[0] -= 0.01;
+            wall.aabb.max[0] -= 0.01;
+            wall.moved = [-0.01, 0.0];
+            let mut all = solids.clone();
+            all.push(wall);
+            b.step(&t, Intent::default(), &all, DT);
+            assert!(!b.bounds(&t).overlaps(&wall.aabb), "{:?}", b.pos);
+        }
+        assert!((b.bounds(&t).max[0] - wall.aabb.min[0]).abs() < 1e-9);
+        assert!(b.on_ground);
     }
 }
