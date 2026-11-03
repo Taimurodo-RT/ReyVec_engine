@@ -22,7 +22,9 @@ use std::sync::Arc;
 use reyvec_svg::SvgDrawing;
 use reyvec_vector::{Affine, BlendMode, Color, Instance, SceneItem, ShapeId, ShapeLibrary};
 
-use reyvec_game::{Aabb, Action, Body, Collider, InputFrame, Intent, Tuning};
+use reyvec_game::{
+    Aabb, Action, AttackTuning, Body, Collider, Dummy, Fighter, InputFrame, Intent, Tuning,
+};
 
 use crate::assets::{self, MorphTrack};
 use crate::{
@@ -44,6 +46,8 @@ pub struct Placement {
     pub opacity: f32,
     /// Отражено слева направо (персонаж смотрит влево, 6.1).
     pub flip: bool,
+    /// Вспышка от попадания (6.5): от 0 до 1, фигуры сущности и её детей белеют.
+    pub flash: f32,
 }
 
 impl Placement {
@@ -56,6 +60,7 @@ impl Placement {
         shadow: None,
         opacity: 1.0,
         flip: false,
+        flash: 0.0,
     };
 }
 
@@ -72,6 +77,8 @@ pub struct GlobalPlacement {
     /// заданы явно. Фигуры разных групп не сливаются в один слой: два небольших слоя
     /// дешевле одного на всю сцену (узкое место света 3).
     pub group: u64,
+    /// Вспышка: наибольшая у сущности и её предков.
+    pub flash: f32,
 }
 
 impl GlobalPlacement {
@@ -82,6 +89,7 @@ impl GlobalPlacement {
         shadow: false,
         opacity: 1.0,
         group: 0,
+        flash: 0.0,
     };
 
     fn then(&self, p: &Placement, me: Entity) -> Self {
@@ -96,6 +104,7 @@ impl GlobalPlacement {
             shadow: p.shadow.unwrap_or(self.shadow),
             opacity: self.opacity * p.opacity,
             group: if own { me.to_bits() } else { self.group },
+            flash: self.flash.max(p.flash),
         }
     }
 
@@ -179,12 +188,47 @@ pub struct Solid {
     pub slope: f64,
 }
 
-/// Персонаж игрока (6.1): настройки, состояние и место появления.
-#[derive(Component, Clone, Copy, Debug, PartialEq)]
+/// Персонаж игрока (6.1): настройки, состояние и место появления; удар (6.5).
+#[derive(Component, Clone, Debug, PartialEq)]
 pub struct Player {
     pub tuning: Tuning,
     pub body: Body,
     pub spawn: [f64; 2],
+    pub attack: AttackTuning,
+    pub fighter: Fighter,
+    /// Сколько попаданий по целям.
+    pub hits: u32,
+}
+
+/// Манекен (6.5) и прозрачность его предмета из файла (разбитый не виден).
+#[derive(Component, Clone, Debug, PartialEq)]
+pub struct Target {
+    pub dummy: Dummy,
+    pub opacity: f32,
+}
+
+/// Фигура взмаха удара: видна только в фазе удара героя.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Strike;
+
+/// Бой на этот шаг: стоп-кадр и тряска камеры.
+#[derive(Resource, Default)]
+struct Combat {
+    /// Сколько ещё длится стоп-кадр, секунды.
+    hit_stop: f64,
+    /// Тряска: сколько осталось, полная длительность и размах.
+    shake_left: f64,
+    shake_time: f64,
+    shake: f64,
+}
+
+/// Нажатия, пришедшие во время стоп-кадра: персонаж получит их на первом шаге после
+/// него, иначе короткое нажатие в стоп-кадре потерялось бы.
+#[derive(Resource, Default, Clone, Copy)]
+struct Pending {
+    jump: bool,
+    dash: bool,
+    attack: bool,
 }
 
 /// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест).
@@ -249,6 +293,8 @@ impl SceneWorld {
         world.init_resource::<Solids>();
         world.init_resource::<GameInput>();
         world.init_resource::<LastPress>();
+        world.init_resource::<Combat>();
+        world.init_resource::<Pending>();
         world.insert_resource(LastStep(0.0));
         let mut spawner = Spawner {
             world: &mut world,
@@ -279,6 +325,8 @@ impl SceneWorld {
             solids: Vec::new(),
             tiles: None,
             player: None,
+            strike: Vec::new(),
+            dummy: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
@@ -292,6 +340,7 @@ impl SceneWorld {
                 propagate,
                 gather_solids,
                 play,
+                combat_look,
                 propagate_again,
                 collect,
             )
@@ -361,6 +410,13 @@ impl SceneWorld {
         let mut q = self.world.query::<&Player>();
         let tuning = q.iter(&self.world).next().map(|p| p.tuning);
         (solids, tuning)
+    }
+
+    /// Манекены сцены (для проверок).
+    #[cfg(test)]
+    pub(crate) fn dummies(&mut self) -> Vec<Dummy> {
+        let mut q = self.world.query::<&Target>();
+        q.iter(&self.world).map(|t| t.dummy.clone()).collect()
     }
 
     /// Сколько сущностей в мире.
@@ -438,6 +494,7 @@ impl Spawner<'_> {
             shadow: n.shadow,
             opacity: n.opacity,
             flip: false,
+            flash: 0.0,
         };
         let name = if n.name.is_empty() {
             path.to_string()
@@ -453,6 +510,15 @@ impl Spawner<'_> {
                 tuning: p.tuning(),
                 body: Body::new(placement.at),
                 spawn: placement.at,
+                attack: p.attack.tuning(),
+                fighter: Fighter::default(),
+                hits: 0,
+            });
+        }
+        if let Some(d) = &n.dummy {
+            self.world.entity_mut(me).insert(Target {
+                dummy: Dummy::new(placement.at, [d.size.0, d.size.1], d.hp, d.respawn),
+                opacity: n.opacity,
             });
         }
         for s in &n.solids {
@@ -564,6 +630,32 @@ impl Spawner<'_> {
                 });
             }
         }
+        for (j, shape) in n.strike.iter().enumerate() {
+            let id = shape.shape_id(self.library, self.cache).map_err(|m| {
+                SceneError::new(format!("предмет «{name}», взмах strike {}: {m}", j + 1))
+            })?;
+            let (at, angle, color) = shape.placement();
+            let order = self.next();
+            self.spawn(
+                (
+                    Placement {
+                        at: [at.0, at.1],
+                        angle,
+                        opacity: 0.0,
+                        ..Placement::IDENTITY
+                    },
+                    GlobalPlacement::ROOT,
+                    VectorShape {
+                        id,
+                        tint: color.0,
+                        order,
+                        morph: None,
+                    },
+                    Strike,
+                ),
+                Some(me),
+            );
+        }
         for (j, p) in n.pictures.iter().enumerate() {
             let fail =
                 |m: String| SceneError::new(format!("предмет «{name}», рисунок {}: {m}", j + 1));
@@ -650,50 +742,162 @@ fn animate(time: Res<SceneTime>, mut moving: Query<(&Motion, &mut Placement)>) {
     }
 }
 
-/// Персонаж игрока: шаги контроллера за время с прошлого шага логики.
+/// Персонаж игрока и манекены: шаги контроллера за время с прошлого шага логики, удар
+/// и попадания (6.5). Во время стоп-кадра тела стоят, а свечение и тряска идут.
+#[allow(clippy::too_many_arguments)]
 fn play(
     time: Res<SceneTime>,
     input: Res<GameInput>,
     solids: Res<Solids>,
     mut last: ResMut<LastStep>,
+    mut combat: ResMut<Combat>,
+    mut pending: ResMut<Pending>,
     mut players: Query<(&mut Player, &mut Placement)>,
+    mut targets: Query<(Entity, &mut Target), Without<Player>>,
 ) {
     let dt = (time.0 - last.0).clamp(0.0, 0.25);
     last.0 = time.0;
     let input = input.0;
+    pending.jump |= input.pressed(Action::Jump);
+    pending.dash |= input.pressed(Action::Dash);
+    pending.attack |= input.pressed(Action::Attack);
+
+    // Таймеры, которые идут и в стоп-кадре.
+    combat.shake_left = (combat.shake_left - dt).max(0.0);
+    let heroes: Vec<Aabb> = players
+        .iter()
+        .map(|(p, _)| p.body.bounds(&p.tuning))
+        .collect();
+    for (_, mut t) in &mut targets {
+        t.dummy
+            .tick(dt, |at| heroes.iter().any(|h| h.overlaps(&at)));
+    }
+    let frozen = combat.hit_stop.min(dt);
+    combat.hit_stop -= frozen;
+    let dt = dt - frozen;
+    if dt <= 1e-9 {
+        for (_, mut t) in &mut targets {
+            t.dummy.moved = [0.0, 0.0];
+        }
+        return;
+    }
+    let presses = std::mem::take(&mut *pending);
+
+    // Запас на неточность дробей: ровно один шаг логики — один шаг персонажа.
+    let steps = (dt / PLAYER_STEP - 1e-6).ceil().max(1.0) as usize;
+    let sdt = dt / steps as f64;
+    // Платформы сдвинулись один раз за шаг логики: везут только в первом из шагов.
+    let still = |c: &Collider| Collider {
+        moved: [0.0, 0.0],
+        ..*c
+    };
+    // Для героя манекены — тоже твёрдые тела (на них можно встать, их не пройти).
+    let bodies: Vec<Collider> = targets
+        .iter()
+        .filter(|(_, t)| t.dummy.alive())
+        .map(|(e, t)| t.dummy.collider(e.to_bits()))
+        .collect();
+    let with_bodies: Vec<Collider> = solids.0.iter().chain(&bodies).copied().collect();
+    let with_bodies_still: Vec<Collider> = with_bodies.iter().map(still).collect();
+
+    let mut stop = false;
     for (mut player, mut place) in &mut players {
         let p = &mut *player;
-        // Запас на неточность дробей: ровно один шаг логики — один шаг персонажа.
-        let steps = (dt / PLAYER_STEP - 1e-6).ceil() as usize;
-        // Платформы сдвинулись один раз за шаг логики: везут персонажа только в первом
-        // из нескольких его шагов.
-        let still: Vec<Collider> = solids
-            .0
-            .iter()
-            .map(|c| Collider {
-                moved: [0.0, 0.0],
-                ..*c
-            })
-            .collect();
         for i in 0..steps {
             // Нажатие — только на первом из нескольких шагов.
             let first = i == 0;
             let intent = Intent {
                 x: input.x(),
-                jump_pressed: first && input.pressed(Action::Jump),
+                jump_pressed: first && presses.jump,
                 jump_held: input.held(Action::Jump),
                 down: input.held(Action::Down),
-                dash_pressed: first && input.pressed(Action::Dash),
+                dash_pressed: first && presses.dash,
                 up: input.held(Action::Up),
             };
-            let colliders = if first { &solids.0 } else { &still };
-            p.body.step(&p.tuning, intent, colliders, dt / steps as f64);
+            let colliders = if first {
+                &with_bodies
+            } else {
+                &with_bodies_still
+            };
+            p.body.step(&p.tuning, intent, colliders, sdt);
+            let can = !p.body.on_ledge();
+            p.fighter
+                .step(&p.attack, first && presses.attack, can, p.body.facing, sdt);
+            if let Some(hitbox) = p.fighter.hitbox(&p.attack, p.body.pos, p.tuning.half()) {
+                for (e, mut t) in &mut targets {
+                    if t.dummy.alive()
+                        && hitbox.overlaps(&t.dummy.bounds())
+                        && p.fighter.first_hit(e.to_bits())
+                    {
+                        let dir = p.fighter.dir();
+                        let k = p.attack.knockback;
+                        t.dummy.hurt(p.attack.damage, [dir * k[0], k[1]]);
+                        p.hits += 1;
+                        combat.hit_stop = combat.hit_stop.max(p.attack.hit_stop);
+                        if p.attack.shake > 0.0 && p.attack.shake_time > 0.0 {
+                            combat.shake = p.attack.shake;
+                            combat.shake_time = p.attack.shake_time;
+                            combat.shake_left = p.attack.shake_time;
+                        }
+                    }
+                }
+            }
+            if combat.hit_stop > 0.0 {
+                // Попал: остаток шага уже в стоп-кадре.
+                stop = true;
+                break;
+            }
         }
         if p.body.pos[1] < p.spawn[1] - FALL_OUT {
             p.body = Body::new(p.spawn);
         }
         place.at = p.body.pos;
         place.flip = p.body.facing < 0.0;
+    }
+    for (e, mut t) in &mut targets {
+        let d = &mut t.dummy;
+        if stop {
+            d.moved = [0.0, 0.0];
+            continue;
+        }
+        // Манекены не проходят друг сквозь друга: отброшенный упирается в соседа.
+        let me = e.to_bits();
+        let mine: Vec<Collider> = solids
+            .0
+            .iter()
+            .chain(bodies.iter().filter(|c| c.id != me))
+            .copied()
+            .collect();
+        let mine_still: Vec<Collider> = mine.iter().map(still).collect();
+        let mut moved = [0.0, 0.0];
+        for i in 0..steps {
+            d.step(if i == 0 { &mine } else { &mine_still }, sdt);
+            moved[0] += d.moved[0];
+            moved[1] += d.moved[1];
+        }
+        d.moved = moved;
+        if d.body.pos[1] < d.spawn[1] - FALL_OUT {
+            d.body = Body::new(d.spawn);
+            d.moved = [0.0, 0.0];
+        }
+    }
+}
+
+/// Как выглядит бой: манекены на своих местах, белеют от попадания, разбитые не видны;
+/// взмах удара виден только в фазе удара.
+fn combat_look(
+    players: Query<&Player>,
+    mut targets: Query<(&Target, &mut Placement), Without<Strike>>,
+    mut strikes: Query<&mut Placement, With<Strike>>,
+) {
+    let striking = players.iter().any(|p| p.fighter.striking());
+    for mut place in &mut strikes {
+        place.opacity = if striking { 1.0 } else { 0.0 };
+    }
+    for (t, mut place) in &mut targets {
+        place.at = t.dummy.body.pos;
+        place.flash = (t.dummy.flash / reyvec_game::combat::FLASH_TIME) as f32;
+        place.opacity = if t.dummy.alive() { t.opacity } else { 0.0 };
     }
 }
 
@@ -795,6 +999,7 @@ fn collect(
     players: Query<&Player>,
     solids: Res<Solids>,
     press: Res<LastPress>,
+    combat: Res<Combat>,
     mut snapshot: ResMut<Snapshot>,
 ) {
     let mut drawn: Vec<(Drawn, &GlobalPlacement)> = shapes
@@ -812,6 +1017,10 @@ fn collect(
     // Слой: подряд идущие фигуры одной группы с одинаковой тенью и прозрачностью.
     let mut open: Option<(u64, bool, f32)> = None;
     for (what, g) in &drawn {
+        if g.opacity <= 0.0 {
+            // Не видно (взмах вне удара, разбитый манекен): не рисуется и не даёт тени.
+            continue;
+        }
         let key = (g.group, g.shadow, g.opacity);
         if open != Some(key) {
             if open.is_some() {
@@ -830,7 +1039,8 @@ fn collect(
         match what {
             Drawn::Shape(shape) => {
                 shape_count += 1;
-                let mut instance = Instance::new(shape.id, g.affine).with_tint(shape.tint);
+                let mut instance =
+                    Instance::new(shape.id, g.affine).with_tint(flashed(shape.tint, g.flash));
                 if let Some(track) = &shape.morph {
                     instance = instance.with_morph(track.at(time.0));
                 }
@@ -871,9 +1081,32 @@ fn collect(
             on_ground: p.body.on_ground,
             hanging: p.body.on_ledge(),
             solids: solids.0.len(),
+            striking: p.fighter.striking(),
+            swings: p.fighter.swings,
+            hits: p.hits,
         }),
         input_stamp: press.0,
+        shake: if combat.shake_time > 0.0 {
+            (combat.shake * combat.shake_left / combat.shake_time) as f32
+        } else {
+            0.0
+        },
     };
+}
+
+/// Цвет фигуры во вспышке `flash` (от 0 до 1): ближе к яркому белому.
+fn flashed(c: Color, flash: f32) -> Color {
+    if flash <= 0.0 {
+        return c;
+    }
+    let k = flash.min(1.0);
+    let to = |v: f32| v + (1.6 - v) * k;
+    Color {
+        r: to(c.r),
+        g: to(c.g),
+        b: to(c.b),
+        a: c.a,
+    }
 }
 
 fn place_light(l: &SceneLight, g: &GlobalPlacement) -> SceneLight {

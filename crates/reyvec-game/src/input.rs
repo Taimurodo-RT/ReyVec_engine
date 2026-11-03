@@ -20,16 +20,19 @@ pub enum Action {
     Down,
     Jump,
     Dash,
+    /// Удар (6.5).
+    Attack,
 }
 
 impl Action {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Left,
         Self::Right,
         Self::Up,
         Self::Down,
         Self::Jump,
         Self::Dash,
+        Self::Attack,
     ];
 
     fn bit(self) -> u32 {

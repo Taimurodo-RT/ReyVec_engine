@@ -517,7 +517,9 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
 
 /// Строка «Герой»: где стоит, скорость, идёт ли камера.
 fn player_text(p: &reyvec_scene::PlayerView, follow: bool) -> String {
-    let state = if p.hanging {
+    let state = if p.striking {
+        "бьёт"
+    } else if p.hanging {
         "висит на краю (вверх — забраться)"
     } else if p.on_ground {
         "на земле"
@@ -531,8 +533,9 @@ fn player_text(p: &reyvec_scene::PlayerView, follow: bool) -> String {
         "камера свободна (R — за героем)"
     };
     format!(
-        "Герой: {state}, x {:.2} y {:.2}, скорость {speed:.2}; {camera}; твёрдых {}",
-        p.at[0], p.at[1], p.solids
+        "Герой: {state}, x {:.2} y {:.2}, скорость {speed:.2}; {camera}; твёрдых {}; \
+         ударов {}, попаданий {} (Ctrl или A — удар)",
+        p.at[0], p.at[1], p.solids, p.swings, p.hits
     )
 }
 
@@ -742,6 +745,9 @@ mod tests {
                     on_ground: true,
                     hanging: false,
                     solids: 14,
+                    striking: false,
+                    swings: 3,
+                    hits: 2,
                 },
                 input_ms: Some(8.3),
                 frame_ms: Some(17.5),

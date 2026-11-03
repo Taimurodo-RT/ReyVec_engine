@@ -105,6 +105,7 @@ fn button_action(b: Button) -> Option<Action> {
     match b {
         Button::South => Some(Action::Jump),
         Button::West | Button::RightTrigger | Button::RightTrigger2 => Some(Action::Dash),
+        Button::North => Some(Action::Attack),
         Button::DPadLeft => Some(Action::Left),
         Button::DPadRight => Some(Action::Right),
         Button::DPadUp => Some(Action::Up),
@@ -121,6 +122,7 @@ mod tests {
     fn buttons_map_to_actions() {
         assert_eq!(button_action(Button::South), Some(Action::Jump));
         assert_eq!(button_action(Button::West), Some(Action::Dash));
+        assert_eq!(button_action(Button::North), Some(Action::Attack));
         assert_eq!(button_action(Button::DPadDown), Some(Action::Down));
         assert_eq!(button_action(Button::Start), None);
     }

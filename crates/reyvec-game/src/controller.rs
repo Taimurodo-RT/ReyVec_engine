@@ -100,7 +100,7 @@ impl Tuning {
         2.0 * self.jump / self.jump_time
     }
 
-    fn half(&self) -> [f64; 2] {
+    pub fn half(&self) -> [f64; 2] {
         [self.size[0] * 0.5, self.size[1] * 0.5]
     }
 

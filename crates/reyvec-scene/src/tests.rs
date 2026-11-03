@@ -47,8 +47,8 @@ fn example_scene_parses_and_builds() {
         })
         .count();
     // Слои с тенью: стол, полка, герой, ящики под полкой, 6 препятствий коридора (6.1),
-    // подъёмник и столб (6.2), уступы (6.4); окно без слоя.
-    assert_eq!(shadow_layers, 13);
+    // подъёмник и столб (6.2), уступы (6.4), 2 манекена (6.5); окно без слоя.
+    assert_eq!(shadow_layers, 15);
     // Герой (6.1) и твёрдое: пол, стена слева, столешница, 6 банок с крышками, 3 книги,
     // полка, 2 ящика, 6 препятствий коридора, подъёмник и столб; с 6.4 край уступов и
     // сами уступы: 13 склонов, 4 доски и всего 6 прямоугольников из сотен клеток блоков.
@@ -1235,7 +1235,8 @@ fn lift_never_crushes_the_hero_standing_under_it() {
 #[test]
 fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
     // «Обезьяна» жмёт случайные клавиши по минуте игры в разных местах примера. После
-    // каждого шага: герой не внутри твёрдого, не ниже склона, не телепортировался.
+    // каждого шага: герой не внутри твёрдого, не ниже склона, не телепортировался; с 6.5
+    // ещё и бьёт: манекены не внутри твёрдого, герой не застревает в манекене.
     use reyvec_game::{Aabb, Action, InputFrame};
     let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
     let mut lib = library();
@@ -1249,6 +1250,7 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
         (seed >> 33) % n
     };
     let starts = [
+        [-1.17, -0.62],
         [0.4, -0.5],
         [4.0, -0.5],
         [9.6, 0.3],
@@ -1258,6 +1260,8 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
     ];
     let mut grabs = 0;
     let mut slopes = 0;
+    let mut stuck = 0;
+    let mut dummy_hits = 0;
     for start in starts {
         w.set_player_body(reyvec_game::Body::new(start));
         let mut last = w.snapshot().player.unwrap();
@@ -1276,7 +1280,13 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
                     1 => held.push(Action::Right),
                     _ => {}
                 }
-                for a in [Action::Jump, Action::Dash, Action::Down, Action::Up] {
+                for a in [
+                    Action::Jump,
+                    Action::Dash,
+                    Action::Down,
+                    Action::Up,
+                    Action::Attack,
+                ] {
                     if rand(4) == 0 {
                         held.push(a);
                         pressed.push(a);
@@ -1319,9 +1329,187 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
                     assert!(!b.overlaps(s), "внутри твёрдого {s:?}: {place}");
                 }
             }
+            // Манекены: не внутри твёрдого уровня. Герой может оказаться в манекене на
+            // шаг (манекен шагает после героя и может въехать в него), но на следующем
+            // шаге манекен его выталкивает.
+            let mut inside = false;
+            let alive: Vec<_> = w.dummies().into_iter().filter(|d| d.alive()).collect();
+            for (k, d) in alive.iter().enumerate() {
+                for other in &alive[k + 1..] {
+                    assert!(
+                        !d.bounds().overlaps(&other.bounds()),
+                        "манекены друг в друге: {d:?} {other:?}\n{place}"
+                    );
+                }
+            }
+            for d in &alive {
+                let db = d.bounds();
+                for c in solids.iter().filter(|c| !c.oneway && c.slope == 0.0) {
+                    assert!(
+                        !db.overlaps(&c.aabb),
+                        "манекен внутри {:?}: {d:?}\n{place}",
+                        c.aabb
+                    );
+                }
+                inside |= db.overlaps(&b);
+            }
+            stuck = if inside { stuck + 1 } else { 0 };
+            assert!(stuck < 2, "герой застрял в манекене: {place}");
+            dummy_hits = dummy_hits.max(p.hits);
             last = p;
         }
     }
-    eprintln!("схватился за край {grabs} раз, шагов на склонах {slopes}");
+    eprintln!(
+        "схватился за край {grabs} раз, шагов на склонах {slopes}, попаданий по манекенам {dummy_hits}"
+    );
     assert!(slopes > 0, "обезьяна ни разу не постояла на склоне");
+}
+
+/// Мир примера после того, как всё упало на пол.
+fn example_world() -> (SceneWorld, usize) {
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let t = steps(&mut w, 0, 30);
+    (w, t)
+}
+
+/// Самая яркая составляющая оттенка фигур снимка: больше 1 — только во вспышке.
+fn brightest_tint(scene: &Scene) -> f32 {
+    scene
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            SceneItem::Shape(s) => Some(s.tint.r.max(s.tint.g).max(s.tint.b)),
+            _ => None,
+        })
+        .fold(0.0, f32::max)
+}
+
+#[test]
+fn hero_hits_the_dummy_world_freezes_then_the_dummy_flies() {
+    use reyvec_game::Action::{Attack, Left};
+    use reyvec_game::InputFrame;
+    let (mut w, mut t) = example_world();
+    let d0 = w.dummies()[0].clone();
+    assert_eq!(d0.spawn, [-0.9, -0.63]);
+    assert!(d0.body.on_ground, "манекен стоит на полу: {:?}", d0.body);
+    // Герой справа от манекена, лицом к нему, между ними 0,05.
+    w.set_player_body(reyvec_game::Body::new([-0.9 + 0.08 + 0.07 + 0.05, -0.64]));
+    w.set_input(InputFrame::new(&[Left], &[Left]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 20);
+    let idle = w.snapshot();
+    assert!(idle.player.unwrap().on_ground);
+    assert!(brightest_tint(&idle) <= 1.0, "без попадания вспышки нет");
+    let hero0 = w.player_body().unwrap().pos;
+    w.set_input(InputFrame::new(&[Attack], &[Attack]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    // Удар доходит до попадания за замах и шаг-другой.
+    let mut hit_at = None;
+    for i in 0..10 {
+        let s = w.snapshot();
+        if s.player.unwrap().hits > 0 {
+            hit_at = Some(i);
+            break;
+        }
+        t = steps(&mut w, t, 1);
+    }
+    let hit_at = hit_at.expect("удар попал");
+    assert!(hit_at <= 4, "попадание через {hit_at} шагов");
+    let s = w.snapshot();
+    let p = s.player.unwrap();
+    assert!(p.striking, "в момент попадания идёт фаза удара");
+    assert_eq!(s.items.len(), idle.items.len() + 1, "виден взмах");
+    assert!(s.shake > 0.0, "камера трясётся");
+    assert!(brightest_tint(&s) > 1.0, "манекен вспыхнул");
+    let d = w.dummies()[0].clone();
+    assert_eq!(d.hp, 4);
+    // Стоп-кадр: герой и манекен стоят 3–4 шага.
+    let (hero, dummy) = (w.player_body().unwrap().pos, d.body.pos);
+    let mut frozen = 0;
+    for _ in 0..10 {
+        t = steps(&mut w, t, 1);
+        if w.player_body().unwrap().pos == hero && w.dummies()[0].body.pos == dummy {
+            frozen += 1;
+        } else {
+            break;
+        }
+    }
+    assert!((3..=5).contains(&frozen), "стоп-кадр {frozen} шагов");
+    assert!((hero[0] - hero0[0]).abs() < 0.02, "герой бил стоя");
+    // Манекен отлетел влево, подпрыгнул, приземлился и не провалился.
+    let mut top = dummy[1];
+    let mut min_x = dummy[0];
+    for _ in 0..90 {
+        t = steps(&mut w, t, 1);
+        let d = &w.dummies()[0];
+        top = top.max(d.body.pos[1]);
+        min_x = min_x.min(d.body.pos[0]);
+        assert!(
+            d.bounds().min[1] >= -0.78 - 1e-6,
+            "манекен в полу: {:?}",
+            d.bounds()
+        );
+    }
+    let d = w.dummies()[0].clone();
+    assert!(top > dummy[1] + 0.04, "подлетел до {top}");
+    assert!(min_x < dummy[0] - 0.1, "отлетел влево до {min_x}");
+    assert!(
+        d.body.on_ground && d.body.vel[0].abs() < 1e-9,
+        "лёг на пол и встал"
+    );
+    let s = w.snapshot();
+    assert_eq!(s.shake, 0.0, "тряска кончилась");
+    assert!(brightest_tint(&s) <= 1.0, "вспышка кончилась");
+    assert_eq!(s.items.len(), idle.items.len(), "взмах спрятан");
+}
+
+#[test]
+fn dummy_breaks_after_five_hits_and_comes_back_on_its_spot() {
+    use reyvec_game::Action::{Attack, Left};
+    use reyvec_game::InputFrame;
+    let (mut w, mut t) = example_world();
+    let idle = w.snapshot().items.len();
+    w.set_player_body(reyvec_game::Body::new([-0.7, -0.64]));
+    // Повернуться к манекену.
+    w.set_input(InputFrame::new(&[Left], &[Left]));
+    t = steps(&mut w, t, 1);
+    // Герой идёт за манекеном и бьёт каждые 0,4 с.
+    let mut broke = None;
+    for i in 0..900 {
+        let d = &w.dummies()[0];
+        let hero = w.player_body().unwrap();
+        let near = hero.pos[0] - d.body.pos[0] < 0.25;
+        let held: &[reyvec_game::Action] = if near { &[] } else { &[Left] };
+        let pressed: &[reyvec_game::Action] = if near && i % 24 == 0 { &[Attack] } else { &[] };
+        w.set_input(InputFrame::new(held, pressed));
+        t = steps(&mut w, t, 1);
+        if !w.dummies()[0].alive() {
+            broke = Some(t);
+            break;
+        }
+    }
+    broke.unwrap_or_else(|| {
+        panic!(
+            "манекен не разбит: {:?}, герой {:?}",
+            w.dummies(),
+            w.snapshot().player
+        )
+    });
+    let s = w.snapshot();
+    assert!(s.player.unwrap().hits >= 5);
+    assert!(s.items.len() < idle, "разбитый не рисуется");
+    // Отходим с места появления и ждём 2 с.
+    w.set_player_body(reyvec_game::Body::new([0.4, -0.64]));
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 125);
+    let d = w.dummies()[0].clone();
+    assert!(d.alive(), "манекен появился снова");
+    assert_eq!(d.hp, d.max_hp);
+    steps(&mut w, t, 20);
+    let d = w.dummies()[0].clone();
+    assert!((d.body.pos[0] - d.spawn[0]).abs() < 1e-9 && d.body.on_ground);
 }
