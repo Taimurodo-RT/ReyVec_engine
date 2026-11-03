@@ -196,6 +196,9 @@ pub struct Dummy {
     pub respawn: f64,
     /// На сколько сдвинулся за последний шаг (для толчка героя).
     pub moved: [f64; 2],
+    /// Чего хочет (6.9): скрипт врага задаёт бег и прыжок; у манекена без скрипта —
+    /// ничего.
+    pub intent: Intent,
 }
 
 /// Сколько светится манекен после попадания.
@@ -228,6 +231,7 @@ impl Dummy {
             broken: 0.0,
             respawn,
             moved: [0.0, 0.0],
+            intent: Intent::default(),
         }
     }
 
@@ -268,7 +272,9 @@ impl Dummy {
     pub fn step(&mut self, solids: &[Collider], dt: f64) {
         let before = self.body.pos;
         if self.alive() {
-            self.body.step(&self.tuning, Intent::default(), solids, dt);
+            self.body.step(&self.tuning, self.intent, solids, dt);
+            // Нажатие прыжка — только на первом из шагов.
+            self.intent.jump_pressed = false;
         }
         self.moved = [self.body.pos[0] - before[0], self.body.pos[1] - before[1]];
     }

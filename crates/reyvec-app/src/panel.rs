@@ -88,6 +88,8 @@ pub(crate) struct PanelInfo<'a> {
     pub logic: Option<(u64, f64)>,
     /// Персонаж игрока (6.1) и задержки ввода (6.3); камера идёт за ним; геймпад.
     pub player: Option<reyvec_gpu::PlayerStats>,
+    /// Скрипты сцены (6.9).
+    pub scripts: Option<reyvec_scene::ScriptInfo>,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -312,6 +314,15 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         if let Some(p) = info.player {
             ui.label(mono(player_text(&p.view, info.follow)));
             ui.label(mono(input_text(&p, info.gamepad)));
+        }
+        if let Some(s) = &info.scripts {
+            ui.label(mono(scripts_text(s)));
+            for e in &s.errors {
+                ui.label(
+                    RichText::new(format!("Ошибка скрипта: {e}"))
+                        .color(Color32::from_rgb(255, 90, 80)),
+                );
+            }
         }
         if let Some(stats) = info.particles {
             ui.label(mono(particles_text(&stats)));
@@ -552,6 +563,17 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::Snapshot);
         }
     });
+}
+
+/// Строка «Скрипты»: файлы, предметы, правки на лету.
+fn scripts_text(s: &reyvec_scene::ScriptInfo) -> String {
+    format!(
+        "Скрипты Luau: файлов {}, предметов {}, перечитано после правки {}, память {:.1} МБ",
+        s.files,
+        s.actors,
+        s.reloads,
+        s.memory as f64 / (1024.0 * 1024.0)
+    )
 }
 
 /// Строка «Герой»: где стоит, скорость, идёт ли камера.
@@ -818,6 +840,13 @@ mod tests {
                 },
                 input_ms: Some(8.3),
                 frame_ms: Some(17.5),
+            }),
+            scripts: Some(reyvec_scene::ScriptInfo {
+                files: 2,
+                actors: 4,
+                reloads: 1,
+                errors: vec!["жук.luau:3: ожидалось end".into()],
+                memory: 300_000,
             }),
             gamepad: Some("Xbox Controller"),
             follow: true,

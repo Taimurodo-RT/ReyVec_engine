@@ -47,8 +47,8 @@ fn example_scene_parses_and_builds() {
         })
         .count();
     // Слои с тенью: стол, полка, герой, ящики под полкой, 6 препятствий коридора (6.1),
-    // подъёмник и столб (6.2), уступы (6.4), 2 манекена (6.5); окно без слоя.
-    assert_eq!(shadow_layers, 15);
+    // подъёмник и столб (6.2), уступы (6.4), 2 манекена (6.5), жук (6.9); окно без слоя.
+    assert_eq!(shadow_layers, 16);
     // Герой (6.1) и твёрдое: пол, стена слева, столешница, 6 банок с крышками, 3 книги,
     // полка, 2 ящика, 6 препятствий коридора, подъёмник и столб; с 6.4 край уступов и
     // сами уступы: 13 склонов, 4 доски и всего 6 прямоугольников из сотен клеток блоков.
@@ -1671,4 +1671,125 @@ fn bones_errors_are_in_russian() {
         e.to_string().contains("только внутри предмета с player"),
         "{e}"
     );
+}
+
+/// Сцена со скриптами во временной папке: жук-враг и монета.
+fn script_level(dir: &std::path::Path, beetle: &str) -> SceneWorld {
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    std::fs::write(dir.join("scripts/beetle.luau"), beetle).unwrap();
+    std::fs::copy(
+        std::path::Path::new(EXAMPLE_DIR).join("scripts/coin.luau"),
+        dir.join("scripts/coin.luau"),
+    )
+    .unwrap();
+    let text = minimal(
+        r##"nodes: [
+        (name: "пол", solids: [(at: (0.0, -0.9), size: (8.0, 0.2))]),
+        (name: "герой", at: (-1.0, -0.65), player: (size: (0.14, 0.28)), shapes: [Rect(at: (0.0, 0.0), size: (0.14, 0.28), color: "#fff")]),
+        (name: "жук", at: (1.0, -0.7), dummy: (size: (0.2, 0.12), hp: 3), script: "scripts/beetle.luau",
+            shapes: [Rect(at: (0.0, 0.0), size: (0.2, 0.12), color: "#3d6b3a")]),
+        (name: "монета", at: (-0.6, -0.65), script: "scripts/coin.luau", touch: (0.08, 0.08),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.035, color: "#e0a830")]),
+    ]"##,
+    );
+    let file = SceneFile::parse_in(&text, Some(dir)).unwrap();
+    let mut lib = library();
+    SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap()
+}
+
+#[test]
+fn scripts_drive_an_enemy_and_a_coin_and_pick_up_edits() {
+    use reyvec_game::Action::Right;
+    use reyvec_game::InputFrame;
+    let dir = std::env::temp_dir().join(format!("reyvec-scripts-{}", std::process::id()));
+    let beetle =
+        std::fs::read_to_string(std::path::Path::new(EXAMPLE_DIR).join("scripts/beetle.luau"))
+            .unwrap();
+    let mut w = script_level(&dir, &beetle);
+    let mut t = steps(&mut w, 0, 30);
+    let info = w.snapshot().scripts;
+    assert_eq!((info.files, info.actors), (2, 2), "{info:?}");
+    assert!(info.errors.is_empty(), "{info:?}");
+    // Жук гуляет у своего места (герой далеко).
+    let start = w.dummies()[0].spawn[0];
+    let mut xs = Vec::new();
+    for _ in 0..240 {
+        t = steps(&mut w, t, 1);
+        xs.push(w.dummies()[0].body.pos[0]);
+    }
+    let (lo, hi) = xs
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+    assert!(
+        hi - lo > 0.6 && lo > start - 0.6 && hi < start + 0.6,
+        "{lo}…{hi}"
+    );
+    // Герой бежит вправо: монета подобрана (событие один раз), жук бежит к герою.
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    let mut pickups = 0;
+    let mut seen = 0;
+    let mut chased = false;
+    for _ in 0..70 {
+        t = steps(&mut w, t, 1);
+        for (s, e) in w.snapshot().events {
+            if s > seen && matches!(e, GameEvent::Pickup { .. }) {
+                pickups += 1;
+            }
+            seen = seen.max(s);
+        }
+        let hero = w.snapshot().player.unwrap().at[0] as f64;
+        let d = &w.dummies()[0];
+        chased |= (hero - d.body.pos[0]).abs() < 0.9 && d.body.vel[0] < -0.5;
+    }
+    assert_eq!(pickups, 1, "монета подобрана один раз");
+    assert!(chased, "жук не бежит к герою");
+    // Правка скрипта на лету: жук стоит на месте. Ошибка в правке видна, старое
+    // поведение остаётся.
+    let path = dir.join("scripts/beetle.luau");
+    let touch = |text: &str, secs: u64| {
+        std::fs::write(&path, text).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    touch("function update(me)\n  me.move = = 0\nend", 5);
+    t = steps(&mut w, t, 20);
+    let info = w.snapshot().scripts;
+    assert!(info.errors[0].starts_with("beetle.luau:2"), "{info:?}");
+    touch("function update(me) me.move = 0 end", 10);
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 60);
+    let a = w.dummies()[0].body.pos[0];
+    steps(&mut w, t, 30);
+    let b = w.dummies()[0].body.pos[0];
+    let info = w.snapshot().scripts;
+    assert!(info.errors.is_empty() && info.reloads == 2, "{info:?}");
+    assert!((a - b).abs() < 1e-6, "после правки стоит: {a} → {b}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn script_errors_are_in_russian() {
+    let e = error(&minimal(
+        r#"nodes: [(name: "г", player: (), script: "x.luau")]"#,
+    ));
+    assert!(e.to_string().contains("героем управляет игрок"), "{e}");
+    let e = error(&minimal(
+        r#"nodes: [(name: "стол", children: [(script: "x.luau")])]"#,
+    ));
+    assert!(
+        e.to_string()
+            .contains("script можно только у предмета верхнего уровня"),
+        "{e}"
+    );
+    // Нет файла: мир строится, ошибка видна на панели.
+    let text = minimal(r#"nodes: [(name: "м", script: "нет-такого.luau")]"#);
+    let file = SceneFile::parse(&text).unwrap();
+    let mut w = SceneWorld::new(&file, &mut library(), &mut ShapeCache::new()).unwrap();
+    w.update_at(0.0);
+    let info = w.snapshot().scripts;
+    assert!(info.errors[0].contains("не прочитать файл"), "{info:?}");
 }

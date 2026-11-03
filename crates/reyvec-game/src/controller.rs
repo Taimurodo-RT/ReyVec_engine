@@ -692,16 +692,15 @@ impl Body {
             }
         }
         if lift > 0.0 {
-            let free = solids.iter().all(|c| {
-                c.oneway || c.is_slope() || {
-                    let s = &c.aabb;
-                    // Над ступенькой ничего не мешает голове.
-                    !(s.min[0] < b.max[0] - EPS
-                        && s.max[0] > b.min[0] + EPS
-                        && s.min[1] >= b.max[1] - EPS
-                        && s.min[1] < b.max[1] + lift - EPS)
-                }
-            });
+            // На ступеньке персонаж ни во что не входит: ни головой, ни боком (выступ
+            // над ступенькой, например крышка банки шире самой банки).
+            let lifted = Aabb {
+                min: [b.min[0], b.min[1] + lift],
+                max: [b.max[0], b.max[1] + lift],
+            };
+            let free = solids
+                .iter()
+                .all(|c| c.oneway || c.is_slope() || !lifted.overlaps(&c.aabb));
             if !free {
                 return false;
             }

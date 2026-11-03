@@ -541,6 +541,11 @@ impl WindowRenderer {
         self.demo.as_ref().and_then(Demo::player_stats)
     }
 
+    /// Скрипты сцены из файла (6.9).
+    pub fn script_info(&self) -> Option<reyvec_scene::ScriptInfo> {
+        self.demo.as_ref().and_then(Demo::script_info)
+    }
+
     /// Логика сцены из файла: сколько шагов сделано и среднее время шага, мс.
     pub fn logic_stats(&self) -> Option<(u64, f64)> {
         self.demo.as_ref().and_then(Demo::logic_stats)

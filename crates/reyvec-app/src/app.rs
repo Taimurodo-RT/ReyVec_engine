@@ -420,6 +420,7 @@ impl App {
                 scene_error: renderer.scene_error(),
                 logic: renderer.logic_stats(),
                 player: renderer.player_stats(),
+                scripts: renderer.script_info(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),

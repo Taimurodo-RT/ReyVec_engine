@@ -21,6 +21,7 @@ reyvec-sdf = { path = "crates/reyvec-sdf" }
 reyvec-scene = { path = "crates/reyvec-scene" }
 reyvec-game = { path = "crates/reyvec-game" }
 reyvec-audio = { path = "crates/reyvec-audio" }
+reyvec-script = { path = "crates/reyvec-script" }
 ash = "0.38"
 ash-window = "0.13"
 notify = "8"

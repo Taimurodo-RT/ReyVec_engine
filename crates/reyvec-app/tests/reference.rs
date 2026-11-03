@@ -1161,3 +1161,28 @@ fn hero_moves_in_poses_run_jump_fall_strike() {
         assert_eq!(p.anim, *anim, "{name}: {p:?}");
     }
 }
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn scripted_beetle_chases_and_coin_sparkles() {
+    use reyvec_app::{HeadlessPlay, PlayInput};
+    use reyvec_scene::game::Action;
+    // Скрипты примера (6.9): жук в начале коридора бежит к герою; монета в комнате
+    // исчезает с блёстками, когда герой её касается.
+    let beetle = HeadlessPlay {
+        start: Some([2.6, -0.64]),
+        ..Default::default()
+    };
+    let frame = play_frame(None, 1.2, &beetle, Msaa::X4);
+    show_frame("script-beetle", &frame);
+    let coin = HeadlessPlay {
+        start: Some([0.9, -0.64]),
+        inputs: PlayInput::hold(Action::Right, 0.3, 1.0).to_vec(),
+        ..Default::default()
+    };
+    let frame = play_frame(None, 0.55, &coin, Msaa::X4);
+    show_frame("script-coin", &frame);
+    let p = frame.player.expect("герой");
+    eprintln!("монета: {p:?}, частиц {:?}", frame.particles);
+    assert!(p.at[0] > 1.1, "герой добежал до монеты: {p:?}");
+}

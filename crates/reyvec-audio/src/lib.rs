@@ -29,6 +29,8 @@ pub enum Sound {
     Dash,
     Swing,
     Hit,
+    /// Подобрал предмет (6.9).
+    Pickup,
 }
 
 /// Что видно о звуке на панели.
@@ -138,6 +140,7 @@ impl Audio {
             Sound::Dash => bank.dash.clone(),
             Sound::Swing => bank.swing.clone(),
             Sound::Hit => bank.hit.clone(),
+            Sound::Pickup => bank.pickup.clone(),
         };
         self.next_id += 1;
         let sent = commands.send(Command::Play {
