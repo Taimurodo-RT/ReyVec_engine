@@ -200,8 +200,8 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
 float4 fs_main(VertexOut input) : SV_Target
 {
     float r = length(input.local);
+    // Без discard: в SPIR-V 1.6 он требует shaderDemoteToHelperInvocation, а при
+    // смешивании прозрачный угол квадрата и так ничего не меняет.
     float a = input.color.a * saturate((1.0 - r) * 3.0);
-    if (a <= 0.0)
-        discard;
     return float4(input.color.rgb, a);
 }
