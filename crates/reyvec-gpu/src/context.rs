@@ -320,8 +320,13 @@ unsafe extern "system" fn debug_callback(
         }
     };
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
-        VALIDATION_ERRORS.fetch_add(1, Ordering::Relaxed);
+        let n = VALIDATION_ERRORS.fetch_add(1, Ordering::Relaxed);
         tracing::error!(target: "vulkan", "{kind:?}: {message}");
+        // Первые ошибки ещё и в вывод ошибок: в тестах лог не настроен, а без текста
+        // упавшую проверку валидации не разобрать (вывод виден у упавших тестов).
+        if n < 8 {
+            eprintln!("Ошибка валидации Vulkan: {kind:?}: {message}");
+        }
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
         tracing::warn!(target: "vulkan", "{kind:?}: {message}");
     } else {
