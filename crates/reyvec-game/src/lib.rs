@@ -11,14 +11,18 @@
 //!   ступеньки и вис на краю (6.4).
 //! - [`combat`]: удар героя с хитбоксом, манекены, которых отбрасывает, стоп-кадр и
 //!   тряска при попадании (6.5).
+//! - [`anim`]: анимация героя из костей (6.8): позы по состоянию тела и удара, плавные
+//!   переходы, события анимации (шаг ноги — звук и пыль).
 //! - [`Aabb`]: прямоугольник столкновений. Персонаж движется по осям по очереди и
 //!   останавливается ровно у ближайшей стены на пути, поэтому не проскакивает тонкие
 //!   стены даже на большой скорости.
 
+pub mod anim;
 pub mod combat;
 pub mod controller;
 pub mod input;
 
+pub use anim::{Animator, Bone, BonePose, Clip, Pose};
 pub use combat::{AttackTuning, Dummy, Fighter};
 pub use controller::{Body, Collider, Intent, StepEvents, Tuning};
 pub use input::{Action, InputFrame, InputReader, InputShared};

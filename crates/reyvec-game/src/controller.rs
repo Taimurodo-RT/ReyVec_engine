@@ -665,6 +665,11 @@ impl Body {
         self.ledge = None;
     }
 
+    /// Забирается на край (6.8: своя поза).
+    pub fn climbing(&self) -> bool {
+        self.climb.is_some()
+    }
+
     /// Висит на краю или забирается на него.
     pub fn on_ledge(&self) -> bool {
         self.hanging != 0.0

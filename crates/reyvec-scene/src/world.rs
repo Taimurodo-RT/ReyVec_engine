@@ -22,8 +22,10 @@ use std::sync::Arc;
 use reyvec_svg::SvgDrawing;
 use reyvec_vector::{Affine, BlendMode, Color, Instance, SceneItem, ShapeId, ShapeLibrary};
 
+use reyvec_game::anim::AnimInput;
 use reyvec_game::{
-    Aabb, Action, AttackTuning, Body, Collider, Dummy, Fighter, InputFrame, Intent, Tuning,
+    Aabb, Action, Animator, AttackTuning, Body, Bone, Collider, Dummy, Fighter, InputFrame, Intent,
+    Tuning,
 };
 
 use crate::assets::{self, MorphTrack};
@@ -198,6 +200,15 @@ pub struct Player {
     pub fighter: Fighter,
     /// Сколько попаданий по целям.
     pub hits: u32,
+    /// Анимация из костей (6.8).
+    pub anim: Animator,
+}
+
+/// Кость героя (6.8): какая и её место из файла (поза добавляется к нему).
+#[derive(Component, Clone, Copy, Debug)]
+pub struct BoneOf {
+    pub bone: Bone,
+    pub base: Placement,
 }
 
 /// Манекен (6.5) и прозрачность его предмета из файла (разбитый не виден).
@@ -227,14 +238,10 @@ struct Combat {
 struct Events {
     step: u64,
     list: std::collections::VecDeque<(u64, GameEvent)>,
-    /// Сколько осталось до следующего шага бега (пыль из-под ног).
-    run_left: f64,
 }
 
 /// Сколько шагов логики события лежат в снимке.
 const EVENT_STEPS: u64 = 16;
-/// Шаг бега: как часто из-под ног бегущего летит пыль, секунды.
-const RUN_STEP: f64 = 0.12;
 
 /// Нажатия, пришедшие во время стоп-кадра: персонаж получит их на первом шаге после
 /// него, иначе короткое нажатие в стоп-кадре потерялось бы.
@@ -318,6 +325,7 @@ impl SceneWorld {
             dir: file.dir.as_deref(),
             order: 0,
             entities: 0,
+            in_player: false,
         };
         // Источники и объекты верхнего уровня (способ 5.1) — в общем корне без места.
         let root = NodeDesc {
@@ -342,6 +350,7 @@ impl SceneWorld {
             player: None,
             strike: Vec::new(),
             dummy: None,
+            bone: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
@@ -356,6 +365,7 @@ impl SceneWorld {
                 gather_solids,
                 play,
                 combat_look,
+                pose_bones,
                 propagate_again,
                 collect,
             )
@@ -471,6 +481,8 @@ struct Spawner<'a> {
     dir: Option<&'a std::path::Path>,
     order: u32,
     entities: usize,
+    /// Строится содержимое героя: внутри него бывают кости.
+    in_player: bool,
 }
 
 impl Spawner<'_> {
@@ -539,6 +551,15 @@ impl Spawner<'_> {
                 attack: p.attack.tuning(),
                 fighter: Fighter::default(),
                 hits: 0,
+                anim: Animator::default(),
+            });
+        }
+        if let Some(bone) = n.bone.as_deref().and_then(Bone::parse)
+            && self.in_player
+        {
+            self.world.entity_mut(me).insert(BoneOf {
+                bone,
+                base: placement,
             });
         }
         if let Some(d) = &n.dummy {
@@ -754,9 +775,12 @@ impl Spawner<'_> {
                 Some(me),
             );
         }
+        let was = self.in_player;
+        self.in_player |= n.player.is_some();
         for (j, child) in n.children.iter().enumerate() {
             self.node(child, Some(me), &format!("{name} → предмет {}", j + 1))?;
         }
+        self.in_player = was;
         Ok(())
     }
 }
@@ -877,18 +901,6 @@ fn play(
                 let at = [feet[0], p.body.pos[1] as f32];
                 events.list.push_back((step, GameEvent::Dashed { at, dir }));
             }
-            if p.body.on_ground && p.body.vel[0].abs() > 0.8 {
-                events.run_left -= sdt;
-                if events.run_left <= 0.0 {
-                    events.run_left = RUN_STEP;
-                    let dir = p.body.vel[0].signum() as f32;
-                    events
-                        .list
-                        .push_back((step, GameEvent::Run { at: feet, dir }));
-                }
-            } else {
-                events.run_left = 0.0;
-            }
             let can = !p.body.on_ledge();
             let swings = p.fighter.swings;
             p.fighter
@@ -897,6 +909,18 @@ fn play(
                 let at = [p.body.pos[0] as f32, p.body.pos[1] as f32];
                 let dir = p.body.facing as f32;
                 events.list.push_back((step, GameEvent::Swing { at, dir }));
+            }
+            // Анимация (6.8): поза по телу и удару; нога встала на землю — шаг (звук и
+            // пыль из-под ног).
+            let anim = AnimInput {
+                landed: ev.landed,
+                ..AnimInput::of(&p.body, &p.tuning, &p.fighter, &p.attack)
+            };
+            if p.anim.step(&anim, sdt).step {
+                let dir = p.body.vel[0].signum() as f32;
+                events
+                    .list
+                    .push_back((step, GameEvent::Run { at: feet, dir }));
             }
             if let Some(hitbox) = p.fighter.hitbox(&p.attack, p.body.pos, p.tuning.half()) {
                 for (e, mut t) in &mut targets {
@@ -985,6 +1009,22 @@ fn combat_look(
         place.at = t.dummy.body.pos;
         place.flash = (t.dummy.flash / reyvec_game::combat::FLASH_TIME) as f32;
         place.opacity = if t.dummy.alive() { t.opacity } else { 0.0 };
+    }
+}
+
+/// Кости героя в позе анимации: к месту и повороту из файла добавляется поза.
+fn pose_bones(
+    players: Query<&Player>,
+    mut bones: Query<(&BoneOf, &mut Placement), Without<Player>>,
+) {
+    let Some(p) = players.iter().next() else {
+        return;
+    };
+    let pose = p.anim.pose();
+    for (b, mut place) in &mut bones {
+        let bp = pose.bone(b.bone);
+        place.at = [b.base.at[0] + bp.offset[0], b.base.at[1] + bp.offset[1]];
+        place.angle = b.base.angle + bp.angle;
     }
 }
 
@@ -1172,6 +1212,11 @@ fn collect(
             striking: p.fighter.striking(),
             swings: p.fighter.swings,
             hits: p.hits,
+            anim: if p.anim.attacking() {
+                "бьёт"
+            } else {
+                p.anim.clip().label()
+            },
         }),
         input_stamp: press.0,
         shake: if combat.shake_time > 0.0 {

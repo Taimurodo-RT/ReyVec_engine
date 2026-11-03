@@ -1598,3 +1598,77 @@ fn game_events_for_particles_come_once_with_their_step() {
     // Твёрдое уровня в снимке для частиц.
     assert!(!w.snapshot().solids.is_empty());
 }
+
+#[test]
+fn hero_bones_move_in_poses_and_feet_make_steps() {
+    use reyvec_game::Action::*;
+    use reyvec_game::InputFrame;
+    let (mut w, mut t) = example_world();
+    let bones = |w: &mut SceneWorld| {
+        let mut q = w
+            .world_mut()
+            .query::<(&crate::world::BoneOf, &crate::world::Placement)>();
+        let mut all: Vec<_> = q
+            .iter(w.world_mut())
+            .map(|(b, p)| (b.bone, p.angle - b.base.angle))
+            .collect();
+        all.sort_by_key(|(b, _)| *b as usize);
+        all
+    };
+    let idle = bones(&mut w);
+    assert_eq!(idle.len(), 7, "все кости героя примера: {idle:?}");
+    assert_eq!(w.snapshot().player.unwrap().anim, "стоит");
+    // Бежит: ноги расходятся в разные стороны, тело наклонено вперёд.
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    t = steps(&mut w, t, 40);
+    let run = bones(&mut w);
+    let angle = |all: &[(reyvec_game::Bone, f64)], b| {
+        all.iter().find(|(x, _)| *x == b).map(|(_, a)| *a).unwrap()
+    };
+    use reyvec_game::Bone as B;
+    assert_eq!(w.snapshot().player.unwrap().anim, "бежит");
+    assert!(angle(&run, B::Body) < -5.0, "{run:?}");
+    let legs = (angle(&run, B::LegFront), angle(&run, B::LegBack));
+    assert!(
+        legs.0 * legs.1 <= 0.0 && (legs.0 - legs.1).abs() > 5.0,
+        "{legs:?}"
+    );
+    // Прыжок: руки вверх.
+    w.set_input(InputFrame::new(&[Jump], &[Jump]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[Jump]));
+    t = steps(&mut w, t, 12);
+    let jump = bones(&mut w);
+    assert_eq!(w.snapshot().player.unwrap().anim, "прыгает");
+    assert!(angle(&jump, B::ArmFront) > 90.0, "{jump:?}");
+    // Удар: рука за голову, потом вперёд.
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 90);
+    w.set_input(InputFrame::new(&[Attack], &[Attack]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    let mut most: f64 = 0.0;
+    let mut least: f64 = 360.0;
+    for _ in 0..12 {
+        t = steps(&mut w, t, 1);
+        let a = angle(&bones(&mut w), B::ArmFront);
+        most = most.max(a);
+        least = least.min(a);
+    }
+    assert!(most > 150.0 && least < 80.0, "взмах {most}…{least}");
+}
+
+#[test]
+fn bones_errors_are_in_russian() {
+    let e = error(&minimal(
+        r#"nodes: [(name: "г", player: (), children: [(bone: "хвост")])]"#,
+    ));
+    assert!(e.to_string().contains("кости «хвост» нет"), "{e}");
+    let e = error(&minimal(
+        r#"nodes: [(name: "стол", children: [(bone: "рука")])]"#,
+    ));
+    assert!(
+        e.to_string().contains("только внутри предмета с player"),
+        "{e}"
+    );
+}

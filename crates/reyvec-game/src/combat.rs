@@ -160,6 +160,19 @@ impl Fighter {
         self.phase != Phase::Ready
     }
 
+    /// Где удар сейчас, для анимации (6.8): от 0 до 1 — замах, от 1 до 2 — удар (хитбокс
+    /// бьёт), от 2 до 3 — возврат; `None` — удара нет. Анимация берёт эти же фазы, поэтому
+    /// взмах руки и хитбокс совпадают по времени.
+    pub fn progress(&self, t: &AttackTuning) -> Option<f64> {
+        let part = |base: f64, time: f64| base + (1.0 - self.left / time.max(1e-9)).clamp(0.0, 1.0);
+        match self.phase {
+            Phase::Ready => None,
+            Phase::Windup => Some(part(0.0, t.windup)),
+            Phase::Active => Some(part(1.0, t.active)),
+            Phase::Recover => Some(part(2.0, t.recover)),
+        }
+    }
+
     /// Идёт фаза удара (хитбокс бьёт; в ней видно взмах).
     pub fn striking(&self) -> bool {
         self.phase == Phase::Active
