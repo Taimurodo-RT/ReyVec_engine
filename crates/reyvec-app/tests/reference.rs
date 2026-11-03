@@ -1189,7 +1189,7 @@ fn scripted_beetle_chases_and_coin_sparkles() {
 
 #[test]
 #[ignore = "нужен драйвер Vulkan"]
-fn physics_crate_flies_and_beetle_breaks_into_debris() {
+fn physics_crate_flies_and_dummy_breaks_into_debris() {
     use reyvec_app::{HeadlessPlay, PlayInput};
     use reyvec_scene::game::Action;
     // Физика (6.10): удар по ящику в начале коридора — ящик отлетает и кувыркается.
@@ -1203,20 +1203,21 @@ fn physics_crate_flies_and_beetle_breaks_into_debris() {
         show_frame(name, &frame);
         assert!(frame.player.is_some());
     }
-    // Жук: три удара — разбит, обломки цвета жука летят и падают.
+    // Манекен у левой стены: герой бьёт и подходит за отброшенным, пятый удар
+    // разбивает его — обломки цвета манекена летят и падают.
+    let mut inputs = PlayInput::hold(Action::Left, 0.0, 0.05).to_vec();
+    for k in 0..5 {
+        let at = 1.0 + 0.45 * f64::from(k);
+        inputs.extend(PlayInput::hold(Action::Attack, at, at + 0.05));
+        inputs.extend(PlayInput::hold(Action::Left, at + 0.15, at + 0.35));
+    }
     let beetle = HeadlessPlay {
-        start: Some([3.05, -0.64]),
-        inputs: [
-            PlayInput::hold(Action::Attack, 1.0, 1.05),
-            PlayInput::hold(Action::Attack, 1.4, 1.45),
-            PlayInput::hold(Action::Attack, 1.8, 1.85),
-            PlayInput::hold(Action::Attack, 2.2, 2.25),
-        ]
-        .concat(),
+        start: Some([-0.7, -0.64]),
+        inputs,
         ..Default::default()
     };
-    let frame = play_frame(None, 2.6, &beetle, Msaa::X4);
+    let frame = play_frame(None, 3.1, &beetle, Msaa::X4);
     show_frame("physics-debris", &frame);
     let p = frame.player.expect("герой");
-    eprintln!("обломки: {p:?}");
+    assert!(p.hits >= 5, "{p:?}");
 }
