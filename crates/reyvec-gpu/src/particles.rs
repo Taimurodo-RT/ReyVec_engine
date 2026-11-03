@@ -461,9 +461,10 @@ fn dust(at: [f32; 2], vel: [f32; 2], r: &mut Rand) -> Particle {
         vel,
         life,
         max_life: life,
-        size: r.range(0.018, 0.034),
+        size: r.range(0.03, 0.06),
         gravity: 0.25,
-        color: [0.42 * shade, 0.36 * shade, 0.3 * shade, 0.55],
+        // Светлее пола: в тёмной комнате бурая пыль на буром полу не видна.
+        color: [0.62 * shade, 0.56 * shade, 0.48 * shade, 0.5],
         drag: 3.0,
         bounce: 0.1,
         flags: PARTICLE_COLLIDE | PARTICLE_SHRINK,
@@ -522,12 +523,13 @@ pub(crate) fn burst(event: &reyvec_scene::GameEvent, seed: u64) -> Vec<Particle>
                     vel: v,
                     life,
                     max_life: life,
-                    size: r.range(0.01, 0.018),
+                    size: r.range(0.018, 0.032),
                     gravity: 0.7,
                     color: if hot {
-                        [6.0, 5.5, 4.5, 1.0]
+                        [5.0, 3.6, 1.2, 1.0]
                     } else {
-                        [4.0, 1.9, 0.5, 1.0]
+                        // Оранжевые: при сведении к экрану не выгорают в белое.
+                        [3.0, 0.9, 0.15, 1.0]
                     },
                     drag: 2.0,
                     bounce: 0.45,

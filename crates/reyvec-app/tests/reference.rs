@@ -1038,8 +1038,14 @@ fn hit_throws_sparks_that_fly_fall_and_fade() {
         fly.particles
     );
     assert!(b > a + 20, "искр не видно: {a} → {b}");
-    // Через секунду все искры погасли.
-    assert!(d <= a + 2, "искры не гаснут: {d} (до удара {a})");
+    // Через секунду все искры погасли (пиксели сравнивать нельзя: манекен отлетел, а
+    // тёплые пиксели есть и в самой комнате).
+    assert_eq!(
+        gone.particles.live, 0,
+        "искры не гаснут: {:?}",
+        gone.particles
+    );
+    eprintln!("тёплых пикселей через секунду {d}");
     assert_eq!(gone.particles.dropped, 0);
 }
 
