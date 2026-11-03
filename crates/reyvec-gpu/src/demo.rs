@@ -1904,7 +1904,7 @@ impl Demo {
                 .map(|f| {
                     (
                         crate::particles::push(f, center, frame.aspect, zoom, glow),
-                        f.span.count,
+                        self.particles.draw_buffer,
                     )
                 })
         };
@@ -1924,6 +1924,7 @@ impl Demo {
                             self.particle_update,
                             &push,
                             f.span.count,
+                            f.build_list.then_some(self.particles.draw_buffer),
                         );
                     }
                 }
@@ -2005,10 +2006,12 @@ impl Demo {
                         vk::Offset2D::default(),
                     );
                 }
-                if let Some((push, count)) = particle_draw {
+                if let Some((push, list)) = particle_draw {
+                    // Сколько рисовать, видеокарта записала сама (только живые обычные).
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.particle_draw);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                    d.cmd_draw(cmd, 6, count, 0, 0);
+                    let args = crate::particles::DRAW_ARGS_NORMAL;
+                    d.cmd_draw_indirect(cmd, list, args, 1, 16);
                 }
                 if frame.sprite_count > 0 {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
@@ -2083,10 +2086,11 @@ impl Demo {
                 d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                 d.cmd_draw(cmd, 3, 1, 0, 0);
                 // Искры светятся сами: поверх освещённого кадра, уровень их не затемняет.
-                if let Some((push, count)) = particle_glow {
+                if let Some((push, list)) = particle_glow {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.particle_glow);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                    d.cmd_draw(cmd, 6, count, 0, 0);
+                    let args = crate::particles::DRAW_ARGS_GLOW;
+                    d.cmd_draw_indirect(cmd, list, args, 1, 16);
                 }
                 d.cmd_end_rendering(cmd);
             }
