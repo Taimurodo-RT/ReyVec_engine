@@ -225,6 +225,44 @@
                 Circle(at: (0.1, 0.0), r: 0.009, color: "#ffd84a"),
             ],
         ),
+        // Физика (6.10): body — предмет падает, катится, его толкает герой и отбрасывает
+        // удар; на ящик можно встать. size — ширина и высота (у мяча round: true —
+        // диаметр), density — плотность, bounce — упругость (0–1), friction — трение.
+        // Разбитый враг разлетается на обломки, они гаснут через 3 с.
+        (
+            name: "мяч",
+            at: (0.85, -0.3),
+            depth: 2,
+            shadow: true,
+            body: (size: (0.1, 0.1), round: true, density: 0.4, bounce: 0.6),
+            shapes: [
+                Circle(at: (0.0, 0.0), r: 0.05, color: "#d0503a"),
+                Rect(at: (0.0, 0.0), size: (0.1, 0.018), color: "#f0e0c0"),
+            ],
+        ),
+        (
+            name: "ящик лёгкий",
+            at: (2.75, -0.6),
+            depth: 2,
+            shadow: true,
+            body: (size: (0.16, 0.16)),
+            shapes: [
+                Rect(at: (0.0, 0.0), size: (0.16, 0.16), corner: 0.01, color: "#a8743e"),
+                Rect(at: (0.0, 0.0), size: (0.16, 0.16), color: "#5a3a20", stroke: 0.012),
+                Line(points: [(-0.07, -0.07), (0.07, 0.07)], width: 0.012, color: "#5a3a20"),
+            ],
+        ),
+        (
+            name: "ящик маленький",
+            at: (2.77, -0.3),
+            depth: 2,
+            shadow: true,
+            body: (size: (0.11, 0.11), density: 0.6),
+            shapes: [
+                Rect(at: (0.0, 0.0), size: (0.11, 0.11), corner: 0.01, color: "#b8844e"),
+                Rect(at: (0.0, 0.0), size: (0.11, 0.11), color: "#5a3a20", stroke: 0.01),
+            ],
+        ),
         // Монеты: одна в комнате справа от героя, три над досками в коридоре.
         (name: "монета 1", at: (1.25, -0.62), depth: 2, script: "scripts/coin.luau", touch: (0.08, 0.08), shapes: [Circle(at: (0.0, 0.0), r: 0.035, color: "#e0a830"), Circle(at: (0.0, 0.0), r: 0.022, color: "#ffd860")]),
         (name: "монета 2", at: (6.9, 0.0), depth: 2, script: "scripts/coin.luau", touch: (0.08, 0.08), shapes: [Circle(at: (0.0, 0.0), r: 0.035, color: "#e0a830"), Circle(at: (0.0, 0.0), r: 0.022, color: "#ffd860")]),

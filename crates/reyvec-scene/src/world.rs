@@ -23,6 +23,7 @@ use reyvec_svg::SvgDrawing;
 use reyvec_vector::{Affine, BlendMode, Color, Instance, SceneItem, ShapeId, ShapeLibrary};
 
 use reyvec_game::anim::AnimInput;
+use reyvec_game::physics::{BodyId, Physics};
 use reyvec_game::{
     Aabb, Action, Animator, AttackTuning, Body, Bone, Collider, Dummy, Fighter, InputFrame, Intent,
     Tuning,
@@ -239,7 +240,56 @@ pub struct BoneOf {
 pub struct Target {
     pub dummy: Dummy,
     pub opacity: f32,
+    /// Цвет обломков, когда разбит (6.10): цвет самой большой фигуры.
+    pub color: Color,
 }
+
+/// Физическое тело предмета (6.10) и его поворот из файла.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct PhysBody {
+    pub id: BodyId,
+    pub angle: f64,
+}
+
+/// Обломок разбитого врага: заранее созданная сущность с квадратом, тело физики и
+/// сколько ему ещё лежать.
+struct Piece {
+    entity: Entity,
+    body: Option<BodyId>,
+    left: f64,
+}
+
+/// Разбит враг: где, его размер, цвет и куда били.
+struct Break {
+    at: [f64; 2],
+    size: [f64; 2],
+    color: Color,
+    dir: f64,
+}
+
+/// Физика сцены (6.10).
+#[derive(Resource)]
+struct PhysicsRes {
+    physics: Physics,
+    /// Тела предметов (без обломков) по порядку: для героя они платформы.
+    bodies: Vec<BodyId>,
+    /// Платформы для героя после прошлого шага физики.
+    platforms: Vec<Collider>,
+    /// Сколько шагать физике (пишет `play`: время шага без стоп-кадра).
+    dt: f64,
+    breaks: Vec<Break>,
+    pieces: Vec<Piece>,
+    seed: u64,
+}
+
+/// Сколько обломков от одного разбитого врага и сколько всего в запасе.
+const PIECES_PER_BREAK: usize = 10;
+const PIECES: usize = 40;
+/// Сколько лежат обломки и сколько из этого времени гаснут, секунды.
+const PIECE_LIFE: f64 = 3.0;
+const PIECE_FADE: f64 = 0.6;
+/// Номера платформ из физических тел для героя (не пересекаются с номерами сущностей).
+const PLATFORM_IDS: u64 = 1 << 62;
 
 /// Фигура взмаха удара: видна только в фазе удара героя.
 #[derive(Component, Clone, Copy, Debug, Default)]
@@ -341,6 +391,15 @@ impl SceneWorld {
         world.init_resource::<Pending>();
         world.init_resource::<Events>();
         world.insert_resource(LastStep(0.0));
+        world.insert_resource(PhysicsRes {
+            physics: Physics::new(reyvec_game::Tuning::default().gravity()),
+            bodies: Vec::new(),
+            platforms: Vec::new(),
+            dt: 0.0,
+            breaks: Vec::new(),
+            pieces: Vec::new(),
+            seed: 0x5eed,
+        });
         world.insert_resource(ScriptRes {
             scripts: reyvec_script::Scripts::new(),
             until_check: SCRIPT_CHECK_STEPS,
@@ -380,6 +439,7 @@ impl SceneWorld {
             bone: None,
             script: None,
             touch: None,
+            body: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
@@ -393,6 +453,7 @@ impl SceneWorld {
                 propagate,
                 gather_solids,
                 play,
+                physics_step,
                 run_scripts,
                 combat_look,
                 pose_bones,
@@ -547,6 +608,47 @@ impl Spawner<'_> {
         self.order
     }
 
+    /// Запас обломков (6.10): квадраты, которые ждут, пока кого-нибудь разобьют.
+    /// Создаётся один раз, при первом манекене.
+    fn debris_pool(&mut self) -> Result<(), SceneError> {
+        if !self.world.resource::<PhysicsRes>().pieces.is_empty() {
+            return Ok(());
+        }
+        let id = crate::debris_square()
+            .shape_id(self.library, self.cache)
+            .map_err(|m| SceneError::new(format!("обломки: {m}")))?;
+        let mut pieces = Vec::with_capacity(PIECES);
+        for _ in 0..PIECES {
+            let order = self.next();
+            let entity = self.spawn(
+                (
+                    Name::new("обломок"),
+                    Placement {
+                        depth: 2.5,
+                        opacity: 0.0,
+                        shadow: Some(false),
+                        ..Placement::IDENTITY
+                    },
+                    GlobalPlacement::ROOT,
+                    VectorShape {
+                        id,
+                        tint: Color::WHITE,
+                        order,
+                        morph: None,
+                    },
+                ),
+                None,
+            );
+            pieces.push(Piece {
+                entity,
+                body: None,
+                left: 0.0,
+            });
+        }
+        self.world.resource_mut::<PhysicsRes>().pieces = pieces;
+        Ok(())
+    }
+
     fn spawn(&mut self, bundle: impl Bundle, parent: Option<Entity>) -> Entity {
         self.entities += 1;
         let mut e = self.world.spawn(bundle);
@@ -587,6 +689,16 @@ impl Spawner<'_> {
                 anim: Animator::default(),
             });
         }
+        if let Some(b) = &n.body {
+            let mut res = self.world.resource_mut::<PhysicsRes>();
+            let id = res
+                .physics
+                .add(placement.at, n.angle, [0.0, 0.0], &b.physics());
+            res.bodies.push(id);
+            self.world
+                .entity_mut(me)
+                .insert(PhysBody { id, angle: n.angle });
+        }
         if let Some(file) = &n.script {
             let path = match self.dir {
                 Some(dir) => dir.join(file),
@@ -613,10 +725,25 @@ impl Spawner<'_> {
             });
         }
         if let Some(d) = &n.dummy {
+            let color = n
+                .shapes
+                .iter()
+                .map(|s| {
+                    let area = match s {
+                        ShapeDesc::Rect { size, .. } => size.0 * size.1,
+                        ShapeDesc::Circle { r, .. } => std::f64::consts::PI * r * r,
+                        _ => 0.0,
+                    };
+                    (area, s.placement().2.0)
+                })
+                .fold((0.0, Color::WHITE), |a, b| if b.0 > a.0 { b } else { a })
+                .1;
             self.world.entity_mut(me).insert(Target {
                 dummy: Dummy::new(placement.at, [d.size.0, d.size.1], d.hp, d.respawn),
                 opacity: n.opacity,
+                color,
             });
+            self.debris_pool()?;
         }
         for s in &n.solids {
             self.spawn(
@@ -853,9 +980,11 @@ fn play(
     mut combat: ResMut<Combat>,
     mut pending: ResMut<Pending>,
     mut events: ResMut<Events>,
+    mut phys: ResMut<PhysicsRes>,
     mut players: Query<(&mut Player, &mut Placement)>,
     mut targets: Query<(Entity, &mut Target), Without<Player>>,
 ) {
+    phys.dt = 0.0;
     let dt = (time.0 - last.0).clamp(0.0, 0.25);
     last.0 = time.0;
     events.step += 1;
@@ -892,6 +1021,7 @@ fn play(
         return;
     }
     let presses = std::mem::take(&mut *pending);
+    phys.dt = dt;
 
     // Запас на неточность дробей: ровно один шаг логики — один шаг персонажа.
     let steps = (dt / PLAYER_STEP - 1e-6).ceil().max(1.0) as usize;
@@ -907,7 +1037,14 @@ fn play(
         .filter(|(_, t)| t.dummy.alive())
         .map(|(e, t)| t.dummy.collider(e.to_bits()))
         .collect();
-    let with_bodies: Vec<Collider> = solids.0.iter().chain(&bodies).copied().collect();
+    // Физические тела (6.10) для героя — платформы: на них встают, сбоку герой их толкает.
+    let with_bodies: Vec<Collider> = solids
+        .0
+        .iter()
+        .chain(&bodies)
+        .chain(&phys.platforms)
+        .copied()
+        .collect();
     let with_bodies_still: Vec<Collider> = with_bodies.iter().map(still).collect();
 
     let mut stop = false;
@@ -992,7 +1129,15 @@ fn play(
                             },
                         ));
                         let k = p.attack.knockback;
-                        t.dummy.hurt(p.attack.damage, [dir * k[0], k[1]]);
+                        if t.dummy.hurt(p.attack.damage, [dir * k[0], k[1]]) {
+                            // Разбит: обломки разлетаются (6.10).
+                            phys.breaks.push(Break {
+                                at: t.dummy.body.pos,
+                                size: t.dummy.tuning.size,
+                                color: t.color,
+                                dir,
+                            });
+                        }
                         p.hits += 1;
                         combat.hit_stop = combat.hit_stop.max(p.attack.hit_stop);
                         if p.attack.shake > 0.0 && p.attack.shake_time > 0.0 {
@@ -1069,6 +1214,158 @@ fn combat_look(
         place.flash = (t.dummy.flash / reyvec_game::combat::FLASH_TIME) as f32;
         place.opacity = if t.dummy.alive() { t.opacity } else { 0.0 };
     }
+}
+
+/// Обломки: место и цвет квадрата (не тела предметов и не герой).
+type PieceShapes<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Placement, &'static mut VectorShape),
+    (Without<PhysBody>, Without<Player>),
+>;
+
+/// Физика (6.10): уровень, герой и враги — кинематические тела, предметы с `body` и
+/// обломки — настоящие. Удар героя отбрасывает тела; разбитый враг разлетается на
+/// обломки, которые через несколько секунд гаснут.
+fn physics_step(
+    solids: Res<Solids>,
+    mut phys: ResMut<PhysicsRes>,
+    mut events: ResMut<Events>,
+    mut players: Query<(Entity, &mut Player)>,
+    targets: Query<(Entity, &Target)>,
+    mut bodies: Query<(Entity, &PhysBody, &mut Placement), Without<Player>>,
+    mut shapes: PieceShapes,
+) {
+    let phys = &mut *phys;
+    let dt = phys.dt;
+    if dt <= 0.0 || (phys.bodies.is_empty() && phys.pieces.is_empty()) {
+        return;
+    }
+    let step = events.step;
+    // Кинематические тела: уровень, герои, целые враги.
+    let level = solids.0.iter().map(|c| (c.id, *c));
+    let heroes: Vec<(u64, Collider)> = players
+        .iter()
+        .map(|(e, p)| (e.to_bits(), Collider::solid(p.body.bounds(&p.tuning))))
+        .collect();
+    let enemies: Vec<(u64, Collider)> = targets
+        .iter()
+        .filter(|(_, t)| t.dummy.alive())
+        .map(|(e, t)| (e.to_bits(), Collider::solid(t.dummy.bounds())))
+        .collect();
+    phys.physics.set_solids(level.chain(heroes).chain(enemies));
+    // Удар героя отбрасывает тела.
+    for (_, mut player) in &mut players {
+        let p = &mut *player;
+        let Some(hitbox) = p.fighter.hitbox(&p.attack, p.body.pos, p.tuning.half()) else {
+            continue;
+        };
+        for (e, b, _) in &bodies {
+            let Some(bounds) = phys.physics.bounds(b.id) else {
+                continue;
+            };
+            if hitbox.overlaps(&bounds) && p.fighter.first_hit(e.to_bits()) {
+                let dir = p.fighter.dir();
+                let k = p.attack.knockback;
+                phys.physics
+                    .kick(b.id, [dir * k[0] * 1.4, k[1] * 1.2], -dir * 6.0);
+                let x = if dir > 0.0 {
+                    bounds.min[0]
+                } else {
+                    bounds.max[0]
+                };
+                let y = (bounds.min[1] + bounds.max[1]) * 0.5;
+                events.list.push_back((
+                    step,
+                    GameEvent::Hit {
+                        at: [x as f32, y as f32],
+                        dir: dir as f32,
+                    },
+                ));
+            }
+        }
+    }
+    // Обломки разбитых врагов.
+    for brk in std::mem::take(&mut phys.breaks) {
+        for i in 0..PIECES_PER_BREAK {
+            phys.seed = phys
+                .seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let r = |k: u32| ((phys.seed >> (16 + 8 * k)) & 0xff) as f64 / 255.0;
+            let (rx, ry, rs, rv) = (r(0), r(1), r(2), r(3));
+            // Свободный обломок или тот, что дольше всех лежит.
+            let Some(slot) = (0..phys.pieces.len()).min_by(|&a, &b| {
+                phys.pieces[a]
+                    .left
+                    .partial_cmp(&phys.pieces[b].left)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) else {
+                break;
+            };
+            if let Some(old) = phys.pieces[slot].body.take() {
+                phys.physics.remove(old);
+            }
+            let side = 0.18 + 0.12 * rs;
+            let piece = brk.size[0].min(brk.size[1]) * side;
+            let at = [
+                brk.at[0] + (rx - 0.5) * brk.size[0] * 0.7,
+                brk.at[1] + (ry - 0.5) * brk.size[1] * 0.7,
+            ];
+            let vel = [
+                brk.dir * (0.6 + 1.6 * rv) + (rx - 0.5) * 1.2,
+                1.0 + 1.8 * ry,
+            ];
+            let desc = reyvec_game::physics::BodyDesc {
+                size: [piece, piece],
+                density: 0.5,
+                bounce: 0.35,
+                ..Default::default()
+            };
+            let id = phys.physics.add(at, 0.0, vel, &desc);
+            phys.physics
+                .kick(id, [0.0, 0.0], (rs - 0.5) * 30.0 + i as f64);
+            let p = &mut phys.pieces[slot];
+            p.body = Some(id);
+            p.left = PIECE_LIFE;
+            if let Ok((mut place, mut shape)) = shapes.get_mut(p.entity) {
+                place.scale = piece;
+                shape.tint = brk.color;
+            }
+        }
+    }
+    phys.physics.step(dt);
+    // Места тел и обломков после шага.
+    for (_, b, mut place) in &mut bodies {
+        if let Some((at, angle)) = phys.physics.pose(b.id) {
+            place.at = at;
+            place.angle = b.angle + angle;
+        }
+    }
+    for i in 0..phys.pieces.len() {
+        let p = &mut phys.pieces[i];
+        let Some(id) = p.body else {
+            continue;
+        };
+        p.left -= dt;
+        let Ok((mut place, _)) = shapes.get_mut(p.entity) else {
+            continue;
+        };
+        if p.left <= 0.0 {
+            p.body = None;
+            p.left = 0.0;
+            place.opacity = 0.0;
+            phys.physics.remove(id);
+            continue;
+        }
+        if let Some((at, angle)) = phys.physics.pose(id) {
+            place.at = at;
+            place.angle = angle;
+            place.opacity = (p.left / PIECE_FADE).min(1.0) as f32;
+        }
+    }
+    let ids = phys.bodies.clone();
+    phys.platforms = phys.physics.platforms(&ids, PLATFORM_IDS);
 }
 
 /// Скрипты (6.9): на каждом шаге логики каждый предмет со скриптом решает, что делать.

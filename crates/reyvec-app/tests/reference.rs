@@ -1186,3 +1186,38 @@ fn scripted_beetle_chases_and_coin_sparkles() {
     eprintln!("монета: {p:?}, частиц {:?}", frame.particles);
     assert!(p.at[0] > 1.1, "герой добежал до монеты: {p:?}");
 }
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn physics_crate_flies_and_dummy_breaks_into_debris() {
+    use reyvec_app::{HeadlessPlay, PlayInput};
+    use reyvec_scene::game::Action;
+    // Физика (6.10): удар по ящику в начале коридора — ящик отлетает и кувыркается.
+    let crate_hit = HeadlessPlay {
+        start: Some([2.5, -0.64]),
+        inputs: PlayInput::hold(Action::Attack, 1.0, 1.05).to_vec(),
+        ..Default::default()
+    };
+    for (name, time) in [("physics-crate-before", 0.95), ("physics-crate-flies", 1.3)] {
+        let frame = play_frame(None, time, &crate_hit, Msaa::X4);
+        show_frame(name, &frame);
+        assert!(frame.player.is_some());
+    }
+    // Манекен у левой стены: герой бьёт и подходит за отброшенным, пятый удар
+    // разбивает его — обломки цвета манекена летят и падают.
+    let mut inputs = PlayInput::hold(Action::Left, 0.0, 0.05).to_vec();
+    for k in 0..5 {
+        let at = 1.0 + 0.45 * f64::from(k);
+        inputs.extend(PlayInput::hold(Action::Attack, at, at + 0.05));
+        inputs.extend(PlayInput::hold(Action::Left, at + 0.15, at + 0.35));
+    }
+    let beetle = HeadlessPlay {
+        start: Some([-0.7, -0.64]),
+        inputs,
+        ..Default::default()
+    };
+    let frame = play_frame(None, 3.1, &beetle, Msaa::X4);
+    show_frame("physics-debris", &frame);
+    let p = frame.player.expect("герой");
+    assert!(p.hits >= 5, "{p:?}");
+}
