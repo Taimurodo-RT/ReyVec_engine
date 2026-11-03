@@ -1046,6 +1046,12 @@ impl Demo {
         )
     }
 
+    /// Скрипты сцены из файла (6.9), если они есть.
+    pub fn script_info(&self) -> Option<reyvec_scene::ScriptInfo> {
+        let s = &self.file_scene.scripts;
+        (s.files > 0).then(|| s.clone())
+    }
+
     /// Снимок сцены из файла, который рисуется сейчас.
     pub fn file_player(&self) -> Option<reyvec_scene::PlayerView> {
         self.file_scene.player

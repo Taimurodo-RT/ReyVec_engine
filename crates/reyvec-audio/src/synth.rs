@@ -136,6 +136,20 @@ pub fn hit(rate: f32) -> Vec<f32> {
     })
 }
 
+/// Подобрал: две высокие ноты колокольчиком (ми и си), вторая чуть позже.
+pub fn pickup(rate: f32) -> Vec<f32> {
+    render(0.32, rate, |t| {
+        let bell = |f: f32, t: f32| {
+            if t < 0.0 {
+                return 0.0;
+            }
+            let e = envelope(t, 0.002, 0.09);
+            ((TAU * f * t).sin() + 0.3 * (TAU * 2.0 * f * t).sin()) * e
+        };
+        0.3 * bell(1318.5, t) + 0.3 * bell(1975.5, t - 0.07)
+    })
+}
+
 /// Частота ноты MIDI (69 — ля первой октавы, 440 Гц).
 fn note(midi: f32) -> f32 {
     440.0 * 2f32.powf((midi - 69.0) / 12.0)
@@ -191,6 +205,7 @@ pub struct Bank {
     pub dash: Arc<[f32]>,
     pub swing: Arc<[f32]>,
     pub hit: Arc<[f32]>,
+    pub pickup: Arc<[f32]>,
     pub music: Arc<[f32]>,
 }
 
@@ -206,6 +221,7 @@ impl Bank {
             dash: dash(r).into(),
             swing: swing(r).into(),
             hit: hit(r).into(),
+            pickup: pickup(r).into(),
             music: music(r).into(),
         }
     }
@@ -229,6 +245,7 @@ mod tests {
             ("рывок", dash(rate)),
             ("взмах", swing(rate)),
             ("попадание", hit(rate)),
+            ("подобрал", pickup(rate)),
         ];
         for (name, s) in &all {
             let seconds = s.len() as f32 / rate;

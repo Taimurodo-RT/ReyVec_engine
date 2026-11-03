@@ -204,6 +204,29 @@ pub struct Player {
     pub anim: Animator,
 }
 
+/// Предмет со скриптом (6.9): его таблица `me` в скрипте, прямоугольник касания героя
+/// и место из файла. У манекена скрипт задаёт бег и прыжок, у других предметов — место
+/// и видимость.
+#[derive(Component)]
+pub struct Scripted {
+    actor: reyvec_script::Actor,
+    touch: [f64; 2],
+    /// Прозрачность из файла (скрытый скриптом — 0).
+    opacity: f32,
+    /// Уже подобран: событие «подобрал» один раз, пока скрипт не сбросит `collected`.
+    collected: bool,
+}
+
+/// Все скрипты мира и счётчик шагов до проверки файлов на правку.
+#[derive(Resource)]
+struct ScriptRes {
+    scripts: reyvec_script::Scripts,
+    until_check: u32,
+}
+
+/// Как часто проверять файлы скриптов на правку: раз в столько шагов логики (0,25 с).
+const SCRIPT_CHECK_STEPS: u32 = 15;
+
 /// Кость героя (6.8): какая и её место из файла (поза добавляется к нему).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct BoneOf {
@@ -318,6 +341,10 @@ impl SceneWorld {
         world.init_resource::<Pending>();
         world.init_resource::<Events>();
         world.insert_resource(LastStep(0.0));
+        world.insert_resource(ScriptRes {
+            scripts: reyvec_script::Scripts::new(),
+            until_check: SCRIPT_CHECK_STEPS,
+        });
         let mut spawner = Spawner {
             world: &mut world,
             library,
@@ -351,6 +378,8 @@ impl SceneWorld {
             strike: Vec::new(),
             dummy: None,
             bone: None,
+            script: None,
+            touch: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
@@ -364,6 +393,7 @@ impl SceneWorld {
                 propagate,
                 gather_solids,
                 play,
+                run_scripts,
                 combat_look,
                 pose_bones,
                 propagate_again,
@@ -451,8 +481,11 @@ impl SceneWorld {
     /// Манекены сцены (для проверок).
     #[cfg(test)]
     pub(crate) fn dummies(&mut self) -> Vec<Dummy> {
-        let mut q = self.world.query::<&Target>();
-        q.iter(&self.world).map(|t| t.dummy.clone()).collect()
+        // В порядке файла (сущности создаются по порядку).
+        let mut q = self.world.query::<(Entity, &Target)>();
+        let mut all: Vec<_> = q.iter(&self.world).collect();
+        all.sort_by_key(|(e, _)| e.index());
+        all.into_iter().map(|(_, t)| t.dummy.clone()).collect()
     }
 
     /// Сколько сущностей в мире.
@@ -553,6 +586,23 @@ impl Spawner<'_> {
                 hits: 0,
                 anim: Animator::default(),
             });
+        }
+        if let Some(file) = &n.script {
+            let path = match self.dir {
+                Some(dir) => dir.join(file),
+                None => std::path::PathBuf::from(file),
+            };
+            let mut res = self.world.resource_mut::<ScriptRes>();
+            let id = res.scripts.load(&path);
+            let touch = n.dummy.map(|d| d.size).or(n.touch).unwrap_or((0.1, 0.1));
+            if let Some(actor) = res.scripts.actor(id) {
+                self.world.entity_mut(me).insert(Scripted {
+                    actor,
+                    touch: [touch.0, touch.1],
+                    opacity: n.opacity,
+                    collected: false,
+                });
+            }
         }
         if let Some(bone) = n.bone.as_deref().and_then(Bone::parse)
             && self.in_player
@@ -965,19 +1015,27 @@ fn play(
         place.at = p.body.pos;
         place.flip = p.body.facing < 0.0;
     }
+    // Где герой теперь, после своего шага: в него упираются манекены.
+    let heroes_now: Vec<Aabb> = players
+        .iter()
+        .map(|(p, _)| p.body.bounds(&p.tuning))
+        .collect();
     for (e, mut t) in &mut targets {
         let d = &mut t.dummy;
         if stop {
             d.moved = [0.0, 0.0];
             continue;
         }
-        // Манекены не проходят друг сквозь друга: отброшенный упирается в соседа.
+        // Манекены не проходят друг сквозь друга: отброшенный упирается в соседа. Герой
+        // для них тоже твёрдый (6.9): враг со скриптом упирается в героя, а не входит в
+        // него.
         let me = e.to_bits();
         let mine: Vec<Collider> = solids
             .0
             .iter()
             .chain(bodies.iter().filter(|c| c.id != me))
             .copied()
+            .chain(heroes_now.iter().map(|h| Collider::solid(*h)))
             .collect();
         let mine_still: Vec<Collider> = mine.iter().map(still).collect();
         let mut moved = [0.0, 0.0];
@@ -1007,8 +1065,104 @@ fn combat_look(
     }
     for (t, mut place) in &mut targets {
         place.at = t.dummy.body.pos;
+        place.flip = t.dummy.body.facing < 0.0;
         place.flash = (t.dummy.flash / reyvec_game::combat::FLASH_TIME) as f32;
         place.opacity = if t.dummy.alive() { t.opacity } else { 0.0 };
+    }
+}
+
+/// Скрипты (6.9): на каждом шаге логики каждый предмет со скриптом решает, что делать.
+/// Раз в [`SCRIPT_CHECK_STEPS`] шагов изменённые файлы перечитываются.
+fn run_scripts(
+    time: Res<SceneTime>,
+    combat: Res<Combat>,
+    mut res: ResMut<ScriptRes>,
+    mut events: ResMut<Events>,
+    players: Query<&Player>,
+    mut actors: Query<(&mut Scripted, &mut Placement, Option<&mut Target>), Without<Player>>,
+) {
+    if actors.is_empty() {
+        return;
+    }
+    let res = &mut *res;
+    res.until_check = res.until_check.saturating_sub(1);
+    if res.until_check == 0 {
+        res.until_check = SCRIPT_CHECK_STEPS;
+        res.scripts.reload_changed();
+    }
+    if combat.hit_stop > 0.0 {
+        // Стоп-кадр: скрипты тоже ждут.
+        return;
+    }
+    let (hero, hero_box) = match players.iter().next() {
+        Some(p) => (
+            reyvec_script::HeroIn {
+                x: p.body.pos[0],
+                y: p.body.pos[1],
+                vx: p.body.vel[0],
+                vy: p.body.vel[1],
+                striking: p.fighter.striking(),
+            },
+            Some(p.body.bounds(&p.tuning)),
+        ),
+        None => (reyvec_script::HeroIn::default(), None),
+    };
+    let step = events.step;
+    for (mut s, mut place, target) in &mut actors {
+        let s = &mut *s;
+        let (pos, vel, on_ground, wall, hp, alive) = match &target {
+            Some(t) => {
+                let b = &t.dummy.body;
+                (
+                    b.pos,
+                    b.vel,
+                    b.on_ground,
+                    b.wall,
+                    t.dummy.hp,
+                    t.dummy.alive(),
+                )
+            }
+            None => (place.at, [0.0, 0.0], false, 0.0, 0, true),
+        };
+        let bounds = Aabb::around(pos, [s.touch[0] * 0.5, s.touch[1] * 0.5]);
+        let input = reyvec_script::ActorIn {
+            x: pos[0],
+            y: pos[1],
+            vx: vel[0],
+            vy: vel[1],
+            on_ground,
+            wall,
+            hp,
+            alive,
+            touching: alive && hero_box.is_some_and(|h| h.overlaps(&bounds)),
+            time: time.0,
+        };
+        let out = res
+            .scripts
+            .run(&s.actor, &input, &hero, crate::STEP.as_secs_f64());
+        match target {
+            Some(mut t) => {
+                t.dummy.intent.x = out.move_x;
+                t.dummy.intent.jump_pressed |= out.jump;
+                // Прыжок врага всегда в полную высоту.
+                t.dummy.intent.jump_held = true;
+            }
+            None => {
+                if let (Some(x), Some(y)) = (out.x, out.y) {
+                    place.at = [x, y];
+                }
+                place.opacity = if out.hidden { 0.0 } else { s.opacity };
+            }
+        }
+        if out.collected && !s.collected {
+            events.list.push_back((
+                step,
+                GameEvent::Pickup {
+                    at: [pos[0] as f32, pos[1] as f32],
+                },
+            ));
+        }
+        s.collected = out.collected;
     }
 }
 
@@ -1128,6 +1282,8 @@ fn collect(
     press: Res<LastPress>,
     combat: Res<Combat>,
     events: Res<Events>,
+    scripts: Res<ScriptRes>,
+    scripted: Query<(), With<Scripted>>,
     mut snapshot: ResMut<Snapshot>,
 ) {
     let mut drawn: Vec<(Drawn, &GlobalPlacement)> = shapes
@@ -1226,6 +1382,13 @@ fn collect(
         },
         events: events.list.iter().copied().collect(),
         solids: solids.0.clone(),
+        scripts: crate::ScriptInfo {
+            files: scripts.scripts.len(),
+            actors: scripted.iter().count(),
+            reloads: scripts.scripts.reloads,
+            errors: scripts.scripts.errors(),
+            memory: scripts.scripts.memory(),
+        },
     };
 }
 

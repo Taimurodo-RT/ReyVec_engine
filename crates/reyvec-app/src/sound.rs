@@ -7,6 +7,7 @@ use reyvec_scene::GameEvent;
 pub(crate) fn sound_for(event: &GameEvent) -> (Sound, f32, [f32; 2]) {
     match *event {
         GameEvent::Run { at, .. } => (Sound::Step, -12.0, at),
+        GameEvent::Pickup { at } => (Sound::Pickup, -8.0, at),
         GameEvent::Jumped { at } => (Sound::Jump, -9.0, at),
         // Чем сильнее упал, тем громче (с 4 единиц в секунду уже в полную силу).
         GameEvent::Landed { at, speed } => (Sound::Land, -18.0 + 4.5 * speed.min(4.0), at),

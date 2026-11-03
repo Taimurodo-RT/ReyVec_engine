@@ -270,6 +270,15 @@ pub struct NodeDesc {
     /// (плечо, бедро, шея): вокруг неё кость поворачивается, фигуры кости рисуются от неё.
     #[serde(default)]
     pub bone: Option<String>,
+    /// Скрипт поведения на Luau (6.9): путь к файлу `.luau` от папки сцены. У манекена
+    /// скрипт решает, куда идти и когда прыгать (враг); у других предметов — где
+    /// предмет и виден ли он (монета). Только у предмета верхнего уровня.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Размер прямоугольника касания героя для предмета со скриптом (`me.touching`),
+    /// середина — место предмета. У манекена — его прямоугольник.
+    #[serde(default)]
+    pub touch: Option<P>,
 }
 
 /// Манекен: размер прямоугольника столкновений, здоровье (сколько попаданий выдержит)
@@ -564,6 +573,8 @@ impl NodeDesc {
             strike: Vec::new(),
             dummy: None,
             bone: None,
+            script: None,
+            touch: None,
         }
     }
 
@@ -693,6 +704,17 @@ impl NodeDesc {
             d.check()
                 .map_err(|m| SceneError::new(format!("{here}, dummy: {m}")))?;
         }
+        if self.script.is_some() && self.player.is_some() {
+            return Err(SceneError::new(format!(
+                "{here}: героем управляет игрок, скрипт (script) бывает у манекенов и \
+                 предметов"
+            )));
+        }
+        if let Some(t) = self.touch {
+            check_size("ширина touch", t.0)
+                .and_then(|()| check_size("высота touch", t.1))
+                .map_err(|m| SceneError::new(format!("{here}: {m}")))?;
+        }
         if let Some(b) = &self.bone
             && reyvec_game::Bone::parse(b).is_none()
         {
@@ -705,6 +727,7 @@ impl NodeDesc {
             for (what, set) in [
                 ("player", child.player.is_some()),
                 ("dummy", child.dummy.is_some()),
+                ("script", child.script.is_some()),
             ] {
                 if set {
                     return Err(SceneError::new(format!(
@@ -931,6 +954,22 @@ pub struct Scene {
     pub events: Vec<(u64, GameEvent)>,
     /// Твёрдое уровня на последнем шаге (6.6): от него отскакивают частицы.
     pub solids: Vec<reyvec_game::Collider>,
+    /// Скрипты (6.9): сколько файлов, сколько раз перечитаны, ошибки.
+    pub scripts: ScriptInfo,
+}
+
+/// Скрипты сцены для панели (6.9).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ScriptInfo {
+    /// Файлов скриптов и предметов со скриптами.
+    pub files: usize,
+    pub actors: usize,
+    /// Сколько раз файлы перечитаны после правки.
+    pub reloads: u32,
+    /// Ошибки (файл:строка: что не так), по одной на файл.
+    pub errors: Vec<String>,
+    /// Память скриптов, байт.
+    pub memory: usize,
 }
 
 /// Событие игры для частиц и звука (6.6, 6.7). Места в координатах сцены.
@@ -948,6 +987,8 @@ pub enum GameEvent {
     Swing { at: [f32; 2], dir: f32 },
     /// Удар попал: место попадания и куда бил.
     Hit { at: [f32; 2], dir: f32 },
+    /// Герой подобрал предмет (скрипт отметил `collected`, 6.9).
+    Pickup { at: [f32; 2] },
 }
 
 /// Что видно о персонаже игрока снаружи мира: для камеры и панели.

@@ -523,6 +523,27 @@ pub(crate) fn burst(event: &reyvec_scene::GameEvent, seed: u64) -> Vec<Particle>
         }
         // Взмах слышно, но пыли он не поднимает.
         E::Swing { .. } => {}
+        E::Pickup { at } => {
+            // Золотые блёстки кольцом вверх, медленно гаснут.
+            for i in 0..16 {
+                let angle = std::f32::consts::TAU * i as f32 / 16.0 + r.range(-0.1, 0.1);
+                let speed = r.range(0.4, 0.9);
+                let v = [speed * angle.cos(), speed * angle.sin() + 0.3];
+                let life = r.range(0.4, 0.7);
+                out.push(Particle {
+                    pos: at,
+                    vel: v,
+                    life,
+                    max_life: life,
+                    size: r.range(0.014, 0.024),
+                    gravity: 0.2,
+                    color: [3.2, 2.4, 0.6, 1.0],
+                    drag: 2.5,
+                    bounce: 0.3,
+                    flags: PARTICLE_SHRINK | PARTICLE_GLOW,
+                });
+            }
+        }
         E::Hit { at, dir } => {
             // Искры: ярче белого (их подхватывает свечение), летят веером от удара.
             for i in 0..28 {
