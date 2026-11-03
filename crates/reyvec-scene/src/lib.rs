@@ -279,6 +279,66 @@ pub struct NodeDesc {
     /// середина — место предмета. У манекена — его прямоугольник.
     #[serde(default)]
     pub touch: Option<P>,
+    /// Физическое тело (6.10): предмет падает, катится, его толкает герой и отбрасывает
+    /// удар. Только у предмета верхнего уровня, не у героя и не у манекена.
+    #[serde(default)]
+    pub body: Option<BodyDesc>,
+}
+
+/// Физическое тело предмета: `size` — ширина и высота (у круглого `round: true` —
+/// диаметр по ширине), `density` — плотность (тяжелее — труднее толкнуть), `bounce` —
+/// упругость от 0 до 1, `friction` — трение.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BodyDesc {
+    pub size: P,
+    pub round: bool,
+    pub density: f64,
+    pub bounce: f64,
+    pub friction: f64,
+}
+
+impl Default for BodyDesc {
+    fn default() -> Self {
+        let d = reyvec_game::physics::BodyDesc::default();
+        Self {
+            size: (d.size[0], d.size[1]),
+            round: d.round,
+            density: d.density,
+            bounce: d.bounce,
+            friction: d.friction,
+        }
+    }
+}
+
+impl BodyDesc {
+    pub fn physics(&self) -> reyvec_game::physics::BodyDesc {
+        reyvec_game::physics::BodyDesc {
+            size: [self.size.0, self.size.1],
+            round: self.round,
+            density: self.density,
+            bounce: self.bounce,
+            friction: self.friction,
+        }
+    }
+
+    fn check(&self) -> Result<(), String> {
+        check_size("ширина size", self.size.0)?;
+        check_size("высота size", self.size.1)?;
+        if !(self.density.is_finite() && self.density > 0.0 && self.density <= 1000.0) {
+            return Err(format!(
+                "density {} — нужно больше 0 и до 1000",
+                self.density
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.bounce) {
+            return Err(format!("bounce {} — нужно от 0 до 1", self.bounce));
+        }
+        if !(self.friction.is_finite() && (0.0..=10.0).contains(&self.friction)) {
+            return Err(format!("friction {} — нужно от 0 до 10", self.friction));
+        }
+        Ok(())
+    }
 }
 
 /// Манекен: размер прямоугольника столкновений, здоровье (сколько попаданий выдержит)
@@ -575,6 +635,7 @@ impl NodeDesc {
             bone: None,
             script: None,
             touch: None,
+            body: None,
         }
     }
 
@@ -710,6 +771,16 @@ impl NodeDesc {
                  предметов"
             )));
         }
+        if let Some(b) = &self.body {
+            if self.player.is_some() || self.dummy.is_some() {
+                return Err(SceneError::new(format!(
+                    "{here}: body (физическое тело) не бывает у героя и манекена: их \
+                     двигает свой контроллер"
+                )));
+            }
+            b.check()
+                .map_err(|m| SceneError::new(format!("{here}, body: {m}")))?;
+        }
         if let Some(t) = self.touch {
             check_size("ширина touch", t.0)
                 .and_then(|()| check_size("высота touch", t.1))
@@ -728,6 +799,7 @@ impl NodeDesc {
                 ("player", child.player.is_some()),
                 ("dummy", child.dummy.is_some()),
                 ("script", child.script.is_some()),
+                ("body", child.body.is_some()),
             ] {
                 if set {
                     return Err(SceneError::new(format!(
@@ -1207,7 +1279,15 @@ impl SceneFile {
                     .and_then(|t| t.build().ok())
                     .map(|level| level.shapes)
                     .unwrap_or_default();
-                for shape in n.shapes.iter().chain(&tiles).chain(&n.strike) {
+                // У манекена ещё квадрат обломков (6.10): в том же порядке, что и при
+                // постройке мира (до фигур манекена).
+                let debris: Vec<ShapeDesc> = n.dummy.map(|_| debris_square()).into_iter().collect();
+                for shape in debris
+                    .iter()
+                    .chain(&n.shapes)
+                    .chain(&tiles)
+                    .chain(&n.strike)
+                {
                     let (key, path, stroke) = shape.geometry();
                     if known.contains(&key) || !seen.insert(key.clone()) {
                         continue;
@@ -1399,6 +1479,20 @@ fn check_point(what: &str, p: P) -> Result<(), String> {
             "{what} ({}, {}) — координаты должны быть от −{MAX_COORD} до {MAX_COORD}",
             p.0, p.1
         ))
+    }
+}
+
+/// Квадрат обломков (6.10): белый, 1 на 1, цвет и размер — у каждого обломка свои.
+pub(crate) fn debris_square() -> ShapeDesc {
+    ShapeDesc::Rect {
+        at: (0.0, 0.0),
+        size: (1.0, 1.0),
+        angle: 0.0,
+        corner: 0.12,
+        color: Hex(Color::WHITE),
+        stroke: None,
+        solid: false,
+        oneway: false,
     }
 }
 

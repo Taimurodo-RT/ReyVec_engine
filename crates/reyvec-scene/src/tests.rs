@@ -47,8 +47,9 @@ fn example_scene_parses_and_builds() {
         })
         .count();
     // Слои с тенью: стол, полка, герой, ящики под полкой, 6 препятствий коридора (6.1),
-    // подъёмник и столб (6.2), уступы (6.4), 2 манекена (6.5), жук (6.9); окно без слоя.
-    assert_eq!(shadow_layers, 16);
+    // подъёмник и столб (6.2), уступы (6.4), 2 манекена (6.5), жук (6.9), мяч и 2 ящика
+    // с физикой (6.10); окно без слоя.
+    assert_eq!(shadow_layers, 19);
     // Герой (6.1) и твёрдое: пол, стена слева, столешница, 6 банок с крышками, 3 книги,
     // полка, 2 ящика, 6 препятствий коридора, подъёмник и столб; с 6.4 край уступов и
     // сами уступы: 13 склонов, 4 доски и всего 6 прямоугольников из сотен клеток блоков.
@@ -1501,7 +1502,16 @@ fn dummy_breaks_after_five_hits_and_comes_back_on_its_spot() {
     });
     let s = w.snapshot();
     assert!(s.player.unwrap().hits >= 5);
-    assert!(s.items.len() < idle, "разбитый не рисуется");
+    // Разбитый не рисуется (его фигуры прозрачны), зато летят обломки (6.10).
+    let _ = idle;
+    let mut q = w
+        .world_mut()
+        .query::<(&crate::world::Target, &crate::world::Placement)>();
+    let hidden = q
+        .iter(w.world_mut())
+        .filter(|(t, p)| !t.dummy.alive() && p.opacity == 0.0)
+        .count();
+    assert_eq!(hidden, 1, "разбитый не рисуется");
     // Отходим с места появления и ждём 2 с.
     w.set_player_body(reyvec_game::Body::new([0.4, -0.64]));
     w.set_input(InputFrame::new(&[], &[]));
@@ -1792,4 +1802,100 @@ fn script_errors_are_in_russian() {
     w.update_at(0.0);
     let info = w.snapshot().scripts;
     assert!(info.errors[0].contains("не прочитать файл"), "{info:?}");
+}
+
+/// Место физического тела по имени предмета.
+fn body_at(w: &mut SceneWorld, name: &str) -> [f64; 2] {
+    let e = w.find(name).expect("предмет есть");
+    w.world_mut()
+        .get::<crate::world::Placement>(e)
+        .expect("место")
+        .at
+}
+
+#[test]
+fn hero_kicks_the_ball_stands_on_a_crate_and_breaks_into_debris() {
+    use reyvec_game::Action::{Attack, Left, Right};
+    use reyvec_game::InputFrame;
+    let (mut w, mut t) = example_world();
+    // Мяч упал на пол.
+    t = steps(&mut w, t, 60);
+    let ball = body_at(&mut w, "мяч");
+    assert!(
+        (ball[1] - (-0.78 + 0.05)).abs() < 0.01,
+        "мяч на полу: {ball:?}"
+    );
+    // Герой бежит вправо в мяч: мяч катится впереди.
+    w.set_player_body(reyvec_game::Body::new([0.5, -0.64]));
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    t = steps(&mut w, t, 30);
+    let pushed = body_at(&mut w, "мяч");
+    assert!(
+        pushed[0] > ball[0] + 0.1,
+        "мяч не покатился: {ball:?} → {pushed:?}"
+    );
+    // Ящик в начале коридора: прыжок на него — герой стоит на ящике.
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 60);
+    let crate_at = body_at(&mut w, "ящик лёгкий");
+    w.set_player_body(reyvec_game::Body::new([crate_at[0], crate_at[1] + 0.35]));
+    t = steps(&mut w, t, 40);
+    let p = w.snapshot().player.unwrap();
+    let crate_now = body_at(&mut w, "ящик лёгкий");
+    assert!(p.on_ground, "{p:?}");
+    assert!(
+        f64::from(p.at[1]) - 0.14 > crate_now[1] + 0.05,
+        "герой на ящике, а не на полу: {p:?}, ящик {crate_now:?}"
+    );
+    // Удар по ящику: он отлетает.
+    w.set_player_body(reyvec_game::Body::new([crate_now[0] - 0.2, -0.64]));
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 20);
+    let before = body_at(&mut w, "ящик лёгкий");
+    w.set_input(InputFrame::new(&[Attack], &[Attack]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 30);
+    let after = body_at(&mut w, "ящик лёгкий");
+    assert!(
+        after[0] > before[0] + 0.15,
+        "удар отбросил ящик: {before:?} → {after:?}"
+    );
+    // Манекен разбит: обломки летят, потом гаснут.
+    let visible = |w: &mut SceneWorld| {
+        let mut q = w
+            .world_mut()
+            .query::<(&bevy_ecs::name::Name, &crate::world::Placement)>();
+        q.iter(w.world_mut())
+            .filter(|(n, p)| n.as_str() == "обломок" && p.opacity > 0.0)
+            .count()
+    };
+    assert_eq!(visible(&mut w), 0);
+    w.set_player_body(reyvec_game::Body::new([-0.7, -0.64]));
+    w.set_input(InputFrame::new(&[Left], &[Left]));
+    t = steps(&mut w, t, 1);
+    // Герой идёт за манекеном и бьёт каждые 0,4 с, пока тот не разобьётся.
+    let mut most = 0;
+    for i in 0..900 {
+        let d = &w.dummies()[0];
+        let hero = w.player_body().unwrap();
+        let near = hero.pos[0] - d.body.pos[0] < 0.25;
+        let held: &[reyvec_game::Action] = if near { &[] } else { &[Left] };
+        let pressed: &[reyvec_game::Action] = if near && i % 24 == 0 { &[Attack] } else { &[] };
+        w.set_input(InputFrame::new(held, pressed));
+        t = steps(&mut w, t, 1);
+        most = most.max(visible(&mut w));
+        if !w.dummies()[0].alive() {
+            break;
+        }
+    }
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 1);
+    most = most.max(visible(&mut w));
+    assert_eq!(most, 10, "обломки разбитого манекена");
+    t = steps(&mut w, t, 60 * 4);
+    let _ = t;
+    assert_eq!(visible(&mut w), 0, "обломки погасли");
 }
