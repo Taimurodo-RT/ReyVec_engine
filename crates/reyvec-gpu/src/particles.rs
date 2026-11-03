@@ -521,6 +521,8 @@ pub(crate) fn burst(event: &reyvec_scene::GameEvent, seed: u64) -> Vec<Particle>
                 out.push(d);
             }
         }
+        // Взмах слышно, но пыли он не поднимает.
+        E::Swing { .. } => {}
         E::Hit { at, dir } => {
             // Искры: ярче белого (их подхватывает свечение), летят веером от удара.
             for i in 0..28 {

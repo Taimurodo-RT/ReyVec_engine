@@ -890,8 +890,14 @@ fn play(
                 events.run_left = 0.0;
             }
             let can = !p.body.on_ledge();
+            let swings = p.fighter.swings;
             p.fighter
                 .step(&p.attack, first && presses.attack, can, p.body.facing, sdt);
+            if p.fighter.swings > swings {
+                let at = [p.body.pos[0] as f32, p.body.pos[1] as f32];
+                let dir = p.body.facing as f32;
+                events.list.push_back((step, GameEvent::Swing { at, dir }));
+            }
             if let Some(hitbox) = p.fighter.hitbox(&p.attack, p.body.pos, p.tuning.half()) {
                 for (e, mut t) in &mut targets {
                     if t.dummy.alive()

@@ -1,0 +1,16 @@
+[package]
+name = "reyvec-audio"
+description = "ReyVec: звук игры: свой смеситель поверх cpal, звуки и музыка-заготовки синтезом."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cpal = "0.18"
+tracing.workspace = true
+
+[lints]
+workspace = true
