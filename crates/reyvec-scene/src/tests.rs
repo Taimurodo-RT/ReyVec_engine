@@ -1513,3 +1513,88 @@ fn dummy_breaks_after_five_hits_and_comes_back_on_its_spot() {
     let d = w.dummies()[0].clone();
     assert!((d.body.pos[0] - d.spawn[0]).abs() < 1e-9 && d.body.on_ground);
 }
+
+#[test]
+fn game_events_for_particles_come_once_with_their_step() {
+    use reyvec_game::Action::{Attack, Left, Right};
+    use reyvec_game::InputFrame;
+    let (mut w, mut t) = example_world();
+    // Падает с высоты на пол: приземление с местом под ногами и скоростью.
+    w.set_player_body(reyvec_game::Body::new([0.4, -0.2]));
+    let mut seen = 0u64;
+    let mut all = Vec::new();
+    let mut take = |w: &SceneWorld, all: &mut Vec<GameEvent>| {
+        for (step, e) in w.snapshot().events {
+            if step > seen {
+                all.push(e);
+            }
+        }
+        if let Some(&(s, _)) = w.snapshot().events.last() {
+            seen = seen.max(s);
+        }
+    };
+    for _ in 0..40 {
+        t = steps(&mut w, t, 1);
+        take(&w, &mut all);
+    }
+    let landed: Vec<_> = all
+        .iter()
+        .filter_map(|e| match e {
+            GameEvent::Landed { at, speed } => Some((*at, *speed)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(landed.len(), 1, "одно приземление: {all:?}");
+    let (at, speed) = landed[0];
+    assert!(
+        (at[1] - -0.78).abs() < 0.01 && (at[0] - 0.4).abs() < 0.01,
+        "{at:?}"
+    );
+    assert!(speed > 1.0, "падал быстро: {speed}");
+    // Бег: шаги пыли каждые ~0,12 с.
+    all.clear();
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    for _ in 0..60 {
+        t = steps(&mut w, t, 1);
+        take(&w, &mut all);
+    }
+    let runs = all
+        .iter()
+        .filter(|e| matches!(e, GameEvent::Run { dir, .. } if *dir > 0.0))
+        .count();
+    assert!(
+        (5..=9).contains(&runs),
+        "шагов бега за секунду {runs}: {all:?}"
+    );
+    // Удар по манекену: одно попадание с местом у края манекена.
+    w.set_player_body(reyvec_game::Body::new([-0.59, -0.64]));
+    w.set_input(InputFrame::new(&[Left], &[Left]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 30);
+    take(&w, &mut all);
+    all.clear();
+    w.set_input(InputFrame::new(&[Attack], &[Attack]));
+    t = steps(&mut w, t, 1);
+    w.set_input(InputFrame::new(&[], &[]));
+    take(&w, &mut all);
+    for _ in 0..20 {
+        t = steps(&mut w, t, 1);
+        take(&w, &mut all);
+    }
+    let hits: Vec<_> = all
+        .iter()
+        .filter_map(|e| match e {
+            GameEvent::Hit { at, dir } => Some((*at, *dir)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "{all:?}");
+    let d = w.dummies()[0].clone();
+    assert!(
+        hits[0].1 < 0.0 && (hits[0].0[0] - (d.spawn[0] + 0.08) as f32).abs() < 0.03,
+        "{hits:?}"
+    );
+    // Твёрдое уровня в снимке для частиц.
+    assert!(!w.snapshot().solids.is_empty());
+}

@@ -28,8 +28,8 @@ use reyvec_game::{
 
 use crate::assets::{self, MorphTrack};
 use crate::{
-    Background, LightKind, NodeDesc, PlayerView, Scene, SceneError, SceneFile, SceneLight,
-    SceneObject, ShapeCache, ShapeDesc,
+    Background, GameEvent, LightKind, NodeDesc, PlayerView, Scene, SceneError, SceneFile,
+    SceneLight, SceneObject, ShapeCache, ShapeDesc,
 };
 
 /// Место сущности относительно родителя.
@@ -222,6 +222,20 @@ struct Combat {
     shake: f64,
 }
 
+/// События игры (6.6): номер шага логики и что случилось, за последние шаги.
+#[derive(Resource, Default)]
+struct Events {
+    step: u64,
+    list: std::collections::VecDeque<(u64, GameEvent)>,
+    /// Сколько осталось до следующего шага бега (пыль из-под ног).
+    run_left: f64,
+}
+
+/// Сколько шагов логики события лежат в снимке.
+const EVENT_STEPS: u64 = 16;
+/// Шаг бега: как часто из-под ног бегущего летит пыль, секунды.
+const RUN_STEP: f64 = 0.12;
+
 /// Нажатия, пришедшие во время стоп-кадра: персонаж получит их на первом шаге после
 /// него, иначе короткое нажатие в стоп-кадре потерялось бы.
 #[derive(Resource, Default, Clone, Copy)]
@@ -295,6 +309,7 @@ impl SceneWorld {
         world.init_resource::<LastPress>();
         world.init_resource::<Combat>();
         world.init_resource::<Pending>();
+        world.init_resource::<Events>();
         world.insert_resource(LastStep(0.0));
         let mut spawner = Spawner {
             world: &mut world,
@@ -370,6 +385,17 @@ impl SceneWorld {
         let mut scene = self.world.resource::<Snapshot>().0.clone();
         scene.entities = self.entities;
         scene
+    }
+
+    /// События игры за последние шаги (то же, что `Scene::events` снимка, только без
+    /// копии всего снимка): для частиц, когда мир шагает много шагов за кадр.
+    pub fn events(&self) -> Vec<(u64, GameEvent)> {
+        self.world
+            .resource::<Events>()
+            .list
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Мир продолжает уже идущее время сцены: следующий [`SceneWorld::update_at`] шагает
@@ -752,11 +778,21 @@ fn play(
     mut last: ResMut<LastStep>,
     mut combat: ResMut<Combat>,
     mut pending: ResMut<Pending>,
+    mut events: ResMut<Events>,
     mut players: Query<(&mut Player, &mut Placement)>,
     mut targets: Query<(Entity, &mut Target), Without<Player>>,
 ) {
     let dt = (time.0 - last.0).clamp(0.0, 0.25);
     last.0 = time.0;
+    events.step += 1;
+    let step = events.step;
+    while events
+        .list
+        .front()
+        .is_some_and(|&(s, _)| s + EVENT_STEPS <= step)
+    {
+        events.list.pop_front();
+    }
     let input = input.0;
     pending.jump |= input.pressed(Action::Jump);
     pending.dash |= input.pressed(Action::Dash);
@@ -819,7 +855,40 @@ fn play(
             } else {
                 &with_bodies_still
             };
-            p.body.step(&p.tuning, intent, colliders, sdt);
+            let fall = -p.body.vel[1];
+            let ev = p.body.step(&p.tuning, intent, colliders, sdt);
+            let feet = [
+                p.body.pos[0] as f32,
+                (p.body.pos[1] - p.tuning.size[1] * 0.5) as f32,
+            ];
+            if ev.landed {
+                let speed = fall.max(0.0) as f32;
+                events
+                    .list
+                    .push_back((step, GameEvent::Landed { at: feet, speed }));
+            }
+            if ev.jumped || ev.wall_jumped {
+                events
+                    .list
+                    .push_back((step, GameEvent::Jumped { at: feet }));
+            }
+            if ev.dashed {
+                let dir = p.body.facing as f32;
+                let at = [feet[0], p.body.pos[1] as f32];
+                events.list.push_back((step, GameEvent::Dashed { at, dir }));
+            }
+            if p.body.on_ground && p.body.vel[0].abs() > 0.8 {
+                events.run_left -= sdt;
+                if events.run_left <= 0.0 {
+                    events.run_left = RUN_STEP;
+                    let dir = p.body.vel[0].signum() as f32;
+                    events
+                        .list
+                        .push_back((step, GameEvent::Run { at: feet, dir }));
+                }
+            } else {
+                events.run_left = 0.0;
+            }
             let can = !p.body.on_ledge();
             p.fighter
                 .step(&p.attack, first && presses.attack, can, p.body.facing, sdt);
@@ -830,6 +899,18 @@ fn play(
                         && p.fighter.first_hit(e.to_bits())
                     {
                         let dir = p.fighter.dir();
+                        // Место попадания: край цели со стороны героя, на высоте удара.
+                        let b = t.dummy.bounds();
+                        let x = if dir > 0.0 { b.min[0] } else { b.max[0] };
+                        let y =
+                            hitbox.min[1].max(b.min[1]) * 0.5 + hitbox.max[1].min(b.max[1]) * 0.5;
+                        events.list.push_back((
+                            step,
+                            GameEvent::Hit {
+                                at: [x as f32, y as f32],
+                                dir: dir as f32,
+                            },
+                        ));
                         let k = p.attack.knockback;
                         t.dummy.hurt(p.attack.damage, [dir * k[0], k[1]]);
                         p.hits += 1;
@@ -1000,6 +1081,7 @@ fn collect(
     solids: Res<Solids>,
     press: Res<LastPress>,
     combat: Res<Combat>,
+    events: Res<Events>,
     mut snapshot: ResMut<Snapshot>,
 ) {
     let mut drawn: Vec<(Drawn, &GlobalPlacement)> = shapes
@@ -1091,6 +1173,8 @@ fn collect(
         } else {
             0.0
         },
+        events: events.list.iter().copied().collect(),
+        solids: solids.0.clone(),
     };
 }
 

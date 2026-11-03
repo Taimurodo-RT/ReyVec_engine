@@ -797,6 +797,7 @@ fn hero_casts_shadow_and_is_drawn_where_logic_puts_him() {
     let jump = HeadlessPlay {
         start: None,
         inputs: PlayInput::hold(Action::Jump, 1.0, 1.6).to_vec(),
+        ..Default::default()
     };
     let a = play_frame(Some(text), 1.0, &stand, Msaa::X4);
     let b = play_frame(Some(text), 1.36, &jump, Msaa::X4);
@@ -856,6 +857,7 @@ fn hero_tours_the_example_level() {
     let at = |x: f64, y: f64, inputs: Vec<PlayInput>| HeadlessPlay {
         start: Some([x, y]),
         inputs,
+        ..Default::default()
     };
     let shots = [
         // У лампы над столом, бежит вправо.
@@ -931,6 +933,7 @@ fn hero_strikes_the_dummy_it_flashes_and_flies() {
             PlayInput::hold(Action::Attack, 1.0, 1.05),
         ]
         .concat(),
+        ..Default::default()
     };
     let before = play_frame(None, 0.95, &play, Msaa::X4);
     let hit = play_frame(None, 1.09, &play, Msaa::X4);
@@ -968,4 +971,140 @@ fn hero_strikes_the_dummy_it_flashes_and_flies() {
     eprintln!("место манекена после отлёта {c:?}");
     let p = after.player.expect("герой");
     assert!(!p.striking && p.hits == 1, "{p:?}");
+}
+
+/// Сколько пикселей кадра в прямоугольнике сцены `lo`–`hi` подходят под `pick`.
+fn count_pixels(
+    frame: &reyvec_app::HeadlessImage,
+    lo: [f64; 2],
+    hi: [f64; 2],
+    pick: impl Fn([u8; 4]) -> bool,
+) -> usize {
+    // Шаг — пиксель кадра (высота кадра 2 / zoom единиц сцены).
+    let step = 2.0 / (frame.camera.1 * f64::from(frame.image.height));
+    let mut n = 0;
+    let mut y = lo[1];
+    while y < hi[1] {
+        let mut x = lo[0];
+        while x < hi[0] {
+            if frame.scene_pixel([x, y]).is_some_and(&pick) {
+                n += 1;
+            }
+            x += step;
+        }
+        y += step;
+    }
+    n
+}
+
+/// Искра: яркий тёплый пиксель (оранжевый или почти белый с жёлтым), не серый.
+fn spark(c: [u8; 4]) -> bool {
+    c[0] > 200 && u32::from(c[0]) > u32::from(c[2]) + 70
+}
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn hit_throws_sparks_that_fly_fall_and_fade() {
+    use reyvec_app::{HeadlessPlay, PlayInput};
+    use reyvec_scene::game::Action;
+    // Тот же удар, что в hero_strikes_the_dummy_it_flashes_and_flies.
+    let play = HeadlessPlay {
+        start: Some([-0.59, -0.64]),
+        inputs: [
+            PlayInput::hold(Action::Left, 0.5, 0.52),
+            PlayInput::hold(Action::Attack, 1.0, 1.05),
+        ]
+        .concat(),
+        ..Default::default()
+    };
+    let before = play_frame(None, 0.95, &play, Msaa::X4);
+    let fly = play_frame(None, 1.16, &play, Msaa::X4);
+    let late = play_frame(None, 1.3, &play, Msaa::X4);
+    let gone = play_frame(None, 2.0, &play, Msaa::X4);
+    show_frame("sparks-fly", &fly);
+    show_frame("sparks-late", &late);
+    eprintln!(
+        "частицы: до {:?}, полёт {:?}, позже {:?}, через секунду {:?}",
+        before.particles, fly.particles, late.particles, gone.particles
+    );
+    // Вокруг манекена и над полом: искры летят влево от места удара.
+    let (lo, hi) = ([-1.5, -0.8], [-0.5, -0.1]);
+    let count = |f: &reyvec_app::HeadlessImage| count_pixels(f, lo, hi, spark);
+    let (a, b, c, d) = (count(&before), count(&fly), count(&late), count(&gone));
+    eprintln!("пикселей искр: до {a}, полёт {b}, позже {c}, через секунду {d}");
+    assert!(
+        fly.particles.live >= 28,
+        "искры в работе: {:?}",
+        fly.particles
+    );
+    assert!(b > a + 20, "искр не видно: {a} → {b}");
+    // Через секунду все искры погасли.
+    assert!(d <= a + 2, "искры не гаснут: {d} (до удара {a})");
+    assert_eq!(gone.particles.dropped, 0);
+}
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn landing_kicks_up_dust() {
+    use reyvec_app::HeadlessPlay;
+    // Падает с высоты на пол комнаты (пол на -0,78).
+    let play = HeadlessPlay {
+        start: Some([0.4, 0.1]),
+        ..Default::default()
+    };
+    let mut landed = None;
+    for i in 1..=12 {
+        let t = i as f32 * 0.05;
+        let f = play_frame(None, t, &play, Msaa::X4);
+        let p = f.player.expect("герой");
+        if p.on_ground {
+            landed = Some((t, f));
+            break;
+        }
+    }
+    let (t, _) = landed.expect("приземлился за 0,6 с");
+    let dust = play_frame(None, t + 0.12, &play, Msaa::X4);
+    show_frame("landing-dust", &dust);
+    eprintln!(
+        "приземлился к {t} с, частицы через 0,12 с: {:?}",
+        dust.particles
+    );
+    assert!(dust.particles.live >= 8, "пыли нет: {:?}", dust.particles);
+    let settled = play_frame(None, t + 1.5, &play, Msaa::X4);
+    assert_eq!(settled.particles.live, 0, "пыль осела и погасла");
+}
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn fountain_of_particles_runs_on_the_gpu() {
+    use reyvec_app::HeadlessPlay;
+    // 0,3 с фонтана: около 15 000 частиц (всё за один кадр, меньше предела за кадр).
+    let play = HeadlessPlay {
+        fountain: true,
+        ..Default::default()
+    };
+    let frame = play_frame(None, 0.3, &play, Msaa::X4);
+    show_frame("fountain", &frame);
+    eprintln!(
+        "фонтан: {:?}, время видеокарты {:?}",
+        frame.particles, frame.gpu_timings
+    );
+    assert!(frame.particles.fountain);
+    assert!(
+        (14_000..=16_384).contains(&frame.particles.live),
+        "{:?}",
+        frame.particles
+    );
+    assert_eq!(frame.particles.dropped, 0);
+    // Брызги фонтана видны над героем.
+    let p = frame.player.expect("герой");
+    let at = [f64::from(p.at[0]), f64::from(p.at[1])];
+    let lit = count_pixels(
+        &frame,
+        [at[0] - 0.6, at[1] + 0.1],
+        [at[0] + 0.6, at[1] + 1.0],
+        |c| brightness(c) > 300,
+    );
+    eprintln!("ярких пикселей фонтана: {lit}");
+    assert!(lit > 200, "фонтана не видно: {lit}");
 }

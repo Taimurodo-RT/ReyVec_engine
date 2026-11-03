@@ -223,6 +223,34 @@ pub(crate) fn graphics_pipeline_stencil(
     }
 }
 
+/// Собирает вычислительный конвейер (6.6) из SPIR-V с точкой входа `main`.
+pub(crate) fn compute_pipeline(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    spv: &[u8],
+) -> Result<vk::Pipeline, GpuError> {
+    let module = create_shader(device, spv)?;
+    let stage = vk::PipelineShaderStageCreateInfo::default()
+        .stage(vk::ShaderStageFlags::COMPUTE)
+        .module(module)
+        .name(c"main");
+    let info = vk::ComputePipelineCreateInfo::default()
+        .stage(stage)
+        .layout(layout);
+    // SAFETY: структуры живут до конца вызова, модуль шейдера валиден.
+    let result =
+        unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &[info], None) };
+    // SAFETY: после создания конвейера модуль не нужен.
+    unsafe { device.destroy_shader_module(module, None) };
+    match result {
+        Ok(p) => Ok(p[0]),
+        Err((_, result)) => Err(GpuError::Vulkan {
+            what: "создание вычислительного конвейера",
+            result,
+        }),
+    }
+}
+
 /// Начинает проход рисования в `view` с очисткой фоном и ставит область вывода на всю картинку.
 /// Картинка уже должна быть в раскладке `COLOR_ATTACHMENT_OPTIMAL`.
 ///

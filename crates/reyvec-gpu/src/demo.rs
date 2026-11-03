@@ -380,6 +380,19 @@ pub(crate) struct Demo {
     /// Лёгкий шум при выводе против полос на плавных переходах.
     dither: bool,
     sprites: vk::Pipeline,
+    /// Частицы (6.6): кольцо на видеокарте, расчёт и рисование, шаги расчёта этого кадра.
+    particles: crate::particles::ParticleSystem,
+    particle_update: vk::Pipeline,
+    particle_draw: vk::Pipeline,
+    particle_steps: Vec<crate::particles::ParticleFrame>,
+    /// Новые частицы по шагам логики, пока мир шагает по сценарию без окна.
+    particle_queue: Vec<(f64, f32, Vec<crate::particles::Particle>)>,
+    /// Последний шаг логики, события которого уже дали частицы.
+    seen_event_step: u64,
+    /// Фонтан для замера скорости частиц (около 100 000 живых).
+    fountain: bool,
+    /// Время прошлого кадра с частицами (в окне шаг расчёта — время между кадрами).
+    particle_time: Option<f64>,
     /// Копирует кадр сцены в окно; зависит от формата окна.
     present: vk::Pipeline,
     /// Сводит картинку MSAA в обычный кадр сцены.
@@ -506,6 +519,7 @@ impl Demo {
                 &format!("спрайты кадра {i}"),
             )?);
         }
+        let particles = crate::particles::ParticleSystem::new(ctx, res, frames_in_flight)?;
         let mut light_buffers = Vec::new();
         for i in 0..frames_in_flight {
             light_buffers.push(res.create_buffer(
@@ -601,6 +615,14 @@ impl Demo {
             glow: true,
             dither: true,
             sprites: vk::Pipeline::null(),
+            particles,
+            particle_update: vk::Pipeline::null(),
+            particle_draw: vk::Pipeline::null(),
+            particle_steps: Vec::new(),
+            particle_queue: Vec::new(),
+            seen_event_step: 0,
+            fountain: false,
+            particle_time: None,
             present: vk::Pipeline::null(),
             resolve: vk::Pipeline::null(),
             format: vk::Format::UNDEFINED,
@@ -670,6 +692,20 @@ impl Demo {
                 Some(stencil_format),
             )?;
             demo.object_mask = build_object_mask(ctx, res, shaders)?;
+            demo.particle_draw = build(
+                ctx,
+                res,
+                shaders,
+                "particles",
+                scene_format,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.particle_update = crate::pipeline::compute_pipeline(
+                &ctx.device,
+                res.bindless.pipeline_layout,
+                shaders.compute("particles"),
+            )?;
             demo.bloom_down = build(
                 ctx,
                 res,
@@ -852,6 +888,7 @@ impl Demo {
     /// Сценарий игры для кадров без окна: герой встаёт в `play.start`, нажатия идут по
     /// времени, мир шагает шагами логики до момента кадра.
     pub fn set_play(&mut self, play: crate::HeadlessPlay) {
+        self.fountain = play.fountain;
         self.play = Some(PlayState {
             script: play,
             time: 0.0,
@@ -888,8 +925,98 @@ impl Demo {
             world.set_input(reyvec_scene::game::InputFrame::new(&play.held, &pressed));
             world.update_at(next);
             play.time = next;
+            // Частицы шагают вместе с логикой: каждый шаг — свой шаг расчёта на
+            // видеокарте, иначе в кадре через секунду не было бы ни полёта, ни отскока.
+            let mut emitted = event_particles(&world.events(), &mut self.seen_event_step);
+            if self.fountain {
+                let at = fountain_at(world.player_body().map(|b| b.pos), self.camera);
+                let seed = (next * 1000.0) as u64;
+                emitted.extend(crate::particles::fountain(at, step as f32, seed));
+            }
+            self.particle_queue.push((next, step as f32, emitted));
         }
         self.file_scene = world.snapshot();
+    }
+
+    /// Шаги расчёта частиц этого кадра (6.6): новые частицы из событий игры и фонтана,
+    /// твёрдое уровня на экране. Частицы есть только в сцене «из файла».
+    fn prepare_particles(
+        &mut self,
+        res: &mut GpuResources,
+        slot: usize,
+        time: f32,
+        scene: DemoScene,
+        aspect: f32,
+    ) {
+        if scene != DemoScene::File {
+            self.particle_steps.clear();
+            self.particle_queue.clear();
+            self.particle_time = None;
+            return;
+        }
+        let now = f64::from(time);
+        let steps = if self.play.is_some() {
+            std::mem::take(&mut self.particle_queue)
+        } else {
+            // В окне: один шаг на кадр длиной в время между кадрами.
+            let dt = self
+                .particle_time
+                .map_or(0.0, |t| (now - t).clamp(0.0, 0.1)) as f32;
+            let mut emitted = event_particles(&self.file_scene.events, &mut self.seen_event_step);
+            if self.fountain {
+                let at = fountain_at(
+                    self.file_scene
+                        .player
+                        .map(|p| [f64::from(p.at[0]), f64::from(p.at[1])]),
+                    self.camera,
+                );
+                emitted.extend(crate::particles::fountain(at, dt, (now * 1000.0) as u64));
+            }
+            vec![(now, dt, emitted)]
+        };
+        self.particle_time = Some(now);
+        // Твёрдое для отскока: только то, что рядом с экраном (с запасом на полёт).
+        let view = crate::cull::ViewRect::new(
+            [self.camera.center.x as f32, self.camera.center.y as f32],
+            self.camera.zoom as f32,
+            aspect,
+        );
+        let margin = 0.5;
+        let solids: Vec<crate::particles::ParticleSolid> = self
+            .file_scene
+            .solids
+            .iter()
+            .filter(|c| {
+                let (lo, hi) = (c.aabb.min, c.aabb.max);
+                hi[0] as f32 >= view.lo[0] - margin
+                    && lo[0] as f32 <= view.hi[0] + margin
+                    && hi[1] as f32 >= view.lo[1] - margin
+                    && lo[1] as f32 <= view.hi[1] + margin
+            })
+            .map(|c| crate::particles::ParticleSolid {
+                lo: [c.aabb.min[0] as f32, c.aabb.min[1] as f32],
+                hi: [c.aabb.max[0] as f32, c.aabb.max[1] as f32],
+                slope: c.slope as f32,
+                oneway: c.oneway,
+            })
+            .collect();
+        self.particle_steps =
+            self.particles
+                .prepare(res, slot, steps, &solids, crate::particles::GRAVITY);
+    }
+
+    /// Частицы в работе (для панели и проверок).
+    pub fn particle_stats(&self) -> crate::ParticleStats {
+        crate::ParticleStats {
+            live: self.particle_steps.last().map_or(0, |f| f.span.count),
+            dropped: self.particles.dropped,
+            fountain: self.fountain,
+        }
+    }
+
+    /// Включает фонтан частиц со следующего кадра.
+    pub fn set_fountain(&mut self, on: bool) {
+        self.fountain = on;
     }
 
     /// Где камера: середина и приближение (для проверок кадров без окна).
@@ -1141,6 +1268,7 @@ impl Demo {
                 ("resolve", Msaa::Off, None),
                 ("sdf_demo", msaa, stencil),
                 ("sdf_object", msaa, stencil),
+                ("particles", msaa, stencil),
             ] {
                 made.push(build(ctx, res, shaders, name, format, samples, stencil)?);
             }
@@ -1160,12 +1288,14 @@ impl Demo {
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.object, None);
+            ctx.device.destroy_pipeline(self.particle_draw, None);
         }
         self.triangle = made[0];
         self.sprites = made[1];
         self.resolve = made[2];
         self.sdf = made[3];
         self.object = made[4];
+        self.particle_draw = made[5];
         self.msaa = msaa;
         self.scene_format = format;
         Ok(())
@@ -1215,6 +1345,12 @@ impl Demo {
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
+                "particles" => (
+                    &mut self.particle_draw,
+                    self.scene_format,
+                    self.msaa,
+                    stencil,
+                ),
                 "light" => (&mut self.light, LIGHT_FORMAT, Msaa::Off, None),
                 "sdf_object" => {
                     match build_object_mask(ctx, res, shaders) {
@@ -1458,6 +1594,7 @@ impl Demo {
             }
             self.follow_player(time);
         }
+        self.prepare_particles(res, slot, time, scene, aspect);
         let vector = match scene {
             DemoScene::Gpu => {
                 self.vector_items = 0;
@@ -1700,6 +1837,40 @@ impl Demo {
             }
         });
 
+        // Частицы (6.6): расчёт до прохода «сцена» (по шагу на каждый шаг логики), рисование
+        // в нём поверх фигур.
+        let center = [self.camera.center.x as f32, self.camera.center.y as f32];
+        let zoom = self.camera.zoom as f32;
+        let particle_draw = self
+            .particle_steps
+            .last()
+            .filter(|f| f.span.count > 0)
+            .map(|f| {
+                (
+                    crate::particles::push(f, center, frame.aspect, zoom),
+                    f.span.count,
+                )
+            });
+        if self.particle_steps.iter().any(|f| f.span.count > 0) {
+            graph.add_pass("частицы", &[], move |p| {
+                for f in &self.particle_steps {
+                    let push = crate::particles::push(f, center, frame.aspect, zoom);
+                    // SAFETY: проход вне рисования; кольцо и буфер загрузки кадра живы,
+                    // пока видеокарта выполняет кадр.
+                    unsafe {
+                        crate::particles::record_update(
+                            p.device,
+                            p.cmd,
+                            layout,
+                            self.particle_update,
+                            &push,
+                            f.span.count,
+                        );
+                    }
+                }
+            });
+        }
+
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
             (stencil, Access::StencilAttachment),
@@ -1774,6 +1945,11 @@ impl Demo {
                         full,
                         vk::Offset2D::default(),
                     );
+                }
+                if let Some((push, count)) = particle_draw {
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.particle_draw);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 6, count, 0, 0);
                 }
                 if frame.sprite_count > 0 {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sprites);
@@ -2245,6 +2421,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.bloom_up, None);
             ctx.device.destroy_pipeline(self.rc_cascade, None);
             ctx.device.destroy_pipeline(self.rc_gather, None);
+            ctx.device.destroy_pipeline(self.particle_update, None);
+            ctx.device.destroy_pipeline(self.particle_draw, None);
             for name in FIELD_SHADERS {
                 ctx.device.destroy_pipeline(*self.field.slot(name), None);
             }
@@ -2258,6 +2436,8 @@ impl Demo {
         self.bloom_up = vk::Pipeline::null();
         self.rc_cascade = vk::Pipeline::null();
         self.rc_gather = vk::Pipeline::null();
+        self.particle_update = vk::Pipeline::null();
+        self.particle_draw = vk::Pipeline::null();
         self.field = FieldPipelines::default();
         self.sprites = vk::Pipeline::null();
         self.present = vk::Pipeline::null();
@@ -2568,6 +2748,8 @@ fn build(
         "light_mask_layer" => Blend::Screen,
         // SDF-объекты с мягким краем поверх фона.
         "sdf_object" => Blend::Alpha,
+        // Частицы: мягкие кружки поверх сцены.
+        "particles" => Blend::Alpha,
         _ => Blend::Opaque,
     };
     graphics_pipeline_stencil(
@@ -2709,6 +2891,36 @@ fn hue_to_rgb(h: f32) -> [f32; 3] {
         1.0 - (k.min(4.0 - k).clamp(0.0, 1.0))
     };
     [f(5.0), f(3.0), f(1.0)]
+}
+
+/// Частицы новых событий игры: события с шагом после `seen` (одно событие лежит в
+/// нескольких снимках подряд, а частицы даёт один раз). Если мир начался заново (номера
+/// шагов меньше прошлых), счёт идёт сначала.
+fn event_particles(
+    events: &[(u64, reyvec_scene::GameEvent)],
+    seen: &mut u64,
+) -> Vec<crate::particles::Particle> {
+    if events.last().is_some_and(|&(s, _)| s + 64 < *seen) {
+        *seen = 0;
+    }
+    let mut out = Vec::new();
+    for (i, &(step, event)) in events.iter().enumerate() {
+        if step > *seen {
+            out.extend(crate::particles::burst(&event, step * 31 + i as u64));
+        }
+    }
+    if let Some(&(s, _)) = events.last() {
+        *seen = (*seen).max(s);
+    }
+    out
+}
+
+/// Откуда бьёт фонтан для замера: чуть выше героя или из середины экрана.
+fn fountain_at(player: Option<[f64; 2]>, camera: reyvec_vector::Camera2D) -> [f32; 2] {
+    match player {
+        Some(p) => [p[0] as f32, p[1] as f32 + 0.3],
+        None => [camera.center.x as f32, camera.center.y as f32],
+    }
 }
 
 /// Сценарий игры для кадров без окна и докуда мир уже прошёл.

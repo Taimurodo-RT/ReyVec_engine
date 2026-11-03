@@ -40,6 +40,7 @@ mod graph;
 mod headless;
 mod lab;
 mod lights;
+mod particles;
 mod pipeline;
 mod resources;
 mod shaders;
@@ -61,6 +62,7 @@ pub use headless::{
     FrameImage, HeadlessImage, HeadlessPlay, HeadlessScene, PlayInput, render_headless,
     render_headless_play, render_triangle_headless,
 };
+pub use particles::ParticleStats;
 pub use pipeline::CLEAR_COLOR;
 pub use resources::{BufferId, BufferMemory, TextureId};
 pub use timing::{GpuFrameTimings, GpuTimingAverage, PassTiming};
