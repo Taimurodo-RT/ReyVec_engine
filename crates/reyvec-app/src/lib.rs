@@ -8,6 +8,7 @@ mod gamepad;
 mod logging;
 mod panel;
 pub mod snapshot;
+mod sound;
 
 pub use app::{AppConfig, AppError, RunSummary, run};
 pub use logging::{LogGuard, init_logging};

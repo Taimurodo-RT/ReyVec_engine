@@ -521,6 +521,14 @@ impl WindowRenderer {
         (self.scene() == DemoScene::File).then(|| demo.particle_stats())
     }
 
+    /// Новые события игры с прошлого вызова: по ним играет звук.
+    pub fn take_game_events(&mut self) -> Vec<reyvec_scene::GameEvent> {
+        self.demo
+            .as_mut()
+            .map(Demo::take_game_events)
+            .unwrap_or_default()
+    }
+
     /// Включает фонтан частиц для замера.
     pub fn set_fountain(&mut self, on: bool) {
         if let Some(demo) = self.demo.as_mut() {

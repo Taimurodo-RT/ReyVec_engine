@@ -29,6 +29,8 @@ pub(crate) enum PanelAction {
     Dither(bool),
     /// Фонтан частиц для замера (6.6).
     Fountain(bool),
+    /// Музыка (6.7).
+    Music(bool),
     ResetCamera,
     Snapshot,
     /// Проверка загрузки (5.4): новая тяжёлая картина в фоне (`true`) или в кадре.
@@ -90,6 +92,8 @@ pub(crate) struct PanelInfo<'a> {
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
     pub particles: Option<reyvec_gpu::ParticleStats>,
+    /// Звук (6.7).
+    pub audio: Option<reyvec_audio::AudioStats>,
     /// Загрузка в фоне (5.4).
     pub loading: reyvec_gpu::LoadStats,
     /// Свет и SDF-объекты: сколько в сцене и сколько на экране (5.5в).
@@ -312,6 +316,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         if let Some(stats) = info.particles {
             ui.label(mono(particles_text(&stats)));
         }
+        if let Some(a) = &info.audio {
+            ui.label(mono(audio_text(a)));
+        }
         ui.label(mono(loading_text(&info.loading)));
         if let Some(d) = &info.loading.details {
             ui.label(mono(format!(
@@ -477,6 +484,18 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::Cascades(cascades));
         }
     }
+    if let Some(a) = &info.audio {
+        let mut music = a.music;
+        if ui
+            .add_enabled(
+                a.device.is_some(),
+                egui::Checkbox::new(&mut music, "Музыка (O)"),
+            )
+            .changed()
+        {
+            actions.push(PanelAction::Music(music));
+        }
+    }
     if let Some(stats) = info.particles {
         let mut fountain = stats.fountain;
         if ui
@@ -536,6 +555,20 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
 }
 
 /// Строка «Герой»: где стоит, скорость, идёт ли камера.
+fn audio_text(a: &reyvec_audio::AudioStats) -> String {
+    match (&a.device, &a.error) {
+        (Some(device), _) => {
+            let loaded = match a.load_ms {
+                Some(ms) => format!("звуки собраны за {ms:.0} мс"),
+                None => "звуки собираются".into(),
+            };
+            format!("Звук: {device}; {loaded}, сыграно {}", a.played)
+        }
+        (None, Some(e)) => format!("Звука нет: {e}"),
+        (None, None) => "Звука нет".into(),
+    }
+}
+
 fn particles_text(p: &reyvec_gpu::ParticleStats) -> String {
     let mut text = format!("Частицы: {} в работе", p.live);
     if p.dropped > 0 {
@@ -782,6 +815,14 @@ mod tests {
             }),
             gamepad: Some("Xbox Controller"),
             follow: true,
+            audio: Some(reyvec_audio::AudioStats {
+                device: Some("Динамики, 48000 Гц, каналов 2".into()),
+                error: None,
+                load_ms: Some(120.0),
+                played: 42,
+                skipped: 0,
+                music: true,
+            }),
             particles: Some(reyvec_gpu::ParticleStats {
                 live: 1200,
                 dropped: 0,

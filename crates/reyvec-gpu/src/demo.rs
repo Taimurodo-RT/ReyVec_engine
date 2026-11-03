@@ -391,6 +391,8 @@ pub(crate) struct Demo {
     particle_queue: Vec<(f64, f32, Vec<crate::particles::Particle>)>,
     /// Последний шаг логики, события которого уже дали частицы.
     seen_event_step: u64,
+    /// Новые события игры, которые ещё не забрал звук (6.7).
+    fresh_events: Vec<reyvec_scene::GameEvent>,
     /// Фонтан для замера скорости частиц (около 100 000 живых).
     fountain: bool,
     /// Время прошлого кадра с частицами (в окне шаг расчёта — время между кадрами).
@@ -624,6 +626,7 @@ impl Demo {
             particle_steps: Vec::new(),
             particle_queue: Vec::new(),
             seen_event_step: 0,
+            fresh_events: Vec::new(),
             fountain: false,
             particle_time: None,
             present: vk::Pipeline::null(),
@@ -930,7 +933,11 @@ impl Demo {
             play.time = next;
             // Частицы шагают вместе с логикой: каждый шаг — свой шаг расчёта на
             // видеокарте, иначе в кадре через секунду не было бы ни полёта, ни отскока.
-            let mut emitted = event_particles(&world.events(), &mut self.seen_event_step);
+            let mut emitted = event_particles(
+                &world.events(),
+                &mut self.seen_event_step,
+                &mut self.fresh_events,
+            );
             if self.fountain {
                 let at = fountain_at(world.player_body().map(|b| b.pos), self.camera);
                 let seed = (next * 1000.0) as u64;
@@ -965,7 +972,11 @@ impl Demo {
             let dt = self
                 .particle_time
                 .map_or(0.0, |t| (now - t).clamp(0.0, 0.1)) as f32;
-            let mut emitted = event_particles(&self.file_scene.events, &mut self.seen_event_step);
+            let mut emitted = event_particles(
+                &self.file_scene.events,
+                &mut self.seen_event_step,
+                &mut self.fresh_events,
+            );
             if self.fountain {
                 let at = fountain_at(
                     self.file_scene
@@ -1015,6 +1026,11 @@ impl Demo {
             dropped: self.particles.dropped,
             fountain: self.fountain,
         }
+    }
+
+    /// Новые события игры с прошлого вызова (для звука).
+    pub fn take_game_events(&mut self) -> Vec<reyvec_scene::GameEvent> {
+        std::mem::take(&mut self.fresh_events)
     }
 
     /// Включает фонтан частиц со следующего кадра.
@@ -2935,6 +2951,7 @@ fn hue_to_rgb(h: f32) -> [f32; 3] {
 fn event_particles(
     events: &[(u64, reyvec_scene::GameEvent)],
     seen: &mut u64,
+    fresh: &mut Vec<reyvec_scene::GameEvent>,
 ) -> Vec<crate::particles::Particle> {
     if events.last().is_some_and(|&(s, _)| s + 64 < *seen) {
         *seen = 0;
@@ -2943,6 +2960,10 @@ fn event_particles(
     for (i, &(step, event)) in events.iter().enumerate() {
         if step > *seen {
             out.extend(crate::particles::burst(&event, step * 31 + i as u64));
+            // Для звука (6.7); если их никто не забирает (кадры без окна), не копятся.
+            if fresh.len() < MAX_FRESH_EVENTS {
+                fresh.push(event);
+            }
         }
     }
     if let Some(&(s, _)) = events.last() {
@@ -2950,6 +2971,9 @@ fn event_particles(
     }
     out
 }
+
+/// Сколько новых событий игры ждут, пока их заберут (звук).
+const MAX_FRESH_EVENTS: usize = 256;
 
 /// Откуда бьёт фонтан для замера: чуть выше героя или из середины экрана.
 fn fountain_at(player: Option<[f64; 2]>, camera: reyvec_vector::Camera2D) -> [f32; 2] {

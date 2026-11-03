@@ -112,6 +112,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         scene_file_label: None,
         modifiers: ModifiersState::empty(),
         gamepads: crate::gamepad::Gamepads::new(),
+        audio: reyvec_audio::Audio::new(true),
     };
     event_loop
         .run_app(&mut app)
@@ -169,6 +170,8 @@ struct App {
     modifiers: ModifiersState,
     /// Геймпады (6.3).
     gamepads: crate::gamepad::Gamepads,
+    /// Звук (6.7): звуки событий игры и музыка.
+    audio: reyvec_audio::Audio,
 }
 
 impl App {
@@ -341,6 +344,10 @@ impl App {
                 r.set_fountain(on);
                 tracing::info!("Фонтан частиц: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::Music(on) => {
+                self.audio.set_music(on);
+                tracing::info!("Музыка: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
                 r.set_follow(true);
@@ -416,6 +423,7 @@ impl App {
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),
+                audio: Some(self.audio.stats()),
                 loading: renderer.load_stats(),
                 cull: renderer.cull_stats(),
                 last_snapshot: self.last_snapshot.as_deref(),
@@ -440,6 +448,15 @@ impl App {
             };
             panel.frame(window, &info)
         });
+        // Звук событий игры этого кадра (6.7).
+        self.audio.poll();
+        let camera = renderer.camera();
+        let aspect = f64::from(size.width) / f64::from(size.height.max(1));
+        for event in renderer.take_game_events() {
+            let (sound, decibels, at) = crate::sound::sound_for(&event);
+            let pan = crate::sound::pan_for(at[0], camera.center.x, camera.zoom, aspect);
+            self.audio.play(sound, decibels, pan);
+        }
         match renderer.render([size.width, size.height], time, ui) {
             Ok(FrameStatus::Presented) => {
                 self.frames += 1;
@@ -799,6 +816,19 @@ impl ApplicationHandler for App {
                 .is_some_and(|r| r.scene() == DemoScene::File) =>
             {
                 self.apply(PanelAction::LoadPicture(!self.modifiers.shift_key()));
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyO),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                let on = !self.audio.stats().music;
+                self.apply(PanelAction::Music(on));
             }
             WindowEvent::KeyboardInput {
                 event:
