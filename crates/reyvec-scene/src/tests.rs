@@ -23,11 +23,15 @@ fn example_scene_parses_and_builds() {
     assert!(scene.shapes > 20);
     // В комнате 4 источника и 3 объекта, в коридоре (5.5в) 16 бра с огоньками и 4 лужи:
     // больше, чем видеокарта берёт за кадр, в кадр идут только те, что на экране.
-    // С 6.2 ещё награда на столбе в конце коридора: свет и светящийся шар.
-    assert_eq!(scene.lights.len(), 4 + 16 + 1);
-    assert_eq!(scene.objects.len(), 3 + 16 + 4 + 1);
+    // С 6.2 ещё награда на столбе в конце коридора: свет и светящийся шар, с 6.4 — две
+    // лампы с огоньками над уступами.
+    assert_eq!(scene.lights.len(), 4 + 16 + 1 + 2);
+    assert_eq!(scene.objects.len(), 3 + 16 + 4 + 1 + 2);
     // Шар, неон, огоньки и награда светятся, слизь отбрасывает тень.
-    assert_eq!(scene.objects.iter().filter(|o| o.glow).count(), 2 + 16 + 1);
+    assert_eq!(
+        scene.objects.iter().filter(|o| o.glow).count(),
+        2 + 16 + 1 + 2
+    );
     assert_eq!(scene.objects.iter().filter(|o| o.shadow).count(), 1 + 4);
     let shadow_layers = scene
         .items
@@ -43,12 +47,16 @@ fn example_scene_parses_and_builds() {
         })
         .count();
     // Слои с тенью: стол, полка, герой, ящики под полкой, 6 препятствий коридора (6.1),
-    // подъёмник и столб (6.2); окно без слоя.
-    assert_eq!(shadow_layers, 12);
+    // подъёмник и столб (6.2), уступы (6.4); окно без слоя.
+    assert_eq!(shadow_layers, 13);
     // Герой (6.1) и твёрдое: пол, стена слева, столешница, 6 банок с крышками, 3 книги,
-    // полка, 2 ящика, 6 препятствий коридора, подъёмник и столб.
+    // полка, 2 ящика, 6 препятствий коридора, подъёмник и столб; с 6.4 край уступов и
+    // сами уступы: 13 склонов, 4 доски и всего 6 прямоугольников из сотен клеток блоков.
     let player = scene.player.expect("в примере есть герой");
-    assert_eq!(player.solids, 2 + 1 + 6 + 3 + 1 + 2 + 6 + 2);
+    assert_eq!(
+        player.solids,
+        2 + 1 + 6 + 3 + 1 + 2 + 6 + 2 + 1 + 13 + 4 + 6
+    );
     // Сущности: предметы, фигуры, рисунки, источники, объекты и общий корень.
     assert!(scene.entities > 40, "{}", scene.entities);
     // Рисунки из файлов (5.5): фото SVG на полке и клякса Motif за окном.
@@ -1094,5 +1102,111 @@ fn hero_of_the_example_wall_jumps_up_to_the_reward() {
     assert!(
         p.on_ground && (p.at[1] - 0.89).abs() < 1e-3,
         "на столбе: {p:?}"
+    );
+}
+
+/// Держит ввод `held` (и `pressed` на первом шаге), пока `done` не скажет «хватит» или не
+/// пройдёт `limit` шагов; `each` видит героя после каждого шага.
+fn hold_until(
+    w: &mut SceneWorld,
+    t: &mut usize,
+    held: &[reyvec_game::Action],
+    pressed: &[reyvec_game::Action],
+    limit: usize,
+    mut each: impl FnMut(&PlayerView) -> bool,
+) -> PlayerView {
+    use reyvec_game::InputFrame;
+    w.set_input(InputFrame::new(held, pressed));
+    for _ in 0..limit {
+        *t = steps(w, *t, 1);
+        w.set_input(InputFrame::new(held, &[]));
+        let p = w.snapshot().player.unwrap();
+        if each(&p) {
+            return p;
+        }
+    }
+    w.snapshot().player.unwrap()
+}
+
+#[test]
+fn hero_of_the_example_crosses_the_ledges() {
+    use reyvec_game::Action::{Jump, Left, Right, Up};
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let mut t = steps(&mut w, 0, 30);
+    // Высота середины героя, стоящего на высоте `y` (половина роста 0,14).
+    let on = |y: f32| y + 0.14;
+    let floor = -0.78;
+    // На верху стены колодца (0,9) и вниз к уступам.
+    let mut body = w.player_body().unwrap();
+    body.pos = [11.35, 1.1];
+    w.set_player_body(body);
+    t = steps(&mut w, t, 40);
+    let p = w.snapshot().player.unwrap();
+    assert!(
+        p.on_ground && (p.at[1] - on(0.9)).abs() < 1e-3,
+        "на стене: {p:?}"
+    );
+    // Со стены на доску (0,4), с неё на склон холма, через площадку (0,3) и вниз:
+    // с площадки до пола не отрываясь от земли.
+    let mut top = f32::MIN;
+    let p = hold_until(&mut w, &mut t, &[Right], &[], 600, |p| {
+        if p.at[0] > 12.8 {
+            assert!(p.on_ground, "оторвался на холме: {p:?}");
+            top = top.max(p.at[1]);
+        }
+        p.at[0] > 13.6
+    });
+    assert!(p.at[0] > 13.6);
+    assert!((p.at[1] - on(floor)).abs() < 1e-3, "за холмом: {p:?}");
+    assert!(
+        (top - on(floor + 0.3)).abs() < 1e-3,
+        "площадка холма: {top}"
+    );
+
+    // Высокий блок (верх на 0,7 над полом) выше прыжка: повиснуть на краю и забраться.
+    let p = hold_until(&mut w, &mut t, &[Right], &[], 200, |p| p.vel[0] == 0.0);
+    assert!(p.on_ground && p.at[0] < 13.93, "у блока: {p:?}");
+    let p = hold_until(&mut w, &mut t, &[Right, Jump], &[Jump], 120, |p| p.hanging);
+    assert!(p.hanging, "не повис: {p:?}");
+    let ledge = floor + 0.7;
+    assert!(
+        (p.at[1] + 0.14 - (ledge + 0.02)).abs() < 1e-3,
+        "руки на краю: {p:?}"
+    );
+    // Висит, пока не нажмёшь вверх.
+    let p = hold_until(&mut w, &mut t, &[Right], &[], 60, |_| false);
+    assert!(p.hanging);
+    let p = hold_until(&mut w, &mut t, &[Up], &[Up], 1, |_| true);
+    assert!(
+        p.on_ground && !p.hanging && (p.at[1] - on(ledge)).abs() < 1e-3,
+        "наверху блока: {p:?}"
+    );
+
+    // Длинный спуск по склону: прижимается, а не скачет ступеньками.
+    let p = hold_until(&mut w, &mut t, &[Right], &[], 200, |p| p.at[0] > 14.4);
+    assert!(p.on_ground);
+    let p = hold_until(&mut w, &mut t, &[Right], &[], 400, |p| {
+        assert!(p.on_ground, "оторвался на спуске: {p:?}");
+        p.at[0] > 15.2
+    });
+    assert!((p.at[1] - on(floor)).abs() < 1e-3, "внизу спуска: {p:?}");
+
+    // Обратно: с верхней доски у колодца (0,9 над полом) — за край стены и на неё.
+    let mut body = w.player_body().unwrap();
+    body.pos = [11.55, f64::from(on(floor + 0.9)) + 0.05];
+    body.vel = [0.0, 0.0];
+    w.set_player_body(body);
+    w.set_input(reyvec_game::InputFrame::new(&[], &[]));
+    t = steps(&mut w, t, 30);
+    let p = w.snapshot().player.unwrap();
+    assert!(p.on_ground, "на доске: {p:?}");
+    let p = hold_until(&mut w, &mut t, &[Left, Jump], &[Jump], 120, |p| p.hanging);
+    assert!(p.hanging, "не повис на стене: {p:?}");
+    let p = hold_until(&mut w, &mut t, &[Up], &[Up], 1, |_| true);
+    assert!(
+        p.on_ground && (p.at[1] - on(0.9)).abs() < 1e-3,
+        "на стене: {p:?}"
     );
 }

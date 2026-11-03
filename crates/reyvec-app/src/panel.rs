@@ -517,7 +517,9 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
 
 /// Строка «Герой»: где стоит, скорость, идёт ли камера.
 fn player_text(p: &reyvec_scene::PlayerView, follow: bool) -> String {
-    let state = if p.on_ground {
+    let state = if p.hanging {
+        "висит на краю (вверх — забраться)"
+    } else if p.on_ground {
         "на земле"
     } else {
         "в воздухе"
@@ -738,6 +740,7 @@ mod tests {
                     at: [0.5, -0.64],
                     vel: [1.6, 0.0],
                     on_ground: true,
+                    hanging: false,
                     solids: 14,
                 },
                 input_ms: Some(8.3),

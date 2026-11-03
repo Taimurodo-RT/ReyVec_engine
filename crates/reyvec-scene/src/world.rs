@@ -175,6 +175,8 @@ pub struct Solid {
     pub oneway: bool,
     /// Середина на прошлом шаге: по ней видно, что предмет едет (6.2).
     pub last: Option<[f64; 2]>,
+    /// Склон (6.4): подъём слева направо, 0 — не склон ([`Collider::slope`]).
+    pub slope: f64,
 }
 
 /// Персонаж игрока (6.1): настройки, состояние и место появления.
@@ -275,6 +277,7 @@ impl SceneWorld {
             pictures: Vec::new(),
             morphs: Vec::new(),
             solids: Vec::new(),
+            tiles: None,
             player: None,
         };
         spawner.node(&root, None, "сцена")?;
@@ -455,10 +458,55 @@ impl Spawner<'_> {
                         half: [s.size.0 * 0.5, s.size.1 * 0.5],
                         oneway: s.oneway,
                         last: None,
+                        slope: 0.0,
                     },
                 ),
                 Some(me),
             );
+        }
+        if let Some(tiles) = &n.tiles {
+            let fail = |m: String| SceneError::new(format!("предмет «{name}», tiles: {m}"));
+            let level = tiles.build().map_err(fail)?;
+            for s in &level.solids {
+                self.spawn(
+                    (
+                        Placement {
+                            at: s.at,
+                            ..Placement::IDENTITY
+                        },
+                        GlobalPlacement::ROOT,
+                        Solid {
+                            half: s.half,
+                            oneway: s.oneway,
+                            last: None,
+                            slope: s.slope,
+                        },
+                    ),
+                    Some(me),
+                );
+            }
+            for shape in &level.shapes {
+                let id = shape.shape_id(self.library, self.cache).map_err(fail)?;
+                let (at, angle, color) = shape.placement();
+                let order = self.next();
+                self.spawn(
+                    (
+                        Placement {
+                            at: [at.0, at.1],
+                            angle,
+                            ..Placement::IDENTITY
+                        },
+                        GlobalPlacement::ROOT,
+                        VectorShape {
+                            id,
+                            tint: color.0,
+                            order,
+                            morph: None,
+                        },
+                    ),
+                    Some(me),
+                );
+            }
         }
         if n.spin != 0.0 || n.swing.is_some() || n.bob.is_some() {
             self.world.entity_mut(me).insert(Motion {
@@ -503,6 +551,7 @@ impl Spawner<'_> {
                     half: [size.0 * 0.5, size.1 * 0.5],
                     oneway: *oneway,
                     last: None,
+                    slope: 0.0,
                 });
             }
         }
@@ -626,6 +675,7 @@ fn play(
                 jump_held: input.held(Action::Jump),
                 down: input.held(Action::Down),
                 dash_pressed: first && input.pressed(Action::Dash),
+                up: input.held(Action::Up),
             };
             let colliders = if first { &solids.0 } else { &still };
             p.body.step(&p.tuning, intent, colliders, dt / steps as f64);
@@ -656,11 +706,20 @@ fn gather_solids(mut q: Query<(Entity, &mut Solid, &GlobalPlacement)>, mut solid
             .last
             .map_or([0.0, 0.0], |l| [center[0] - l[0], center[1] - l[1]]);
         s.last = Some(center);
+        // Склон: подъём растягивается вместе с предметом, отражённый — в другую сторону.
+        let slope = if s.slope == 0.0 {
+            0.0
+        } else {
+            let a = g.affine.as_coeffs();
+            let flip = (a[0] * a[3] - a[1] * a[2]).signum();
+            s.slope * (aabb.max[1] - aabb.min[1]) / (2.0 * hy).max(1e-12) * flip
+        };
         solids.0.push(Collider {
             aabb,
             oneway: s.oneway,
             id: e.to_bits(),
             moved,
+            slope,
         });
     }
 }
@@ -801,6 +860,7 @@ fn collect(
             at: [p.body.pos[0] as f32, p.body.pos[1] as f32],
             vel: [p.body.vel[0] as f32, p.body.vel[1] as f32],
             on_ground: p.body.on_ground,
+            hanging: p.body.hanging != 0.0,
             solids: solids.0.len(),
         }),
         input_stamp: press.0,

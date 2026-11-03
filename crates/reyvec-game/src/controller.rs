@@ -17,6 +17,15 @@
 //! Столкновения: сначала по горизонтали, потом по вертикали. На каждой оси путь
 //! обрезается у ближайшего края стены, поэтому персонаж не проскакивает стену при любой
 //! скорости и встаёт ровно вплотную.
+//!
+//! Наклоны (6.4): наклонный прямоугольник держит только сверху, по линии из угла в
+//! угол. На нём стоит середина низа персонажа, а не весь прямоугольник: так он не висит
+//! над склоном краем. Бегущий вниз по склону прижимается к нему, а не слетает
+//! ступеньками; маленькую ступеньку (до половины ширины) на земле перешагивает сам.
+//!
+//! Цепляние за край (6.4): в падении, прижавшись к стене, персонаж хватается за её верх,
+//! если тот на уровне головы и сверху есть место встать. Вверх — забраться, прыжок —
+//! прыгнуть вверх, вниз или от стены — отпустить.
 
 use crate::{Aabb, EPS};
 
@@ -53,6 +62,8 @@ pub struct Tuning {
     pub wall_slide: f64,
     /// Прыжок от стены: во сколько раз скорости бега отталкивает вбок (0 — нельзя).
     pub wall_jump: f64,
+    /// Можно цепляться за край (6.4).
+    pub ledge: bool,
 }
 
 impl Default for Tuning {
@@ -73,6 +84,7 @@ impl Default for Tuning {
             dash_time: 0.16,
             wall_slide: 0.5,
             wall_jump: 1.1,
+            ledge: true,
         }
     }
 }
@@ -91,6 +103,12 @@ impl Tuning {
     fn half(&self) -> [f64; 2] {
         [self.size[0] * 0.5, self.size[1] * 0.5]
     }
+
+    /// Какую ступеньку персонаж на земле перешагивает сам: на 45° склоне край
+    /// прямоугольника упирается в верх соседнего блока как раз на половине ширины ниже.
+    fn step_up(&self) -> f64 {
+        self.size[0] * 0.5 + 0.01
+    }
 }
 
 /// Чего хочет игрок на этом шаге.
@@ -106,6 +124,8 @@ pub struct Intent {
     pub down: bool,
     /// Рывок нажат на этом шаге.
     pub dash_pressed: bool,
+    /// Зажато «вверх»: висящий на краю забирается наверх (6.4).
+    pub up: bool,
 }
 
 /// Твёрдый прямоугольник уровня.
@@ -118,6 +138,12 @@ pub struct Collider {
     pub id: u64,
     /// На сколько сдвинулся за этот шаг (движущаяся платформа везёт стоящего на ней).
     pub moved: [f64; 2],
+    /// Наклон (6.4): 0 — обычный прямоугольник. Иначе это склон, и число — на сколько
+    /// он поднимается слева направо (меньше 0 — опускается): верх склона идёт по прямой
+    /// от одного верхнего угла прямоугольника вниз на эту высоту у другого края. Ниже
+    /// склона прямоугольник сплошной (столбик под склоном у уровня из тайлов). Склон
+    /// держит только сверху.
+    pub slope: f64,
 }
 
 impl Collider {
@@ -128,7 +154,40 @@ impl Collider {
             oneway: false,
             id: 0,
             moved: [0.0, 0.0],
+            slope: 0.0,
         }
+    }
+
+    /// Неподвижный склон, поднимающийся слева направо на `rise` (меньше 0 —
+    /// опускающийся).
+    pub fn slope(aabb: Aabb, rise: f64) -> Self {
+        Self {
+            slope: rise,
+            ..Self::solid(aabb)
+        }
+    }
+
+    /// Высота склона над точкой `x` (за краями — высота ближнего края).
+    fn surface(&self, x: f64) -> f64 {
+        let b = &self.aabb;
+        let w = b.max[0] - b.min[0];
+        let t = if w > 0.0 {
+            ((x - b.min[0]) / w).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let t = if self.slope > 0.0 { t } else { 1.0 - t };
+        b.max[1] - self.slope.abs() * (1.0 - t)
+    }
+
+    /// Крутизна склона: подъём на единицу пути.
+    fn steepness(&self) -> f64 {
+        let b = &self.aabb;
+        self.slope.abs() / (b.max[0] - b.min[0]).max(EPS)
+    }
+
+    fn is_slope(&self) -> bool {
+        self.slope != 0.0
     }
 
     /// Неподвижная платформа, которая держит только сверху.
@@ -153,6 +212,12 @@ pub struct Body {
     pub wall: f64,
     /// Идёт рывок.
     pub dashing: bool,
+    /// Висит на краю (6.4): -1 — край слева, 1 — справа, 0 — не висит.
+    pub hanging: f64,
+    /// Верх края, за который держится, и прямоугольник под ним.
+    ledge: Option<Aabb>,
+    /// Сколько ещё нельзя снова схватиться за край (только что отпустил).
+    grab_cooldown: f64,
     coyote_left: f64,
     buffer_left: f64,
     /// На чём стоит (номер [`Collider::id`]) и платформа ли это.
@@ -184,6 +249,10 @@ pub struct StepEvents {
     pub dashed: bool,
     /// Спрыгнул сквозь платформу.
     pub dropped: bool,
+    /// Схватился за край.
+    pub grabbed: bool,
+    /// Забрался на край.
+    pub climbed: bool,
 }
 
 /// Насколько близко к стене считается «прижат».
@@ -192,6 +261,10 @@ const WALL_TOUCH: f64 = 0.002;
 const WALL_LOCK: f64 = 0.14;
 /// Сколько спрыгивание не замечает платформ, секунд.
 const DROP_TIME: f64 = 0.2;
+/// Насколько верх висящего выше края: руки лежат на краю.
+const HANG_ABOVE: f64 = 0.02;
+/// Сколько после того, как отпустил край, за него нельзя схватиться, секунд.
+const GRAB_COOLDOWN: f64 = 0.25;
 
 impl Body {
     /// Персонаж стоит в `pos` без движения.
@@ -203,6 +276,9 @@ impl Body {
             facing: 1.0,
             wall: 0.0,
             dashing: false,
+            hanging: 0.0,
+            ledge: None,
+            grab_cooldown: 0.0,
             coyote_left: 0.0,
             buffer_left: 0.0,
             ground: None,
@@ -246,7 +322,48 @@ impl Body {
         }
         self.wall_lock -= dt;
         self.drop_left -= dt;
+        self.grab_cooldown -= dt;
         let x = intent.x.clamp(-1.0, 1.0);
+
+        // Висит на краю: стоит на месте, пока не нажмут.
+        if let Some(ledge) = self.ledge {
+            let side = self.hanging;
+            if intent.jump_pressed {
+                self.let_go();
+                self.vel = [0.0, tuning.jump_speed()];
+                self.grab_cooldown = GRAB_COOLDOWN;
+                ev.jumped = true;
+            } else if intent.up {
+                // Встаёт на край у самой стены.
+                let edge = if side > 0.0 {
+                    ledge.min[0]
+                } else {
+                    ledge.max[0]
+                };
+                let mut stand = edge + side * (half[0] + 0.005);
+                if ledge.max[0] - ledge.min[0] >= tuning.size[0] {
+                    stand = stand.clamp(ledge.min[0] + half[0], ledge.max[0] - half[0]);
+                }
+                self.let_go();
+                self.pos = [stand, ledge.max[1] + half[1]];
+                self.vel = [0.0, 0.0];
+                self.on_ground = true;
+                self.coyote_left = tuning.coyote;
+                ev.climbed = true;
+                return ev;
+            } else if intent.down || x * side < 0.0 {
+                self.let_go();
+                self.grab_cooldown = GRAB_COOLDOWN;
+            } else {
+                self.vel = [0.0, 0.0];
+                self.facing = side;
+                self.wall = side;
+                self.dash_ready = true;
+                self.buffer_left = 0.0;
+                return ev;
+            }
+        }
+
         // Прижат ли к стене (в воздухе, платформы не в счёт).
         self.wall = 0.0;
         if !self.on_ground {
@@ -305,7 +422,7 @@ impl Body {
         } else {
             self.coyote_left -= dt;
         }
-        if intent.jump_pressed {
+        if intent.jump_pressed && !ev.jumped {
             self.buffer_left = tuning.buffer;
         } else {
             self.buffer_left -= dt;
@@ -347,15 +464,28 @@ impl Body {
             }
         }
 
-        // Столкновения: сначала вбок, потом по вертикали.
+        // Столкновения: сначала вбок, потом по вертикали. Идущий по земле не замечает
+        // ступеньки ниже `step_up` и встаёт на неё.
+        let walking = self.on_ground && self.vel[1] <= 0.0;
+        let foot_before = [self.pos[0], self.pos[1] - half[1]];
         let dx = self.vel[0] * dt;
-        let (moved, _) = sweep(self.bounds(tuning), 0, dx, solids, false);
-        if moved != dx {
+        let mut probe = self.bounds(tuning);
+        if walking {
+            probe.min[1] += tuning.step_up();
+        }
+        let (mut moved_x, _) = sweep(probe, 0, dx, solids, false);
+        self.pos[0] += moved_x;
+        if walking && !self.climb_step(tuning, solids) {
+            // На ступеньку не встать (над ней низко): упёрся, как в стену.
+            self.pos[0] -= moved_x;
+            moved_x = sweep(self.bounds(tuning), 0, dx, solids, false).0;
+            self.pos[0] += moved_x;
+        }
+        if moved_x != dx {
             self.vel[0] = 0.0;
             ev.hit_wall = true;
             self.dash_left = 0.0;
         }
-        self.pos[0] += moved;
         let dy = self.vel[1] * dt;
         let platforms = self.drop_left <= 0.0;
         let (moved, by) = sweep(Aabb::around(self.pos, half), 1, dy, solids, platforms);
@@ -368,15 +498,191 @@ impl Body {
                 self.on_ground = true;
                 self.ground = by.map(|i| solids[i].id);
                 self.on_platform = by.is_some_and(|i| solids[i].oneway);
-                ev.landed = !was_on_ground;
             } else {
                 ev.hit_ceiling = true;
             }
             self.vel[1] = 0.0;
         }
         self.pos[1] += moved;
+
+        // Склоны держат сверху; бегущего по земле прижимают, а не дают слететь.
+        let snap = if walking { moved_x.abs() + 0.005 } else { 0.0 };
+        self.stand_on_slopes(tuning, solids, foot_before, snap);
+        if walking && !self.on_ground && snap > 0.0 {
+            // Сошёл со склона на ровное или с ровного чуть ниже — тоже прижимается.
+            let (down, by) = sweep(self.bounds(tuning), 1, -snap, solids, platforms);
+            if down > -snap {
+                self.pos[1] += down;
+                self.on_ground = true;
+                self.ground = by.map(|i| solids[i].id);
+                self.on_platform = by.is_some_and(|i| solids[i].oneway);
+                self.vel[1] = 0.0;
+            }
+        }
+        ev.landed = self.on_ground && !was_on_ground;
         self.dashing = self.dash_left > 0.0;
+
+        // Схватиться за край: в падении, прижавшись к стене, край на уровне головы.
+        if tuning.ledge
+            && !self.on_ground
+            && !self.dashing
+            && self.vel[1] <= 0.0
+            && self.grab_cooldown <= 0.0
+            && x != 0.0
+            && let Some(ledge) = self.find_ledge(tuning, solids, x.signum(), -moved)
+        {
+            self.hanging = x.signum();
+            self.ledge = Some(ledge);
+            self.pos[1] = ledge.max[1] + HANG_ABOVE - half[1];
+            self.vel = [0.0, 0.0];
+            self.wall = self.hanging;
+            self.facing = self.hanging;
+            self.dash_ready = true;
+            self.dash_left = 0.0;
+            self.dashing = false;
+            ev.grabbed = true;
+        }
         ev
+    }
+
+    fn let_go(&mut self) {
+        self.hanging = 0.0;
+        self.ledge = None;
+    }
+
+    /// Шагнул на низкую ступеньку: встать на её верх, если над головой есть место
+    /// (`false` — места нет).
+    fn climb_step(&mut self, tuning: &Tuning, solids: &[Collider]) -> bool {
+        let b = self.bounds(tuning);
+        let mut lift: f64 = 0.0;
+        for c in solids {
+            if c.oneway || c.is_slope() {
+                continue;
+            }
+            let s = &c.aabb;
+            let across = s.min[0] < b.max[0] - EPS && s.max[0] > b.min[0] + EPS;
+            let rise = s.max[1] - b.min[1];
+            if across && rise > EPS && rise <= tuning.step_up() && s.min[1] < b.min[1] + EPS {
+                lift = lift.max(rise);
+            }
+        }
+        if lift > 0.0 {
+            let free = solids.iter().all(|c| {
+                c.oneway || c.is_slope() || {
+                    let s = &c.aabb;
+                    // Над ступенькой ничего не мешает голове.
+                    !(s.min[0] < b.max[0] - EPS
+                        && s.max[0] > b.min[0] + EPS
+                        && s.min[1] >= b.max[1] - EPS
+                        && s.min[1] < b.max[1] + lift - EPS)
+                }
+            });
+            if !free {
+                return false;
+            }
+            self.pos[1] += lift;
+        }
+        true
+    }
+
+    /// Встать на склон под серединой низа. `snap` — насколько можно опуститься к склону
+    /// внизу (бег вниз по склону), 0 — только если провалился в него.
+    fn stand_on_slopes(
+        &mut self,
+        tuning: &Tuning,
+        solids: &[Collider],
+        foot_before: [f64; 2],
+        snap: f64,
+    ) {
+        if self.vel[1] > 0.0 {
+            return;
+        }
+        let foot = [self.pos[0], self.pos[1] - tuning.half()[1]];
+        let mut best: Option<(f64, &Collider)> = None;
+        for c in solids.iter().filter(|c| c.is_slope()) {
+            let s = &c.aabb;
+            if foot[0] < s.min[0] - EPS || foot[0] > s.max[0] + EPS {
+                continue;
+            }
+            let h = c.surface(foot[0]);
+            // Сверху: до шага стоял не ниже склона (с запасом на подъём по нему).
+            let from_above = foot_before[1] >= c.surface(foot_before[0]) - 0.01;
+            // Край прямоугольника мог стоять на углу соседнего блока выше склона.
+            let reach = if snap > 0.0 {
+                (snap + tuning.half()[0]) * c.steepness() + 0.005
+            } else {
+                0.0
+            };
+            let sink = foot[1] < h + EPS;
+            let near = foot[1] - h <= reach;
+            if from_above && (sink || near) && best.is_none_or(|(b, _)| h > b) {
+                best = Some((h, c));
+            }
+        }
+        if let Some((h, c)) = best {
+            // Опуститься к склону можно, только если по пути нет ничего твёрдого.
+            if foot[1] > h {
+                let (down, _) = sweep(self.bounds(tuning), 1, h - foot[1], solids, false);
+                if down > h - foot[1] {
+                    return;
+                }
+            }
+            self.pos[1] += h - foot[1];
+            self.vel[1] = 0.0;
+            self.on_ground = true;
+            self.ground = Some(c.id);
+            self.on_platform = false;
+        }
+    }
+
+    /// Край, за который можно схватиться со стороны `side`: верх стены на уровне головы
+    /// (за этот шаг голова опустилась на `fell`), сверху есть место встать.
+    fn find_ledge(
+        &self,
+        tuning: &Tuning,
+        solids: &[Collider],
+        side: f64,
+        fell: f64,
+    ) -> Option<Aabb> {
+        let b = self.bounds(tuning);
+        let band = (tuning.size[1] * 0.3).max(fell + 0.01);
+        let blocked = |area: Aabb| solids.iter().any(|c| !c.oneway && c.aabb.overlaps(&area));
+        solids
+            .iter()
+            .filter(|c| !c.oneway && !c.is_slope() && c.moved == [0.0, 0.0])
+            .filter(|c| {
+                let s = &c.aabb;
+                let face = if side > 0.0 {
+                    s.min[0] - b.max[0]
+                } else {
+                    b.min[0] - s.max[0]
+                };
+                face.abs() <= WALL_TOUCH
+                    && s.max[1] <= b.max[1] + EPS
+                    && s.max[1] >= b.max[1] - band
+                    && s.min[1] < s.max[1] - EPS
+            })
+            .map(|c| c.aabb)
+            .find(|s| {
+                let top = s.max[1];
+                // Голове есть куда подняться до виса.
+                let head = Aabb {
+                    min: [b.min[0], b.max[1]],
+                    max: [b.max[0], top + HANG_ABOVE + EPS * 10.0],
+                };
+                // Наверху есть место встать.
+                let edge = if side > 0.0 { s.min[0] } else { s.max[0] };
+                let x0 = if side > 0.0 {
+                    edge
+                } else {
+                    edge - tuning.size[0]
+                };
+                let stand = Aabb {
+                    min: [x0 + EPS * 10.0, top + EPS * 10.0],
+                    max: [x0 + tuning.size[0] - EPS * 10.0, top + tuning.size[1]],
+                };
+                (head.max[1] <= head.min[1] || !blocked(head)) && !blocked(stand)
+            })
     }
 }
 
@@ -389,7 +695,7 @@ fn approach(v: f64, target: f64, by: f64) -> f64 {
 }
 
 /// Насколько можно сдвинуть `b` по оси `axis` на `d`, не войдя ни в один из `solids`, и
-/// какой из них остановил. Прямоугольники, в которых `b` уже стоит (например, персонажа
+/// какой из них остановил. Склоны здесь не держат: их проверяет [`Body::stand_on_slopes`]. Прямоугольники, в которых `b` уже стоит (например, персонажа
 /// поставили внутрь стены), не держат: из них можно выйти. Платформы держат, только если
 /// `platforms` и движение вниз начинается не ниже их верха.
 fn sweep(
@@ -404,7 +710,7 @@ fn sweep(
     let mut by = None;
     for (i, c) in solids.iter().enumerate() {
         let s = &c.aabb;
-        if c.oneway && !(platforms && axis == 1 && d < 0.0) {
+        if c.is_slope() || (c.oneway && !(platforms && axis == 1 && d < 0.0)) {
             continue;
         }
         // Мимо по другой оси.
@@ -880,5 +1186,257 @@ mod tests {
         let x0 = b.pos[0];
         run(&mut b, &t, &solids, 6, toward);
         assert!(b.pos[0] < x0 - 0.05, "{} {x0}", b.pos[0]);
+    }
+
+    /// Пол, холм из двух склонов по 45° с площадкой между ними, как из тайлов: под
+    /// склонами сплошные столбики.
+    fn hill() -> Vec<Collider> {
+        let r = |x0: f64, y0: f64, x1: f64, y1: f64| Aabb {
+            min: [x0, y0],
+            max: [x1, y1],
+        };
+        vec![
+            Collider::solid(r(-10.0, -1.0, 1.0, 0.0)),
+            Collider::slope(r(1.0, -1.0, 1.5, 0.5), 0.5),
+            Collider::slope(r(1.5, -1.0, 2.0, 1.0), 0.5),
+            Collider::solid(r(2.0, -1.0, 3.0, 1.0)),
+            Collider::slope(r(3.0, -1.0, 4.0, 1.0), -1.0),
+            Collider::solid(r(4.0, -1.0, 10.0, 0.0)),
+        ]
+    }
+
+    fn walk(x: f64) -> Intent {
+        Intent {
+            x,
+            ..Intent::default()
+        }
+    }
+
+    #[test]
+    fn walks_over_a_hill_without_leaving_the_ground() {
+        let t = Tuning::default();
+        let solids = hill();
+        let mut b = Body::new([0.0, t.size[1] * 0.5 + 0.05]);
+        run(&mut b, &t, &solids, 30, Intent::default());
+        assert!(b.on_ground);
+        let mut top: f64 = 0.0;
+        for i in 0..400 {
+            let ev = b.step(&t, walk(1.0), &solids, DT);
+            assert!(b.on_ground, "шаг {i}: оторвался от земли в {:?}", b.pos);
+            assert!(!ev.landed, "шаг {i}: «приземлился» на ровном месте");
+            let foot = b.pos[1] - t.size[1] * 0.5;
+            // Середина низа на поверхности (ступенька у края площадки — до step_up).
+            let ground = match b.pos[0] {
+                x if x < 1.0 => 0.0,
+                x if x < 2.0 => x - 1.0,
+                x if x < 3.0 => 1.0,
+                x if x < 4.0 => 4.0 - x,
+                _ => 0.0,
+            };
+            assert!(
+                foot >= ground - 1e-6 && foot <= ground + t.step_up(),
+                "шаг {i}: x {:.3} низ {foot:.3}, земля {ground:.3}",
+                b.pos[0]
+            );
+            top = top.max(foot);
+            if b.pos[0] > 5.0 {
+                break;
+            }
+        }
+        assert!(b.pos[0] > 5.0, "не дошёл: {:?}", b.pos);
+        assert!((top - 1.0).abs() < 1e-6, "площадка: {top}");
+        // И обратно.
+        for _ in 0..400 {
+            b.step(&t, walk(-1.0), &solids, DT);
+            assert!(b.on_ground, "обратно: оторвался в {:?}", b.pos);
+            if b.pos[0] < 0.0 {
+                break;
+            }
+        }
+        assert!(b.pos[0] < 0.0);
+    }
+
+    #[test]
+    fn stands_still_on_a_slope_and_lands_on_it() {
+        let t = Tuning::default();
+        let solids = hill();
+        let mut b = Body::new([1.5, 1.2]);
+        run(&mut b, &t, &solids, 90, Intent::default());
+        assert!(b.on_ground);
+        let foot = b.pos[1] - t.size[1] * 0.5;
+        assert!((foot - 0.5).abs() < 1e-6, "{foot}");
+        let x = b.pos[0];
+        run(&mut b, &t, &solids, 120, Intent::default());
+        assert!((b.pos[0] - x).abs() < 1e-9, "сполз: {:?}", b.pos);
+        assert!((b.pos[1] - t.size[1] * 0.5 - 0.5).abs() < 1e-6);
+        // Прыжок со склона.
+        b.step(&t, jump_now(), &solids, DT);
+        assert!(!b.on_ground && b.vel[1] > 0.0);
+    }
+
+    #[test]
+    fn steps_up_low_ledges_but_not_high_ones() {
+        let t = Tuning::default();
+        let mut solids = floor();
+        solids.push(Collider::solid(Aabb {
+            min: [0.5, -0.5],
+            max: [1.0, 0.05],
+        }));
+        solids.push(Collider::solid(Aabb {
+            min: [2.0, -0.5],
+            max: [2.5, 0.2],
+        }));
+        let mut b = standing(&t);
+        run(&mut b, &t, &solids, 50, walk(1.0));
+        assert!(b.pos[0] > 1.0 && b.on_ground, "{:?}", b.pos);
+        run(&mut b, &t, &solids, 120, walk(1.0));
+        // Высокий блок — стена.
+        assert!(
+            (b.bounds(&t).max[0] - 2.0).abs() < 1e-9,
+            "прошёл сквозь: {:?}",
+            b.pos
+        );
+        assert!((b.bounds(&t).min[1]).abs() < 1e-9);
+    }
+
+    /// Пол и высокий блок справа: верх на 0.7, выше прыжка.
+    fn cliff() -> Vec<Collider> {
+        let mut s = floor();
+        s.push(Collider::solid(Aabb {
+            min: [1.0, -1.0],
+            max: [2.0, 0.7],
+        }));
+        s
+    }
+
+    fn hang_on_cliff(t: &Tuning, solids: &[Collider]) -> Body {
+        let mut b = standing(t);
+        b.pos[0] = 0.7;
+        let toward = Intent {
+            x: 1.0,
+            jump_held: true,
+            ..Intent::default()
+        };
+        b.step(
+            t,
+            Intent {
+                jump_pressed: true,
+                ..toward
+            },
+            solids,
+            DT,
+        );
+        let mut grabbed = false;
+        for _ in 0..120 {
+            if b.step(t, toward, solids, DT).grabbed {
+                grabbed = true;
+                break;
+            }
+        }
+        assert!(grabbed, "не схватился: {:?}", b.pos);
+        b
+    }
+
+    #[test]
+    fn grabs_a_ledge_hangs_and_climbs() {
+        let t = Tuning::default();
+        let solids = cliff();
+        let mut b = hang_on_cliff(&t, &solids);
+        assert_eq!(b.hanging, 1.0);
+        let top = b.bounds(&t).max[1];
+        assert!((top - (0.7 + HANG_ABOVE)).abs() < 1e-9, "{top}");
+        assert!((b.bounds(&t).max[0] - 1.0).abs() < 1e-9);
+        // Висит, сколько угодно.
+        let hold = walk(1.0);
+        run(&mut b, &t, &solids, 120, hold);
+        assert_eq!(b.hanging, 1.0);
+        assert!((b.bounds(&t).max[1] - top).abs() < 1e-12);
+        // Вверх — стоит на краю.
+        let ev = b.step(&t, Intent { up: true, ..hold }, &solids, DT);
+        assert!(ev.climbed && b.on_ground && b.hanging == 0.0);
+        run(&mut b, &t, &solids, 30, Intent::default());
+        assert!(b.on_ground);
+        assert!((b.bounds(&t).min[1] - 0.7).abs() < 1e-9, "{:?}", b.pos);
+        assert!(b.pos[0] > 1.0);
+    }
+
+    #[test]
+    fn jumps_from_a_ledge_or_lets_go() {
+        let t = Tuning::default();
+        let solids = cliff();
+        let mut b = hang_on_cliff(&t, &solids);
+        // Прыжок с края к стене — оказывается наверху.
+        let toward = Intent {
+            x: 1.0,
+            jump_held: true,
+            ..Intent::default()
+        };
+        assert!(
+            b.step(
+                &t,
+                Intent {
+                    jump_pressed: true,
+                    ..toward
+                },
+                &solids,
+                DT
+            )
+            .jumped
+        );
+        for _ in 0..90 {
+            if b.step(&t, toward, &solids, DT).landed {
+                break;
+            }
+        }
+        assert!(b.on_ground && b.bounds(&t).min[1] > 0.69, "{:?}", b.pos);
+
+        // Вниз — отпускает и падает на пол, сразу снова не хватается.
+        let mut b = hang_on_cliff(&t, &solids);
+        b.step(
+            &t,
+            Intent {
+                down: true,
+                x: 1.0,
+                ..Intent::default()
+            },
+            &solids,
+            DT,
+        );
+        assert_eq!(b.hanging, 0.0);
+        let mut grabbed = false;
+        for _ in 0..90 {
+            grabbed |= b.step(&t, walk(1.0), &solids, DT).grabbed;
+        }
+        assert!(!grabbed && b.on_ground, "{:?}", b.pos);
+    }
+
+    #[test]
+    fn no_grab_without_room_on_top() {
+        let t = Tuning::default();
+        let mut solids = cliff();
+        // Над краем низкий потолок: встать некуда.
+        solids.push(Collider::solid(Aabb {
+            min: [1.0, 0.8],
+            max: [2.0, 1.0],
+        }));
+        let mut b = standing(&t);
+        b.pos[0] = 0.7;
+        let toward = Intent {
+            x: 1.0,
+            jump_held: true,
+            ..Intent::default()
+        };
+        b.step(
+            &t,
+            Intent {
+                jump_pressed: true,
+                ..toward
+            },
+            &solids,
+            DT,
+        );
+        for _ in 0..120 {
+            assert!(!b.step(&t, toward, &solids, DT).grabbed, "{:?}", b.pos);
+        }
     }
 }
