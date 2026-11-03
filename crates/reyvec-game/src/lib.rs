@@ -26,7 +26,7 @@ pub mod input;
 pub mod physics;
 
 pub use anim::{Animator, Bone, BonePose, Clip, Pose};
-pub use combat::{AttackTuning, Dummy, Fighter};
+pub use combat::{AttackTuning, Dummy, Fighter, Health, Hurt};
 pub use controller::{Body, Collider, Intent, StepEvents, Tuning};
 pub use input::{Action, InputFrame, InputReader, InputShared};
 
@@ -61,6 +61,22 @@ impl Aabb {
             }
         }
         Some(b)
+    }
+
+    /// Середина.
+    pub fn center(&self) -> [f64; 2] {
+        [
+            (self.min[0] + self.max[0]) * 0.5,
+            (self.min[1] + self.max[1]) * 0.5,
+        ]
+    }
+
+    /// Шире на `by` со всех сторон.
+    pub fn grow(&self, by: f64) -> Self {
+        Self {
+            min: [self.min[0] - by, self.min[1] - by],
+            max: [self.max[0] + by, self.max[1] + by],
+        }
     }
 
     /// Пересекается ли с `other` (касание не считается).

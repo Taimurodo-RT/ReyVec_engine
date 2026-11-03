@@ -349,6 +349,8 @@ pub struct DummyDesc {
     pub size: P,
     pub hp: u32,
     pub respawn: f64,
+    /// Сколько здоровья отнимает у героя касание (6.10б): 0 — безобидный манекен.
+    pub contact: u32,
 }
 
 impl Default for DummyDesc {
@@ -357,6 +359,7 @@ impl Default for DummyDesc {
             size: (0.16, 0.3),
             hp: 5,
             respawn: 2.0,
+            contact: 0,
         }
     }
 }
@@ -367,6 +370,9 @@ impl DummyDesc {
         check_size("высота size", self.size.1)?;
         if !(1..=1000).contains(&self.hp) {
             return Err(format!("hp {} — нужно от 1 до 1000", self.hp));
+        }
+        if self.contact > 100 {
+            return Err(format!("contact {} — нужно от 0 до 100", self.contact));
         }
         if !(self.respawn.is_finite() && (0.1..=60.0).contains(&self.respawn)) {
             return Err(format!(
@@ -503,6 +509,8 @@ pub struct PlayerDesc {
     pub ledge: bool,
     /// Удар (6.5).
     pub attack: AttackDesc,
+    /// Здоровье героя (6.10б).
+    pub hp: u32,
 }
 
 impl Default for PlayerDesc {
@@ -526,6 +534,7 @@ impl Default for PlayerDesc {
             wall_jump: t.wall_jump,
             ledge: t.ledge,
             attack: AttackDesc::default(),
+            hp: 5,
         }
     }
 }
@@ -555,6 +564,9 @@ impl PlayerDesc {
     fn check(&self) -> Result<(), String> {
         check_size("ширина size", self.size.0)?;
         check_size("высота size", self.size.1)?;
+        if !(1..=100).contains(&self.hp) {
+            return Err(format!("hp {} — нужно от 1 до 100", self.hp));
+        }
         let positive = [
             ("speed", self.speed),
             ("accel", self.accel),
@@ -1061,6 +1073,16 @@ pub enum GameEvent {
     Hit { at: [f32; 2], dir: f32 },
     /// Герой подобрал предмет (скрипт отметил `collected`, 6.9).
     Pickup { at: [f32; 2] },
+    /// Враг получил урон (6.10б): над ним, сколько и осталось ли здоровье.
+    Damage {
+        at: [f32; 2],
+        amount: u32,
+        left: u32,
+    },
+    /// Враг задел героя (6.10б): середина героя, урон и откуда удар.
+    Hurt { at: [f32; 2], amount: u32, dir: f32 },
+    /// Здоровье героя кончилось: где он был (появится снова в начале).
+    Died { at: [f32; 2] },
 }
 
 /// Что видно о персонаже игрока снаружи мира: для камеры и панели.
@@ -1081,6 +1103,11 @@ pub struct PlayerView {
     pub hits: u32,
     /// Что показывает анимация (6.8): «бежит», «прыгает»…
     pub anim: &'static str,
+    /// Здоровье и сколько его всего (6.10б).
+    pub hp: u32,
+    pub max_hp: u32,
+    /// Неуязвим после удара.
+    pub invulnerable: bool,
 }
 
 /// Готовые формы фигур: одна форма нарезается на треугольники один раз за работу

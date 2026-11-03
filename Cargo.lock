@@ -3254,6 +3254,8 @@ dependencies = [
  "reyvec-scene",
  "reyvec-sdf",
  "reyvec-vector",
+ "ron",
+ "serde",
  "thiserror 2.0.21",
  "tracing",
  "tracing-appender",

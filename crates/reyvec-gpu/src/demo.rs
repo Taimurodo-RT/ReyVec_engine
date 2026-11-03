@@ -871,6 +871,15 @@ impl Demo {
         }
     }
 
+    /// Пауза игры (6.10б): мир сцены из файла не шагает.
+    pub fn set_game_paused(&mut self, on: bool) {
+        if let Some(logic) = &self.file_logic
+            && logic.paused() != on
+        {
+            logic.set_paused(on);
+        }
+    }
+
     /// Камера идёт за персонажем игрока.
     pub fn follow(&self) -> bool {
         self.follow

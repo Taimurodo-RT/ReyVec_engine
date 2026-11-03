@@ -42,6 +42,8 @@ struct Frames {
 struct Shared {
     frames: Mutex<Frames>,
     stop: AtomicBool,
+    /// Пауза (6.10б, открыто меню): мир не шагает, время сцены стоит.
+    paused: AtomicBool,
     steps: AtomicU64,
     /// Время одного шага логики (среднее, микросекунды).
     step_us: AtomicU64,
@@ -72,6 +74,7 @@ impl SceneLogic {
                 cur_at: Instant::now(),
             }),
             stop: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
             steps: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
             input: InputShared::new(),
@@ -111,6 +114,20 @@ impl SceneLogic {
     /// Всё отпущено (окно потеряло фокус).
     pub fn release_all(&self) {
         self.shared.input.release_all();
+    }
+
+    /// Ставит мир на паузу или снимает с неё. На паузе время сцены стоит, нажатия
+    /// не копятся: всё отпускается.
+    pub fn set_paused(&self, on: bool) {
+        if on {
+            self.shared.input.release_all();
+        }
+        self.shared.paused.store(on, Ordering::Relaxed);
+    }
+
+    /// Мир на паузе.
+    pub fn paused(&self) -> bool {
+        self.shared.paused.load(Ordering::Relaxed)
     }
 
     /// Сколько в среднем нажатие ждёт шага логики, мс (`None`, пока нажатий не было).
@@ -172,6 +189,13 @@ fn run(mut world: SceneWorld, start: f64, commands: Receiver<Command>, shared: &
             if let Some(body) = body {
                 world.set_player_body(body);
             }
+        }
+        if shared.paused.load(Ordering::Relaxed) {
+            // Время сцены стоит: шаг не делается. Нажатия, пришедшие на паузе, читаются
+            // и выбрасываются, чтобы после неё герой не прыгнул сам.
+            input.read(&shared.input);
+            next += STEP;
+            continue;
         }
         let started = Instant::now();
         world.set_input(input.read(&shared.input));

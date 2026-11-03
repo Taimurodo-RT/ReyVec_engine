@@ -112,6 +112,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         scene_file_label: None,
         modifiers: ModifiersState::empty(),
         gamepads: crate::gamepad::Gamepads::new(),
+        game_ui: crate::game_ui::GameUi::new(),
         audio: reyvec_audio::Audio::new(true),
     };
     event_loop
@@ -170,6 +171,8 @@ struct App {
     modifiers: ModifiersState,
     /// Геймпады (6.3).
     gamepads: crate::gamepad::Gamepads,
+    /// Игровой интерфейс и настройка клавиш (6.10б).
+    game_ui: crate::game_ui::GameUi,
     /// Звук (6.7): звуки событий игры и музыка.
     audio: reyvec_audio::Audio,
 }
@@ -381,7 +384,8 @@ impl App {
         };
         let _zone = reyvec_gpu::cpu_zone!("кадр");
         // Геймпад: в игру, только пока открыта сцена с героем.
-        let playing = renderer.scene() == DemoScene::File;
+        let playing = renderer.scene() == DemoScene::File && !self.game_ui.menu_open();
+        renderer.set_game_paused(renderer.scene() == DemoScene::File && self.game_ui.menu_open());
         self.gamepads.poll(|action, down| {
             if playing {
                 renderer.game_action(action, down);
@@ -403,6 +407,25 @@ impl App {
             .into_iter()
             .filter(|m| renderer.msaa_supported(*m) == *m)
             .collect();
+        // Звук и интерфейс событий игры этого кадра (6.7, 6.10б).
+        self.audio.poll();
+        let camera = renderer.camera();
+        let aspect = f64::from(size.width) / f64::from(size.height.max(1));
+        for event in renderer.take_game_events() {
+            self.game_ui.on_event(&event);
+            let Some((sound, decibels, at)) = crate::sound::sound_for(&event) else {
+                continue;
+            };
+            let pan = crate::sound::pan_for(at[0], camera.center.x, camera.zoom, aspect);
+            self.audio.play(sound, decibels, pan);
+        }
+        let game_view = crate::game_ui::GameView {
+            player: renderer.player_stats().map(|p| p.view),
+            center: [camera.center.x, camera.center.y],
+            zoom: camera.zoom,
+        };
+        let game_ui = &mut self.game_ui;
+        let in_game = renderer.scene() == DemoScene::File;
         let ui = self.panel.as_mut().and_then(|panel| {
             let info = PanelInfo {
                 adapter: &self.stats.adapter,
@@ -447,16 +470,10 @@ impl App {
                 cascades: renderer.cascades(),
                 dither: renderer.dither(),
             };
-            panel.frame(window, &info)
+            panel.frame(window, &info, in_game.then_some((game_ui, &game_view)))
         });
-        // Звук событий игры этого кадра (6.7).
-        self.audio.poll();
-        let camera = renderer.camera();
-        let aspect = f64::from(size.width) / f64::from(size.height.max(1));
-        for event in renderer.take_game_events() {
-            let (sound, decibels, at) = crate::sound::sound_for(&event);
-            let pan = crate::sound::pan_for(at[0], camera.center.x, camera.zoom, aspect);
-            self.audio.play(sound, decibels, pan);
+        if self.game_ui.take_quit() {
+            return self.close(event_loop);
         }
         match renderer.render([size.width, size.height], time, ui) {
             Ok(FrameStatus::Presented) => {
@@ -525,23 +542,6 @@ fn to_screen(p: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> Vec2 {
     Vec2::new((2.0 * p.x - w) / h, (h - 2.0 * p.y) / h)
 }
 
-/// Клавиша управления персонажем (6.1, 6.2, 6.5): стрелки, пробел, Shift или X — рывок,
-/// Ctrl или A — удар. Остальные буквы заняты переключателями песочницы; настройка клавиш
-/// — в меню (6.10).
-fn game_action(code: KeyCode) -> Option<reyvec_scene::game::Action> {
-    use reyvec_scene::game::Action;
-    match code {
-        KeyCode::ArrowLeft => Some(Action::Left),
-        KeyCode::ArrowRight => Some(Action::Right),
-        KeyCode::ArrowUp => Some(Action::Up),
-        KeyCode::ArrowDown => Some(Action::Down),
-        KeyCode::Space => Some(Action::Jump),
-        KeyCode::ShiftLeft | KeyCode::ShiftRight | KeyCode::KeyX => Some(Action::Dash),
-        KeyCode::ControlLeft | KeyCode::ControlRight | KeyCode::KeyA => Some(Action::Attack),
-        _ => None,
-    }
-}
-
 /// Клавиша выбора сцены песочницы. Клавиши по месту на клавиатуре, поэтому раскладка
 /// не важна.
 fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
@@ -581,8 +581,48 @@ impl ApplicationHandler for App {
         if let (Some(panel), Some(window)) = (self.panel.as_mut(), &self.window) {
             panel_took = panel.on_window_event(window, &event);
         }
+        let in_game = self
+            .renderer
+            .as_ref()
+            .is_some_and(|r| r.scene() == DemoScene::File);
+        // Меню ждёт клавишу для назначения (6.10б): её забирает меню.
+        if let WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key: PhysicalKey::Code(code),
+                    state: ElementState::Pressed,
+                    repeat: false,
+                    ..
+                },
+            ..
+        } = &event
+            && in_game
+            && self.game_ui.capturing()
+        {
+            self.game_ui.capture_key(*code);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
+            // В игре Esc открывает меню (выход — из меню), в остальных сценах закрывает
+            // окно.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Escape),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if in_game => {
+                self.game_ui.escape();
+                if self.game_ui.menu_open()
+                    && let Some(r) = self.renderer.as_mut()
+                {
+                    r.release_game_input();
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -592,6 +632,8 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => self.close(event_loop),
+            // Пока открыто меню, клавиши песочницы не работают.
+            WindowEvent::KeyboardInput { .. } if in_game && self.game_ui.menu_open() => {}
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -600,13 +642,9 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } if game_action(code).is_some()
-                && self
-                    .renderer
-                    .as_ref()
-                    .is_some_and(|r| r.scene() == DemoScene::File) =>
-            {
-                if let (Some(action), Some(r)) = (game_action(code), self.renderer.as_mut()) {
+            } if in_game && self.game_ui.action(code).is_some() => {
+                if let (Some(action), Some(r)) = (self.game_ui.action(code), self.renderer.as_mut())
+                {
                     r.game_action(action, state == ElementState::Pressed);
                 }
             }

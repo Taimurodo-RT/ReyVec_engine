@@ -1310,7 +1310,9 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
             let place = format!("старт {start:?}, шаг {i}: {p:?}\n{}", history.join("\n"));
             assert!(p.at[0].is_finite() && p.at[1].is_finite(), "{place}");
             let jump = (p.at[0] - last.at[0]).hypot(p.at[1] - last.at[1]);
-            assert!(jump < 0.2, "телепорт на {jump}: {place}");
+            // Здоровье кончилось (6.10б) — герой появляется в начале с полным.
+            let respawned = p.hp > last.hp;
+            assert!(jump < 0.2 || respawned, "телепорт на {jump}: {place}");
             grabs += usize::from(p.hanging && !last.hanging);
             for c in &solids {
                 if c.oneway {
@@ -1898,4 +1900,117 @@ fn hero_kicks_the_ball_stands_on_a_crate_and_breaks_into_debris() {
     t = steps(&mut w, t, 60 * 4);
     let _ = t;
     assert_eq!(visible(&mut w), 0, "обломки погасли");
+}
+
+#[test]
+fn enemy_touch_hurts_the_hero_blinks_and_respawns_when_health_runs_out() {
+    use reyvec_game::Action::Right;
+    use reyvec_game::InputFrame;
+    let text = minimal(
+        r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "герой", at: (0.0, -0.7), player: (size: (0.1, 0.2), hp: 2),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+    (name: "шип", at: (0.5, -0.74), dummy: (size: (0.12, 0.12), hp: 3, contact: 1),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.12, 0.12), color: "#f00")]),
+]"##,
+    );
+    let mut w = world(&text);
+    let mut t = steps(&mut w, 0, 30);
+    assert_eq!(w.snapshot().player.unwrap().hp, 2);
+    // Бежит в шип: ранен на 1, отброшен назад, неуязвим и мигает.
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    let mut hurt = None;
+    let mut seen = 0;
+    for _ in 0..60 {
+        t = steps(&mut w, t, 1);
+        for e in fresh(&w, &mut seen) {
+            if let GameEvent::Hurt { amount, dir, .. } = e {
+                hurt = Some((amount, dir));
+            }
+        }
+        if hurt.is_some() {
+            break;
+        }
+    }
+    assert_eq!(hurt, Some((1, -1.0)), "касание ранит и отбрасывает влево");
+    let p = w.snapshot().player.unwrap();
+    assert_eq!(p.hp, 1);
+    assert!(p.invulnerable && p.vel[0] < 0.0, "{p:?}");
+    let hero = w.find("герой").unwrap();
+    let mut opacities = Vec::new();
+    for _ in 0..20 {
+        t = steps(&mut w, t, 1);
+        opacities.push(w.world_mut().get::<Placement>(hero).unwrap().opacity);
+    }
+    assert!(
+        opacities.contains(&1.0) && opacities.iter().any(|o| *o < 1.0),
+        "мигает: {opacities:?}"
+    );
+    // Неуязвимость прошла, снова в шип: здоровье кончилось — герой в начале, полный.
+    let mut died = false;
+    for _ in 0..240 {
+        t = steps(&mut w, t, 1);
+        died |= fresh(&w, &mut seen)
+            .iter()
+            .any(|e| matches!(e, GameEvent::Died { .. }));
+        if died {
+            break;
+        }
+    }
+    assert!(died, "{:?}", w.snapshot().player);
+    let p = w.snapshot().player.unwrap();
+    assert_eq!(p.hp, 2);
+    assert!(p.at[0].abs() < 0.05, "появился в начале: {p:?}");
+}
+
+#[test]
+fn hero_hits_show_damage_numbers_with_hp_left() {
+    use reyvec_game::Action::Attack;
+    use reyvec_game::InputFrame;
+    let text = minimal(
+        r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "герой", at: (0.0, -0.7), player: (size: (0.1, 0.2)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+    (name: "манекен", at: (0.16, -0.65), dummy: (size: (0.16, 0.3), hp: 2),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.16, 0.3), color: "#f00")]),
+]"##,
+    );
+    let mut w = world(&text);
+    let mut t = steps(&mut w, 0, 30);
+    let mut damage = Vec::new();
+    let mut seen = 0;
+    for _ in 0..2 {
+        w.set_input(InputFrame::new(&[Attack], &[Attack]));
+        t = steps(&mut w, t, 1);
+        w.set_input(InputFrame::new(&[], &[]));
+        for _ in 0..40 {
+            t = steps(&mut w, t, 1);
+            for e in fresh(&w, &mut seen) {
+                if let GameEvent::Damage { amount, left, .. } = e {
+                    damage.push((amount, left));
+                }
+            }
+        }
+        // Отброшенный манекен — снова к герою.
+        let e = w.find("манекен").unwrap();
+        let mut target = w.world_mut().get_mut::<crate::world::Target>(e).unwrap();
+        target.dummy.body = reyvec_game::Body::new([0.16, -0.65]);
+    }
+    assert_eq!(damage, vec![(1, 1), (1, 0)]);
+}
+
+/// События, которых ещё не было (после шага `seen`).
+fn fresh(w: &SceneWorld, seen: &mut u64) -> Vec<GameEvent> {
+    let events = w.snapshot().events;
+    let out = events
+        .iter()
+        .filter(|(s, _)| *s > *seen)
+        .map(|(_, e)| *e)
+        .collect();
+    if let Some(&(s, _)) = events.last() {
+        *seen = (*seen).max(s);
+    }
+    out
 }

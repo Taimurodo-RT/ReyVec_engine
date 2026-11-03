@@ -521,8 +521,38 @@ pub(crate) fn burst(event: &reyvec_scene::GameEvent, seed: u64) -> Vec<Particle>
                 out.push(d);
             }
         }
-        // Взмах слышно, но пыли он не поднимает.
-        E::Swing { .. } => {}
+        // Взмах слышно, но пыли он не поднимает; число урона рисует интерфейс.
+        E::Swing { .. } | E::Damage { .. } => {}
+        E::Hurt { at, dir, .. } => {
+            // Красные брызги от героя в сторону отброса.
+            for _ in 0..14 {
+                let v = [dir * r.range(0.3, 1.4), r.range(0.2, 1.4)];
+                let life = r.range(0.25, 0.5);
+                out.push(Particle {
+                    pos: at,
+                    vel: v,
+                    life,
+                    max_life: life,
+                    size: r.range(0.016, 0.028),
+                    gravity: 0.9,
+                    color: [3.0, 0.25, 0.2, 1.0],
+                    drag: 1.5,
+                    bounce: 0.2,
+                    flags: PARTICLE_SHRINK | PARTICLE_GLOW,
+                });
+            }
+        }
+        E::Died { at } => {
+            // Облако пыли кольцом.
+            for i in 0..24 {
+                let angle = std::f32::consts::TAU * i as f32 / 24.0;
+                let speed = r.range(0.4, 1.0);
+                let v = [speed * angle.cos(), speed * angle.sin()];
+                let mut d = dust(at, v, &mut r);
+                d.gravity = 0.1;
+                out.push(d);
+            }
+        }
         E::Pickup { at } => {
             // Золотые блёстки кольцом вверх, медленно гаснут.
             for i in 0..16 {
