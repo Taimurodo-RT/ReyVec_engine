@@ -18,4 +18,5 @@
 | [0012-audio.md](0012-audio.md) | Звук: свой смеситель на `cpal` вместо `kira`, звуки-заготовки синтезом (6.7) |
 | [0013-scripts.md](0013-scripts.md) | Скрипты поведения на Luau: враги и предметы, правка на лету, песочница (6.9) |
 | [0014-game-ui-and-controls.md](0014-game-ui-and-controls.md) | Интерфейс игры (здоровье, числа урона, меню паузы) на egui и настройка клавиш в файле (6.10б) |
-| [0015-physics-rapier-local.md](0015-physics-rapier-local.md) | Физика: Rapier 0.36 своей копией в `third_party`, наши надстройки только через `reyvec-game/physics`, полигон (6.12) |
+| [0015-controls-schemes.md](0015-controls-schemes.md) | Управление: действия, привязки клавиш и мыши, выборы поведения и схемы «Консоль / Меню / Игра / Песочница» (6.12) |
+| [0016-physics-rapier-local.md](0016-physics-rapier-local.md) | Физика: Rapier 0.36 своей копией в `third_party`, наши надстройки только через `reyvec-game/physics`, полигон (6.13) |

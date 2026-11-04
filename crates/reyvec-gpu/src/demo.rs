@@ -447,7 +447,7 @@ pub(crate) struct Demo {
     /// (снимки, тесты) — прямо в кадре в заданный момент, чтобы кадр был повторяемым.
     file_world: Option<reyvec_scene::SceneWorld>,
     file_logic: Option<reyvec_scene::SceneLogic>,
-    /// Следующий принятый мир — другой файл сцены: персонаж не переносится (6.12).
+    /// Следующий принятый мир — другой файл сцены: персонаж не переносится (6.13).
     fresh_scene: bool,
     logic_thread: bool,
     /// Загрузка в фоне (5.4): файл сцены, уровни детализации, проверочная картина.
@@ -774,7 +774,7 @@ impl Demo {
         }
     }
 
-    /// Другой файл сцены (N в песочнице, 6.12): как [`Self::set_scene_file`], но персонаж
+    /// Другой файл сцены (N в песочнице, 6.13): как [`Self::set_scene_file`], но персонаж
     /// встаёт на место из нового файла, а не остаётся там, где был.
     pub fn switch_scene_file(&mut self, text: &str, dir: Option<&std::path::Path>) {
         self.fresh_scene = true;
@@ -877,7 +877,7 @@ impl Demo {
         }
     }
 
-    /// Мышь для физики сцены из файла (6.12): точка в координатах сцены и держат ли
+    /// Мышь для физики сцены из файла (6.13): точка в координатах сцены и держат ли
     /// кнопку захвата.
     pub fn physics_pointer(&mut self, at: [f64; 2], held: bool) {
         if let Some(logic) = &self.file_logic {
@@ -904,7 +904,7 @@ impl Demo {
         }
     }
 
-    /// Физика сцены из файла для панели (6.12), если в сцене есть тела.
+    /// Физика сцены из файла для панели (6.13), если в сцене есть тела.
     pub fn physics_stats(&self) -> Option<reyvec_scene::game::physics::PhysicsStats> {
         self.file_scene.physics
     }

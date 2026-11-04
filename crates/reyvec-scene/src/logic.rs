@@ -65,7 +65,7 @@ struct Shared {
     /// Среднее время от нажатия до шага логики, который его взял (микросекунды; 0 —
     /// нажатий ещё не было).
     input_us: AtomicU64,
-    /// Мышь для физики (6.12): пишет окно, читает поток логики в начале шага.
+    /// Мышь для физики (6.13): пишет окно, читает поток логики в начале шага.
     pointer: Mutex<Pointer>,
 }
 
@@ -151,6 +151,16 @@ impl SceneLogic {
     /// Действие игрока нажато или отпущено. Поток логики возьмёт его в ближайший шаг.
     pub fn set_action(&self, action: Action, down: bool) {
         self.shared.input.set(action, down);
+    }
+
+    /// Точка прицела: курсор в координатах сцены (`None` — курсор вне окна, 6.12).
+    pub fn set_aim(&self, at: Option<[f64; 2]>) {
+        self.shared.input.set_aim(at);
+    }
+
+    /// Нажатие, направленное в точку прицела (удар мышью в сторону курсора).
+    pub fn press_aimed(&self, action: Action) {
+        self.shared.input.press_aimed(action);
     }
 
     /// Всё отпущено (окно потеряло фокус).

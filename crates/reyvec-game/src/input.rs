@@ -8,7 +8,7 @@
 //!
 //! Между потоками общие только атомарные числа: окно не ждёт логику, логика не ждёт окно.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 /// Действие игрока.
@@ -81,6 +81,12 @@ pub struct InputShared {
     presses: [AtomicU32; COUNT],
     /// Когда было последнее нажатие (наносекунды от `epoch`).
     last_press_ns: AtomicU64,
+    /// Точка прицела (6.12): где курсор в координатах сцены (биты `f64`).
+    aim: [AtomicU64; 2],
+    aim_on: AtomicBool,
+    /// Нажатия «с прицелом» с прошлого чтения: действие направлено в точку прицела
+    /// (удар мышью в сторону курсора).
+    aimed: AtomicU32,
 }
 
 impl Default for InputShared {
@@ -96,7 +102,26 @@ impl InputShared {
             held: AtomicU32::new(0),
             presses: std::array::from_fn(|_| AtomicU32::new(0)),
             last_press_ns: AtomicU64::new(0),
+            aim: [AtomicU64::new(0), AtomicU64::new(0)],
+            aim_on: AtomicBool::new(false),
+            aimed: AtomicU32::new(0),
         }
+    }
+
+    /// Точка прицела в координатах сцены (`None` — курсор вне окна).
+    pub fn set_aim(&self, at: Option<[f64; 2]>) {
+        if let Some(at) = at {
+            self.aim[0].store(at[0].to_bits(), Ordering::Relaxed);
+            self.aim[1].store(at[1].to_bits(), Ordering::Relaxed);
+        }
+        self.aim_on.store(at.is_some(), Ordering::Release);
+    }
+
+    /// Нажатие, направленное в точку прицела: как [`Self::set`] с `down`, и шаг узнает,
+    /// что это действие нужно сделать в сторону курсора ([`InputFrame::aimed`]).
+    pub fn press_aimed(&self, action: Action) {
+        self.aimed.fetch_or(action.bit(), Ordering::AcqRel);
+        self.set(action, true);
     }
 
     /// Действие нажато (`down`) или отпущено. Повтор зажатой клавиши системой нажатием не
@@ -131,10 +156,14 @@ impl InputShared {
 }
 
 /// Ввод одного шага логики.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InputFrame {
     held: u32,
     pressed: u32,
+    /// Из нажатых — направленные в точку прицела.
+    aimed: u32,
+    /// Точка прицела (курсор в координатах сцены).
+    aim: Option<[f64; 2]>,
     /// Когда было последнее нажатие, взятое в этот шаг (0 — нажатий не было): по нему
     /// кадр узнаёт, сколько прошло от нажатия до ответа на экране.
     stamp: u64,
@@ -147,8 +176,27 @@ impl InputFrame {
         Self {
             held: bits(held) | bits(pressed),
             pressed: bits(pressed),
+            aimed: 0,
+            aim: None,
             stamp: 0,
         }
+    }
+
+    /// Тот же ввод с точкой прицела `aim`; `aimed` из нажатых направлены в неё.
+    pub fn with_aim(mut self, aim: [f64; 2], aimed: &[Action]) -> Self {
+        self.aim = Some(aim);
+        self.aimed = aimed.iter().fold(0, |b, x| b | x.bit()) & self.pressed;
+        self
+    }
+
+    /// Точка прицела, если курсор над окном.
+    pub fn aim(&self) -> Option<[f64; 2]> {
+        self.aim
+    }
+
+    /// Действие нажато с прошлого шага и направлено в точку прицела.
+    pub fn aimed(&self, action: Action) -> bool {
+        self.aimed & self.pressed & action.bit() != 0
     }
 
     /// Действие зажато сейчас (или было нажато с прошлого шага).
@@ -205,9 +253,17 @@ impl InputReader {
                 self.latency_ms * 0.8 + ms * 0.2
             };
         }
+        let aim = shared.aim_on.load(Ordering::Acquire).then(|| {
+            [
+                f64::from_bits(shared.aim[0].load(Ordering::Relaxed)),
+                f64::from_bits(shared.aim[1].load(Ordering::Relaxed)),
+            ]
+        });
         InputFrame {
             held: shared.held.load(Ordering::Acquire) | pressed,
             pressed,
+            aimed: shared.aimed.swap(0, Ordering::AcqRel) & pressed,
+            aim,
             stamp,
         }
     }
@@ -235,6 +291,25 @@ mod tests {
         assert!(!f.pressed(Action::Jump));
         assert!(!f.held(Action::Jump));
         assert!(reader.latency_ms().is_some());
+    }
+
+    #[test]
+    fn aimed_press_carries_the_cursor_point_for_one_step() {
+        let shared = InputShared::new();
+        let mut reader = InputReader::default();
+        assert_eq!(reader.read(&shared).aim(), None);
+        shared.set_aim(Some([1.5, -0.25]));
+        shared.press_aimed(Action::Attack);
+        shared.set(Action::Attack, false);
+        let f = reader.read(&shared);
+        assert!(f.pressed(Action::Attack) && f.aimed(Action::Attack));
+        assert_eq!(f.aim(), Some([1.5, -0.25]));
+        // Следующее нажатие клавишей — уже не к курсору.
+        shared.set(Action::Attack, true);
+        let f = reader.read(&shared);
+        assert!(f.pressed(Action::Attack) && !f.aimed(Action::Attack));
+        shared.set_aim(None);
+        assert_eq!(reader.read(&shared).aim(), None);
     }
 
     #[test]

@@ -92,7 +92,7 @@ pub(crate) struct PanelInfo<'a> {
     pub player: Option<reyvec_gpu::PlayerStats>,
     /// Скрипты сцены (6.9).
     pub scripts: Option<reyvec_scene::ScriptInfo>,
-    /// Физика сцены (6.12): тела, сочленения, мягкие тела, время шага.
+    /// Физика сцены (6.13): тела, сочленения, мягкие тела, время шага.
     pub physics: Option<reyvec_scene::game::physics::PhysicsStats>,
     pub gamepad: Option<&'a str>,
     pub follow: bool,

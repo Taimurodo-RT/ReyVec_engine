@@ -304,7 +304,7 @@ struct PhysicsRes {
     breaks: Vec<Break>,
     pieces: Vec<Piece>,
     seed: u64,
-    /// Полигон (6.12): сочленения, мягкие тела, выброс тел, мышь.
+    /// Полигон (6.13): сочленения, мягкие тела, выброс тел, мышь.
     extra: phys::Extra,
 }
 
@@ -369,6 +369,8 @@ struct Pending {
     jump: bool,
     dash: bool,
     attack: bool,
+    /// Удар нажат мышью «к курсору»: куда бить (6.12).
+    attack_at: Option<[f64; 2]>,
 }
 
 /// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест).
@@ -656,7 +658,7 @@ impl SceneWorld {
         all.into_iter().map(|(_, t)| t.dummy.clone()).collect()
     }
 
-    /// Мышь для физики (полигон, 6.12): захват телом и взрыв.
+    /// Мышь для физики (полигон, 6.13): захват телом и взрыв.
     pub fn set_pointer(&mut self, pointer: Pointer) {
         self.world
             .resource_mut::<PhysicsRes>()
@@ -1208,6 +1210,11 @@ fn play(
     pending.jump |= input.pressed(Action::Jump);
     pending.dash |= input.pressed(Action::Dash);
     pending.attack |= input.pressed(Action::Attack);
+    if input.aimed(Action::Attack) {
+        pending.attack_at = input.aim();
+    } else if input.pressed(Action::Attack) {
+        pending.attack_at = None;
+    }
 
     // Таймеры, которые идут и в стоп-кадре.
     combat.shake_left = (combat.shake_left - dt).max(0.0);
@@ -1297,6 +1304,15 @@ fn play(
                 events.list.push_back((step, GameEvent::Dashed { at, dir }));
             }
             let can = !p.body.on_ledge();
+            // Удар мышью — в сторону курсора (если так выбрано в настройках управления).
+            if first
+                && presses.attack
+                && can
+                && let Some(at) = presses.attack_at
+                && (at[0] - p.body.pos[0]).abs() > 1e-6
+            {
+                p.body.facing = (at[0] - p.body.pos[0]).signum();
+            }
             let swings = p.fighter.swings;
             p.fighter
                 .step(&p.attack, first && presses.attack, can, p.body.facing, sdt);
@@ -1823,7 +1839,7 @@ fn visit(
 enum Drawn<'a> {
     Shape(&'a VectorShape),
     Picture(&'a SvgPicture),
-    /// Нитки мягких тел и сочленений (6.12): поверх всего на своей глубине.
+    /// Нитки мягких тел и сочленений (6.13): поверх всего на своей глубине.
     Free(&'a phys::FreeItem),
 }
 

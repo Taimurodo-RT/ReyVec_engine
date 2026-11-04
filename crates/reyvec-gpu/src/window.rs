@@ -471,7 +471,7 @@ impl WindowRenderer {
         }
     }
 
-    /// Другой файл сцены той же папки (N в сцене из файла, 6.12): персонаж встаёт на
+    /// Другой файл сцены той же папки (N в сцене из файла, 6.13): персонаж встаёт на
     /// место из нового файла.
     pub fn switch_scene_file(&mut self, text: &str) {
         self.files.scene = Some(text.into());
@@ -480,21 +480,21 @@ impl WindowRenderer {
         }
     }
 
-    /// Мышь для физики (6.12): точка в координатах сцены и держат ли кнопку захвата.
+    /// Мышь для физики (6.13): точка в координатах сцены и держат ли кнопку захвата.
     pub fn physics_pointer(&mut self, at: [f64; 2], held: bool) {
         if let Some(demo) = self.demo.as_mut() {
             demo.physics_pointer(at, held);
         }
     }
 
-    /// Взрыв в точке сцены `at` (6.12).
+    /// Взрыв в точке сцены `at` (6.13).
     pub fn physics_blast(&mut self, at: [f64; 2]) {
         if let Some(demo) = self.demo.as_mut() {
             demo.physics_blast(at);
         }
     }
 
-    /// Физика сцены из файла для панели (6.12).
+    /// Физика сцены из файла для панели (6.13).
     pub fn physics_stats(&self) -> Option<reyvec_scene::game::physics::PhysicsStats> {
         self.demo.as_ref().and_then(Demo::physics_stats)
     }
