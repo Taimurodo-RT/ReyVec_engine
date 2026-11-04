@@ -548,6 +548,16 @@ impl WindowRenderer {
         self.demo.as_ref().and_then(Demo::player_stats)
     }
 
+    /// Поток логики сцены из файла (для консоли разработчика, 6.11).
+    pub fn scene_logic(&self) -> Option<&reyvec_scene::SceneLogic> {
+        self.demo.as_ref().and_then(Demo::scene_logic)
+    }
+
+    /// Твёрдое сцены из файла в рисуемом кадре.
+    pub fn file_solids(&self) -> &[reyvec_scene::game::Collider] {
+        self.demo.as_ref().map_or(&[], Demo::file_solids)
+    }
+
     /// Скрипты сцены из файла (6.9).
     pub fn script_info(&self) -> Option<reyvec_scene::ScriptInfo> {
         self.demo.as_ref().and_then(Demo::script_info)

@@ -1061,6 +1061,16 @@ impl Demo {
         (s.files > 0).then(|| s.clone())
     }
 
+    /// Поток логики сцены из файла (для консоли разработчика, 6.11).
+    pub fn scene_logic(&self) -> Option<&reyvec_scene::SceneLogic> {
+        self.file_logic.as_ref()
+    }
+
+    /// Твёрдое сцены из файла в рисуемом кадре (показ столкновений в консоли).
+    pub fn file_solids(&self) -> &[reyvec_scene::game::Collider] {
+        &self.file_scene.solids
+    }
+
     /// Снимок сцены из файла, который рисуется сейчас.
     pub fn file_player(&self) -> Option<reyvec_scene::PlayerView> {
         self.file_scene.player

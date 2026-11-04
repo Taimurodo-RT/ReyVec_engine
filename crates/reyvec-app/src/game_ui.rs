@@ -13,6 +13,7 @@ use reyvec_scene::game::Action;
 use reyvec_scene::{GameEvent, PlayerView};
 use winit::keyboard::KeyCode;
 
+use crate::console::{Console, ConsoleView};
 use crate::controls::{Controls, MAX_KEYS, controls_path, key_name};
 
 /// Сколько живёт число урона, секунды, и на сколько поднимается (единиц сцены).
@@ -52,6 +53,8 @@ pub(crate) struct GameView {
     /// Камера: середина и приближение.
     pub center: [f64; 2],
     pub zoom: f64,
+    /// Твёрдое сцены (только пока консоль показывает столкновения).
+    pub solids: Vec<reyvec_scene::game::Collider>,
 }
 
 pub(crate) struct GameUi {
@@ -66,6 +69,8 @@ pub(crate) struct GameUi {
     note: Option<(String, bool)>,
     quit: bool,
     last: Instant,
+    /// Консоль разработчика (6.11).
+    pub console: Console,
 }
 
 impl GameUi {
@@ -83,12 +88,13 @@ impl GameUi {
             note: None,
             quit: false,
             last: Instant::now(),
+            console: Console::new(),
         }
     }
 
-    /// Действие клавиши (меню закрыто).
+    /// Действие клавиши (меню и консоль закрыты).
     pub(crate) fn action(&self, code: KeyCode) -> Option<Action> {
-        if self.menu_open() {
+        if self.menu_open() || self.console.is_open() {
             None
         } else {
             self.controls.action(code)
@@ -136,6 +142,7 @@ impl GameUi {
 
     /// Событие игры: число урона, монета, надпись.
     pub(crate) fn on_event(&mut self, event: &GameEvent) {
+        self.console.on_event(event);
         match *event {
             GameEvent::Damage { at, amount, left } => self.floats.push(Float {
                 at,
@@ -221,6 +228,15 @@ impl GameUi {
                 RED.gamma_multiply(alpha),
             );
         }
+        self.console.draw(
+            ctx,
+            &ConsoleView {
+                center: view.center,
+                zoom: view.zoom,
+                player: view.player.as_ref(),
+                solids: &view.solids,
+            },
+        );
         if self.menu_open() {
             painter.rect_filled(screen, 0.0, Color32::from_black_alpha(150));
             self.menu_window(ctx);
@@ -420,6 +436,7 @@ mod tests {
             note: None,
             quit: false,
             last: Instant::now(),
+            console: Console::new(),
         }
     }
 
@@ -493,6 +510,7 @@ mod tests {
             }),
             center: [0.0, 0.0],
             zoom: 1.0,
+            solids: Vec::new(),
         };
         let ctx = egui::Context::default();
         for menu in [Menu::Closed, Menu::Main, Menu::Controls] {
