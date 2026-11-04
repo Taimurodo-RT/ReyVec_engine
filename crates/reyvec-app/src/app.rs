@@ -593,7 +593,7 @@ const ZOOM_STEP: f64 = 1.2;
 
 /// Точка окна (пиксели, y вниз) в координатах экрана сцены: y вверх от -1 до 1, x от
 /// `-aspect` до `aspect`. Возвращается вектором от центра окна.
-fn to_screen(p: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> Vec2 {
+pub(crate) fn to_screen(p: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> Vec2 {
     let h = f64::from(size.height.max(1));
     let w = f64::from(size.width);
     Vec2::new((2.0 * p.x - w) / h, (h - 2.0 * p.y) / h)
@@ -1336,7 +1336,7 @@ fn save_snapshot(image: reyvec_gpu::FrameImage) -> Option<(String, std::thread::
 
 /// Источник ввода события окна: клавиша, кнопка мыши или щелчок колеса, нажато ли и
 /// повтор ли это зажатой клавиши.
-fn input_of(event: &WindowEvent) -> Option<(Input, bool, bool)> {
+pub(crate) fn input_of(event: &WindowEvent) -> Option<(Input, bool, bool)> {
     match event {
         WindowEvent::KeyboardInput {
             event:

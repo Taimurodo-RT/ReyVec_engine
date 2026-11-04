@@ -52,6 +52,8 @@ jobs:
           .\scripts\run.ps1 --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\scripts\run.ps1 --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\editor.ps1 --version
           exit $LASTEXITCODE
       # Обновление поверх ручной правки: файл заменяется версией из репозитория,
       # копия правки сохраняется в dist\local-changes.
@@ -148,6 +150,18 @@ jobs:
           xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/snapshot-check.sh ./target/debug/reyvec-sandbox
           # Камера мышью: колесо приближает, перетаскивание двигает (два снимка F12 разные).
           xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/camera-check.sh ./target/debug/reyvec-sandbox
+      # Редактор (Р.1): окно без рамки, панели и сцена из файла, снимок окна в лог
+      # (собрать картинку: строки между метками PNG, base64 -d). Второй прогон — с рамкой
+      # системы (--window-frame), запасной путь.
+      - name: Editor window with validation (frameless and framed), snapshot
+        run: |
+          cargo build -p reyvec-editor
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-editor --validation --snapshot "$RUNNER_TEMP/editor.png" --snapshot-after 4
+          test -s "$RUNNER_TEMP/editor.png"
+          echo "--- PNG editor ---"
+          base64 -w 4000 "$RUNNER_TEMP/editor.png"
+          echo "--- конец PNG ---"
+          xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-editor --validation --window-frame --seconds 3
       # Окно всё время меняет размер: swapchain пересоздаётся без остановки видеокарты,
       # старый удаляется по заборам показа. Второй прогон: запасной путь без заборов.
       - name: Window resizing with validation (present fences and fallback)

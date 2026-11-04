@@ -1,4 +1,4 @@
-//! Логи: в консоль, в файл `reyvec.log` рядом с программой и в консоль разработчика.
+//! Логи: в консоль, в файл `reyvec.log` (у редактора `reyvec-editor.log`) рядом с программой и в консоль разработчика.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -21,6 +21,12 @@ pub struct LogGuard {
 /// `RUST_LOG`, например `RUST_LOG=debug`. Файл перезаписывается при каждом запуске,
 /// его удобно прислать, если что-то пошло не так. Повторный вызов ничего не ломает.
 pub fn init_logging() -> LogGuard {
+    init_logging_to("reyvec.log")
+}
+
+/// Как [`init_logging`], но в файл с другим именем рядом с программой (у редактора свой
+/// лог `reyvec-editor.log`, чтобы не затирать лог песочницы).
+pub fn init_logging_to(file_name: &str) -> LogGuard {
     let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let console = tracing_subscriber::fmt::layer()
         .with_target(false)
@@ -28,7 +34,7 @@ pub fn init_logging() -> LogGuard {
 
     let path = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("reyvec.log")));
+        .and_then(|exe| exe.parent().map(|dir| dir.join(file_name)));
     let file = path.as_ref().and_then(|p| File::create(p).ok());
 
     match file {

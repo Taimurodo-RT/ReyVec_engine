@@ -3269,6 +3269,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "reyvec-editor"
+version = "0.1.0"
+dependencies = [
+ "reyvec-app",
+ "tracing",
+]
+
+[[package]]
 name = "reyvec-game"
 version = "0.1.0"
 dependencies = [
