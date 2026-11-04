@@ -809,7 +809,7 @@ fn gpu_chart(ui: &mut egui::Ui, history: &VecDeque<f32>) {
 }
 
 /// Шрифты с кириллицей (лицензии в `assets/fonts/README.md`).
-fn fonts() -> FontDefinitions {
+pub(crate) fn fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::empty();
     fonts.font_data.insert(
         "inter".into(),

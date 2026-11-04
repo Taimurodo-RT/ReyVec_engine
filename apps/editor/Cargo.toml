@@ -1,0 +1,20 @@
+[package]
+name = "reyvec-editor"
+description = "Редактор ReyVec: сцена движка посередине, панели инструментов вокруг."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "reyvec-editor"
+path = "src/main.rs"
+
+[dependencies]
+reyvec-app.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
