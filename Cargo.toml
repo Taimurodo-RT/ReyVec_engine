@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*"]
+# Копии чужих библиотек (third_party/README.md): не наши, их не проверяем clippy и fmt.
+exclude = ["third_party"]
 
 [workspace.package]
 version = "0.1.0"
@@ -78,3 +80,9 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+
+# Физика Rapier и его геометрия Parry живут копией в репозитории (decisions/0015):
+# сборка не зависит от того, что выйдет на crates.io, и мы можем править их сами.
+[patch.crates-io]
+rapier2d = { path = "third_party/rapier2d" }
+parry2d = { path = "third_party/parry2d" }
