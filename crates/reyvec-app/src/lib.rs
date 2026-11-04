@@ -6,6 +6,7 @@
 mod app;
 mod console;
 mod controls;
+mod fly;
 mod game_ui;
 mod gamepad;
 mod logging;

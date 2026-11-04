@@ -12,7 +12,7 @@
 //! - `--no-vsync`: без вертикальной синхронизации (показывает предельный FPS);
 //! - `--no-hot-reload`: не следить за файлами шейдеров;
 //! - `--no-tracy`: не ждать подключения программы Tracy;
-//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph|light|lamps|blobs|lab|file`: с какой сцены начать (по умолчанию `vector`);
+//! - `--scene gpu|vector|morph|layers|masks|svg|motif|stream|text|stress|stress-morph|light|lamps|blobs|lab|file|3d`: с какой сцены начать (по умолчанию `vector`);
 //! - `--scene-file <файл.ron>`: свой файл сцены для сцены «из файла» (клавиша N); без него
 //!   берётся `scenes/first-room.ron` из папки проекта. После сохранения файла сцена обновляется;
 //!   в этой сцене N ещё раз — следующий файл из той же папки (например, полигон физики
@@ -53,7 +53,8 @@ const HELP: &str = "\
                          light (свет на SDF, этап 4; клавиша L), lamps (лампы
                          и мягкие тени; клавиша K), blobs (слизь, капли и магия
                          из SDF; клавиша J), lab (демо-сцена «лаборатория мага»;
-                         клавиша H) или file (сцена из файла, этап 5; клавиша N)
+                         клавиша H), file (сцена из файла, этап 5; клавиша N)
+                         или 3d (объёмный мир, этап 7; клавиша I)
   --scene-file <файл.ron>  свой файл сцены для сцены «из файла» (с неё и начнёт); без него
                          берётся scenes\\first-room.ron из папки проекта. Правка файла
                          видна в окне сразу после сохранения. В этой сцене N ещё раз —
@@ -135,11 +136,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--scene" => {
                 let n = it.next().ok_or(
-                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs, lab или file",
+                    "после --scene нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs, lab, file или 3d",
                 )?;
                 out.scene = Some(reyvec_app::DemoScene::from_name(&n).ok_or_else(|| {
                     format!(
-                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs, lab или file"
+                        "--scene: «{n}», а нужно gpu, vector, morph, layers, masks, svg, motif, stream, text, stress, stress-morph, light, lamps, blobs, lab, file или 3d"
                     )
                 })?);
             }
@@ -569,7 +570,11 @@ mod tests {
             Some(reyvec_app::FillMode::PerShape)
         );
         assert!(parse("--fill quads").is_err());
-        assert!(parse("--scene 3d").is_err());
+        assert_eq!(
+            parse("--scene 3d").unwrap().scene,
+            Some(reyvec_app::DemoScene::Space)
+        );
+        assert!(parse("--scene 4d").is_err());
         assert_eq!(parse("--msaa 8").unwrap().msaa, Some(reyvec_app::Msaa::X8));
         assert_eq!(
             parse("--msaa off").unwrap().msaa,

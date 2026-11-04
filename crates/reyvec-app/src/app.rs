@@ -117,6 +117,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         gamepads: crate::gamepad::Gamepads::new(),
         game_ui: crate::game_ui::GameUi::new(),
         audio: reyvec_audio::Audio::new(true),
+        fly: crate::fly::Fly::default(),
+        last_frame: Instant::now(),
     };
     event_loop
         .run_app(&mut app)
@@ -180,6 +182,9 @@ struct App {
     game_ui: crate::game_ui::GameUi,
     /// Звук (6.7): звуки событий игры и музыка.
     audio: reyvec_audio::Audio,
+    /// Полёт камерой в сцене «3D» (7.1) и время прошлого кадра для шага полёта.
+    fly: crate::fly::Fly,
+    last_frame: Instant,
 }
 
 impl App {
@@ -274,6 +279,7 @@ impl App {
         };
         match action {
             PanelAction::Scene(scene) => {
+                self.fly.release();
                 r.set_scene(scene);
                 tracing::info!("Сцена: {}", scene.title());
             }
@@ -358,6 +364,7 @@ impl App {
             }
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
+                r.set_space_camera(reyvec_sdf::Camera3D::default());
                 r.set_follow(true);
                 tracing::info!("Камера в начале");
             }
@@ -388,6 +395,15 @@ impl App {
             return;
         };
         let _zone = reyvec_gpu::cpu_zone!("кадр");
+        // Полёт камерой сцены «3D» (7.1): шаг по времени с прошлого кадра.
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+        if renderer.scene() == DemoScene::Space {
+            let mut camera = renderer.space_camera();
+            camera.fly(&self.fly.take(), dt);
+            renderer.set_space_camera(camera);
+        }
         // Геймпад: в игру, только пока открыта сцена с героем.
         let playing = renderer.scene() == DemoScene::File && !self.game_ui.menu_open();
         renderer.set_game_paused(renderer.scene() == DemoScene::File && self.game_ui.menu_open());
@@ -483,6 +499,8 @@ impl App {
                 player: renderer.player_stats(),
                 scripts: renderer.script_info(),
                 physics: renderer.physics_stats(),
+                space: (renderer.scene() == DemoScene::Space)
+                    .then(|| space_text(&renderer.space_camera(), self.fly.speed)),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),
@@ -581,6 +599,20 @@ fn to_screen(p: PhysicalPosition<f64>, size: PhysicalSize<u32>) -> Vec2 {
     Vec2::new((2.0 * p.x - w) / h, (h - 2.0 * p.y) / h)
 }
 
+/// Строка камеры 3D для панели.
+fn space_text(c: &reyvec_sdf::Camera3D, speed: f32) -> String {
+    format!(
+        "Камера 3D: {} ({:.1}; {:.1}; {:.1}) м, поворот {:.0}°, наклон {:.0}°, скорость {:.1} м/с",
+        c.projection_label(),
+        c.eye.x,
+        c.eye.y,
+        c.eye.z,
+        c.yaw.to_degrees(),
+        c.pitch.to_degrees(),
+        speed
+    )
+}
+
 /// Клавиша выбора сцены песочницы. Клавиши по месту на клавиатуре, поэтому раскладка
 /// не важна.
 fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
@@ -601,11 +633,75 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::KeyJ => Some(DemoScene::Blobs),
         KeyCode::KeyH => Some(DemoScene::Lab),
         KeyCode::KeyN => Some(DemoScene::File),
+        KeyCode::KeyI => Some(DemoScene::Space),
         _ => None,
     }
 }
 
 impl App {
+    /// Событие окна в сцене «3D»: `true`, если его забрал полёт камерой.
+    fn space_event(&mut self, event: &WindowEvent, panel_took: bool) -> bool {
+        match event {
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state,
+                        repeat,
+                        ..
+                    },
+                ..
+            } => {
+                let down = *state == ElementState::Pressed;
+                if *code == crate::fly::TOGGLE_PROJECTION {
+                    if down
+                        && !*repeat
+                        && let Some(r) = self.renderer.as_mut()
+                    {
+                        let mut camera = r.space_camera();
+                        // Размер сохраняется у середины сцены (там шар и формы).
+                        camera.toggle_projection(camera.eye.length());
+                        r.set_space_camera(camera);
+                        tracing::info!("Камера 3D: {}", camera.projection_label());
+                    }
+                    return true;
+                }
+                self.fly.key(*code, down)
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left | MouseButton::Right,
+                ..
+            } => {
+                self.fly.looking = *state == ElementState::Pressed && !panel_took;
+                true
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if !self.fly.looking {
+                    return false;
+                }
+                if let Some(prev) = self.cursor {
+                    self.fly.mouse(position.x - prev.x, position.y - prev.y);
+                }
+                self.cursor = Some(*position);
+                true
+            }
+            WindowEvent::MouseWheel { delta, .. } if !panel_took => {
+                let steps = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
+                    MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
+                };
+                self.fly.wheel(steps);
+                true
+            }
+            WindowEvent::Focused(false) | WindowEvent::CursorLeft { .. } => {
+                self.fly.release();
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Взрыв под мышью в сцене из файла (6.13).
     fn blast_at_cursor(&mut self) {
         let (Some(r), Some(w), Some(c)) = (self.renderer.as_mut(), &self.window, self.cursor)
@@ -757,6 +853,15 @@ impl ApplicationHandler for App {
                     return;
                 }
             }
+        }
+        // Сцена «3D» (7.1): клавиши полёта, мышь и колесо — камере.
+        if self
+            .renderer
+            .as_ref()
+            .is_some_and(|r| r.scene() == DemoScene::Space)
+            && self.space_event(&event, panel_took)
+        {
+            return;
         }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),

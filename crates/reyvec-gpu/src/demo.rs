@@ -92,6 +92,8 @@ pub enum DemoScene {
     /// Этап 5: сцена из файла (`scenes/first-room.ron` или свой файл): правка файла
     /// сразу видна в окне (5.1).
     File,
+    /// Этап 7: объёмный мир реймарчингом (7.1 — камера 3D, пол с сеткой, простые формы).
+    Space,
 }
 
 /// Свои файлы для сцен песочницы (содержимое файлов). Без них сцены показывают примеры.
@@ -141,12 +143,13 @@ impl DemoScene {
             Self::Blobs => "слизь и магия",
             Self::Lab => "лаборатория мага",
             Self::File => "из файла",
+            Self::Space => "3D",
         }
     }
 
     /// Сцена по имени из командной строки: `gpu`, `vector`, `morph`, `layers`, `masks`,
     /// `svg`, `motif`, `stream`, `text`, `stress`, `stress-morph`, `light`, `lamps`,
-    /// `blobs`, `lab` или `file`.
+    /// `blobs`, `lab`, `file` или `3d`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "gpu" => Some(Self::Gpu),
@@ -165,6 +168,7 @@ impl DemoScene {
             "blobs" => Some(Self::Blobs),
             "lab" => Some(Self::Lab),
             "file" => Some(Self::File),
+            "3d" | "space" => Some(Self::Space),
             _ => None,
         }
     }
@@ -354,6 +358,10 @@ pub(crate) struct Demo {
     triangle: vk::Pipeline,
     /// Сцена «свет»: SDF-фигуры одним треугольником на весь экран (`sdf_demo.slang`).
     sdf: vk::Pipeline,
+    /// Сцена «3D» (7.1): лучи от камеры на весь экран (`raymarch.slang`).
+    raymarch: vk::Pipeline,
+    /// Камера сцены «3D».
+    space_camera: reyvec_sdf::Camera3D,
     /// Поле расстояний сцены «свет» (4.2): маска теней и проходы jump flooding.
     field: FieldPipelines,
     /// Линии фона сцены «свет» по полю из картинки (jump flooding), а не точному.
@@ -590,6 +598,8 @@ impl Demo {
         let mut demo = Self {
             triangle: vk::Pipeline::null(),
             sdf: vk::Pipeline::null(),
+            raymarch: vk::Pipeline::null(),
+            space_camera: reyvec_sdf::Camera3D::default(),
             field: FieldPipelines::default(),
             light_field: false,
             file_scene: reyvec_scene::Scene::default(),
@@ -681,6 +691,15 @@ impl Demo {
                 res,
                 shaders,
                 "sdf_demo",
+                scene_format,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.raymarch = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch",
                 scene_format,
                 Msaa::Off,
                 Some(stencil_format),
@@ -1254,6 +1273,16 @@ impl Demo {
         self.camera = camera;
     }
 
+    /// Камера сцены «3D».
+    pub fn space_camera(&self) -> reyvec_sdf::Camera3D {
+        self.space_camera
+    }
+
+    /// Ставит камеру сцены «3D» со следующего кадра.
+    pub fn set_space_camera(&mut self, camera: reyvec_sdf::Camera3D) {
+        self.space_camera = camera;
+    }
+
     /// Сколько процессор тратит на подготовку векторного кадра (раскладка фигур, запись
     /// экземпляров и команд), мс, сглажено за последние кадры, сколько в кадре фигур и
     /// сколько из них нарисовано (остальные целиком за краем экрана).
@@ -1358,6 +1387,7 @@ impl Demo {
                 ("sdf_demo", msaa, stencil),
                 ("sdf_object", msaa, stencil),
                 ("particles", msaa, stencil),
+                ("raymarch", msaa, stencil),
             ] {
                 made.push(build(ctx, res, shaders, name, format, samples, stencil)?);
             }
@@ -1378,6 +1408,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.object, None);
             ctx.device.destroy_pipeline(self.particle_draw, None);
+            ctx.device.destroy_pipeline(self.raymarch, None);
         }
         self.triangle = made[0];
         self.sprites = made[1];
@@ -1385,6 +1416,7 @@ impl Demo {
         self.sdf = made[3];
         self.object = made[4];
         self.particle_draw = made[5];
+        self.raymarch = made[6];
         self.msaa = msaa;
         self.scene_format = format;
         Ok(())
@@ -1446,6 +1478,7 @@ impl Demo {
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
+                "raymarch" => (&mut self.raymarch, self.scene_format, self.msaa, stencil),
                 "particles" => {
                     match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
                         Ok(new) => {
@@ -1707,7 +1740,7 @@ impl Demo {
         }
         self.prepare_particles(res, slot, time, scene, aspect);
         let vector = match scene {
-            DemoScene::Gpu => {
+            DemoScene::Gpu | DemoScene::Space => {
                 self.vector_items = 0;
                 None
             }
@@ -2039,6 +2072,12 @@ impl Demo {
                         frame.lab_backdrop,
                     );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.sdf);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                }
+                if frame.scene == DemoScene::Space {
+                    let push = space_push(&self.space_camera, frame.extent, frame.time);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.raymarch);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
@@ -2538,6 +2577,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.present, None);
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
+            ctx.device.destroy_pipeline(self.raymarch, None);
             ctx.device.destroy_pipeline(self.light, None);
             ctx.device.destroy_pipeline(self.object, None);
             ctx.device.destroy_pipeline(self.object_mask, None);
@@ -2554,6 +2594,7 @@ impl Demo {
         }
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
+        self.raymarch = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
         self.object = vk::Pipeline::null();
         self.object_mask = vk::Pipeline::null();
@@ -2654,6 +2695,25 @@ fn sdf_push(
         | (u32::from(no_shapes) << 2)
         | (u32::from(lab) << 3);
     push[28..32].copy_from_slice(&flags.to_ne_bytes());
+    push
+}
+
+/// Константы для `raymarch.slang` (7.1) в раскладке его `Push`: столбцы обратной матрицы
+/// камеры, глаз, время, соотношение сторон, высота кадра и флаги.
+fn space_push(camera: &reyvec_sdf::Camera3D, extent: vk::Extent2D, time: f32) -> [u8; 96] {
+    let aspect = extent.width as f32 / extent.height.max(1) as f32;
+    let inv = camera.inverse_view_proj(aspect).to_cols_array();
+    let mut values = [0f32; 24];
+    values[..16].copy_from_slice(&inv);
+    values[16..19].copy_from_slice(&camera.eye.to_array());
+    values[19] = time;
+    values[20] = aspect;
+    values[21] = extent.height.max(1) as f32;
+    let mut push = [0u8; 96];
+    for (i, v) in values.into_iter().enumerate() {
+        push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
+    }
+    // Флаги (values[22] как u32) пока 0.
     push
 }
 
