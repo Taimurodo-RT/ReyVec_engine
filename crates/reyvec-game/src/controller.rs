@@ -367,7 +367,7 @@ impl Body {
             self.vel = [0.0, 0.0];
             if k >= 1.0 {
                 self.climb = None;
-                self.hanging = 0.0;
+                self.let_go();
                 self.on_ground = true;
                 self.coyote_left = tuning.coyote;
                 ev.climbed = true;
@@ -404,6 +404,11 @@ impl Body {
                 });
                 self.ledge = None;
                 self.vel = [0.0, 0.0];
+                // Дальше в этом шаге ничего: иначе тяжесть чуть опустит его, и
+                // зажатая к стене стрелка снова схватит тот же край. Забравшись, он
+                // «висел» бы на нём с нулевой стороной и с зажатой стрелкой вверх
+                // забирался ещё раз — проезжал до дальнего конца края.
+                return ev;
             } else if intent.down || x * side < 0.0 {
                 self.let_go();
                 self.grab_cooldown = GRAB_COOLDOWN;
@@ -1506,6 +1511,39 @@ mod tests {
         assert!(b.on_ground);
         assert!((b.bounds(&t).min[1] - 0.7).abs() < 1e-9, "{:?}", b.pos);
         assert!(b.pos[0] > 1.0);
+    }
+
+    #[test]
+    fn climbing_with_toward_and_up_held_does_not_climb_again() {
+        // Повис со стрелкой к стене, нажал вверх и держит обе. Раньше герой во время
+        // забирания снова хватался за тот же край и, встав, забирался ещё раз —
+        // проезжал по краю без скорости до его дальнего конца. Теперь он встаёт у
+        // стены и дальше просто идёт: скорость растёт как при обычном беге.
+        let t = Tuning::default();
+        let solids = cliff();
+        let mut b = hang_on_cliff(&t, &solids);
+        let both = Intent {
+            up: true,
+            ..walk(1.0)
+        };
+        let mut climbs = 0;
+        for _ in 0..120 {
+            let before = b.pos;
+            let ev = b.step(&t, both, &solids, DT);
+            climbs += usize::from(ev.climbed);
+            if climbs > 0 {
+                // На краю: каждый шаг не дальше, чем позволяет скорость бега.
+                let dx = b.pos[0] - before[0];
+                assert!(
+                    dx <= b.vel[0].max(0.0) * DT + 1e-9,
+                    "проехал {dx} при {:?}",
+                    b.vel
+                );
+                assert!(b.on_ground || b.pos[0] > 2.0, "{:?}", b.pos);
+            }
+        }
+        assert_eq!(climbs, 1);
+        assert!(!b.climbing() && !b.on_ledge());
     }
 
     #[test]
