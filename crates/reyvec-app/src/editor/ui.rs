@@ -6,7 +6,7 @@
 //! Поэтому интерфейс раскладывается и проверяется тестами без окна и видеокарты.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Layout, Margin, Pos2,
@@ -15,6 +15,7 @@ use egui::{
 use reyvec_scene::{Background, NodeDesc, SceneFile};
 use winit::window::ResizeDirection;
 
+use super::assets::Assets;
 use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
 use super::outline::{self, Kind};
 use super::theme::*;
@@ -92,6 +93,8 @@ pub(crate) struct EditorUi {
     actions: Vec<Action>,
     /// Что показывать в нижней строке (меню «Вид → Нижняя строка»).
     status: [bool; STATUS_ITEMS.len()],
+    /// Время последних кадров, мс: график в профайлере.
+    frames: VecDeque<f32>,
     /// Ширина вкладок пространств в прошлом кадре: по ней они ставятся в середину полосы.
     tabs_width: f32,
 }
@@ -105,6 +108,8 @@ const STATUS_ITEMS: [&str; 6] = [
     "Время кадра",
     "Подсказка клавиш",
 ];
+/// Сколько последних кадров на графике профайлера.
+const FRAME_HISTORY: usize = 240;
 const ST_SCENE: usize = 0;
 const ST_GPU: usize = 1;
 const ST_COUNT: usize = 2;
@@ -127,6 +132,7 @@ impl EditorUi {
             actions: Vec::new(),
             status: [true; STATUS_ITEMS.len()],
             tabs_width: 0.0,
+            frames: VecDeque::new(),
         }
     }
 
@@ -168,6 +174,10 @@ impl EditorUi {
     pub(crate) fn draw(&mut self, ui: &mut Ui, info: &Info) {
         let ctx = ui.ctx().clone();
         self.hotkeys(&ctx, info);
+        if self.frames.len() == FRAME_HISTORY {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(info.frame_ms as f32);
         egui::Panel::top("editor-title")
             .exact_size(TITLE_HEIGHT)
             .resizable(false)
@@ -463,6 +473,13 @@ impl EditorUi {
         tab_strip(ui, tabs, active);
         let tab = tabs[*active];
         Frame::NONE.inner_margin(PAD_PANEL).show(ui, |ui| {
+            // Ассеты прокручивают дерево и плитки сами, профайлер раскладывается в колонки
+            // по месту и прокрутки не имеет.
+            match tab {
+                Tab::Assets => return self.assets.draw(ui),
+                Tab::Profiler => return profiler(ui, info, &self.frames),
+                _ => {}
+            }
             egui::ScrollArea::vertical()
                 .id_salt(("area", self.workspace, side.index()))
                 .auto_shrink(false)
@@ -470,9 +487,8 @@ impl EditorUi {
                 .show(ui, |ui| match tab {
                     Tab::Hierarchy => self.hierarchy(ui, info),
                     Tab::Inspector => self.inspector(ui, info),
-                    Tab::Assets => self.assets.draw(ui),
                     Tab::Console => console(ui, &self.log),
-                    Tab::Profiler => profiler(ui, info),
+                    Tab::Assets | Tab::Profiler => {}
                     Tab::Soon { title, text } => soon(ui, title, text),
                 });
         });
@@ -904,45 +920,168 @@ fn console(ui: &mut Ui, log: &VecDeque<(Color32, String)>) {
     }
 }
 
-fn profiler(ui: &mut Ui, info: &Info) {
-    egui::Grid::new("profiler")
-        .num_columns(2)
-        .spacing(vec2(GAP_XXL, GAP_M))
-        .show(ui, |ui| {
-            prop(ui, "Кадров в секунду");
-            ui.label(RichText::new(format!("{:.0}", info.fps)).monospace());
-            ui.end_row();
-            prop(ui, "Кадр целиком");
-            ui.label(RichText::new(format!("{:.2} мс", info.frame_ms)).monospace());
-            ui.end_row();
-            prop(ui, "Видеокарта на кадр");
-            ui.label(
-                RichText::new(
-                    info.gpu_ms
-                        .map_or_else(|| "нет замеров".into(), |ms| format!("{ms:.2} мс")),
-                )
-                .monospace(),
-            );
-            ui.end_row();
-            prop(ui, "Видеокарта");
-            ui.label(info.adapter);
-            ui.end_row();
-        });
-    if let Some(ms) = info.gpu_ms {
-        ui.add_space(6.0);
-        ui.label(
-            RichText::new("Бюджет кадра 4 мс (RTX 5080, 1080p)")
-                .small()
-                .color(MUTED),
-        );
-        let (rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width().min(360.0), 6.0), Sense::hover());
-        ui.painter().rect_filled(rect, 3, BORDER_STRONG);
-        let part = (ms / 4.0).clamp(0.0, 1.0) as f32;
-        let fill = Rect::from_min_size(rect.min, vec2(rect.width() * part, rect.height()));
-        ui.painter()
-            .rect_filled(fill, 3, if ms <= 4.0 { ACCENT } else { BAD });
+/// Профайлер: плитки в несколько колонок по ширине панели, без прокрутки.
+fn profiler(ui: &mut Ui, info: &Info, frames: &VecDeque<f32>) {
+    const BUDGET_MS: f64 = 4.0;
+    const MIN_TILE: f32 = 150.0;
+    let worst = frames.iter().copied().fold(0.0f32, f32::max);
+    let avg = frames.iter().sum::<f32>() / frames.len().max(1) as f32;
+    let items = info.scene.map_or(0, outline::count);
+    type Tile<'a> = (&'a str, String, String, Option<f64>);
+    let tiles: [Tile; 5] = [
+        (
+            "Кадров в секунду",
+            format!("{:.0}", info.fps),
+            format!("худший кадр {worst:.1} мс"),
+            None,
+        ),
+        (
+            "Кадр целиком",
+            format!("{:.2} мс", info.frame_ms),
+            format!("в среднем {avg:.1} мс"),
+            None,
+        ),
+        (
+            "Видеокарта на кадр",
+            info.gpu_ms
+                .map_or_else(|| "—".into(), |ms| format!("{ms:.2} мс")),
+            format!("бюджет {BUDGET_MS:.0} мс (RTX 5080, 1080p)"),
+            info.gpu_ms.map(|ms| ms / BUDGET_MS),
+        ),
+        ("Видеокарта", info.adapter.to_owned(), String::new(), None),
+        (
+            "Предметов в сцене",
+            format!("{items}"),
+            "со вложенными".into(),
+            None,
+        ),
+    ];
+    // Плитки и последней — график времени кадра; колонок столько, сколько влезает.
+    let count = tiles.len() + 1;
+    let width = ui.available_width();
+    let cols = ((width + GAP_L) / (MIN_TILE + GAP_L))
+        .floor()
+        .clamp(1.0, count as f32) as usize;
+    let tile_w = (width - GAP_L * (cols - 1) as f32) / cols as f32;
+    let rows = count.div_ceil(cols);
+    let tile_h =
+        ((ui.available_height() - GAP_L * (rows - 1) as f32) / rows as f32).clamp(52.0, 72.0);
+    let top = ui.cursor().min;
+    for n in 0..count {
+        let (r, c) = (n / cols, n % cols);
+        let at = top + vec2(c as f32 * (tile_w + GAP_L), r as f32 * (tile_h + GAP_L));
+        let rect = Rect::from_min_size(at, vec2(tile_w, tile_h));
+        match tiles.get(n) {
+            Some((title, big, small, part)) => metric_tile(ui, rect, title, big, small, *part),
+            None => frame_graph(ui, rect, frames, BUDGET_MS as f32),
+        }
     }
+    ui.allocate_rect(
+        Rect::from_min_size(top, vec2(width, rows as f32 * (tile_h + GAP_L))),
+        Sense::hover(),
+    );
+}
+
+/// Плитка профайлера: подпись, крупное число, пояснение и полоска бюджета.
+fn metric_tile(ui: &Ui, rect: Rect, title: &str, big: &str, small: &str, part: Option<f64>) {
+    let p = ui.painter();
+    p.rect(
+        rect,
+        RADIUS_L,
+        CARD,
+        Stroke::new(LINE, BORDER_STRONG),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(vec2(f32::from(PAD_CARD.left), GAP_L));
+    let clip = p.with_clip_rect(rect.shrink(1.0));
+    clip.text(
+        inner.left_top(),
+        Align2::LEFT_TOP,
+        title,
+        FontId::proportional(FONT_SMALL),
+        MUTED,
+    );
+    // Числа моноширинным шрифтом, название видеокарты обычным.
+    let font = if big.starts_with(|c: char| c.is_ascii_digit() || c == '—') {
+        FontId::monospace(FONT_HEADING)
+    } else {
+        FontId::proportional(FONT_TITLE)
+    };
+    clip.text(
+        pos2(inner.left(), inner.top() + FONT_SMALL + GAP_S),
+        Align2::LEFT_TOP,
+        big,
+        font,
+        TEXT,
+    );
+    if let Some(part) = part {
+        let bar = Rect::from_min_size(
+            pos2(inner.left(), inner.bottom() - GAP_S),
+            vec2(inner.width(), GAP_S),
+        );
+        clip.rect_filled(bar, 2, BORDER_STRONG);
+        let fill = Rect::from_min_size(
+            bar.min,
+            vec2(bar.width() * part.clamp(0.0, 1.0) as f32, bar.height()),
+        );
+        clip.rect_filled(fill, 2, if part <= 1.0 { ACCENT } else { BAD });
+    } else if !small.is_empty() {
+        clip.text(
+            pos2(inner.left(), inner.bottom()),
+            Align2::LEFT_BOTTOM,
+            small,
+            FontId::proportional(FONT_SMALL),
+            MUTED,
+        );
+    }
+    // Полный текст под мышью: длинное название видеокарты может не влезть.
+    ui.interact(rect, ui.scope_id().with(title), Sense::hover())
+        .on_hover_text(format!("{title}: {big}\n{small}"));
+}
+
+/// График времени последних кадров с линией бюджета.
+fn frame_graph(ui: &Ui, rect: Rect, frames: &VecDeque<f32>, budget: f32) {
+    let p = ui.painter();
+    p.rect(
+        rect,
+        RADIUS_L,
+        CARD,
+        Stroke::new(LINE, BORDER_STRONG),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(vec2(f32::from(PAD_CARD.left), GAP_L));
+    p.text(
+        inner.left_top(),
+        Align2::LEFT_TOP,
+        "Время кадра",
+        FontId::proportional(FONT_SMALL),
+        MUTED,
+    );
+    let plot = Rect::from_min_max(
+        pos2(inner.left(), inner.top() + FONT_SMALL + GAP_M),
+        inner.max,
+    );
+    if frames.len() < 2 || plot.height() < GAP_L {
+        return;
+    }
+    let top = frames.iter().copied().fold(budget * 2.0, f32::max);
+    let y = |ms: f32| plot.bottom() - (ms / top).clamp(0.0, 1.0) * plot.height();
+    let step = plot.width() / (FRAME_HISTORY - 1) as f32;
+    let x0 = plot.right() - (frames.len() - 1) as f32 * step;
+    let line: Vec<Pos2> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, &ms)| pos2(x0 + i as f32 * step, y(ms)))
+        .collect();
+    p.hline(plot.x_range(), y(budget), Stroke::new(LINE, BORDER_STRONG));
+    p.text(
+        inner.right_top(),
+        Align2::RIGHT_TOP,
+        format!("{budget:.0} мс"),
+        FontId::proportional(FONT_SMALL),
+        MUTED,
+    );
+    p.line(line, Stroke::new(1.5, ACCENT));
 }
 
 fn soon(ui: &mut Ui, title: &str, text: &str) {
@@ -1209,122 +1348,6 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
-/// Файлы проекта для вкладки «Ассеты»: папки `scenes` и `assets/*`.
-struct Assets {
-    folders: Vec<(String, Vec<String>)>,
-    open: usize,
-}
-
-impl Assets {
-    fn scan(project: Option<&Path>) -> Self {
-        let mut folders = Vec::new();
-        if let Some(root) = project {
-            let mut dirs: Vec<PathBuf> = vec![root.join("scenes")];
-            if let Ok(rd) = std::fs::read_dir(root.join("assets")) {
-                let mut sub: Vec<PathBuf> = rd
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| p.is_dir())
-                    .collect();
-                sub.sort();
-                dirs.extend(sub);
-            }
-            for dir in dirs {
-                let Ok(rd) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                let mut files: Vec<String> = rd
-                    .filter_map(|e| e.ok())
-                    .map(|e| {
-                        let name = e.file_name().to_string_lossy().into_owned();
-                        if e.path().is_dir() {
-                            format!("{name}/")
-                        } else {
-                            name
-                        }
-                    })
-                    .collect();
-                files.sort();
-                let name = dir
-                    .strip_prefix(root)
-                    .unwrap_or(&dir)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                folders.push((name, files));
-            }
-        }
-        Self { folders, open: 0 }
-    }
-
-    fn draw(&mut self, ui: &mut Ui) {
-        if self.folders.is_empty() {
-            ui.label(RichText::new("Папка проекта не найдена").color(MUTED));
-            return;
-        }
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(150.0);
-                for (i, (name, _)) in self.folders.iter().enumerate() {
-                    if ui.selectable_label(i == self.open, name.as_str()).clicked() {
-                        self.open = i;
-                    }
-                }
-            });
-            ui.separator();
-            ui.vertical(|ui| {
-                let files = &self.folders[self.open.min(self.folders.len() - 1)].1;
-                if files.is_empty() {
-                    ui.label(RichText::new("Пусто").color(MUTED));
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = vec2(10.0, 10.0);
-                    for f in files {
-                        asset_tile(ui, f);
-                    }
-                });
-            });
-        });
-    }
-}
-
-fn asset_tile(ui: &mut Ui, name: &str) {
-    let (rect, response) = ui.allocate_exact_size(vec2(96.0, 92.0), Sense::click());
-    let thumb = Rect::from_min_size(rect.min, vec2(rect.width(), 64.0));
-    let fill = if response.hovered() { HOVER } else { CARD };
-    ui.painter().rect(
-        thumb,
-        8,
-        fill,
-        Stroke::new(1.0, BORDER_STRONG),
-        egui::StrokeKind::Inside,
-    );
-    let ext = if name.ends_with('/') {
-        "папка".to_owned()
-    } else {
-        name.rsplit_once('.')
-            .map_or_else(String::new, |(_, e)| format!(".{e}"))
-    };
-    ui.painter().text(
-        thumb.center(),
-        Align2::CENTER_CENTER,
-        ext,
-        FontId::monospace(FONT_SMALL),
-        MUTED,
-    );
-    let short: String = if name.chars().count() > 14 {
-        name.chars().take(13).chain(['…']).collect()
-    } else {
-        name.to_owned()
-    };
-    ui.painter().text(
-        pos2(rect.left() + 2.0, thumb.bottom() + 8.0),
-        Align2::LEFT_TOP,
-        short,
-        FontId::proportional(FONT_SMALL),
-        TEXT_DIM,
-    );
-    response.on_hover_text(name);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,7 +1391,7 @@ mod tests {
         let ctx = new_ctx();
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut ui = EditorUi::new(Some(&root));
-        assert!(!ui.assets.folders.is_empty(), "папки проекта нашлись");
+
         for ws in 0..WORKSPACES.len() {
             ui.workspace = ws;
             for play in [PlayState::Edit, PlayState::Playing, PlayState::Paused] {
@@ -1455,6 +1478,8 @@ mod tests {
         ui.open.insert(vec![hero]);
         let (w, h) = (1600usize, 900usize);
         let mut textures: HashMap<egui::TextureId, (usize, usize, Vec<Color32>)> = HashMap::new();
+        // Время только растёт: egui считает по нему анимации и частоту кадров.
+        let mut clock = 0.0f64;
         // Мир, Мир во время игры, Ассеты, Сюжет, Логика и Мир с раскрытым меню «ReyVec → Вид».
         for (ws, play, menu) in [
             (START_WORKSPACE, PlayState::Edit, false),
@@ -1462,9 +1487,21 @@ mod tests {
             (1, PlayState::Edit, false),
             (0, PlayState::Edit, false),
             (3, PlayState::Edit, false),
+            (5, PlayState::Edit, false),
+            // Пауза в «Мире» снимается с профайлером внизу: широкая панель, много колонок.
+            (START_WORKSPACE, PlayState::Paused, false),
             (START_WORKSPACE, PlayState::Edit, true),
         ] {
+            if play == PlayState::Paused {
+                ui.tabs[ws][Side::Bottom.index()] = 2;
+            }
             ui.workspace = ws;
+            if ws == 5 {
+                // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.
+                ui.frames = (0..FRAME_HISTORY)
+                    .map(|i| 3.0 + (i as f32 * 0.21).sin() + if i % 37 == 0 { 3.5 } else { 0.0 })
+                    .collect();
+            }
             let info = info(Some(&file), play);
             let mut out = None;
             for frame in 0..12u32 {
@@ -1486,7 +1523,10 @@ mod tests {
                 let input = egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(w as f32, h as f32))),
                     events,
-                    time: Some(f64::from(frame) * 0.1),
+                    time: Some({
+                        clock += 0.1;
+                        clock
+                    }),
                     ..Default::default()
                 };
                 let mut o = ctx.run_ui(input, |u| ui.draw(u, &info));
