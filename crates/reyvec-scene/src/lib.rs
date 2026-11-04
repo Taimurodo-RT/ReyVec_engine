@@ -283,19 +283,43 @@ pub struct NodeDesc {
     /// удар. Только у предмета верхнего уровня, не у героя и не у манекена.
     #[serde(default)]
     pub body: Option<BodyDesc>,
+    /// Сочленения (6.11): шарниры, сварка, ползуны, верёвки, пружины. Только у предмета
+    /// с `body`.
+    #[serde(default)]
+    pub joints: Vec<JointSpec>,
+    /// Мягкое тело (6.11): верёвка, желе, сетка. Предмет — только место, где оно
+    /// появляется, и его вид.
+    #[serde(default)]
+    pub soft: Option<SoftSpec>,
+    /// Повтор (6.11): предмет становится рядом копий (пирамида, мост из досок).
+    #[serde(default)]
+    pub repeat: Option<RepeatDesc>,
+    /// Выброс тел (6.11): предмет с `body` — образец, такие тела вылетают из его места.
+    #[serde(default)]
+    pub spawn: Option<SpawnDesc>,
 }
 
 /// Физическое тело предмета: `size` — ширина и высота (у круглого `round: true` —
-/// диаметр по ширине), `density` — плотность (тяжелее — труднее толкнуть), `bounce` —
-/// упругость от 0 до 1, `friction` — трение.
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+/// диаметр по ширине; у капсулы `capsule: true` — прямоугольник, в который она вписана),
+/// `points` — выпуклый многоугольник по точкам вместо прямоугольника, `density` —
+/// плотность (тяжелее — труднее толкнуть), `bounce` — упругость от 0 до 1, `friction` —
+/// трение, `fixed: true` — неподвижное (опора), `damping` — сопротивление воздуха,
+/// `gravity` — во сколько раз действует тяжесть, `bullet: true` — быстрое тело (не
+/// пролетает сквозь тонкое; выброшенные `spawn` тела — всегда такие).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BodyDesc {
     pub size: P,
     pub round: bool,
+    pub capsule: bool,
+    pub points: Vec<P>,
     pub density: f64,
     pub bounce: f64,
     pub friction: f64,
+    pub fixed: bool,
+    pub damping: f64,
+    pub gravity: f64,
+    pub bullet: bool,
 }
 
 impl Default for BodyDesc {
@@ -303,28 +327,63 @@ impl Default for BodyDesc {
         let d = reyvec_game::physics::BodyDesc::default();
         Self {
             size: (d.size[0], d.size[1]),
-            round: d.round,
+            round: false,
+            capsule: false,
+            points: Vec::new(),
             density: d.density,
             bounce: d.bounce,
             friction: d.friction,
+            fixed: d.fixed,
+            damping: d.damping,
+            gravity: d.gravity,
+            bullet: d.bullet,
         }
     }
 }
 
 impl BodyDesc {
     pub fn physics(&self) -> reyvec_game::physics::BodyDesc {
+        use reyvec_game::physics::BodyShape;
+        let shape = if !self.points.is_empty() {
+            BodyShape::Polygon(self.points.iter().map(|p| [p.0, p.1]).collect())
+        } else if self.round {
+            BodyShape::Ball
+        } else if self.capsule {
+            BodyShape::Capsule
+        } else {
+            BodyShape::Box
+        };
         reyvec_game::physics::BodyDesc {
             size: [self.size.0, self.size.1],
-            round: self.round,
+            shape,
             density: self.density,
             bounce: self.bounce,
             friction: self.friction,
+            fixed: self.fixed,
+            damping: self.damping,
+            gravity: self.gravity,
+            bullet: self.bullet,
         }
     }
 
     fn check(&self) -> Result<(), String> {
         check_size("ширина size", self.size.0)?;
         check_size("высота size", self.size.1)?;
+        let shapes = [self.round, self.capsule, !self.points.is_empty()];
+        if shapes.iter().filter(|s| **s).count() > 1 {
+            return Err("round, capsule и points — выбери одно".into());
+        }
+        if !self.points.is_empty() {
+            if !(3..=32).contains(&self.points.len()) {
+                return Err(format!(
+                    "points: точек {} — у многоугольника от 3 до 32",
+                    self.points.len()
+                ));
+            }
+            for p in &self.points {
+                check_point("points", *p)?;
+            }
+        }
         if !(self.density.is_finite() && self.density > 0.0 && self.density <= 1000.0) {
             return Err(format!(
                 "density {} — нужно больше 0 и до 1000",
@@ -336,6 +395,12 @@ impl BodyDesc {
         }
         if !(self.friction.is_finite() && (0.0..=10.0).contains(&self.friction)) {
             return Err(format!("friction {} — нужно от 0 до 10", self.friction));
+        }
+        if !(self.damping.is_finite() && (0.0..=100.0).contains(&self.damping)) {
+            return Err(format!("damping {} — нужно от 0 до 100", self.damping));
+        }
+        if !(self.gravity.is_finite() && self.gravity.abs() <= 100.0) {
+            return Err(format!("gravity {} — нужно от −100 до 100", self.gravity));
         }
         Ok(())
     }
@@ -648,6 +713,10 @@ impl NodeDesc {
             script: None,
             touch: None,
             body: None,
+            joints: Vec::new(),
+            soft: None,
+            repeat: None,
+            spawn: None,
         }
     }
 
@@ -793,6 +862,49 @@ impl NodeDesc {
             b.check()
                 .map_err(|m| SceneError::new(format!("{here}, body: {m}")))?;
         }
+        for (j, joint) in self.joints.iter().enumerate() {
+            if self.body.is_none() {
+                return Err(SceneError::new(format!(
+                    "{here}: joints (сочленения) бывают только у предмета с body"
+                )));
+            }
+            joint
+                .check()
+                .map_err(|m| SceneError::new(format!("{here}, сочленение {}: {m}", j + 1)))?;
+            if joint.kind == JointKindDesc::Weld && joint.motor.is_some() {
+                return Err(SceneError::new(format!(
+                    "{here}, сочленение {}: у сварки нет мотора",
+                    j + 1
+                )));
+            }
+        }
+        if let Some(soft) = &self.soft {
+            if self.body.is_some() || self.player.is_some() || self.dummy.is_some() {
+                return Err(SceneError::new(format!(
+                    "{here}: soft (мягкое тело) — отдельный предмет, без body, player и dummy"
+                )));
+            }
+            soft.check()
+                .map_err(|m| SceneError::new(format!("{here}, soft: {m}")))?;
+        }
+        if let Some(r) = &self.repeat {
+            if self.player.is_some() || self.script.is_some() || self.spawn.is_some() {
+                return Err(SceneError::new(format!(
+                    "{here}: repeat (повтор) не бывает у героя, предмета со скриптом и spawn"
+                )));
+            }
+            r.check()
+                .map_err(|m| SceneError::new(format!("{here}, repeat: {m}")))?;
+        }
+        if let Some(sp) = &self.spawn {
+            if self.body.is_none() || !self.joints.is_empty() {
+                return Err(SceneError::new(format!(
+                    "{here}: spawn (выброс тел) — у предмета с body и без joints"
+                )));
+            }
+            sp.check()
+                .map_err(|m| SceneError::new(format!("{here}, spawn: {m}")))?;
+        }
         if let Some(t) = self.touch {
             check_size("ширина touch", t.0)
                 .and_then(|()| check_size("высота touch", t.1))
@@ -812,6 +924,10 @@ impl NodeDesc {
                 ("dummy", child.dummy.is_some()),
                 ("script", child.script.is_some()),
                 ("body", child.body.is_some()),
+                ("joints", !child.joints.is_empty()),
+                ("soft", child.soft.is_some()),
+                ("repeat", child.repeat.is_some()),
+                ("spawn", child.spawn.is_some()),
             ] {
                 if set {
                     return Err(SceneError::new(format!(
@@ -1040,6 +1156,8 @@ pub struct Scene {
     pub solids: Vec<reyvec_game::Collider>,
     /// Скрипты (6.9): сколько файлов, сколько раз перечитаны, ошибки.
     pub scripts: ScriptInfo,
+    /// Физика для панели (6.11), если в сцене есть тела.
+    pub physics: Option<reyvec_game::physics::PhysicsStats>,
 }
 
 /// Скрипты сцены для панели (6.9).
@@ -1649,6 +1767,17 @@ impl ShapeDesc {
         }
     }
 
+    /// Перекрашивает фигуру (копии повтора с `colors`).
+    pub(crate) fn set_color(&mut self, c: Hex) {
+        match self {
+            Self::Rect { color, .. }
+            | Self::Circle { color, .. }
+            | Self::Polygon { color, .. }
+            | Self::Line { color, .. }
+            | Self::Path { color, .. } => *color = c,
+        }
+    }
+
     pub(crate) fn placement(&self) -> (P, f64, Hex) {
         match self {
             Self::Rect {
@@ -2010,7 +2139,12 @@ impl SceneWatcher {
 mod assets;
 mod loader;
 mod logic;
+mod physics_desc;
 pub use assets::{MorphDesc, MorphTrack, PictureDesc};
+pub use physics_desc::{
+    JointKindDesc, JointOn, JointSpec, JointTo, LineDesc, MotorDesc, PinDesc, RepeatDesc,
+    SoftShapeDesc, SoftSpec, SpawnDesc,
+};
 use reyvec_motif::MorphFile;
 use reyvec_svg::SvgDrawing;
 mod tiles;
@@ -2021,9 +2155,11 @@ pub use logic::{STEP, SceneLogic};
 pub use reyvec_game as game;
 pub use tiles::TilesDesc;
 pub use world::{
-    GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, SvgPicture,
-    VectorShape,
+    GlobalPlacement, LightSource, Motion, Placement, Pointer, SceneTime, SceneWorld, SdfShape,
+    SvgPicture, VectorShape,
 };
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_phys;

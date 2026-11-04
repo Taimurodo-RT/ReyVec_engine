@@ -30,10 +30,14 @@ use reyvec_game::{
 };
 
 use crate::assets::{self, MorphTrack};
+
+#[path = "world_phys.rs"]
+mod phys;
 use crate::{
     Background, GameEvent, LightKind, NodeDesc, PlayerView, Scene, SceneError, SceneFile,
     SceneLight, SceneObject, ShapeCache, ShapeDesc,
 };
+pub use phys::Pointer;
 
 /// Место сущности относительно родителя.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
@@ -248,11 +252,10 @@ pub struct Target {
     pub contact: u32,
 }
 
-/// Физическое тело предмета (6.10) и его поворот из файла.
+/// Физическое тело предмета (6.10).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct PhysBody {
     pub id: BodyId,
-    pub angle: f64,
 }
 
 /// Обломок разбитого врага: заранее созданная сущность с квадратом, тело физики и
@@ -284,7 +287,26 @@ struct PhysicsRes {
     breaks: Vec<Break>,
     pieces: Vec<Piece>,
     seed: u64,
+    /// Полигон (6.11): сочленения, мягкие тела, выброс тел, мышь.
+    extra: phys::Extra,
 }
+
+/// Невидимая заранее созданная копия предмета с `spawn`: место для выброшенного тела.
+#[derive(Component, Clone, Copy, Debug, Default)]
+struct SpawnSlot;
+
+/// Места выброшенных тел (не тела предметов, не герой и не фигуры обломков).
+type SlotPlaces<'w, 's> = Query<
+    'w,
+    's,
+    &'static mut Placement,
+    (
+        With<SpawnSlot>,
+        Without<PhysBody>,
+        Without<Player>,
+        Without<VectorShape>,
+    ),
+>;
 
 /// Сколько обломков от одного разбитого врага и сколько всего в запасе.
 const PIECES_PER_BREAK: usize = 10;
@@ -406,6 +428,7 @@ impl SceneWorld {
             breaks: Vec::new(),
             pieces: Vec::new(),
             seed: 0x5eed,
+            extra: phys::Extra::default(),
         });
         world.insert_resource(ScriptRes {
             scripts: reyvec_script::Scripts::new(),
@@ -447,9 +470,22 @@ impl SceneWorld {
             script: None,
             touch: None,
             body: None,
+            joints: Vec::new(),
+            soft: None,
+            repeat: None,
+            spawn: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
+        {
+            // Сочленения и мягкие тела — когда все тела уже есть.
+            let mut res = world.resource_mut::<PhysicsRes>();
+            let res = &mut *res;
+            res.extra.resolve(&mut res.physics);
+            if let Some(e) = res.extra.errors.first() {
+                return Err(SceneError::new(e.clone()));
+            }
+        }
         let mut schedule = Schedule::default();
         world.init_resource::<SceneTime>();
         // Места считаются дважды: сначала для всего, что движется само (платформы едут
@@ -554,6 +590,14 @@ impl SceneWorld {
         let mut all: Vec<_> = q.iter(&self.world).collect();
         all.sort_by_key(|(e, _)| e.index());
         all.into_iter().map(|(_, t)| t.dummy.clone()).collect()
+    }
+
+    /// Мышь для физики (полигон, 6.11): захват телом и взрыв.
+    pub fn set_pointer(&mut self, pointer: Pointer) {
+        self.world
+            .resource_mut::<PhysicsRes>()
+            .extra
+            .set_pointer(pointer);
     }
 
     /// Сколько сущностей в мире.
@@ -665,7 +709,87 @@ impl Spawner<'_> {
         e.id()
     }
 
+    /// Отрезок 1×1 и круг диаметром 1 для мягких тел и ниток сочленений.
+    fn units(&mut self) -> Result<(), SceneError> {
+        if self
+            .world
+            .resource::<PhysicsRes>()
+            .extra
+            .unit_rect
+            .is_some()
+        {
+            return Ok(());
+        }
+        let fail = |m: String| SceneError::new(format!("нитки физики: {m}"));
+        let rect = ShapeDesc::Rect {
+            at: (0.0, 0.0),
+            size: (1.0, 1.0),
+            angle: 0.0,
+            corner: 0.0,
+            color: crate::Hex(Color::WHITE),
+            stroke: None,
+            solid: false,
+            oneway: false,
+        }
+        .shape_id(self.library, self.cache)
+        .map_err(fail)?;
+        let circle = ShapeDesc::Circle {
+            at: (0.0, 0.0),
+            r: 0.5,
+            color: crate::Hex(Color::WHITE),
+            stroke: None,
+        }
+        .shape_id(self.library, self.cache)
+        .map_err(fail)?;
+        let mut res = self.world.resource_mut::<PhysicsRes>();
+        res.extra.unit_rect = Some(rect);
+        res.extra.unit_circle = Some(circle);
+        Ok(())
+    }
+
+    /// Предмет из файла: с повтором — несколько копий, с выбросом — запас невидимых
+    /// копий, которые по очереди становятся новыми телами.
     fn node(&mut self, n: &NodeDesc, parent: Option<Entity>, path: &str) -> Result<(), SceneError> {
+        let name = if n.name.is_empty() {
+            path.to_string()
+        } else {
+            n.name.clone()
+        };
+        if n.repeat.is_some() {
+            for copy in phys::repeat_copies(n, &name) {
+                self.node_one(&copy, parent, path)?;
+            }
+            return Ok(());
+        }
+        if let Some(spawn) = n.spawn {
+            let mut slots = Vec::with_capacity(spawn.max);
+            for k in 0..spawn.max {
+                let copy = NodeDesc {
+                    name: format!("{name} ~{}", k + 1),
+                    body: None,
+                    spawn: None,
+                    opacity: 0.0,
+                    ..n.clone()
+                };
+                let e = self.node_one(&copy, parent, path)?;
+                self.world.entity_mut(e).insert(SpawnSlot);
+                slots.push(e);
+            }
+            self.world
+                .resource_mut::<PhysicsRes>()
+                .extra
+                .add_emitter(n, spawn, slots);
+            return Ok(());
+        }
+        self.node_one(n, parent, path).map(|_| ())
+    }
+
+    fn node_one(
+        &mut self,
+        n: &NodeDesc,
+        parent: Option<Entity>,
+        path: &str,
+    ) -> Result<Entity, SceneError> {
         let placement = Placement {
             at: [n.at.0, n.at.1],
             depth: n.depth,
@@ -703,9 +827,19 @@ impl Spawner<'_> {
                 .physics
                 .add(placement.at, n.angle, [0.0, 0.0], &b.physics());
             res.bodies.push(id);
+            res.extra.add_body(&name, id);
+            res.extra.add_joints(n, id);
+            self.world.entity_mut(me).insert(PhysBody { id });
+            if n.joints.iter().any(|j| j.line.is_some()) {
+                self.units()?;
+            }
+        }
+        if let Some(soft) = &n.soft {
             self.world
-                .entity_mut(me)
-                .insert(PhysBody { id, angle: n.angle });
+                .resource_mut::<PhysicsRes>()
+                .extra
+                .add_soft(n, soft);
+            self.units()?;
         }
         if let Some(file) = &n.script {
             let path = match self.dir {
@@ -967,7 +1101,7 @@ impl Spawner<'_> {
             self.node(child, Some(me), &format!("{name} → предмет {}", j + 1))?;
         }
         self.in_player = was;
-        Ok(())
+        Ok(me)
     }
 }
 
@@ -1290,6 +1424,7 @@ type PieceShapes<'w, 's> = Query<
 /// Физика (6.10): уровень, герой и враги — кинематические тела, предметы с `body` и
 /// обломки — настоящие. Удар героя отбрасывает тела; разбитый враг разлетается на
 /// обломки, которые через несколько секунд гаснут.
+#[allow(clippy::too_many_arguments)]
 fn physics_step(
     solids: Res<Solids>,
     mut phys: ResMut<PhysicsRes>,
@@ -1298,10 +1433,11 @@ fn physics_step(
     targets: Query<(Entity, &Target)>,
     mut bodies: Query<(Entity, &PhysBody, &mut Placement), Without<Player>>,
     mut shapes: PieceShapes,
+    mut slots: SlotPlaces,
 ) {
     let phys = &mut *phys;
     let dt = phys.dt;
-    if dt <= 0.0 || (phys.bodies.is_empty() && phys.pieces.is_empty()) {
+    if dt <= 0.0 || (!phys.physics.has_work() && phys.pieces.is_empty() && !phys.extra.has_work()) {
         return;
     }
     let step = events.step;
@@ -1383,6 +1519,7 @@ fn physics_step(
                 size: [piece, piece],
                 density: 0.5,
                 bounce: 0.35,
+                bullet: true,
                 ..Default::default()
             };
             let id = phys.physics.add(at, 0.0, vel, &desc);
@@ -1397,12 +1534,15 @@ fn physics_step(
             }
         }
     }
+    phys.extra.before_step(&mut phys.physics, dt, &mut slots);
     phys.physics.step(dt);
-    // Места тел и обломков после шага.
+    phys.extra
+        .after_step(&mut phys.physics, dt, step, &mut events.list, &mut slots);
+    // Места тел и обломков после шага (тело создано уже повёрнутым, поворот — его).
     for (_, b, mut place) in &mut bodies {
         if let Some((at, angle)) = phys.physics.pose(b.id) {
             place.at = at;
-            place.angle = b.angle + angle;
+            place.angle = angle;
         }
     }
     for i in 0..phys.pieces.len() {
@@ -1617,6 +1757,8 @@ fn visit(
 enum Drawn<'a> {
     Shape(&'a VectorShape),
     Picture(&'a SvgPicture),
+    /// Нитки мягких тел и сочленений (6.11): поверх всего на своей глубине.
+    Free(&'a phys::FreeItem),
 }
 
 impl Drawn<'_> {
@@ -1624,6 +1766,7 @@ impl Drawn<'_> {
         match self {
             Self::Shape(s) => s.order,
             Self::Picture(p) => p.order,
+            Self::Free(_) => u32::MAX,
         }
     }
 }
@@ -1644,12 +1787,16 @@ fn collect(
     events: Res<Events>,
     scripts: Res<ScriptRes>,
     scripted: Query<(), With<Scripted>>,
+    phys: Res<PhysicsRes>,
     mut snapshot: ResMut<Snapshot>,
 ) {
+    let mut free = Vec::new();
+    phys.extra.draw(&phys.physics, &mut free);
     let mut drawn: Vec<(Drawn, &GlobalPlacement)> = shapes
         .iter()
         .map(|(s, g)| (Drawn::Shape(s), g))
         .chain(pictures.iter().map(|(p, g)| (Drawn::Picture(p), g)))
+        .chain(free.iter().map(|f| (Drawn::Free(f), &f.place)))
         .collect();
     drawn.sort_by(|a, b| {
         a.1.depth
@@ -1694,6 +1841,10 @@ fn collect(
                 shape_count += p.drawing.shape_count;
                 items.extend(p.drawing.placed(g.affine));
             }
+            Drawn::Free(f) => {
+                shape_count += 1;
+                items.push(Instance::new(f.id, f.affine).with_tint(f.tint).into());
+            }
         }
     }
     if open.is_some() {
@@ -1710,6 +1861,7 @@ fn collect(
         .map(|(o, g)| (o.order, place_object(&o.object, g)))
         .collect();
     sdf.sort_by_key(|(o, _)| *o);
+    let jellies = phys.extra.jelly_objects(&phys.physics);
 
     snapshot.0 = Scene {
         background: settings.background,
@@ -1717,7 +1869,7 @@ fn collect(
         shapes: shape_count,
         items,
         lights: lit.into_iter().map(|(_, l)| l).collect(),
-        objects: sdf.into_iter().map(|(_, o)| o).collect(),
+        objects: sdf.into_iter().map(|(_, o)| o).chain(jellies).collect(),
         entities: 0,
         player: players.iter().next().map(|p| PlayerView {
             at: [p.body.pos[0] as f32, p.body.pos[1] as f32],
@@ -1752,6 +1904,7 @@ fn collect(
             errors: scripts.scripts.errors(),
             memory: scripts.scripts.memory(),
         },
+        physics: phys.extra.stats,
     };
 }
 

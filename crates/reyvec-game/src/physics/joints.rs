@@ -94,10 +94,16 @@ impl Physics {
             None => self.ground_body(),
         };
         // `pa` — опора (первое тело Rapier), `pb` — само тело.
-        let (pa, pb) = (*self.bodies.get(b)?.position(), *self.bodies.get(a.0)?.position());
+        let (pa, pb) = (
+            *self.bodies.get(b)?.position(),
+            *self.bodies.get(a.0)?.position(),
+        );
         let at = v(d.at);
         let to = v(d.to_at.unwrap_or(d.at));
-        let (la, lb) = (pa.inverse_transform_point(to), pb.inverse_transform_point(at));
+        let (la, lb) = (
+            pa.inverse_transform_point(to),
+            pb.inverse_transform_point(at),
+        );
         let soft = |m: Option<Motor>| m.map(|m| (m.speed, m.force));
         let mut data: GenericJoint = match d.kind {
             JointKind::Hinge { limits } => {

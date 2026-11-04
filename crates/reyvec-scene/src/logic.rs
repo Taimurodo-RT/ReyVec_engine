@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use reyvec_game::{Action, InputReader, InputShared};
 use reyvec_vector::{Affine, SceneItem};
 
-use crate::{Scene, SceneWorld};
+use crate::{Pointer, Scene, SceneWorld};
 
 /// Шаг логики: 60 раз в секунду (решение 0004).
 pub const STEP: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -28,8 +28,9 @@ pub const STEP: Duration = Duration::from_nanos(1_000_000_000 / 60);
 const MAX_CATCH_UP: u32 = 5;
 
 enum Command {
-    /// Новый мир (файл сцены сохранили): время сцены продолжается.
-    Replace(Box<SceneWorld>),
+    /// Новый мир (файл сцены сохранили): время сцены продолжается. `keep_player` —
+    /// персонаж остаётся там, где был (тот же файл), иначе стоит на месте из файла.
+    Replace(Box<SceneWorld>, bool),
 }
 
 struct Frames {
@@ -52,6 +53,8 @@ struct Shared {
     /// Среднее время от нажатия до шага логики, который его взял (микросекунды; 0 —
     /// нажатий ещё не было).
     input_us: AtomicU64,
+    /// Мышь для физики (6.11): пишет окно, читает поток логики в начале шага.
+    pointer: Mutex<Pointer>,
 }
 
 /// Поток логики сцены.
@@ -79,6 +82,7 @@ impl SceneLogic {
             step_us: AtomicU64::new(0),
             input: InputShared::new(),
             input_us: AtomicU64::new(0),
+            pointer: Mutex::new(Pointer::default()),
         });
         let (tx, rx) = channel();
         let inner = shared.clone();
@@ -95,7 +99,26 @@ impl SceneLogic {
 
     /// Заменяет мир (после сохранения файла сцены). Время сцены не сбрасывается.
     pub fn replace(&self, world: SceneWorld) {
-        let _ = self.commands.send(Command::Replace(Box::new(world)));
+        let _ = self.commands.send(Command::Replace(Box::new(world), true));
+    }
+
+    /// Другая сцена (другой файл): время идёт дальше, персонаж — на месте из файла.
+    pub fn switch(&self, world: SceneWorld) {
+        let _ = self.commands.send(Command::Replace(Box::new(world), false));
+    }
+
+    /// Мышь для физики: где она в координатах сцены и держат ли кнопку захвата.
+    pub fn set_pointer(&self, at: [f64; 2], held: bool) {
+        let mut p = self.shared.pointer.lock().expect("мышь");
+        p.at = at;
+        p.held = held;
+    }
+
+    /// Взрыв в точке `at` на ближайшем шаге логики.
+    pub fn blast(&self, at: [f64; 2]) {
+        let mut p = self.shared.pointer.lock().expect("мышь");
+        p.at = at;
+        p.blast = true;
     }
 
     /// Снимок для кадра в момент `now`: между двумя последними шагами логики.
@@ -181,12 +204,14 @@ fn run(mut world: SceneWorld, start: f64, commands: Receiver<Command>, shared: &
         if behind > MAX_CATCH_UP {
             next = now;
         }
-        while let Ok(Command::Replace(new)) = commands.try_recv() {
+        while let Ok(Command::Replace(new, keep_player)) = commands.try_recv() {
             // Файл сцены сохранили: персонаж остаётся там, где был.
             let body = world.player_body();
             world = *new;
             world.continue_from(start + step_index as f64 * step);
-            if let Some(body) = body {
+            if let Some(body) = body
+                && keep_player
+            {
                 world.set_player_body(body);
             }
         }
@@ -199,6 +224,12 @@ fn run(mut world: SceneWorld, start: f64, commands: Receiver<Command>, shared: &
         }
         let started = Instant::now();
         world.set_input(input.read(&shared.input));
+        {
+            // Взрыв срабатывает один раз: забираем его, место и кнопка остаются.
+            let mut p = shared.pointer.lock().expect("мышь");
+            world.set_pointer(*p);
+            p.blast = false;
+        }
         if let Some(ms) = input.latency_ms() {
             shared
                 .input_us

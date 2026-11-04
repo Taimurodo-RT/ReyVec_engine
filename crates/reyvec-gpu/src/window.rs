@@ -471,6 +471,34 @@ impl WindowRenderer {
         }
     }
 
+    /// Другой файл сцены той же папки (N в сцене из файла, 6.11): персонаж встаёт на
+    /// место из нового файла.
+    pub fn switch_scene_file(&mut self, text: &str) {
+        self.files.scene = Some(text.into());
+        if let Some(demo) = self.demo.as_mut() {
+            demo.switch_scene_file(text, self.files.scene_dir.as_deref());
+        }
+    }
+
+    /// Мышь для физики (6.11): точка в координатах сцены и держат ли кнопку захвата.
+    pub fn physics_pointer(&mut self, at: [f64; 2], held: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.physics_pointer(at, held);
+        }
+    }
+
+    /// Взрыв в точке сцены `at` (6.11).
+    pub fn physics_blast(&mut self, at: [f64; 2]) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.physics_blast(at);
+        }
+    }
+
+    /// Физика сцены из файла для панели (6.11).
+    pub fn physics_stats(&self) -> Option<reyvec_scene::game::physics::PhysicsStats> {
+        self.demo.as_ref().and_then(Demo::physics_stats)
+    }
+
     /// Загрузка в фоне (5.4): что сейчас грузится и сколько стоила последняя загрузка.
     pub fn load_stats(&self) -> crate::LoadStats {
         self.demo.as_ref().map(Demo::load_stats).unwrap_or_default()

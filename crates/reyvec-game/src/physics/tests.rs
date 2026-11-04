@@ -169,10 +169,14 @@ fn pendulum_on_hinge_swings_and_keeps_its_length() {
     let mut w = Physics::new(9.3);
     let bob = w.add([0.5, 0.0], 0.0, [0.0, 0.0], &boxy(0.05));
     let rod = JointDesc::new(JointKind::Rope { length: 0.5 }, [0.5, 0.0]);
-    w.join(bob, None, &JointDesc {
-        to_at: Some([0.0, 0.0]),
-        ..rod
-    })
+    w.join(
+        bob,
+        None,
+        &JointDesc {
+            to_at: Some([0.0, 0.0]),
+            ..rod
+        },
+    )
     .unwrap();
     let mut lowest: f64 = 0.0;
     let mut crossed = false;
@@ -184,7 +188,10 @@ fn pendulum_on_hinge_swings_and_keeps_its_length() {
         let len = (at[0] * at[0] + at[1] * at[1]).sqrt();
         assert!(len < 0.52, "верёвка растянулась: {len}");
     }
-    assert!(lowest < -0.45 && crossed, "маятник качнулся: {lowest}, {crossed}");
+    assert!(
+        lowest < -0.45 && crossed,
+        "маятник качнулся: {lowest}, {crossed}"
+    );
 }
 
 #[test]
@@ -210,10 +217,14 @@ fn weld_holds_and_motor_turns_a_wheel() {
         force: 10.0,
         flip: 0.5,
     };
-    w.join(wheel, None, &JointDesc {
-        motor: Some(motor),
-        ..JointDesc::new(JointKind::Hinge { limits: None }, [1.0, 0.0])
-    })
+    w.join(
+        wheel,
+        None,
+        &JointDesc {
+            motor: Some(motor),
+            ..JointDesc::new(JointKind::Hinge { limits: None }, [1.0, 0.0])
+        },
+    )
     .unwrap();
     let mut angles = Vec::new();
     for i in 0..60 {
@@ -225,7 +236,10 @@ fn weld_holds_and_motor_turns_a_wheel() {
     let (at, _) = w.pose(a).unwrap();
     assert!((at[1] - 0.5).abs() < 0.005, "сварка не держит: {at:?}");
     assert!(angles[0] > 100.0, "мотор крутит вперёд: {angles:?}");
-    assert!(angles[1] < angles[0] - 50.0, "мотор повернул обратно: {angles:?}");
+    assert!(
+        angles[1] < angles[0] - 50.0,
+        "мотор повернул обратно: {angles:?}"
+    );
 }
 
 #[test]
@@ -281,7 +295,10 @@ fn capsule_and_polygon_land_on_the_floor() {
     let (t, ta) = w.pose(tri).unwrap();
     // Капсула падает набок (низ у пола), треугольник стоит на стороне.
     assert!(c[1] < -0.73 && c[1] > -0.78, "капсула: {c:?}");
-    assert!((t[1] - (-0.8 + 0.06)).abs() < 0.02 && ta.abs() < 2.0, "треугольник: {t:?} {ta}");
+    assert!(
+        (t[1] - (-0.8 + 0.06)).abs() < 0.02 && ta.abs() < 2.0,
+        "треугольник: {t:?} {ta}"
+    );
 }
 
 #[test]
@@ -319,7 +336,10 @@ fn rope_hangs_a_weight_and_jelly_rests_on_the_floor() {
     });
     step_with_floor(&mut w, 240);
     let (at, _) = w.pose(weight).unwrap();
-    assert!(at[1] > -0.4 && at[1] < -0.2, "груз висит на верёвке: {at:?}");
+    assert!(
+        at[1] > -0.4 && at[1] < -0.2,
+        "груз висит на верёвке: {at:?}"
+    );
     let jc = w.soft_center(jelly).unwrap();
     assert!(jc[1] > -0.8 && jc[1] < -0.62, "желе лежит на полу: {jc:?}");
     let views = w.soft_views();
@@ -372,11 +392,50 @@ fn mouse_drags_a_box_and_blast_throws_it() {
         w.step(DT);
     }
     let (at, _) = w.pose(b).unwrap();
-    assert!((at[0] - 0.5).abs() < 0.1 && (at[1] - 0.0).abs() < 0.12, "тянется к мыши: {at:?}");
+    assert!(
+        (at[0] - 0.5).abs() < 0.1 && (at[1] - 0.0).abs() < 0.12,
+        "тянется к мыши: {at:?}"
+    );
     assert!(w.grip_line().is_some());
     w.release();
     assert!(w.grip_line().is_none());
     w.blast([0.3, 0.0], 0.5, 4.0);
     let vel = w.velocity(b).unwrap();
     assert!(vel[0] > 1.0, "взрыв толкнул вправо: {vel:?}");
+}
+
+/// Тела, добавленные во время игры (выброс), падают на тонкую полку и не проходят
+/// сквозь неё: они «пули», а полка — обычное тело. Когда «пулями» были все тела, кубики
+/// пролетали сквозь полку: пули друг друга не проверяют.
+#[test]
+fn bodies_added_later_land_on_a_thin_welded_shelf() {
+    let mut w = Physics::new(crate::Tuning::default().gravity());
+    let shelf = w.add(
+        [0.25, -0.25],
+        0.0,
+        [0.0, 0.0],
+        &BodyDesc {
+            size: [0.5, 0.04],
+            ..BodyDesc::default()
+        },
+    );
+    w.join(shelf, None, &JointDesc::new(JointKind::Weld, [0.0, -0.25]));
+    let cube = BodyDesc {
+        size: [0.045, 0.045],
+        density: 3.0,
+        bullet: true,
+        ..BodyDesc::default()
+    };
+    let mut cubes = Vec::new();
+    for i in 1..=240 {
+        if i % 15 == 0 && cubes.len() < 4 {
+            let x = 0.1 + 0.1 * cubes.len() as f64;
+            cubes.push(w.add([x, 0.55], 0.0, [0.0, 0.0], &cube));
+        }
+        step_with_floor(&mut w, 1);
+    }
+    for c in cubes {
+        let (at, _) = w.pose(c).unwrap();
+        assert!(at[1] > -0.25, "кубик провалился сквозь полку: {at:?}");
+    }
 }

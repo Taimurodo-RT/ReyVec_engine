@@ -189,9 +189,7 @@ impl Physics {
                 None => break,
             }
         }
-        self.soft_bodies
-            .get(h)
-            .map_or(0, |s| s.user_data as u32)
+        self.soft_bodies.get(h).map_or(0, |s| s.user_data as u32)
     }
 
     /// Все мягкие тела (и куски порванных) для рисования.

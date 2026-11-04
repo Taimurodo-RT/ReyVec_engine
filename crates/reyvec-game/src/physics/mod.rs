@@ -68,6 +68,10 @@ pub struct BodyDesc {
     pub damping: f64,
     /// Во сколько раз на тело действует тяжесть (0 — парит).
     pub gravity: f64,
+    /// Быстрое тело («пуля»: ядро, обломок, выброшенное тело): Rapier проверяет весь его
+    /// путь за шаг, и оно не пролетает сквозь тонкое. Пули друг друга так не проверяют,
+    /// поэтому обычным телам этого не включаем: иначе кубик падает сквозь тонкую полку.
+    pub bullet: bool,
 }
 
 impl Default for BodyDesc {
@@ -81,6 +85,7 @@ impl Default for BodyDesc {
             fixed: false,
             damping: 0.0,
             gravity: 1.0,
+            bullet: false,
         }
     }
 }
@@ -120,7 +125,10 @@ struct Mover {
 /// мягкого тела.
 #[derive(Clone, Copy, Debug)]
 enum Grip {
-    Body { body: RigidBodyHandle, local: Vector },
+    Body {
+        body: RigidBodyHandle,
+        local: Vector,
+    },
     /// `keep` — частица была закреплена и остаётся закреплённой там, где её отпустили.
     Particle {
         soft: SoftBodyHandle,
@@ -222,8 +230,10 @@ impl Physics {
                 .linear_damping(d.damping.max(0.0) as f32)
                 .angular_damping(d.damping.max(0.0) as f32)
                 .gravity_scale(d.gravity as f32)
-                // Быстрые тела не пролетают сквозь тонкие стены.
-                .ccd_enabled(true)
+                // Быстрые тела не пролетают сквозь тонкие стены. Без этого Rapier всё равно
+                // проверяет путь быстрых тел до неподвижных; «пуля» проверяет ещё и до
+                // подвижных. (Мягкое предсказание касаний пробовали: роняет пирамиду.)
+                .ccd_enabled(d.bullet)
         };
         let body = builder
             .translation(v(at))
