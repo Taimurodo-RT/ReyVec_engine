@@ -92,6 +92,8 @@ pub(crate) struct PanelInfo<'a> {
     pub player: Option<reyvec_gpu::PlayerStats>,
     /// Скрипты сцены (6.9).
     pub scripts: Option<reyvec_scene::ScriptInfo>,
+    /// Физика сцены (6.13): тела, сочленения, мягкие тела, время шага.
+    pub physics: Option<reyvec_scene::game::physics::PhysicsStats>,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -337,6 +339,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         if let Some(p) = info.player {
             ui.label(mono(player_text(&p.view, info.follow)));
             ui.label(mono(input_text(&p, info.gamepad)));
+        }
+        if let Some(p) = &info.physics {
+            ui.label(mono(physics_text(p)));
         }
         if let Some(s) = &info.scripts {
             ui.label(mono(scripts_text(s)));
@@ -586,6 +591,14 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::Snapshot);
         }
     });
+}
+
+/// Строка «Физика»: тела, сочленения, мягкие тела и время шага Rapier.
+fn physics_text(p: &reyvec_scene::game::physics::PhysicsStats) -> String {
+    format!(
+        "Физика: тел {} (спят {}), сочленений {} (порвано {}), мягких {} (частиц {}), шаг {:.2} мс",
+        p.bodies, p.sleeping, p.joints, p.broken, p.soft, p.particles, p.step_ms
+    )
 }
 
 /// Строка «Скрипты»: файлы, предметы, правки на лету.
@@ -871,6 +884,15 @@ mod tests {
                 reloads: 1,
                 errors: vec!["жук.luau:3: ожидалось end".into()],
                 memory: 300_000,
+            }),
+            physics: Some(reyvec_scene::game::physics::PhysicsStats {
+                bodies: 320,
+                sleeping: 200,
+                joints: 60,
+                broken: 1,
+                soft: 6,
+                particles: 180,
+                step_ms: 1.2,
             }),
             gamepad: Some("Xbox Controller"),
             follow: true,

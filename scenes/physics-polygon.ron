@@ -1,0 +1,494 @@
+// Полигон физики (6.13): что умеет Rapier 0.36 в нашем движке. Слева направо: пирамида
+// из 210 кубиков, маятник и домино, подвесной мост на шарнирах, колыбель Ньютона,
+// пружина, лифт на ползуне с мотором, мельница под дождём из шариков, хрупкая полка,
+// машинка с моторами в колёсах, тряпичные куклы, желе, мягкая верёвка с грузом, цепь
+// с гирей, сетка-гамак, пушка, которая стреляет в тонкую стену.
+//
+// Мышь и клавиши: Q (держать) — схватить тело или частицу мягкого тела под курсором и
+// тащить; Y — взрыв в точке под курсором. Кнопки мыши — как в игре (левая — удар,
+// правая — рывок, средняя двигает камеру; R — вернуть её к герою). N — следующий файл
+// сцены из папки scenes.
+//
+// Всё как в первой комнате: открой файл, поменяй число, сохрани — сцена соберётся
+// заново. Новое в файле сцены (у предметов верхнего уровня):
+//   body: (...) — физическое тело: size, round: true (круг), capsule: true (капсула),
+//     points: [(x, y), ...] (выпуклый многоугольник), density, bounce, friction,
+//     fixed: true (неподвижное), damping (сопротивление воздуха), gravity (тяжесть),
+//     bullet: true (быстрое тело: не пролетает сквозь тонкое; выброшенные — всегда).
+//   joints: [(kind: ..., to: ..., at: (x, y), ...)] — сочленения тела:
+//     kind: Hinge (шарнир), Weld (сварка), Slider (ползун), Rope (верёвка),
+//       Spring (пружина);
+//     to: World (к неподвижному миру), Node("имя") (к другому телу), Prev (к
+//       предыдущей копии повтора);
+//     at — точка на этом предмете, to_at — точка на том, к чему крепим (в его
+//       координатах; у мира — тоже в координатах этого предмета);
+//     limits: (от, до) — пределы шарнира (градусы) или ползуна; axis — ось ползуна;
+//     length, stiffness, damping — у верёвки и пружины;
+//     motor: (speed: скорость, force: сила, flip: через сколько секунд разворот);
+//     breaks: сила, при которой сочленение рвётся; collide: true — соединённые тела
+//       сталкиваются; line: (width, color) — нарисовать нитку; on: First или Last —
+//       только первой или последней копии повтора.
+//   soft: (shape: ..., ...) — мягкое тело из частиц на пружинках:
+//     shape: Rope(to: (x, y), count: N) — верёвка, Jelly(r: радиус, count: N) — желе,
+//       Net(size: (w, h), cols: N, rows: M) — сетка;
+//     stiffness — жёсткость, damping — гашение дрожания, mass — масса всего тела,
+//     pin: Start / Ends (верёвка), Sides / Top (сетка) — что закреплено в воздухе,
+//     tear: 0.5 — рвётся, если растянуть на половину, attach_start / attach_end —
+//     привязать концы верёвки к телам по имени, color, width — толщина нитей.
+//   repeat: (count: N, step: (dx, dy), rows: M, row_step: (dx, dy), shrink: 1,
+//     colors: [...]) — N копий предмета с шагом (и M рядов; shrink — на сколько каждый
+//     ряд короче: так получается пирамида). Копии зовутся «имя 1», «имя 2»...
+//   spawn: (every: секунд, speed: (vx, vy), spread, life: секунд, max: N, width) —
+//     предмет-образец: раз в every секунд вылетает новое такое же тело.
+(
+    format: "reyvec-scene",
+    version: 1,
+    background: Lab,
+    ambient: "#565c68",
+    lights: [
+        Sun(from: (0.5, 1.0), color: "#fff0d8", power: 0.8, reach: 0.5, size: 0.04),
+    ],
+    nodes: [
+        (
+            // Герой: at — середина его прямоугольника столкновений, фигуры вокруг неё.
+            // Смотрит вправо; когда бежит влево, отражается сам.
+            name: "герой",
+            at: (-1.3, -0.5),
+            depth: 3,
+            shadow: true,
+            player: (size: (0.14, 0.28), speed: 1.6, jump: 0.6, jump_time: 0.36, hp: 5),
+            // Герой собран из костей (6.8): предмет с bone — часть, которая двигается
+            // в анимации. Его at — точка крепления (бедро, плечо, шея): вокруг неё кость
+            // поворачивается, а angle — её наклон в покое. Кости: тело, голова, рука,
+            // рука_сзади, нога, нога_сзади, плащ; кость внутри кости едет вместе с ней
+            // (голова и руки — внутри тела). Позы (стоит, бежит, прыгает, падает, рывок,
+            // стена, край, удар) движок считает сам; шаг ноги — звук и пыль.
+            children: [
+                (
+                    bone: "нога_сзади",
+                    at: (-0.025, -0.085),
+                    depth: -0.02,
+                    shapes: [
+                        Rect(at: (0.0, -0.027), size: (0.034, 0.054), corner: 0.012, color: "#1f1f25"),
+                        Rect(at: (0.008, -0.05), size: (0.044, 0.016), corner: 0.006, color: "#151518"),
+                    ],
+                ),
+                (
+                    bone: "нога",
+                    at: (0.025, -0.085),
+                    depth: 0.02,
+                    shapes: [
+                        Rect(at: (0.0, -0.027), size: (0.034, 0.054), corner: 0.012, color: "#2a2a30"),
+                        Rect(at: (0.008, -0.05), size: (0.044, 0.016), corner: 0.006, color: "#1b1b20"),
+                    ],
+                ),
+                (
+                    // Тело крепится у пояса: наклоняется вперёд на бегу.
+                    bone: "тело",
+                    at: (0.0, -0.085),
+                    shapes: [
+                        Rect(at: (0.0, 0.055), size: (0.11, 0.13), corner: 0.04, color: "#3b5f8a"),
+                        Rect(at: (0.0, 0.0), size: (0.112, 0.016), corner: 0.006, color: "#24384f"),
+                        Rect(at: (-0.005, 0.115), size: (0.12, 0.028), corner: 0.012, color: "#c0392b"),
+                    ],
+                    children: [
+                        (
+                            // Плащ висит за спиной от шеи, на бегу и в падении развевается.
+                            bone: "плащ",
+                            at: (-0.03, 0.115),
+                            depth: -0.04,
+                            shapes: [
+                                Path(svg: "M -0.01 0.0 Q -0.05 -0.07 -0.045 -0.13 L 0.02 -0.12 Q 0.0 -0.06 0.025 0.0 Z", color: "#8e2a20"),
+                            ],
+                        ),
+                        (
+                            bone: "рука_сзади",
+                            at: (-0.02, 0.1),
+                            angle: -10.0,
+                            depth: -0.03,
+                            shapes: [
+                                Rect(at: (0.0, -0.035), size: (0.028, 0.07), corner: 0.012, color: "#2f4c6e"),
+                                Circle(at: (0.0, -0.072), r: 0.014, color: "#d9b88f"),
+                            ],
+                        ),
+                        (
+                            bone: "голова",
+                            at: (0.0, 0.13),
+                            depth: 0.01,
+                            shapes: [
+                                Circle(at: (0.0, 0.04), r: 0.052, color: "#e8c9a0"),
+                                Path(svg: "M -0.052 0.045 Q -0.04 0.1 0.01 0.094 Q 0.05 0.09 0.05 0.06 Q 0.0 0.075 -0.052 0.045 Z", color: "#4a3426"),
+                                Circle(at: (0.026, 0.047), r: 0.011, color: "#1a1a1a"),
+                            ],
+                        ),
+                        (
+                            // Передняя рука с коротким клинком: им герой и бьёт.
+                            bone: "рука",
+                            at: (0.02, 0.1),
+                            angle: 20.0,
+                            depth: 0.03,
+                            shapes: [
+                                Rect(at: (0.0, -0.035), size: (0.028, 0.07), corner: 0.012, color: "#46709f"),
+                                Rect(at: (0.0, -0.08), size: (0.03, 0.008), color: "#6b4a2a"),
+                                Rect(at: (0.0, -0.11), size: (0.012, 0.055), corner: 0.004, color: "#d8dde6"),
+                                Circle(at: (0.0, -0.072), r: 0.014, color: "#e8c9a0"),
+                            ],
+                        ),
+                    ],
+                ),
+            ],
+            // Взмах удара: светлый серп перед героем.
+            strike: [
+                Path(svg: "M 0.08 0.13 Q 0.34 0.0 0.08 -0.13 Q 0.22 0.0 0.08 0.13 Z", color: "#fff1c4"),
+            ],
+        ),
+        (
+            name: "границы",
+            solids: [
+                (at: (10.5, -0.88), size: (25.0, 0.2)),
+                (at: (-1.95, 0.5), size: (0.2, 3.0)),
+                (at: (23.0, 0.5), size: (0.2, 3.0)),
+            ],
+        ),
+
+        // Пирамида: 20 рядов, 210 кубиков. Rapier держит её, но кубики чуть
+        // проседают друг в друга (около 3 см за первую секунду), потом стоят и засыпают.
+        (
+            name: "кубик",
+            at: (-0.4, -0.745),
+            depth: 2,
+            body: (size: (0.07, 0.07), density: 1.0, friction: 0.7),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.07, 0.07), corner: 0.008, color: "#d9a05b")],
+            repeat: (
+                count: 20, step: (0.0705, 0.0), rows: 20, row_step: (0.0, 0.0702), shrink: 1,
+                colors: ["#d9a05b", "#c98a48", "#e0b070", "#b87a40", "#e8c088"],
+            ),
+        ),
+
+        // Маятник: шар на верёвке к миру; отпущен сбоку и бьёт по домино.
+        (
+            name: "биток",
+            at: (1.45, -0.35),
+            depth: 2,
+            body: (size: (0.12, 0.12), round: true, density: 4.0, bounce: 0.2),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.06, color: "#6a7280"), Circle(at: (-0.02, 0.02), r: 0.018, color: "#a8b0bc")],
+            joints: [(kind: Rope, to: World, to_at: (0.4, 0.4), line: (width: 0.006, color: "#c8b48a"))],
+        ),
+        (
+            name: "домино",
+            at: (1.93, -0.66),
+            depth: 2,
+            body: (size: (0.03, 0.24), density: 1.0, friction: 0.5),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.03, 0.24), corner: 0.006, color: "#f0ece0")],
+            repeat: (count: 14, step: (0.13, 0.0), colors: ["#f0ece0", "#e04848"]),
+        ),
+
+        // Подвесной мост: 14 досок на шарнирах, каждая к предыдущей; первая и последняя —
+        // к миру. Герой может по нему пройти (запрыгни с ящика).
+        (
+            name: "столб",
+            at: (3.95, -0.56),
+            depth: 1,
+            shapes: [Rect(at: (0.0, 0.0), size: (0.05, 0.44), color: "#5a3a20"), Rect(at: (2.06, 0.0), size: (0.05, 0.44), color: "#5a3a20")],
+        ),
+        (
+            name: "доска",
+            at: (4.07, -0.35),
+            depth: 2,
+            body: (size: (0.13, 0.035), density: 1.5, friction: 0.9),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.13, 0.035), corner: 0.006, color: "#8a5a32")],
+            repeat: (count: 14, step: (0.14, 0.0), colors: ["#8a5a32", "#7a4e2a"]),
+            joints: [
+                (kind: Hinge, to: Prev, at: (-0.07, 0.0)),
+                (kind: Hinge, to: World, at: (0.07, 0.0), on: Last),
+            ],
+        ),
+        (
+            name: "ступенька",
+            at: (3.7, -0.68),
+            depth: 2,
+            body: (size: (0.2, 0.2), density: 2.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.2, 0.2), corner: 0.01, color: "#a8743e"), Rect(at: (0.0, 0.0), size: (0.2, 0.2), color: "#5a3a20", stroke: 0.012)],
+        ),
+        (
+            name: "ящик на мосту",
+            at: (4.6, -0.2),
+            depth: 2,
+            body: (size: (0.12, 0.12), density: 1.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.12, 0.12), corner: 0.01, color: "#b8844e"), Rect(at: (0.0, 0.0), size: (0.12, 0.12), color: "#5a3a20", stroke: 0.01)],
+            repeat: (count: 3, step: (0.4, 0.0)),
+        ),
+
+        // Колыбель Ньютона: шары на верёвках, упругие и без трения. Крайний отведён.
+        (
+            name: "перекладина",
+            at: (6.75, 0.27),
+            depth: 1,
+            shapes: [Rect(at: (0.0, 0.0), size: (0.7, 0.03), color: "#3a3a40")],
+        ),
+        (
+            name: "шар колыбели",
+            at: (6.8, -0.3),
+            depth: 2,
+            body: (size: (0.1, 0.1), round: true, density: 3.0, bounce: 1.0, friction: 0.0),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.05, color: "#c0c8d4"), Circle(at: (-0.015, 0.015), r: 0.012, color: "#ffffff")],
+            joints: [(kind: Rope, to: World, to_at: (0.0, 0.55), line: (width: 0.004, color: "#d0d0d0"))],
+            repeat: (count: 4, step: (0.1001, 0.0)),
+        ),
+        (
+            name: "шар колыбели отведённый",
+            at: (6.279, -0.104),
+            depth: 2,
+            body: (size: (0.1, 0.1), round: true, density: 3.0, bounce: 1.0, friction: 0.0),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.05, color: "#c0c8d4"), Circle(at: (-0.015, 0.015), r: 0.012, color: "#ffffff")],
+            joints: [(kind: Rope, to: World, to_at: (0.421, 0.354), line: (width: 0.004, color: "#d0d0d0"))],
+        ),
+
+        // Пружина: ящик висит на пружине и качается.
+        (
+            name: "на пружине",
+            at: (7.55, -0.25),
+            depth: 2,
+            body: (size: (0.15, 0.15), density: 1.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.15, 0.15), corner: 0.02, color: "#5a8fc0")],
+            joints: [(kind: Spring, to: World, at: (0.0, 0.075), to_at: (0.0, 0.5), length: 0.25, stiffness: 3.0, damping: 0.02, line: (width: 0.008, color: "#e0c060"))],
+        ),
+
+        // Лифт: ползун вверх-вниз с мотором, разворачивается каждые 3,5 секунды.
+        // Встань на него героем.
+        (
+            name: "лифт",
+            at: (8.4, -0.74),
+            depth: 2,
+            body: (size: (0.45, 0.05), density: 2.0, friction: 1.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.45, 0.05), corner: 0.01, color: "#7a8a96")],
+            joints: [(kind: Slider, to: World, axis: (0.0, 1.0), limits: (0.0, 1.0), motor: (speed: 0.3, force: 40.0, flip: 3.5))],
+        ),
+        (
+            name: "ящик на лифте",
+            at: (8.35, -0.64),
+            depth: 2,
+            body: (size: (0.12, 0.12), density: 0.8),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.12, 0.12), corner: 0.01, color: "#b8844e"), Rect(at: (0.0, 0.0), size: (0.12, 0.12), color: "#5a3a20", stroke: 0.01)],
+        ),
+
+        // Мельница: крестовина на шарнире с мотором, крылья сварены. Сверху — дождь из
+        // шариков. Справа на хрупкую полку сыплются кубики; когда его станет много, сварка
+        // полки порвётся (breaks).
+        (
+            name: "мельница",
+            at: (9.7, -0.2),
+            depth: 2,
+            body: (size: (0.9, 0.05), density: 2.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.9, 0.05), corner: 0.02, color: "#c05a3a"), Circle(at: (0.0, 0.0), r: 0.04, color: "#3a3a40")],
+            joints: [(kind: Hinge, to: World, motor: (speed: -70.0, force: 30.0))],
+        ),
+        (
+            name: "мельница крыло",
+            at: (9.7, -0.2),
+            angle: 90,
+            depth: 1.9,
+            body: (size: (0.9, 0.05), density: 2.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.9, 0.05), corner: 0.02, color: "#a84a30")],
+            joints: [(kind: Weld, to: Node("мельница"))],
+        ),
+        (
+            name: "дождь",
+            at: (10.1, 0.75),
+            depth: 2,
+            body: (size: (0.06, 0.06), round: true, density: 1.0, bounce: 0.3),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.03, color: "#58a8e0")],
+            spawn: (every: 0.12, speed: (0.0, -0.5), spread: 0.2, life: 12.0, max: 60, width: 1.8),
+        ),
+        (
+            name: "песок",
+            at: (10.9, 0.55),
+            depth: 2,
+            body: (size: (0.045, 0.045), density: 3.0, bounce: 0.0, friction: 1.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.045, 0.045), corner: 0.006, color: "#d8b860")],
+            spawn: (every: 0.25, spread: 0.05, life: 30.0, max: 40, width: 0.25),
+        ),
+        (
+            name: "хрупкая полка",
+            at: (10.85, -0.25),
+            depth: 2,
+            body: (size: (0.5, 0.04), density: 1.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.5, 0.04), color: "#8a6a4a")],
+            joints: [(kind: Weld, to: World, at: (-0.25, 0.0), breaks: 1.0)],
+        ),
+
+        // Машинка: кузов и два колеса на шарнирах с моторами, каждые 3 секунды едет
+        // в другую сторону. Её можно перевернуть мышью.
+        (
+            name: "машина",
+            at: (12.2, -0.6),
+            depth: 2,
+            body: (size: (0.5, 0.08), density: 2.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.5, 0.08), corner: 0.02, color: "#e0b020"), Rect(at: (-0.02, 0.07), size: (0.26, 0.08), corner: 0.03, color: "#c09010")],
+        ),
+        (
+            name: "колесо",
+            at: (12.03, -0.69),
+            depth: 2.1,
+            body: (size: (0.18, 0.18), round: true, density: 1.0, friction: 1.5),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.09, color: "#25252a"), Rect(at: (0.0, 0.0), size: (0.12, 0.02), color: "#808080")],
+            joints: [(kind: Hinge, to: Node("машина"), motor: (speed: -300.0, force: 6.0, flip: 3.0))],
+            repeat: (count: 2, step: (0.34, 0.0)),
+        ),
+
+        // Тряпичные куклы: капсулы и голова на шарнирах с пределами. Первая висит на
+        // верёвке — её можно раскачать мышью или взрывом.
+        (name: "кукла 1 тело", at: (13.600, -0.050), depth: 2,
+            body: (capsule: true, size: (0.08, 0.24), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.08, 0.24), corner: 0.040, color: "#c0392b")],
+            joints: []),
+        (name: "кукла 1 голова", at: (13.600, 0.130), depth: 2,
+            body: (round: true, size: (0.11, 0.11), density: 1.0, friction: 0.6),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.055, color: "#f0d0b0")],
+            joints: [(kind: Hinge, to: Node("кукла 1 тело"), at: (0.0, -0.06), limits: (-40, 40)), (kind: Rope, to: World, at: (0.0, 0.05), to_at: (0.0, 0.45), line: (width: 0.006, color: "#c8b48a"))]),
+        (name: "кукла 1 рука л", at: (13.535, -0.040), depth: 2,
+            body: (capsule: true, size: (0.04, 0.17), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.04, 0.17), corner: 0.020, color: "#e8a080")],
+            joints: [(kind: Hinge, to: Node("кукла 1 тело"), at: (0.0, 0.07), limits: (-150, 150))]),
+        (name: "кукла 1 рука п", at: (13.665, -0.040), depth: 2,
+            body: (capsule: true, size: (0.04, 0.17), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.04, 0.17), corner: 0.020, color: "#e8a080")],
+            joints: [(kind: Hinge, to: Node("кукла 1 тело"), at: (0.0, 0.07), limits: (-150, 150))]),
+        (name: "кукла 1 нога л", at: (13.578, -0.250), depth: 2,
+            body: (capsule: true, size: (0.045, 0.2), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.045, 0.2), corner: 0.022, color: "#e8a080")],
+            joints: [(kind: Hinge, to: Node("кукла 1 тело"), at: (0.0, 0.085), limits: (-100, 100))]),
+        (name: "кукла 1 нога п", at: (13.622, -0.250), depth: 2,
+            body: (capsule: true, size: (0.045, 0.2), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.045, 0.2), corner: 0.022, color: "#e8a080")],
+            joints: [(kind: Hinge, to: Node("кукла 1 тело"), at: (0.0, 0.085), limits: (-100, 100))]),
+        (name: "кукла 2 тело", at: (14.100, -0.300), depth: 2,
+            body: (capsule: true, size: (0.08, 0.24), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.08, 0.24), corner: 0.040, color: "#2f6fb0")],
+            joints: []),
+        (name: "кукла 2 голова", at: (14.100, -0.120), depth: 2,
+            body: (round: true, size: (0.11, 0.11), density: 1.0, friction: 0.6),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.055, color: "#f0d0b0")],
+            joints: [(kind: Hinge, to: Node("кукла 2 тело"), at: (0.0, -0.06), limits: (-40, 40))]),
+        (name: "кукла 2 рука л", at: (14.035, -0.290), depth: 2,
+            body: (capsule: true, size: (0.04, 0.17), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.04, 0.17), corner: 0.020, color: "#9cc0e8")],
+            joints: [(kind: Hinge, to: Node("кукла 2 тело"), at: (0.0, 0.07), limits: (-150, 150))]),
+        (name: "кукла 2 рука п", at: (14.165, -0.290), depth: 2,
+            body: (capsule: true, size: (0.04, 0.17), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.04, 0.17), corner: 0.020, color: "#9cc0e8")],
+            joints: [(kind: Hinge, to: Node("кукла 2 тело"), at: (0.0, 0.07), limits: (-150, 150))]),
+        (name: "кукла 2 нога л", at: (14.078, -0.500), depth: 2,
+            body: (capsule: true, size: (0.045, 0.2), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.045, 0.2), corner: 0.022, color: "#9cc0e8")],
+            joints: [(kind: Hinge, to: Node("кукла 2 тело"), at: (0.0, 0.085), limits: (-100, 100))]),
+        (name: "кукла 2 нога п", at: (14.122, -0.500), depth: 2,
+            body: (capsule: true, size: (0.045, 0.2), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.045, 0.2), corner: 0.022, color: "#9cc0e8")],
+            joints: [(kind: Hinge, to: Node("кукла 2 тело"), at: (0.0, 0.085), limits: (-100, 100))]),
+        (name: "кукла 3 тело", at: (14.400, 0.200), depth: 2,
+            body: (capsule: true, size: (0.08, 0.24), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.08, 0.24), corner: 0.040, color: "#3f8a4a")],
+            joints: []),
+        (name: "кукла 3 голова", at: (14.400, 0.380), depth: 2,
+            body: (round: true, size: (0.11, 0.11), density: 1.0, friction: 0.6),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.055, color: "#e8c9a0")],
+            joints: [(kind: Hinge, to: Node("кукла 3 тело"), at: (0.0, -0.06), limits: (-40, 40))]),
+        (name: "кукла 3 рука л", at: (14.335, 0.210), depth: 2,
+            body: (capsule: true, size: (0.04, 0.17), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.04, 0.17), corner: 0.020, color: "#a8d8a0")],
+            joints: [(kind: Hinge, to: Node("кукла 3 тело"), at: (0.0, 0.07), limits: (-150, 150))]),
+        (name: "кукла 3 рука п", at: (14.465, 0.210), depth: 2,
+            body: (capsule: true, size: (0.04, 0.17), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.04, 0.17), corner: 0.020, color: "#a8d8a0")],
+            joints: [(kind: Hinge, to: Node("кукла 3 тело"), at: (0.0, 0.07), limits: (-150, 150))]),
+        (name: "кукла 3 нога л", at: (14.378, 0.000), depth: 2,
+            body: (capsule: true, size: (0.045, 0.2), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.045, 0.2), corner: 0.022, color: "#a8d8a0")],
+            joints: [(kind: Hinge, to: Node("кукла 3 тело"), at: (0.0, 0.085), limits: (-100, 100))]),
+        (name: "кукла 3 нога п", at: (14.422, 0.000), depth: 2,
+            body: (capsule: true, size: (0.045, 0.2), density: 1.0, friction: 0.6),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.045, 0.2), corner: 0.022, color: "#a8d8a0")],
+            joints: [(kind: Hinge, to: Node("кукла 3 тело"), at: (0.0, 0.085), limits: (-100, 100))]),
+
+        // Желе: три капли разной жёсткости (мягкое, среднее, твёрдое) держат площадь.
+        (name: "желе мягкое", at: (15.1, 0.0), depth: 2, soft: (shape: Jelly(r: 0.13, count: 16), stiffness: 6.0, damping: 0.3, mass: 0.04, color: "#58c878")),
+        (name: "желе среднее", at: (15.45, 0.4), depth: 2, soft: (shape: Jelly(r: 0.11, count: 16), stiffness: 12.0, damping: 0.4, mass: 0.04, color: "#e05890")),
+        (name: "желе твёрдое", at: (15.8, 0.0), depth: 2, soft: (shape: Jelly(r: 0.12, count: 16), stiffness: 30.0, damping: 0.5, mass: 0.04, color: "#e0a030")),
+
+        // Мягкая верёвка: начало закреплено в воздухе, конец привязан к грузу.
+        (
+            name: "груз",
+            at: (16.9, -0.1),
+            depth: 2,
+            body: (size: (0.12, 0.12), density: 3.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.12, 0.12), corner: 0.01, color: "#606870"), Rect(at: (0.0, 0.0), size: (0.12, 0.12), color: "#30343a", stroke: 0.012)],
+        ),
+        (
+            name: "верёвка",
+            at: (16.4, 0.5),
+            depth: 2,
+            soft: (shape: Rope(to: (0.5, -0.54), count: 24), stiffness: 40.0, pin: Start, attach_end: "груз", color: "#c8a060", width: 0.012),
+        ),
+
+        // Цепь: 10 звеньев на шарнирах, первое — к миру, последнее держит гирю.
+        (
+            name: "звено",
+            at: (17.45, 0.4),
+            depth: 2,
+            body: (size: (0.08, 0.025), density: 1.0),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.08, 0.025), corner: 0.012, color: "#9098a4")],
+            repeat: (count: 10, step: (0.08, 0.0), colors: ["#9098a4", "#788090"]),
+            joints: [
+                (kind: Hinge, to: Prev, at: (-0.04, 0.0)),
+                (kind: Hinge, to: Node("гиря"), at: (0.04, 0.0), on: Last),
+            ],
+        ),
+        (
+            name: "гиря",
+            at: (18.25, 0.4),
+            depth: 2,
+            body: (size: (0.14, 0.14), round: true, density: 3.0),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.07, color: "#404448")],
+        ),
+
+        // Сетка-гамак: закреплена по бокам, рвётся, если растянуть на 60 %. На неё падает
+        // тяжёлый шар; добавь мышью ещё веса (или взорви рядом).
+        (
+            name: "гамак",
+            at: (19.4, -0.35),
+            depth: 2,
+            soft: (shape: Net(size: (1.0, 0.12), cols: 18, rows: 3), stiffness: 40.0, damping: 0.5, mass: 0.08, pin: Sides, tear: 0.6, color: "#d0c8b0", width: 0.008),
+        ),
+        (
+            name: "тяжёлый шар",
+            at: (19.4, 0.4),
+            depth: 2,
+            body: (size: (0.18, 0.18), round: true, density: 4.0),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.09, color: "#6a3a8a")],
+        ),
+
+        // Пушка: быстрые шарики летят в тонкую стену и не пролетают сквозь неё.
+        (
+            name: "ствол",
+            at: (20.35, -0.62),
+            depth: 2.2,
+            shapes: [Rect(at: (0.0, 0.0), size: (0.3, 0.09), corner: 0.03, color: "#3a3a40"), Circle(at: (-0.12, -0.04), r: 0.08, color: "#5a3a20")],
+        ),
+        (
+            name: "ядро",
+            at: (20.55, -0.6),
+            depth: 2,
+            body: (size: (0.05, 0.05), round: true, density: 4.0, bounce: 0.4),
+            shapes: [Circle(at: (0.0, 0.0), r: 0.025, color: "#202024")],
+            spawn: (every: 0.5, speed: (14.0, 1.0), spread: 0.4, life: 4.0, max: 12),
+        ),
+        (
+            name: "тонкая стена",
+            at: (22.2, -0.45),
+            depth: 2,
+            body: (size: (0.02, 0.66), fixed: true),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.02, 0.66), color: "#c0c8d4")],
+        ),
+    ],
+)

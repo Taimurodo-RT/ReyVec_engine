@@ -110,6 +110,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         closed_at: None,
         cursor: None,
         dragging: false,
+        grabbing: false,
         scene_watcher: None,
         scene_file_label: None,
         modifiers: ModifiersState::empty(),
@@ -166,6 +167,8 @@ struct App {
     cursor: Option<PhysicalPosition<f64>>,
     /// Левая кнопка мыши зажата над сценой: движение мыши двигает камеру.
     dragging: bool,
+    /// Q зажата в сцене из файла: мышь тащит тело (6.13).
+    grabbing: bool,
     /// Слежка за файлом сцены (5.1) и его путь для панели.
     scene_watcher: Option<reyvec_scene::SceneWatcher>,
     scene_file_label: Option<String>,
@@ -393,6 +396,23 @@ impl App {
                 renderer.game_action(action, down);
             }
         });
+        // Мышь для физики: каждый кадр, потому что камера может ехать за героем.
+        if renderer.scene() == DemoScene::File {
+            // Меню или консоль забирают клавиши: отпускание Q до нас не дойдёт.
+            if self.game_ui.menu_open() || self.game_ui.console.is_open() {
+                self.grabbing = false;
+            }
+            let at = self.cursor.map(|c| {
+                let p = renderer
+                    .camera()
+                    .to_scene(to_screen(c, window.inner_size()).to_point());
+                [p.x, p.y]
+            });
+            match at {
+                Some(at) => renderer.physics_pointer(at, self.grabbing),
+                None => self.grabbing = false,
+            }
+        }
         if let Some(watcher) = self.scene_watcher.as_mut() {
             match watcher.poll() {
                 Some(Ok(text)) => {
@@ -462,6 +482,7 @@ impl App {
                 logic: renderer.logic_stats(),
                 player: renderer.player_stats(),
                 scripts: renderer.script_info(),
+                physics: renderer.physics_stats(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),
@@ -582,6 +603,63 @@ fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
         KeyCode::KeyN => Some(DemoScene::File),
         _ => None,
     }
+}
+
+impl App {
+    /// Взрыв под мышью в сцене из файла (6.13).
+    fn blast_at_cursor(&mut self) {
+        let (Some(r), Some(w), Some(c)) = (self.renderer.as_mut(), &self.window, self.cursor)
+        else {
+            return;
+        };
+        let p = r.camera().to_scene(to_screen(c, w.inner_size()).to_point());
+        r.physics_blast([p.x, p.y]);
+    }
+
+    /// Следующий файл сцены (`*.ron`) из папки текущего, по алфавиту и по кругу (6.13):
+    /// за ним теперь и следим.
+    fn next_scene_file(&mut self) {
+        let Some(current) = self.scene_watcher.as_ref().map(|w| w.path().to_path_buf()) else {
+            return;
+        };
+        let Some(next) = next_scene_path(&current) else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&next) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Не прочитать файл сцены «{}»: {e}", next.display());
+                return;
+            }
+        };
+        tracing::info!("Следующая сцена: {}", next.display());
+        match reyvec_scene::SceneWatcher::new(&next) {
+            Ok(w) => {
+                self.scene_file_label = Some(w.path().display().to_string());
+                self.scene_watcher = Some(w);
+            }
+            Err(e) => tracing::warn!("Не удалось следить за файлом {}: {e}", next.display()),
+        }
+        if let Some(r) = self.renderer.as_mut() {
+            r.switch_scene_file(&text);
+            r.set_follow(true);
+        }
+    }
+}
+
+/// Файл сцены после `current` в его папке: `*.ron` по алфавиту, после последнего — первый.
+fn next_scene_path(current: &std::path::Path) -> Option<std::path::PathBuf> {
+    let dir = current.parent()?;
+    let mut all: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "ron") && p.is_file())
+        .collect();
+    all.sort();
+    let name = current.file_name()?;
+    let at = all.iter().position(|p| p.file_name() == Some(name));
+    let next = at.map_or(0, |i| (i + 1) % all.len());
+    all.get(next).cloned()
 }
 
 impl ApplicationHandler for App {
@@ -722,6 +800,43 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 self.apply(PanelAction::Snapshot);
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if code == KeyCode::KeyN && in_game && self.scene_watcher.is_some() => {
+                // Уже в сцене из файла: N берёт следующий файл сцены из той же папки.
+                self.next_scene_file();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyY),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if in_game => self.blast_at_cursor(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyQ),
+                        state,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if in_game => {
+                // Пока Q зажата, мышь тащит тело или частицу мягкого тела под собой.
+                // Кнопки мыши в игре заняты (удар, рывок, камера, решение 0015).
+                self.grabbing = state == ElementState::Pressed;
             }
             WindowEvent::KeyboardInput {
                 event:
