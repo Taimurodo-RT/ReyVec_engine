@@ -347,6 +347,8 @@ struct Pending {
     jump: bool,
     dash: bool,
     attack: bool,
+    /// Удар нажат мышью «к курсору»: куда бить (6.12).
+    attack_at: Option<[f64; 2]>,
 }
 
 /// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест).
@@ -1074,6 +1076,11 @@ fn play(
     pending.jump |= input.pressed(Action::Jump);
     pending.dash |= input.pressed(Action::Dash);
     pending.attack |= input.pressed(Action::Attack);
+    if input.aimed(Action::Attack) {
+        pending.attack_at = input.aim();
+    } else if input.pressed(Action::Attack) {
+        pending.attack_at = None;
+    }
 
     // Таймеры, которые идут и в стоп-кадре.
     combat.shake_left = (combat.shake_left - dt).max(0.0);
@@ -1163,6 +1170,15 @@ fn play(
                 events.list.push_back((step, GameEvent::Dashed { at, dir }));
             }
             let can = !p.body.on_ledge();
+            // Удар мышью — в сторону курсора (если так выбрано в настройках управления).
+            if first
+                && presses.attack
+                && can
+                && let Some(at) = presses.attack_at
+                && (at[0] - p.body.pos[0]).abs() > 1e-6
+            {
+                p.body.facing = (at[0] - p.body.pos[0]).signum();
+            }
             let swings = p.fighter.swings;
             p.fighter
                 .step(&p.attack, first && presses.attack, can, p.body.facing, sdt);

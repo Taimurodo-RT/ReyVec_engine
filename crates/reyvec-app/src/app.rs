@@ -15,7 +15,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::controls::{Input, MouseKey, Route, Wheel, schemes};
 use crate::panel::{Panel, PanelAction, PanelInfo};
+use reyvec_scene::game::Action;
 
 /// Как часто обновлять счётчик кадров в заголовке окна.
 const TITLE_INTERVAL: Duration = Duration::from_millis(500);
@@ -422,6 +424,14 @@ impl App {
         // Консоль разработчика (6.11): команды набранного в прошлом кадре — потоку
         // логики, его ответы — в журнал.
         run_console(&mut self.game_ui.console, renderer.scene_logic());
+        // Точка прицела (6.12): курсор в координатах сцены, пока идёт игра.
+        if let Some(logic) = renderer.scene_logic() {
+            let aim = self.cursor.filter(|_| playing).map(|c| {
+                let p = camera.to_scene(to_screen(c, size).to_point());
+                [p.x, p.y]
+            });
+            logic.set_aim(aim);
+        }
         let game_view = crate::game_ui::GameView {
             player: renderer.player_stats().map(|p| p.view),
             center: [camera.center.x, camera.center.y],
@@ -593,73 +603,85 @@ impl ApplicationHandler for App {
             .renderer
             .as_ref()
             .is_some_and(|r| r.scene() == DemoScene::File);
-        // Меню ждёт клавишу для назначения (6.10б): её забирает меню.
-        if let WindowEvent::KeyboardInput {
-            event:
-                KeyEvent {
-                    physical_key: PhysicalKey::Code(code),
-                    state: ElementState::Pressed,
-                    repeat: false,
-                    ..
-                },
-            ..
-        } = &event
-            && in_game
-            && self.game_ui.capturing()
-        {
-            self.game_ui.capture_key(*code);
-            return;
+        // Управление (6.12): клавиши, кнопки мыши и колесо в сцене с героем идут через
+        // схемы (консоль, меню, игра, песочница) — нажатие получает верхняя схема, у
+        // которой оно что-то значит. Без игры всё достаётся песочнице, как раньше.
+        if in_game && let Some((input, down, repeat)) = input_of(&event) {
+            // Меню ждёт клавишу или кнопку для назначения (6.10б): её забирает меню.
+            if self.game_ui.capturing() {
+                if down && !repeat {
+                    self.game_ui.capture_input(input);
+                }
+                return;
+            }
+            // Щелчок по панели песочницы — панели, а не игре.
+            if panel_took && down && input.is_mouse() && !self.game_ui.menu_open() {
+                return;
+            }
+            let stack = schemes(
+                true,
+                self.game_ui.menu_open(),
+                self.game_ui.console.is_open(),
+            );
+            match self.game_ui.controls().route(&stack, input) {
+                Route::Sandbox => {}
+                Route::Ui => return,
+                Route::OpenConsole | Route::CloseConsole => {
+                    if down && !repeat {
+                        self.game_ui.console.toggle();
+                        if self.game_ui.console.is_open()
+                            && let Some(r) = self.renderer.as_mut()
+                        {
+                            r.release_game_input();
+                        }
+                    }
+                    return;
+                }
+                Route::OpenMenu => {
+                    if down && !repeat {
+                        self.game_ui.escape();
+                        self.dragging = false;
+                        if let Some(r) = self.renderer.as_mut() {
+                            r.release_game_input();
+                        }
+                    }
+                    return;
+                }
+                Route::Menu(key) => {
+                    if down {
+                        self.game_ui.menu_key(key);
+                    }
+                    return;
+                }
+                Route::Game(action) => {
+                    if repeat {
+                        return;
+                    }
+                    let aimed = down
+                        && input.is_mouse()
+                        && action == Action::Attack
+                        && self.game_ui.controls().attack_toward_cursor();
+                    if let Some(r) = self.renderer.as_mut() {
+                        if aimed && let Some(logic) = r.scene_logic() {
+                            logic.press_aimed(action);
+                        } else {
+                            r.game_action(action, down);
+                        }
+                        // Колесо — щелчок: нажато и сразу отпущено.
+                        if matches!(input, Input::Wheel(_)) {
+                            r.game_action(action, false);
+                        }
+                    }
+                    return;
+                }
+                Route::Camera => {
+                    self.dragging = down && !panel_took;
+                    return;
+                }
+            }
         }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
-            // `~` (Ё) открывает и закрывает консоль разработчика (6.11).
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Backquote),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } if in_game && !self.game_ui.menu_open() => {
-                self.game_ui.console.toggle();
-                if self.game_ui.console.is_open()
-                    && let Some(r) = self.renderer.as_mut()
-                {
-                    r.release_game_input();
-                }
-            }
-            // Esc при открытой консоли закрывает её.
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Named(NamedKey::Escape),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } if in_game && self.game_ui.console.is_open() => self.game_ui.console.close(),
-            // В игре Esc открывает меню (выход — из меню), в остальных сценах закрывает
-            // окно.
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        logical_key: Key::Named(NamedKey::Escape),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } if in_game => {
-                self.game_ui.escape();
-                if self.game_ui.menu_open()
-                    && let Some(r) = self.renderer.as_mut()
-                {
-                    r.release_game_input();
-                }
-            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -669,23 +691,6 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => self.close(event_loop),
-            // Пока открыто меню или консоль, клавиши песочницы не работают.
-            WindowEvent::KeyboardInput { .. }
-                if in_game && (self.game_ui.menu_open() || self.game_ui.console.is_open()) => {}
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
-                        state,
-                        ..
-                    },
-                ..
-            } if in_game && self.game_ui.action(code).is_some() => {
-                if let (Some(action), Some(r)) = (self.game_ui.action(code), self.renderer.as_mut())
-                {
-                    r.game_action(action, state == ElementState::Pressed);
-                }
-            }
             WindowEvent::Focused(false) => {
                 // Отпускание клавиш, пока окно не в фокусе, оно не узнает.
                 if let Some(r) = self.renderer.as_mut() {
@@ -1107,6 +1112,39 @@ fn save_snapshot(image: reyvec_gpu::FrameImage) -> Option<(String, std::thread::
         Err(e) => tracing::error!("Снимок кадра не сохранён: {e}"),
     });
     Some((name, handle))
+}
+
+/// Источник ввода события окна: клавиша, кнопка мыши или щелчок колеса, нажато ли и
+/// повтор ли это зажатой клавиши.
+fn input_of(event: &WindowEvent) -> Option<(Input, bool, bool)> {
+    match event {
+        WindowEvent::KeyboardInput {
+            event:
+                KeyEvent {
+                    physical_key: PhysicalKey::Code(code),
+                    state,
+                    repeat,
+                    ..
+                },
+            ..
+        } => Some((Input::Key(*code), *state == ElementState::Pressed, *repeat)),
+        WindowEvent::MouseInput { state, button, .. } => MouseKey::from_winit(*button)
+            .map(|m| (Input::Mouse(m), *state == ElementState::Pressed, false)),
+        WindowEvent::MouseWheel { delta, .. } => {
+            let y = match delta {
+                MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
+                MouseScrollDelta::PixelDelta(p) => p.y,
+            };
+            if y > 0.0 {
+                Some((Input::Wheel(Wheel::Up), true, false))
+            } else if y < 0.0 {
+                Some((Input::Wheel(Wheel::Down), true, false))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Выполняет команды консоли разработчика и забирает ответы потока логики.

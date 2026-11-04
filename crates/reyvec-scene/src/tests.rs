@@ -2119,3 +2119,35 @@ fn logic_thread_pauses_steps_and_slows_down_from_the_console() {
     // 0,5 с при 15 шагах в секунду — около 7 шагов (обычно было бы 30).
     assert!((3..=12).contains(&slow), "замедленно сделано {slow} шагов");
 }
+
+#[test]
+fn mouse_attack_swings_toward_the_cursor() {
+    use reyvec_game::Action::Attack;
+    use reyvec_game::InputFrame;
+    let text = minimal(
+        r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "герой", at: (0.0, -0.7), player: (size: (0.1, 0.2)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+]"##,
+    );
+    let mut w = world(&text);
+    let mut t = steps(&mut w, 0, 30);
+    let mut seen = 0;
+    let mut swings = Vec::new();
+    // Курсор слева, потом справа: удар туда, куда он показывает.
+    for x in [-1.0, 1.0] {
+        w.set_input(InputFrame::new(&[Attack], &[Attack]).with_aim([x, -0.7], &[Attack]));
+        t = steps(&mut w, t, 1);
+        w.set_input(InputFrame::new(&[], &[]));
+        for _ in 0..40 {
+            t = steps(&mut w, t, 1);
+            for e in fresh(&w, &mut seen) {
+                if let GameEvent::Swing { dir, .. } = e {
+                    swings.push(dir);
+                }
+            }
+        }
+    }
+    assert_eq!(swings, vec![-1.0, 1.0]);
+}
