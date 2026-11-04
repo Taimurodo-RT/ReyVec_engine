@@ -1,4 +1,4 @@
-//! Логи: в консоль и в файл `reyvec.log` рядом с программой.
+//! Логи: в консоль, в файл `reyvec.log` рядом с программой и в консоль разработчика.
 
 use std::fs::File;
 use std::path::PathBuf;
@@ -41,6 +41,7 @@ pub fn init_logging() -> LogGuard {
             let _ = tracing_subscriber::registry()
                 .with(console)
                 .with(file_layer)
+                .with(crate::console::ConsoleLog)
                 .try_init();
             LogGuard {
                 _file: Some(guard),
@@ -48,7 +49,10 @@ pub fn init_logging() -> LogGuard {
             }
         }
         None => {
-            let _ = tracing_subscriber::registry().with(console).try_init();
+            let _ = tracing_subscriber::registry()
+                .with(console)
+                .with(crate::console::ConsoleLog)
+                .try_init();
             LogGuard {
                 _file: None,
                 path: None,

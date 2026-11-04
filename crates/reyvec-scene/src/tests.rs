@@ -2014,3 +2014,108 @@ fn fresh(w: &SceneWorld, seen: &mut u64) -> Vec<GameEvent> {
     }
     out
 }
+
+#[test]
+fn console_commands_move_heal_and_protect_the_hero() {
+    use crate::DebugCommand::{God, Health, Respawn, Teleport, Where};
+    use reyvec_game::Action::Right;
+    use reyvec_game::InputFrame;
+    let text = minimal(
+        r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "герой", at: (0.0, -0.7), player: (size: (0.1, 0.2), hp: 3),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+    (name: "шип", at: (0.5, -0.74), dummy: (size: (0.12, 0.12), hp: 3, contact: 1),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.12, 0.12), color: "#f00")]),
+]"##,
+    );
+    let mut w = world(&text);
+    let mut t = steps(&mut w, 0, 30);
+    // Телепорт: стоит там, без скорости, и падает на пол.
+    assert!(w.debug(&Teleport([-1.0, 0.0])).unwrap().contains("-1.00"));
+    w.refresh();
+    let p = w.snapshot().player.unwrap();
+    assert_eq!(p.at, [-1.0, 0.0]);
+    assert_eq!(p.vel, [0.0, 0.0]);
+    assert_eq!(p.size, [0.1, 0.2]);
+    t = steps(&mut w, t, 60);
+    assert!(w.snapshot().player.unwrap().on_ground);
+    // Здоровье — в пределах от 1 до наибольшего.
+    assert_eq!(w.debug(&Health(1)).unwrap(), "здоровье 1 из 3");
+    assert_eq!(w.debug(&Health(99)).unwrap(), "здоровье 3 из 3");
+    assert!(w.debug(&Health(0)).unwrap().starts_with("здоровье 1"));
+    assert!(w.debug(&Where).unwrap().contains("начало в (0.00"));
+    // Бессмертный бежит в шип и не ранен.
+    w.debug(&God(Some(true))).unwrap();
+    w.debug(&Teleport([0.2, -0.7])).unwrap();
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    let mut seen = 0;
+    for _ in 0..60 {
+        t = steps(&mut w, t, 1);
+        for e in fresh(&w, &mut seen) {
+            assert!(!matches!(e, GameEvent::Hurt { .. }), "бессмертный ранен");
+        }
+    }
+    let p = w.snapshot().player.unwrap();
+    assert!(p.god && p.hp == 1, "{p:?}");
+    // Переключение и возврат в начало.
+    assert_eq!(w.debug(&God(None)).unwrap(), "бессмертие выключено");
+    w.set_input(InputFrame::new(&[], &[]));
+    w.debug(&Respawn).unwrap();
+    steps(&mut w, t, 1);
+    let p = w.snapshot().player.unwrap();
+    assert_eq!(p.hp, 3);
+    assert!(p.at[0].abs() < 1e-3, "{p:?}");
+    // Без героя — понятная ошибка.
+    let mut empty = world(&minimal(""));
+    assert_eq!(empty.debug(&Where), Err("в сцене нет героя".into()));
+}
+
+#[test]
+fn logic_thread_pauses_steps_and_slows_down_from_the_console() {
+    let text = minimal(
+        r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "герой", at: (0.0, -0.7), player: (size: (0.1, 0.2)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+]"##,
+    );
+    let logic = SceneLogic::start(world(&text), 0.0);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    wait("логика не шагает", &|| logic.steps() >= 3);
+    // Пауза: шаги стоят; «шаг 2» — ровно два шага.
+    logic.set_debug_paused(true);
+    std::thread::sleep(Duration::from_millis(40));
+    let at = logic.steps();
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(logic.steps(), at, "на паузе шагает");
+    logic.step(2);
+    wait("шаг на паузе", &|| logic.steps() == at + 2);
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(logic.steps(), at + 2);
+    // Команда на паузе видна сразу, без шага.
+    logic.debug(crate::DebugCommand::Teleport([1.0, 0.5]));
+    wait("ответ команды", &|| {
+        logic.frame(Instant::now()).player.unwrap().at == [1.0, 0.5]
+    });
+    let replies = logic.take_replies();
+    assert_eq!(replies.len(), 1);
+    assert!(replies[0].as_ref().unwrap().contains("1.00"));
+    assert_eq!(logic.steps(), at + 2);
+    // Замедление в 4 раза: шаги реже. Пределы скорости соблюдаются.
+    assert_eq!(logic.set_time_scale(100.0), crate::TIME_SCALE.1);
+    assert_eq!(logic.set_time_scale(f64::NAN), 1.0);
+    assert_eq!(logic.set_time_scale(0.25), 0.25);
+    logic.set_debug_paused(false);
+    let from = logic.steps();
+    std::thread::sleep(Duration::from_millis(500));
+    let slow = logic.steps() - from;
+    // 0,5 с при 15 шагах в секунду — около 7 шагов (обычно было бы 30).
+    assert!((3..=12).contains(&slow), "замедленно сделано {slow} шагов");
+}

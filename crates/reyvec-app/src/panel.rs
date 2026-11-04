@@ -92,7 +92,7 @@ pub(crate) struct PanelInfo<'a> {
     pub player: Option<reyvec_gpu::PlayerStats>,
     /// Скрипты сцены (6.9).
     pub scripts: Option<reyvec_scene::ScriptInfo>,
-    /// Физика сцены (6.11): тела, сочленения, мягкие тела, время шага.
+    /// Физика сцены (6.12): тела, сочленения, мягкие тела, время шага.
     pub physics: Option<reyvec_scene::game::physics::PhysicsStats>,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
@@ -213,7 +213,10 @@ impl Panel {
         info: &PanelInfo,
         game: Option<(&mut GameUi, &GameView)>,
     ) -> Option<UiFrame> {
-        self.menu = game.as_ref().is_some_and(|(g, _)| g.menu_open());
+        // Меню и консоль забирают мышь и клавиши себе.
+        self.menu = game
+            .as_ref()
+            .is_some_and(|(g, _)| g.menu_open() || g.console.is_open());
         if !self.visible && game.is_none() {
             return None;
         }
