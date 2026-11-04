@@ -252,6 +252,11 @@ fn cases() -> Vec<Case> {
                 msaa: Msaa::X4,
                 ..at(DemoScene::File, 1.0, false)
             },
+        }, // Этап 7.1: объёмный вид камерой 3D по умолчанию — пол с сеткой и осями, шар,
+        // куб и тор, небо.
+        Case {
+            name: "space-1s",
+            scene: at(DemoScene::Space, 1.0, false),
         },
     ]
 }
@@ -1220,4 +1225,49 @@ fn physics_crate_flies_and_dummy_breaks_into_debris() {
     show_frame("physics-debris", &frame);
     let p = frame.player.expect("герой");
     assert!(p.hits >= 5, "{p:?}");
+}
+
+#[test]
+#[ignore = "нужен драйвер Vulkan"]
+fn space_scene_shows_sky_floor_and_the_ball_in_the_middle() {
+    // Сцена «3D» (7.1): камера по умолчанию смотрит на шар, он в середине кадра; вверху
+    // небо, внизу пол с сеткой; без ошибок валидации.
+    let (width, height) = (640u32, 360u32);
+    let scene = HeadlessScene {
+        width,
+        height,
+        time: 0.0,
+        shader_error: false,
+        scene: DemoScene::Space,
+        msaa: Msaa::Off,
+        perceptual_edges: false,
+        fill: FillMode::Triangles,
+        zoom: false,
+        files: Default::default(),
+        cascades: false,
+    };
+    let options = GpuOptions {
+        validation: true,
+        gpu: None,
+    };
+    let frame = render_headless(&options, &scene).expect("кадр без окна");
+    assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+    let pixel = |x: u32, y: u32| {
+        let i = ((y * width + x) * 4) as usize;
+        [
+            i32::from(frame.image.rgba[i]),
+            i32::from(frame.image.rgba[i + 1]),
+            i32::from(frame.image.rgba[i + 2]),
+        ]
+    };
+    let ball = pixel(width / 2, height / 2);
+    let sky = pixel(width / 2, 4);
+    let floor = pixel(width / 2, height - 4);
+    eprintln!("шар {ball:?}, небо {sky:?}, пол {floor:?}");
+    assert!(
+        ball[0] > ball[1] && ball[1] > ball[2],
+        "шар не оранжевый: {ball:?}"
+    );
+    assert!(sky[2] > sky[0], "небо не синее: {sky:?}");
+    assert!(floor != sky && floor != ball, "пол не виден: {floor:?}");
 }

@@ -351,6 +351,21 @@ impl WindowRenderer {
         }
     }
 
+    /// Камера сцены «3D» (7.1).
+    pub fn space_camera(&self) -> reyvec_sdf::Camera3D {
+        self.demo
+            .as_ref()
+            .map(Demo::space_camera)
+            .unwrap_or_default()
+    }
+
+    /// Ставит камеру сцены «3D» со следующего кадра.
+    pub fn set_space_camera(&mut self, camera: reyvec_sdf::Camera3D) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_camera(camera);
+        }
+    }
+
     /// Время процессора на векторный кадр (сцена и движок раздельно), число фигур и
     /// сколько из них нарисовано после отсечения. `None` у сцены без векторов.
     pub fn vector_cpu(&self) -> Option<crate::VectorCpu> {

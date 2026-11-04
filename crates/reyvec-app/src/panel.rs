@@ -67,6 +67,7 @@ const SCENES: &[(&str, &[(DemoScene, &str)])] = &[
         ],
     ),
     ("Этап 5: сцена", &[(DemoScene::File, "N")]),
+    ("Этап 7: 3D", &[(DemoScene::Space, "I")]),
 ];
 
 /// Что показывает панель. Собирается окном каждый кадр.
@@ -94,6 +95,8 @@ pub(crate) struct PanelInfo<'a> {
     pub scripts: Option<reyvec_scene::ScriptInfo>,
     /// Физика сцены (6.13): тела, сочленения, мягкие тела, время шага.
     pub physics: Option<reyvec_scene::game::physics::PhysicsStats>,
+    /// Камера сцены «3D» (7.1), строкой.
+    pub space: Option<String>,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -315,6 +318,13 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             ui.label("Шейдеры: перезагрузка на лету включена");
         }
         None => {}
+    }
+    if let Some(text) = &info.space {
+        ui.label(mono(text.clone()));
+        ui.label(
+            "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — смотреть \
+             вокруг, колесо — скорость, Tab — перспектива или плоская, R — в начало",
+        );
     }
     if info.scene_id == DemoScene::File {
         match (&info.scene_error, info.scene_file) {
@@ -894,6 +904,7 @@ mod tests {
                 particles: 180,
                 step_ms: 1.2,
             }),
+            space: Some("Камера 3D: перспектива".into()),
             gamepad: Some("Xbox Controller"),
             follow: true,
             audio: Some(reyvec_audio::AudioStats {

@@ -1,6 +1,6 @@
 [package]
 name = "reyvec-sdf"
-description = "ReyVec: поля расстояний 2D (SDF) на процессоре, зеркало шейдерной библиотеки sdf2d.slang."
+description = "ReyVec: поля расстояний (SDF) на процессоре, зеркало шейдерных библиотек, и камера 3D."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+glam.workspace = true
 
 [lints]
 workspace = true
