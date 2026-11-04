@@ -302,10 +302,6 @@ impl Console {
         self.browsing = None;
     }
 
-    pub(crate) fn close(&mut self) {
-        self.open = false;
-    }
-
     /// Показ столкновений включён (рамки рисуются и при закрытой консоли).
     pub(crate) fn colliders(&self) -> bool {
         self.colliders

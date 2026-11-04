@@ -130,6 +130,16 @@ impl SceneLogic {
         self.shared.input.set(action, down);
     }
 
+    /// Точка прицела: курсор в координатах сцены (`None` — курсор вне окна, 6.12).
+    pub fn set_aim(&self, at: Option<[f64; 2]>) {
+        self.shared.input.set_aim(at);
+    }
+
+    /// Нажатие, направленное в точку прицела (удар мышью в сторону курсора).
+    pub fn press_aimed(&self, action: Action) {
+        self.shared.input.press_aimed(action);
+    }
+
     /// Всё отпущено (окно потеряло фокус).
     pub fn release_all(&self) {
         self.shared.input.release_all();

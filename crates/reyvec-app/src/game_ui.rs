@@ -14,7 +14,7 @@ use reyvec_scene::{GameEvent, PlayerView};
 use winit::keyboard::KeyCode;
 
 use crate::console::{Console, ConsoleView};
-use crate::controls::{Controls, MAX_KEYS, controls_path, key_name};
+use crate::controls::{Controls, Input, MAX_KEYS, MenuAction, OPTIONS, controls_path};
 
 /// Сколько живёт число урона, секунды, и на сколько поднимается (единиц сцены).
 const FLOAT_LIFE: f32 = 0.9;
@@ -61,6 +61,8 @@ pub(crate) struct GameUi {
     controls: Controls,
     path: PathBuf,
     menu: Menu,
+    /// Строка меню, выбранная с клавиатуры (6.12).
+    selected: usize,
     capture: Option<Capture>,
     floats: Vec<Float>,
     banner: f32,
@@ -81,6 +83,7 @@ impl GameUi {
             controls: Controls::load(&path),
             path,
             menu: Menu::Closed,
+            selected: 0,
             capture: None,
             floats: Vec::new(),
             banner: 0.0,
@@ -92,13 +95,9 @@ impl GameUi {
         }
     }
 
-    /// Действие клавиши (меню и консоль закрыты).
-    pub(crate) fn action(&self, code: KeyCode) -> Option<Action> {
-        if self.menu_open() || self.console.is_open() {
-            None
-        } else {
-            self.controls.action(code)
-        }
+    /// Привязки и поведение управления.
+    pub(crate) fn controls(&self) -> &Controls {
+        &self.controls
     }
 
     pub(crate) fn menu_open(&self) -> bool {
@@ -112,7 +111,67 @@ impl GameUi {
             Menu::Main => Menu::Closed,
             Menu::Controls => Menu::Main,
         };
+        self.selected = 0;
         self.capture = None;
+    }
+
+    /// Сколько строк в меню (для выбора с клавиатуры).
+    fn rows(&self) -> usize {
+        match self.menu {
+            Menu::Closed => 0,
+            Menu::Main => 3,
+            // Действия, настройки поведения, «По умолчанию», «Назад».
+            Menu::Controls => Action::ALL.len() + OPTIONS.len() + 2,
+        }
+    }
+
+    /// Клавиша меню: вверх и вниз по строкам, выбрать, назад.
+    pub(crate) fn menu_key(&mut self, key: MenuAction) {
+        let n = self.rows().max(1);
+        match key {
+            MenuAction::Up => self.selected = (self.selected + n - 1) % n,
+            MenuAction::Down => self.selected = (self.selected + 1) % n,
+            MenuAction::Back => self.escape(),
+            MenuAction::Select => self.select(self.selected),
+        }
+    }
+
+    /// Нажата строка меню `row` (мышью или клавишей выбора).
+    fn select(&mut self, row: usize) {
+        match self.menu {
+            Menu::Closed => {}
+            Menu::Main => match row {
+                0 => self.menu = Menu::Closed,
+                1 => {
+                    self.menu = Menu::Controls;
+                    self.selected = 0;
+                    self.note = None;
+                }
+                _ => self.quit = true,
+            },
+            Menu::Controls => {
+                let actions = Action::ALL.len();
+                if row < actions {
+                    self.capture = Some(Capture {
+                        action: Action::ALL[row],
+                        replace: true,
+                    });
+                } else if row < actions + OPTIONS.len() {
+                    let i = row - actions;
+                    let next = (self.controls.option(i) + 1) % OPTIONS[i].choices.len();
+                    self.controls.set_option(i, next);
+                    self.save();
+                } else if row == actions + OPTIONS.len() {
+                    self.controls = Controls::default();
+                    self.capture = None;
+                    self.save();
+                } else {
+                    self.menu = Menu::Main;
+                    self.selected = 1;
+                    self.capture = None;
+                }
+            }
+        }
     }
 
     /// Меню ждёт клавишу для назначения.
@@ -121,14 +180,20 @@ impl GameUi {
     }
 
     /// Нажатая клавиша, пока меню ждёт её. Esc — отмена.
+    #[cfg(test)]
     pub(crate) fn capture_key(&mut self, code: KeyCode) {
+        self.capture_input(Input::Key(code));
+    }
+
+    /// Нажатая клавиша, кнопка мыши или щелчок колеса, пока меню ждёт назначения.
+    pub(crate) fn capture_input(&mut self, input: Input) {
         let Some(c) = self.capture.take() else {
             return;
         };
-        if code == KeyCode::Escape {
+        if input == Input::Key(KeyCode::Escape) {
             return;
         }
-        if self.controls.bind(c.action, code, c.replace) {
+        if self.controls.bind(c.action, input, c.replace) {
             self.save();
         } else {
             self.note = Some(("Эту клавишу назначить нельзя".into(), true));
@@ -260,21 +325,26 @@ impl GameUi {
         ui.vertical_centered(|ui| {
             ui.label(RichText::new("Пауза").size(28.0).strong());
             ui.add_space(12.0);
-            let big = |t: &str| {
-                egui::Button::new(RichText::new(t).size(18.0)).min_size([220.0, 36.0].into())
+            let selected = self.selected;
+            let big = |t: &str, row: usize| {
+                egui::Button::new(RichText::new(t).size(18.0))
+                    .min_size([220.0, 36.0].into())
+                    .selected(row == selected)
             };
-            if ui.add(big("Продолжить")).clicked() {
-                self.menu = Menu::Closed;
+            let mut clicked = None;
+            for (row, text) in ["Продолжить", "Управление", "Выйти из программы"]
+                .into_iter()
+                .enumerate()
+            {
+                if ui.add(big(text, row)).clicked() {
+                    clicked = Some(row);
+                }
             }
-            if ui.add(big("Управление")).clicked() {
-                self.menu = Menu::Controls;
-                self.note = None;
-            }
-            if ui.add(big("Выйти из программы")).clicked() {
-                self.quit = true;
+            if let Some(row) = clicked {
+                self.select(row);
             }
             ui.add_space(8.0);
-            ui.label(RichText::new("Esc — вернуться в игру").weak());
+            ui.label(RichText::new("Esc — вернуться в игру, ↑ ↓ и Enter — выбор").weak());
         });
     }
 
@@ -285,16 +355,24 @@ impl GameUi {
             .num_columns(4)
             .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                for a in Action::ALL {
-                    ui.label(RichText::new(a.label()).size(17.0));
-                    let keys = self.controls.keys(a);
+                for (row, a) in Action::ALL.into_iter().enumerate() {
+                    let mut name = RichText::new(a.label()).size(17.0);
+                    if row == self.selected {
+                        name = name.color(GOLD).strong();
+                    }
+                    ui.label(name);
+                    let keys = self.controls.inputs(a);
                     let waiting = self.capture.filter(|c| c.action == a);
                     if waiting.is_some() {
-                        ui.label(RichText::new("нажмите клавишу…").color(GOLD).size(17.0));
+                        ui.label(
+                            RichText::new("нажмите клавишу или кнопку мыши…")
+                                .color(GOLD)
+                                .size(17.0),
+                        );
                     } else if keys.is_empty() {
                         ui.label(RichText::new("нет клавиши").color(RED).size(17.0));
                     } else {
-                        let names: Vec<&str> = keys.iter().filter_map(|k| key_name(*k)).collect();
+                        let names: Vec<&str> = keys.iter().filter_map(|k| k.label()).collect();
                         ui.label(RichText::new(names.join("  /  ")).size(17.0));
                     }
                     if ui.button("Заменить").clicked() {
@@ -316,11 +394,39 @@ impl GameUi {
                     ui.end_row();
                 }
             });
+        ui.add_space(10.0);
+        ui.label(RichText::new("Поведение").size(20.0).strong());
+        egui::Grid::new("поведение")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                for (i, o) in OPTIONS.iter().enumerate() {
+                    let row = Action::ALL.len() + i;
+                    let mut name = RichText::new(o.label).size(17.0);
+                    if row == self.selected {
+                        name = name.color(GOLD).strong();
+                    }
+                    ui.label(name).on_hover_text(o.hint);
+                    let mut choice = self.controls.option(i);
+                    egui::ComboBox::from_id_salt(o.file)
+                        .selected_text(o.choices[choice].label)
+                        .show_ui(ui, |ui| {
+                            for (c, ch) in o.choices.iter().enumerate() {
+                                ui.selectable_value(&mut choice, c, ch.label);
+                            }
+                        });
+                    if choice != self.controls.option(i) {
+                        self.controls.set_option(i, choice);
+                        self.save();
+                    }
+                    ui.end_row();
+                }
+            });
         ui.add_space(6.0);
         if let Some(c) = self.capture {
             ui.label(
                 RichText::new(format!(
-                    "Нажмите клавишу для «{}». Esc — отмена.",
+                    "Нажмите клавишу или кнопку мыши для «{}». Esc — отмена.",
                     c.action.label()
                 ))
                 .color(GOLD),
@@ -344,17 +450,22 @@ impl GameUi {
             ui.label(if *bad { t.color(RED) } else { t.weak() });
         }
         ui.add_space(6.0);
+        let base = Action::ALL.len() + OPTIONS.len();
+        let selected = self.selected;
+        let mut clicked = None;
         ui.horizontal(|ui| {
-            if ui.button("По умолчанию").clicked() {
-                self.controls = Controls::default();
-                self.capture = None;
-                self.save();
-            }
-            if ui.button("Назад").clicked() {
-                self.menu = Menu::Main;
-                self.capture = None;
+            for (k, text) in ["По умолчанию", "Назад"].into_iter().enumerate() {
+                if ui
+                    .add(egui::Button::new(text).selected(selected == base + k))
+                    .clicked()
+                {
+                    clicked = Some(base + k);
+                }
             }
         });
+        if let Some(row) = clicked {
+            self.select(row);
+        }
     }
 }
 
@@ -423,12 +534,14 @@ fn outlined(painter: &egui::Painter, pos: Pos2, text: &str, size: f32, color: Co
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::controls::{Route, schemes};
 
     fn ui() -> GameUi {
         GameUi {
             controls: Controls::default(),
             path: std::env::temp_dir().join("reyvec-test-controls.ron"),
             menu: Menu::Closed,
+            selected: 0,
             capture: None,
             floats: Vec::new(),
             banner: 0.0,
@@ -443,12 +556,17 @@ mod tests {
     #[test]
     fn escape_walks_the_menu_and_menu_blocks_game_keys() {
         let mut g = ui();
-        assert_eq!(g.action(KeyCode::Space), Some(Action::Jump));
+        let space = Input::Key(KeyCode::Space);
+        let route = |g: &GameUi| {
+            g.controls
+                .route(&schemes(true, g.menu_open(), false), space)
+        };
+        assert_eq!(route(&g), Route::Game(Action::Jump));
         g.escape();
         assert!(g.menu_open());
         assert_eq!(
-            g.action(KeyCode::Space),
-            None,
+            route(&g),
+            Route::Menu(MenuAction::Select),
             "в меню клавиши не идут в игру"
         );
         g.menu = Menu::Controls;
@@ -475,6 +593,54 @@ mod tests {
         });
         g.capture_key(KeyCode::KeyW);
         assert_eq!(g.controls.keys(Action::Jump), &[KeyCode::KeyW]);
+        let _ = std::fs::remove_file(&g.path);
+    }
+
+    #[test]
+    fn menu_works_from_the_keyboard_and_binds_the_mouse() {
+        use crate::controls::{MouseKey, Wheel};
+        let mut g = ui();
+        g.escape();
+        assert_eq!(g.menu, Menu::Main);
+        // Вверх с первой строки — на последнюю («Выйти»), вниз — снова на первую.
+        g.menu_key(MenuAction::Up);
+        assert_eq!(g.selected, 2);
+        g.menu_key(MenuAction::Down);
+        g.menu_key(MenuAction::Down);
+        g.menu_key(MenuAction::Select);
+        assert_eq!(g.menu, Menu::Controls);
+        assert_eq!(g.selected, 0);
+        // Выбор строки действия — ждём клавишу или кнопку мыши.
+        g.menu_key(MenuAction::Down);
+        g.menu_key(MenuAction::Select);
+        assert!(g.capturing());
+        g.capture_input(Input::Mouse(MouseKey::Back));
+        assert_eq!(
+            g.controls.inputs(Action::Right),
+            &[Input::Mouse(MouseKey::Back)]
+        );
+        g.capture = Some(Capture {
+            action: Action::Jump,
+            replace: false,
+        });
+        g.capture_input(Input::Wheel(Wheel::Down));
+        assert_eq!(
+            g.controls.action_of(Input::Wheel(Wheel::Down)),
+            Some(Action::Jump)
+        );
+        // Строка настройки поведения: выбор переключает вариант.
+        g.selected = Action::ALL.len();
+        g.menu_key(MenuAction::Select);
+        assert!(!g.controls.attack_toward_cursor());
+        // «По умолчанию» и «Назад».
+        g.selected = Action::ALL.len() + OPTIONS.len();
+        g.menu_key(MenuAction::Select);
+        assert_eq!(g.controls, Controls::default());
+        g.menu_key(MenuAction::Down);
+        g.menu_key(MenuAction::Select);
+        assert_eq!(g.menu, Menu::Main);
+        g.menu_key(MenuAction::Back);
+        assert!(!g.menu_open());
         let _ = std::fs::remove_file(&g.path);
     }
 
