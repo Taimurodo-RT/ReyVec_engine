@@ -192,6 +192,21 @@ pub struct Solid {
 }
 
 /// Персонаж игрока (6.1): настройки, состояние и место появления; удар (6.5).
+/// Команда консоли разработчика для мира сцены (6.11).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DebugCommand {
+    /// Поставить героя в точку сцены.
+    Teleport([f64; 2]),
+    /// Задать здоровье (от 1 до наибольшего).
+    Health(u32),
+    /// Включить, выключить (`None` — переключить) бессмертие.
+    God(Option<bool>),
+    /// Вернуть героя в начало с полным здоровьем.
+    Respawn,
+    /// Где герой и с какой скоростью.
+    Where,
+}
+
 #[derive(Component, Clone, Debug, PartialEq)]
 pub struct Player {
     pub tuning: Tuning,
@@ -205,6 +220,8 @@ pub struct Player {
     pub anim: Animator,
     /// Здоровье (6.10б).
     pub health: Health,
+    /// Бессмертие из консоли разработчика: враги не ранят.
+    pub god: bool,
 }
 
 /// Предмет со скриптом (6.9): его таблица `me` в скрипте, прямоугольник касания героя
@@ -488,6 +505,13 @@ impl SceneWorld {
         self.update();
     }
 
+    /// Пересобирает снимок в то же время сцены, без шага (после команды консоли на
+    /// паузе).
+    pub fn refresh(&mut self) {
+        let t = self.world.resource::<SceneTime>().0;
+        self.update_at(t);
+    }
+
     /// Снимок для рисования после последнего [`SceneWorld::update`].
     pub fn snapshot(&self) -> Scene {
         let mut scene = self.world.resource::<Snapshot>().0.clone();
@@ -535,6 +559,46 @@ impl SceneWorld {
             place.at = body.pos;
             place.flip = body.facing < 0.0;
         }
+    }
+
+    /// Команда консоли разработчика (6.11): что сделано или почему нельзя.
+    pub fn debug(&mut self, command: &DebugCommand) -> Result<String, String> {
+        let mut q = self.world.query::<(&mut Player, &mut Placement)>();
+        let Some((mut p, mut place)) = q.iter_mut(&mut self.world).next() else {
+            return Err("в сцене нет героя".into());
+        };
+        let text = match *command {
+            DebugCommand::Teleport(at) => {
+                let facing = p.body.facing;
+                p.body = Body::new(at);
+                p.body.facing = facing;
+                format!("герой в ({:.2}, {:.2})", at[0], at[1])
+            }
+            DebugCommand::Health(hp) => {
+                let hp = hp.clamp(1, p.health.max);
+                p.health.hp = hp;
+                format!("здоровье {hp} из {}", p.health.max)
+            }
+            DebugCommand::God(on) => {
+                p.god = on.unwrap_or(!p.god);
+                if p.god {
+                    "бессмертие включено".into()
+                } else {
+                    "бессмертие выключено".into()
+                }
+            }
+            DebugCommand::Respawn => {
+                p.body = Body::new(p.spawn);
+                p.health.restore();
+                "герой в начале уровня".into()
+            }
+            DebugCommand::Where => format!(
+                "герой в ({:.2}, {:.2}), скорость ({:.2}, {:.2}), начало в ({:.2}, {:.2})",
+                p.body.pos[0], p.body.pos[1], p.body.vel[0], p.body.vel[1], p.spawn[0], p.spawn[1]
+            ),
+        };
+        place.at = p.body.pos;
+        Ok(text)
     }
 
     /// Твёрдое сцены на последнем шаге и настройки героя (для проверок).
@@ -695,6 +759,7 @@ impl Spawner<'_> {
                 hits: 0,
                 anim: Animator::default(),
                 health: Health::new(p.hp),
+                god: false,
             });
         }
         if let Some(b) = &n.body {
@@ -1182,6 +1247,7 @@ fn play(
         let me = p.body.bounds(&p.tuning).grow(CONTACT_REACH);
         let touch = targets
             .iter()
+            .filter(|_| !p.god)
             .find(|(_, t)| t.contact > 0 && t.dummy.alive() && me.overlaps(&t.dummy.bounds()));
         if let Some((_, t)) = touch {
             let amount = t.contact;
@@ -1736,6 +1802,8 @@ fn collect(
             hp: p.health.hp,
             max_hp: p.health.max,
             invulnerable: p.health.invulnerable > 0.0,
+            size: [p.tuning.size[0] as f32, p.tuning.size[1] as f32],
+            god: p.god,
         }),
         input_stamp: press.0,
         shake: if combat.shake_time > 0.0 {

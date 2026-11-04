@@ -211,7 +211,10 @@ impl Panel {
         info: &PanelInfo,
         game: Option<(&mut GameUi, &GameView)>,
     ) -> Option<UiFrame> {
-        self.menu = game.as_ref().is_some_and(|(g, _)| g.menu_open());
+        // Меню и консоль забирают мышь и клавиши себе.
+        self.menu = game
+            .as_ref()
+            .is_some_and(|(g, _)| g.menu_open() || g.console.is_open());
         if !self.visible && game.is_none() {
             return None;
         }

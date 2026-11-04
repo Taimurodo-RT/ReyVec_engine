@@ -9,7 +9,7 @@
 //! Общие данные между потоками — только снимки под коротким замком (кладём и берём
 //! готовое) и очередь команд; сам мир живёт только в потоке логики.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use reyvec_game::{Action, InputReader, InputShared};
 use reyvec_vector::{Affine, SceneItem};
 
-use crate::{Scene, SceneWorld};
+use crate::{DebugCommand, Scene, SceneWorld};
 
 /// Шаг логики: 60 раз в секунду (решение 0004).
 pub const STEP: Duration = Duration::from_nanos(1_000_000_000 / 60);
@@ -30,7 +30,12 @@ const MAX_CATCH_UP: u32 = 5;
 enum Command {
     /// Новый мир (файл сцены сохранили): время сцены продолжается.
     Replace(Box<SceneWorld>),
+    /// Команда консоли разработчика (6.11); ответ уходит в [`SceneLogic::take_replies`].
+    Debug(DebugCommand),
 }
+
+/// Самое медленное и самое быстрое время из консоли.
+pub const TIME_SCALE: (f64, f64) = (0.05, 4.0);
 
 struct Frames {
     prev: Scene,
@@ -44,6 +49,13 @@ struct Shared {
     stop: AtomicBool,
     /// Пауза (6.10б, открыто меню): мир не шагает, время сцены стоит.
     paused: AtomicBool,
+    /// Пауза из консоли разработчика (6.11): отдельно от меню, чтобы меню её не снимало.
+    debug_paused: AtomicBool,
+    /// Сколько шагов сделать на паузе из консоли («шаг»).
+    step_requests: AtomicU32,
+    /// Скорость времени (биты `f64`): 1 — обычная, 0,25 — в четыре раза медленнее.
+    /// Шаг логики остаётся 1/60 с времени сцены, реже или чаще делаются сами шаги.
+    time_scale: AtomicU64,
     steps: AtomicU64,
     /// Время одного шага логики (среднее, микросекунды).
     step_us: AtomicU64,
@@ -57,6 +69,7 @@ struct Shared {
 /// Поток логики сцены.
 pub struct SceneLogic {
     commands: Sender<Command>,
+    replies: Receiver<Result<String, String>>,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
 }
@@ -75,19 +88,24 @@ impl SceneLogic {
             }),
             stop: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            debug_paused: AtomicBool::new(false),
+            step_requests: AtomicU32::new(0),
+            time_scale: AtomicU64::new(1.0f64.to_bits()),
             steps: AtomicU64::new(0),
             step_us: AtomicU64::new(0),
             input: InputShared::new(),
             input_us: AtomicU64::new(0),
         });
         let (tx, rx) = channel();
+        let (reply_tx, reply_rx) = channel();
         let inner = shared.clone();
         let thread = std::thread::Builder::new()
             .name("логика сцены".into())
-            .spawn(move || run(world, start, rx, &inner))
+            .spawn(move || run(world, start, rx, &reply_tx, &inner))
             .expect("поток логики сцены");
         Self {
             commands: tx,
+            replies: reply_rx,
             shared,
             thread: Some(thread),
         }
@@ -102,7 +120,8 @@ impl SceneLogic {
     pub fn frame(&self, now: Instant) -> Scene {
         let frames = self.shared.frames.lock().expect("снимки логики");
         let since = now.saturating_duration_since(frames.cur_at).as_secs_f64();
-        let alpha = (since / STEP.as_secs_f64()).clamp(0.0, 1.0);
+        let interval = STEP.as_secs_f64() / self.time_scale();
+        let alpha = (since / interval).clamp(0.0, 1.0);
         Scene::lerp(&frames.prev, &frames.cur, alpha as f32)
     }
 
@@ -128,6 +147,51 @@ impl SceneLogic {
     /// Мир на паузе.
     pub fn paused(&self) -> bool {
         self.shared.paused.load(Ordering::Relaxed)
+    }
+
+    /// Команда консоли разработчика: выполнится в начале ближайшего шага (и на паузе),
+    /// ответ — в [`Self::take_replies`].
+    pub fn debug(&self, command: DebugCommand) {
+        let _ = self.commands.send(Command::Debug(command));
+        if let Some(t) = &self.thread {
+            t.thread().unpark();
+        }
+    }
+
+    /// Ответы на команды консоли, пришедшие с прошлого вызова.
+    pub fn take_replies(&self) -> Vec<Result<String, String>> {
+        self.replies.try_iter().collect()
+    }
+
+    /// Пауза из консоли разработчика.
+    pub fn set_debug_paused(&self, on: bool) {
+        if on {
+            self.shared.input.release_all();
+        }
+        self.shared.debug_paused.store(on, Ordering::Relaxed);
+    }
+
+    pub fn debug_paused(&self) -> bool {
+        self.shared.debug_paused.load(Ordering::Relaxed)
+    }
+
+    /// На паузе из консоли сделать ещё `n` шагов.
+    pub fn step(&self, n: u32) {
+        self.shared.step_requests.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Скорость времени (замедление из консоли), в пределах [`TIME_SCALE`].
+    pub fn set_time_scale(&self, scale: f64) -> f64 {
+        let scale = if scale.is_finite() { scale } else { 1.0 };
+        let scale = scale.clamp(TIME_SCALE.0, TIME_SCALE.1);
+        self.shared
+            .time_scale
+            .store(scale.to_bits(), Ordering::Relaxed);
+        scale
+    }
+
+    pub fn time_scale(&self) -> f64 {
+        f64::from_bits(self.shared.time_scale.load(Ordering::Relaxed))
     }
 
     /// Сколько в среднем нажатие ждёт шага логики, мс (`None`, пока нажатий не было).
@@ -164,37 +228,73 @@ impl Drop for SceneLogic {
     }
 }
 
-fn run(mut world: SceneWorld, start: f64, commands: Receiver<Command>, shared: &Shared) {
+fn run(
+    mut world: SceneWorld,
+    start: f64,
+    commands: Receiver<Command>,
+    replies: &Sender<Result<String, String>>,
+    shared: &Shared,
+) {
     let step = STEP.as_secs_f64();
     let mut step_index: u64 = 0;
     let mut next = Instant::now() + STEP;
     let mut average_us = 0.0f64;
     let mut input = InputReader::default();
     while !shared.stop.load(Ordering::Relaxed) {
+        // Скорость времени: реже или чаще шаги, сам шаг тот же.
+        let scale = f64::from_bits(shared.time_scale.load(Ordering::Relaxed));
+        let interval = STEP.div_f64(scale);
         let now = Instant::now();
+        // Команды выполняются сразу, даже на паузе и между шагами.
+        let mut changed = false;
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                // Файл сцены сохранили: персонаж остаётся там, где был.
+                Command::Replace(new) => {
+                    let body = world.player_body();
+                    world = *new;
+                    world.continue_from(start + step_index as f64 * step);
+                    if let Some(body) = body {
+                        world.set_player_body(body);
+                    }
+                }
+                Command::Debug(c) => {
+                    let _ = replies.send(world.debug(&c));
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            // Чтобы на паузе было видно, что сделала команда (герой переставлен).
+            world.refresh();
+            let snapshot = world.snapshot();
+            let mut frames = shared.frames.lock().expect("снимки логики");
+            frames.prev = snapshot.clone();
+            frames.cur = snapshot;
+        }
         if now < next {
             std::thread::park_timeout(next - now);
             continue;
         }
         // Отстали сильно — не догоняем, а продолжаем с текущего момента.
-        let behind = ((now - next).as_secs_f64() / step) as u32;
+        let behind = ((now - next).as_secs_f64() / interval.as_secs_f64()) as u32;
         if behind > MAX_CATCH_UP {
             next = now;
         }
-        while let Ok(Command::Replace(new)) = commands.try_recv() {
-            // Файл сцены сохранили: персонаж остаётся там, где был.
-            let body = world.player_body();
-            world = *new;
-            world.continue_from(start + step_index as f64 * step);
-            if let Some(body) = body {
-                world.set_player_body(body);
-            }
-        }
-        if shared.paused.load(Ordering::Relaxed) {
+        let stepping = shared.debug_paused.load(Ordering::Relaxed)
+            && !shared.paused.load(Ordering::Relaxed)
+            && shared
+                .step_requests
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok();
+        if !stepping
+            && (shared.paused.load(Ordering::Relaxed)
+                || shared.debug_paused.load(Ordering::Relaxed))
+        {
             // Время сцены стоит: шаг не делается. Нажатия, пришедшие на паузе, читаются
             // и выбрасываются, чтобы после неё герой не прыгнул сам.
             input.read(&shared.input);
-            next += STEP;
+            next += interval;
             continue;
         }
         let started = Instant::now();
@@ -220,7 +320,7 @@ fn run(mut world: SceneWorld, start: f64, commands: Receiver<Command>, shared: &
         }
         shared.steps.store(step_index, Ordering::Relaxed);
         shared.step_us.store(average_us as u64, Ordering::Relaxed);
-        next += STEP;
+        next += interval;
     }
 }
 

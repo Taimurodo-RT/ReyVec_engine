@@ -1108,6 +1108,10 @@ pub struct PlayerView {
     pub max_hp: u32,
     /// Неуязвим после удара.
     pub invulnerable: bool,
+    /// Размер прямоугольника столкновений (для показа столкновений в консоли, 6.11).
+    pub size: [f32; 2],
+    /// Бессмертие из консоли разработчика.
+    pub god: bool,
 }
 
 /// Готовые формы фигур: одна форма нарезается на треугольники один раз за работу
@@ -2016,13 +2020,13 @@ use reyvec_svg::SvgDrawing;
 mod tiles;
 mod world;
 pub use loader::{LoadJob, LoadResult, Loaded, Loader};
-pub use logic::{STEP, SceneLogic};
+pub use logic::{STEP, SceneLogic, TIME_SCALE};
 /// Игровые системы (этап 6): ввод и контроллер персонажа.
 pub use reyvec_game as game;
 pub use tiles::TilesDesc;
 pub use world::{
-    GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape, SvgPicture,
-    VectorShape,
+    DebugCommand, GlobalPlacement, LightSource, Motion, Placement, SceneTime, SceneWorld, SdfShape,
+    SvgPicture, VectorShape,
 };
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! Потом здесь появятся время с фиксированным шагом логики и ввод.
 
 mod app;
+mod console;
 mod controls;
 mod game_ui;
 mod gamepad;

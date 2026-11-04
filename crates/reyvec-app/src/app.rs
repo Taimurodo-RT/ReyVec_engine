@@ -419,10 +419,18 @@ impl App {
             let pan = crate::sound::pan_for(at[0], camera.center.x, camera.zoom, aspect);
             self.audio.play(sound, decibels, pan);
         }
+        // Консоль разработчика (6.11): команды набранного в прошлом кадре — потоку
+        // логики, его ответы — в журнал.
+        run_console(&mut self.game_ui.console, renderer.scene_logic());
         let game_view = crate::game_ui::GameView {
             player: renderer.player_stats().map(|p| p.view),
             center: [camera.center.x, camera.center.y],
             zoom: camera.zoom,
+            solids: if self.game_ui.console.colliders() {
+                renderer.file_solids().to_vec()
+            } else {
+                Vec::new()
+            },
         };
         let game_ui = &mut self.game_ui;
         let in_game = renderer.scene() == DemoScene::File;
@@ -604,6 +612,35 @@ impl ApplicationHandler for App {
         }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
+            // `~` (Ё) открывает и закрывает консоль разработчика (6.11).
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::Backquote),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if in_game && !self.game_ui.menu_open() => {
+                self.game_ui.console.toggle();
+                if self.game_ui.console.is_open()
+                    && let Some(r) = self.renderer.as_mut()
+                {
+                    r.release_game_input();
+                }
+            }
+            // Esc при открытой консоли закрывает её.
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::Escape),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } if in_game && self.game_ui.console.is_open() => self.game_ui.console.close(),
             // В игре Esc открывает меню (выход — из меню), в остальных сценах закрывает
             // окно.
             WindowEvent::KeyboardInput {
@@ -632,8 +669,9 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => self.close(event_loop),
-            // Пока открыто меню, клавиши песочницы не работают.
-            WindowEvent::KeyboardInput { .. } if in_game && self.game_ui.menu_open() => {}
+            // Пока открыто меню или консоль, клавиши песочницы не работают.
+            WindowEvent::KeyboardInput { .. }
+                if in_game && (self.game_ui.menu_open() || self.game_ui.console.is_open()) => {}
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -1069,6 +1107,47 @@ fn save_snapshot(image: reyvec_gpu::FrameImage) -> Option<(String, std::thread::
         Err(e) => tracing::error!("Снимок кадра не сохранён: {e}"),
     });
     Some((name, handle))
+}
+
+/// Выполняет команды консоли разработчика и забирает ответы потока логики.
+fn run_console(console: &mut crate::console::Console, logic: Option<&reyvec_scene::SceneLogic>) {
+    use crate::console::Order;
+    let orders = console.take_orders();
+    let Some(logic) = logic else {
+        if !orders.is_empty() {
+            console.reply(Err("команды работают в сцене с героем (N)".into()));
+        }
+        return;
+    };
+    for order in orders {
+        match order {
+            Order::World(c) => logic.debug(c),
+            Order::Pause(on) => {
+                let on = on.unwrap_or(!logic.debug_paused());
+                logic.set_debug_paused(on);
+                console.say(if on {
+                    "пауза: логика стоит («шаг» — по одному шагу)"
+                } else {
+                    "пауза снята"
+                });
+            }
+            Order::Step(n) => {
+                if !logic.debug_paused() {
+                    logic.set_debug_paused(true);
+                    console.say("пауза включена");
+                }
+                logic.step(n);
+                console.say(&format!("шагов: {n} (по 1/60 с)"));
+            }
+            Order::Slow(k) => {
+                let k = logic.set_time_scale(k);
+                console.say(&format!("скорость времени ×{k:.2}"));
+            }
+        }
+    }
+    for reply in logic.take_replies() {
+        console.reply(reply);
+    }
 }
 
 #[cfg(test)]
