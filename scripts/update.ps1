@@ -97,13 +97,14 @@ $commit = (git rev-parse --short=9 HEAD).Trim()
 $branchNow = (git rev-parse --abbrev-ref HEAD).Trim()
 Write-Ok "Ветка $branchNow, коммит $commit"
 
-Write-Step "Собираю песочницу (первый раз это может занять несколько минут)"
-Invoke-Checked "cargo" @("build", "--release", "-p", "reyvec-sandbox") "сборка не удалась. Пришли этот текст разработчику"
+Write-Step "Собираю песочницу и редактор (первый раз это может занять несколько минут)"
+Invoke-Checked "cargo" @("build", "--release", "-p", "reyvec-sandbox", "-p", "reyvec-editor") "сборка не удалась. Пришли этот текст разработчику"
 
 Write-Step "Копирую программу в папку dist"
 $dist = Join-Path $Root "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Copy-Item -Force (Join-Path $Root "target\release\reyvec-sandbox.exe") (Join-Path $dist "reyvec-sandbox.exe")
+Copy-Item -Force (Join-Path $Root "target\release\reyvec-editor.exe") (Join-Path $dist "reyvec-editor.exe")
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm"
 @(
     "ReyVec sandbox",
@@ -111,7 +112,7 @@ $stamp = Get-Date -Format "yyyy-MM-dd HH:mm"
     "commit: $commit",
     "built:  $stamp"
 ) | Set-Content -Encoding UTF8 (Join-Path $dist "version.txt")
-Write-Ok "Готово: dist\reyvec-sandbox.exe"
+Write-Ok "Готово: dist\reyvec-sandbox.exe и dist\reyvec-editor.exe"
 
-Write-Host "`nОбновление завершено. Запусти run.bat, чтобы открыть песочницу." -ForegroundColor Green
+Write-Host "`nОбновление завершено. Запусти run.bat, чтобы открыть песочницу, или editor.bat, чтобы открыть редактор." -ForegroundColor Green
 exit 0

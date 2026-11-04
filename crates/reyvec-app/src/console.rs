@@ -199,6 +199,14 @@ impl Kind {
 /// Строки логов программы, ещё не взятые консолью (их кладёт [`ConsoleLog`]).
 static LOG: Mutex<VecDeque<(Kind, String)>> = Mutex::new(VecDeque::new());
 
+/// Забирает строки логов программы, ещё не взятые консолью, с цветом их уровня
+/// (для консоли редактора).
+pub(crate) fn take_log() -> Vec<(Color32, String)> {
+    LOG.lock()
+        .map(|mut log| log.drain(..).map(|(k, t)| (k.color(), t)).collect())
+        .unwrap_or_default()
+}
+
 /// Слой логов: копирует сообщения программы (от «info» и выше) в журнал консоли.
 pub struct ConsoleLog;
 
