@@ -9,13 +9,13 @@ use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use egui::{
-    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Layout, Margin, Pos2, Rect,
-    Response, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Layout, Margin, Pos2,
+    Rect, Response, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2,
 };
 use reyvec_scene::{Background, NodeDesc, SceneFile};
 use winit::window::ResizeDirection;
 
-use super::layout::{Side, Tab, WORKSPACES, Workspace};
+use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
 use super::outline::{self, Kind};
 use super::theme::*;
 
@@ -90,13 +90,33 @@ pub(crate) struct EditorUi {
     viewport: Option<Rect>,
     viewport_hovered: bool,
     actions: Vec<Action>,
+    /// Что показывать в нижней строке (меню «Вид → Нижняя строка»).
+    status: [bool; STATUS_ITEMS.len()],
+    /// Ширина вкладок пространств в прошлом кадре: по ней они ставятся в середину полосы.
+    tabs_width: f32,
 }
+
+/// Элементы нижней строки, их можно выключить в меню «Вид». Порядок — как на экране.
+const STATUS_ITEMS: [&str; 6] = [
+    "Сцена и её состояние",
+    "Видеокарта",
+    "Число предметов",
+    "Кадров в секунду",
+    "Время кадра",
+    "Подсказка клавиш",
+];
+const ST_SCENE: usize = 0;
+const ST_GPU: usize = 1;
+const ST_COUNT: usize = 2;
+const ST_FPS: usize = 3;
+const ST_FRAME: usize = 4;
+const ST_HINT: usize = 5;
 
 impl EditorUi {
     /// `project`: папка проекта (в ней `assets` и `scenes`), если нашлась.
     pub(crate) fn new(project: Option<&Path>) -> Self {
         Self {
-            workspace: 0,
+            workspace: START_WORKSPACE,
             tabs: vec![[0; 3]; WORKSPACES.len()],
             selected: None,
             open: HashSet::new(),
@@ -105,6 +125,8 @@ impl EditorUi {
             viewport: None,
             viewport_hovered: false,
             actions: Vec::new(),
+            status: [true; STATUS_ITEMS.len()],
+            tabs_width: 0.0,
         }
     }
 
@@ -150,32 +172,38 @@ impl EditorUi {
             .exact_size(TITLE_HEIGHT)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::NONE.fill(BAR).inner_margin(Margin::symmetric(8, 0)))
+            .frame(Frame::NONE.fill(BAR).inner_margin(PAD_BAR))
             .show(ui, |ui| self.title_bar(ui, info));
         egui::Panel::bottom("editor-status")
             .exact_size(STATUS_HEIGHT)
             .resizable(false)
             .show_separator_line(false)
-            .frame(Frame::NONE.fill(BAR).inner_margin(Margin::symmetric(12, 0)))
-            .show(ui, |ui| status_bar(ui, info));
+            .frame(
+                Frame::NONE
+                    .fill(BAR)
+                    .inner_margin(Margin::symmetric(GAP_XL as i8, 0)),
+            )
+            .show(ui, |ui| status_bar(ui, info, &self.status));
         let ws = &WORKSPACES[self.workspace];
         let panel_frame = Frame::NONE.fill(PANEL);
-        egui::Panel::left(("editor-left", self.workspace))
+        // Одни и те же панели у всех пространств: размер, который потянули мышью,
+        // сохраняется при переходе между вкладками.
+        egui::Panel::left("editor-left")
             .resizable(true)
-            .default_size(ws.left.size)
-            .size_range(160.0..=600.0)
+            .default_size(LEFT_WIDTH)
+            .size_range(SIDE_RANGE)
             .frame(panel_frame)
             .show(ui, |ui| self.area(ui, ws, Side::Left, info));
-        egui::Panel::right(("editor-right", self.workspace))
+        egui::Panel::right("editor-right")
             .resizable(true)
-            .default_size(ws.right.size)
-            .size_range(200.0..=640.0)
+            .default_size(RIGHT_WIDTH)
+            .size_range(SIDE_RANGE)
             .frame(panel_frame)
             .show(ui, |ui| self.area(ui, ws, Side::Right, info));
-        egui::Panel::bottom(("editor-bottom", self.workspace))
+        egui::Panel::bottom("editor-bottom")
             .resizable(true)
-            .default_size(ws.bottom.size)
-            .size_range(90.0..=640.0)
+            .default_size(BOTTOM_HEIGHT)
+            .size_range(BOTTOM_RANGE)
             .frame(panel_frame)
             .show(ui, |ui| self.area(ui, ws, Side::Bottom, info));
         egui::CentralPanel::no_frame().show(ui, |ui| self.scene_view(ui, info));
@@ -224,7 +252,7 @@ impl EditorUi {
         ui.painter().hline(
             full.x_range(),
             full.bottom() - 0.5,
-            Stroke::new(1.0, BORDER),
+            Stroke::new(LINE, BORDER),
         );
         let drag = ui.interact(
             bar,
@@ -239,73 +267,109 @@ impl EditorUi {
                 self.actions.push(Action::ToggleMaximize);
             }
         }
+        let mut left = 0.0;
+        let mut right = bar.right();
         ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.spacing_mut().item_spacing.x = GAP_S;
             logo(ui);
-            ui.label(RichText::new("ReyVec").color(TEXT).size(15.0));
-            ui.label(RichText::new("Редактор").color(MUTED));
-            ui.add_space(10.0);
             ui.scope(|ui| self.menus(ui));
-            ui.add_space(10.0);
-            self.workspace_tabs(ui);
+            left = ui.min_rect().right();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 if info.frameless {
                     self.window_buttons(ui, info);
-                    ui.add_space(12.0);
+                    ui.add_space(GAP_XL);
                 }
-                ui.spacing_mut().item_spacing.x = 6.0;
-                ui.label(
-                    RichText::new(format!("{:.0} к/с · {:.1} мс", info.fps, info.frame_ms))
-                        .monospace()
-                        .color(MUTED),
-                );
-                ui.add_space(8.0);
+                ui.spacing_mut().item_spacing.x = GAP_M;
                 self.play_buttons(ui, info.play);
+                right = ui.min_rect().left();
             });
         });
+        // Вкладки пространств посередине окна; если места мало — сразу за названием.
+        let w = self.tabs_width;
+        let x = (full.center().x - w / 2.0).clamp(left + GAP_XL, (right - GAP_XL - w).max(left));
+        let rect = Rect::from_min_size(pos2(x, bar.top()), vec2(w.max(1.0), bar.height()));
+        let r = ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| self.workspace_tabs(ui),
+        );
+        if (r.inner - self.tabs_width).abs() > 0.5 {
+            // Первый кадр или новый шрифт: переложить кадр, чтобы вкладки не прыгали.
+            ui.ctx().request_discard("ширина вкладок пространств");
+        }
+        self.tabs_width = r.inner;
     }
 
+    /// Меню под названием движка: «Файл», «Вид», «Справка» и их пункты.
     fn menus(&mut self, ui: &mut Ui) {
-        // Пункты меню без рамки, как подписи; рамка только под мышью.
+        // Название — как подпись, без рамки; рамка только под мышью.
         let w = &mut ui.visuals_mut().widgets;
         w.inactive.weak_bg_fill = Color32::TRANSPARENT;
         w.inactive.bg_stroke = Stroke::NONE;
+        let mut pick = None;
         let actions = &mut self.actions;
-        ui.menu_button(RichText::new("Файл").color(TEXT_DIM), |ui| {
-            if ui.button("Перечитать сцену с диска").clicked() {
-                actions.push(Action::ReloadScene);
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("Выход").clicked() {
-                actions.push(Action::Close);
-                ui.close();
-            }
+        let current = self.workspace;
+        let status = &mut self.status;
+        let brand = RichText::new("ReyVec").color(TEXT).size(FONT_BRAND);
+        ui.menu_button(brand, |ui| {
+            ui.set_min_width(180.0);
+            ui.menu_button("Файл", |ui| {
+                if ui.button("Перечитать сцену с диска").clicked() {
+                    actions.push(Action::ReloadScene);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Выход").clicked() {
+                    actions.push(Action::Close);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Вид", |ui| {
+                for (i, w) in WORKSPACES.iter().enumerate() {
+                    if ui
+                        .selectable_label(i == current, w.name)
+                        .on_hover_text(w.hint)
+                        .clicked()
+                    {
+                        pick = Some(i);
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.menu_button("Нижняя строка", |ui| {
+                    for (on, name) in status.iter_mut().zip(STATUS_ITEMS) {
+                        ui.checkbox(on, name);
+                    }
+                });
+                if ui.button("Камера в начало сцены").clicked() {
+                    actions.push(Action::ResetCamera);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Справка", |ui| {
+                ui.label("F5 — играть или остановить");
+                ui.label("Esc во время игры — остановить");
+                ui.label("Колесо над сценой — приблизить");
+                ui.label("Перетаскивание сцены — сдвинуть камеру");
+                ui.label("Двойной щелчок по верхней полосе — окно меньше или больше");
+            });
         });
-        ui.menu_button(RichText::new("Вид").color(TEXT_DIM), |ui| {
-            if ui.button("Камера в начало сцены").clicked() {
-                actions.push(Action::ResetCamera);
-                ui.close();
-            }
-        });
-        ui.menu_button(RichText::new("Справка").color(TEXT_DIM), |ui| {
-            ui.label("F5 — играть или остановить");
-            ui.label("Esc во время игры — остановить");
-            ui.label("Колесо над сценой — приблизить");
-            ui.label("Перетаскивание сцены — сдвинуть камеру");
-            ui.label("Двойной щелчок по верхней полосе — окно меньше или больше");
-        });
+        if let Some(i) = pick {
+            self.workspace = i;
+        }
     }
 
-    fn workspace_tabs(&mut self, ui: &mut Ui) {
+    /// Вкладки пространств; возвращает их ширину.
+    fn workspace_tabs(&mut self, ui: &mut Ui) -> f32 {
         Frame::NONE
             .fill(BG)
-            .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(10)
-            .inner_margin(Margin::same(3))
+            .stroke(Stroke::new(LINE, BORDER))
+            .corner_radius(RADIUS_L)
+            .inner_margin(Margin::same(GAP_XS as i8 + 1))
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().item_spacing.x = GAP_XS;
                 for (i, w) in WORKSPACES.iter().enumerate() {
                     let on = i == self.workspace;
                     let text =
@@ -313,12 +377,15 @@ impl EditorUi {
                     let button = egui::Button::new(text)
                         .fill(if on { HOVER } else { Color32::TRANSPARENT })
                         .stroke(Stroke::NONE)
-                        .corner_radius(7);
-                    if ui.add(button).clicked() {
+                        .corner_radius(RADIUS_L - 3);
+                    if ui.add(button).on_hover_text(w.hint).clicked() {
                         self.workspace = i;
                     }
                 }
-            });
+            })
+            .response
+            .rect
+            .width()
     }
 
     fn play_buttons(&mut self, ui: &mut Ui, play: PlayState) {
@@ -349,7 +416,7 @@ impl EditorUi {
     }
 
     fn window_buttons(&mut self, ui: &mut Ui, info: &Info) {
-        let size = vec2(46.0, TITLE_HEIGHT);
+        let size = vec2(WINDOW_BUTTON_WIDTH, TITLE_HEIGHT);
         for (icon, action, hover) in [
             (Icon::Close, Action::Close, CLOSE_HOVER),
             (
@@ -388,29 +455,27 @@ impl EditorUi {
 
     /// Одна область: строка вкладок и открытая вкладка.
     fn area(&mut self, ui: &mut Ui, ws: &Workspace, side: Side, info: &Info) {
-        let tabs = ws.area(side).tabs;
+        let tabs = ws.tabs(side);
         let active = &mut self.tabs[self.workspace][side.index()];
         if *active >= tabs.len() {
             *active = 0;
         }
         tab_strip(ui, tabs, active);
         let tab = tabs[*active];
-        Frame::NONE
-            .inner_margin(Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt(("area", self.workspace, side.index()))
-                    .auto_shrink(false)
-                    .stick_to_bottom(tab == Tab::Console)
-                    .show(ui, |ui| match tab {
-                        Tab::Hierarchy => self.hierarchy(ui, info),
-                        Tab::Inspector => self.inspector(ui, info),
-                        Tab::Assets => self.assets.draw(ui),
-                        Tab::Console => console(ui, &self.log),
-                        Tab::Profiler => profiler(ui, info),
-                        Tab::Soon { title, text } => soon(ui, title, text),
-                    });
-            });
+        Frame::NONE.inner_margin(PAD_PANEL).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt(("area", self.workspace, side.index()))
+                .auto_shrink(false)
+                .stick_to_bottom(tab == Tab::Console)
+                .show(ui, |ui| match tab {
+                    Tab::Hierarchy => self.hierarchy(ui, info),
+                    Tab::Inspector => self.inspector(ui, info),
+                    Tab::Assets => self.assets.draw(ui),
+                    Tab::Console => console(ui, &self.log),
+                    Tab::Profiler => profiler(ui, info),
+                    Tab::Soon { title, text } => soon(ui, title, text),
+                });
+        });
     }
 
     fn hierarchy(&mut self, ui: &mut Ui, info: &Info) {
@@ -427,20 +492,20 @@ impl EditorUi {
         for row in outline::rows(file, &self.open) {
             let selected = self.selected.as_ref() == Some(&row.path);
             let (rect, response) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click());
+                ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
             let painter = ui.painter();
             if selected {
                 painter.rect(
                     rect,
                     6,
                     SELECT_BG,
-                    Stroke::new(1.0, SELECT),
+                    Stroke::new(LINE, SELECT),
                     egui::StrokeKind::Inside,
                 );
             } else if response.hovered() {
                 painter.rect_filled(rect, 6, HOVER);
             }
-            let indent = rect.left() + 6.0 + row.depth as f32 * 16.0;
+            let indent = rect.left() + GAP_M + row.depth as f32 * INDENT;
             let arrow = Rect::from_min_size(pos2(indent, rect.top()), vec2(14.0, rect.height()));
             if row.has_children {
                 let open = self.open.contains(&row.path);
@@ -463,7 +528,7 @@ impl EditorUi {
                 pos2(dot.right() + 8.0, rect.center().y),
                 Align2::LEFT_CENTER,
                 &row.name,
-                FontId::proportional(13.5),
+                FontId::proportional(FONT_BODY),
                 if selected { Color32::WHITE } else { TEXT_DIM },
             );
             if response.clicked() {
@@ -536,7 +601,7 @@ impl EditorUi {
             painter.rect_stroke(
                 rect.shrink(1.0),
                 0,
-                Stroke::new(2.0, ACCENT),
+                Stroke::new(LINE_FOCUS, ACCENT),
                 egui::StrokeKind::Inside,
             );
         }
@@ -570,7 +635,7 @@ fn tab_strip(ui: &mut Ui, tabs: &[Tab], active: &mut usize) {
     );
     let mut x = rect.left() + 6.0;
     for (i, tab) in tabs.iter().enumerate() {
-        let font = FontId::proportional(13.5);
+        let font = FontId::proportional(FONT_BODY);
         let width = ui
             .painter()
             .layout_no_wrap(tab.label().to_owned(), font.clone(), TEXT)
@@ -741,19 +806,62 @@ fn scene_inspector(ui: &mut Ui, file: &SceneFile, name: &str) {
     );
 }
 
+/// Карточка с заголовком; щелчок по заголовку сворачивает её (запоминается по названию).
 fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     Frame::NONE
         .fill(CARD)
-        .stroke(Stroke::new(1.0, BORDER_STRONG))
-        .corner_radius(10)
-        .inner_margin(Margin::symmetric(12, 10))
+        .stroke(Stroke::new(LINE, BORDER_STRONG))
+        .corner_radius(RADIUS_L)
+        .inner_margin(PAD_CARD)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).color(TEXT).size(14.0));
-            ui.add_space(2.0);
-            add(ui);
+            let id = Id::unique(("editor-card", title));
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                true,
+            );
+            let (rect, header) = ui.allocate_exact_size(
+                vec2(ui.available_width(), FONT_TITLE + GAP_S),
+                Sense::click(),
+            );
+            if header.clicked() {
+                state.toggle(ui);
+            }
+            let open = state.openness(ui.ctx());
+            let color = if header.hovered() {
+                Color32::WHITE
+            } else {
+                TEXT
+            };
+            let arrow = Rect::from_center_size(
+                pos2(rect.right() - GAP_M, rect.center().y),
+                vec2(GAP_L, GAP_L),
+            );
+            let painter = ui.painter();
+            paint_icon(
+                painter,
+                arrow.center(),
+                if open > 0.5 {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                MUTED,
+            );
+            painter.text(
+                pos2(rect.left(), rect.center().y),
+                Align2::LEFT_CENTER,
+                title,
+                FontId::proportional(FONT_TITLE),
+                color,
+            );
+            state.show_body_unindented(ui, |ui| {
+                ui.add_space(GAP_XS);
+                add(ui);
+            });
         });
-    ui.add_space(6.0);
+    ui.add_space(GAP_M);
 }
 
 fn prop(ui: &mut Ui, name: &str) {
@@ -764,8 +872,8 @@ fn prop(ui: &mut Ui, name: &str) {
 fn value(ui: &mut Ui, text: &str, mark: Option<Color32>) {
     let r = Frame::NONE
         .fill(BG)
-        .corner_radius(6)
-        .inner_margin(Margin::symmetric(8, 3))
+        .corner_radius(RADIUS_S)
+        .inner_margin(PAD_FIELD)
         .show(ui, |ui| {
             ui.set_min_width(56.0);
             ui.label(RichText::new(text).monospace().color(TEXT));
@@ -799,7 +907,7 @@ fn console(ui: &mut Ui, log: &VecDeque<(Color32, String)>) {
 fn profiler(ui: &mut Ui, info: &Info) {
     egui::Grid::new("profiler")
         .num_columns(2)
-        .spacing(vec2(16.0, 6.0))
+        .spacing(vec2(GAP_XXL, GAP_M))
         .show(ui, |ui| {
             prop(ui, "Кадров в секунду");
             ui.label(RichText::new(format!("{:.0}", info.fps)).monospace());
@@ -849,24 +957,51 @@ fn soon(ui: &mut Ui, title: &str, text: &str) {
     );
 }
 
-fn status_bar(ui: &mut Ui, info: &Info) {
+/// Нижняя строка: короткие сведения слева и справа; лишнее выключается в меню «Вид».
+fn status_bar(ui: &mut Ui, info: &Info, on: &[bool; STATUS_ITEMS.len()]) {
+    let small = |text: String, color| RichText::new(text).small().color(color);
     ui.horizontal_centered(|ui| {
-        ui.spacing_mut().item_spacing.x = 16.0;
-        let (dot, text) = match info.error {
-            Some(_) => (BAD, format!("Ошибка в сцене {}", info.scene_name)),
-            None => (GOOD, format!("Сцена {}", info.scene_name)),
-        };
-        ui.label(RichText::new(format!("● {text}")).small().color(dot));
-        ui.label(RichText::new(info.adapter).small().color(MUTED));
-        if let Some(file) = info.scene {
-            ui.label(
-                RichText::new(format!("Предметов: {}", outline::count(file)))
-                    .small()
-                    .color(MUTED),
-            );
+        ui.spacing_mut().item_spacing.x = GAP_XXL;
+        if on[ST_SCENE] {
+            let (dot, text) = match info.error {
+                Some(_) => (BAD, format!("Ошибка в сцене {}", info.scene_name)),
+                None => (GOOD, format!("Сцена {}", info.scene_name)),
+            };
+            ui.label(small(format!("● {text}"), dot));
+        }
+        if on[ST_GPU] {
+            ui.label(small(info.adapter.to_owned(), MUTED));
+        }
+        if on[ST_COUNT]
+            && let Some(file) = info.scene
+        {
+            ui.label(small(format!("Предметов: {}", outline::count(file)), MUTED));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new("F5 — играть или стоп").small().color(MUTED));
+            if on[ST_HINT] {
+                ui.label(small("F5 — играть или стоп".into(), MUTED));
+            }
+            if on[ST_FRAME] {
+                let gpu = info
+                    .gpu_ms
+                    .map_or_else(String::new, |ms| format!(" · видеокарта {ms:.1} мс"));
+                let text = format!("кадр {:.1} мс{gpu}", info.frame_ms);
+                ui.label(
+                    RichText::new(text)
+                        .monospace()
+                        .size(FONT_SMALL)
+                        .color(MUTED),
+                );
+            }
+            if on[ST_FPS] {
+                let text = format!("{:.0} к/с", info.fps);
+                ui.label(
+                    RichText::new(text)
+                        .monospace()
+                        .size(FONT_SMALL)
+                        .color(TEXT_DIM),
+                );
+            }
         });
     });
 }
@@ -889,7 +1024,7 @@ fn logo(ui: &mut Ui) {
 
 /// Подпись на тёмной плашке поверх сцены.
 fn chip(painter: &egui::Painter, at: Pos2, text: &str, color: Color32) {
-    let galley = painter.layout_no_wrap(text.to_owned(), FontId::proportional(12.5), color);
+    let galley = painter.layout_no_wrap(text.to_owned(), FontId::proportional(FONT_CHIP), color);
     let rect = Rect::from_min_size(at, galley.size() + vec2(16.0, 8.0));
     painter.rect(
         rect,
@@ -1002,14 +1137,14 @@ fn paint_icon(painter: &egui::Painter, c: Pos2, icon: Icon, color: Color32) {
 
 /// Кнопка со значком и подписью; `primary` — залитая цветом акцента.
 fn icon_button(ui: &mut Ui, icon: Icon, text: &str, primary: bool) -> Response {
-    let font = FontId::proportional(13.5);
+    let font = FontId::proportional(FONT_BODY);
     let (fg, fill) = if primary {
         (ON_ACCENT, ACCENT)
     } else {
         (TEXT, RAISED)
     };
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
-    let size = vec2(galley.size().x + 40.0, 30.0);
+    let size = vec2(galley.size().x + 40.0, BUTTON_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let fill = if response.hovered() {
         if primary {
@@ -1023,7 +1158,7 @@ fn icon_button(ui: &mut Ui, icon: Icon, text: &str, primary: bool) -> Response {
     let stroke = if primary {
         Stroke::NONE
     } else {
-        Stroke::new(1.0, BORDER_STRONG)
+        Stroke::new(LINE, BORDER_STRONG)
     };
     ui.painter()
         .rect(rect, 8, fill, stroke, egui::StrokeKind::Inside);
@@ -1172,7 +1307,7 @@ fn asset_tile(ui: &mut Ui, name: &str) {
         thumb.center(),
         Align2::CENTER_CENTER,
         ext,
-        FontId::monospace(12.0),
+        FontId::monospace(FONT_SMALL),
         MUTED,
     );
     let short: String = if name.chars().count() > 14 {
@@ -1184,7 +1319,7 @@ fn asset_tile(ui: &mut Ui, name: &str) {
         pos2(rect.left() + 2.0, thumb.bottom() + 8.0),
         Align2::LEFT_TOP,
         short,
-        FontId::proportional(12.0),
+        FontId::proportional(FONT_SMALL),
         TEXT_DIM,
     );
     response.on_hover_text(name);
@@ -1320,18 +1455,38 @@ mod tests {
         ui.open.insert(vec![hero]);
         let (w, h) = (1600usize, 900usize);
         let mut textures: HashMap<egui::TextureId, (usize, usize, Vec<Color32>)> = HashMap::new();
-        for (ws, play) in [
-            (0, PlayState::Edit),
-            (0, PlayState::Playing),
-            (1, PlayState::Edit),
-            (3, PlayState::Edit),
+        // Мир, Мир во время игры, Ассеты, Сюжет, Логика и Мир с раскрытым меню «ReyVec → Вид».
+        for (ws, play, menu) in [
+            (START_WORKSPACE, PlayState::Edit, false),
+            (START_WORKSPACE, PlayState::Playing, false),
+            (1, PlayState::Edit, false),
+            (0, PlayState::Edit, false),
+            (3, PlayState::Edit, false),
+            (START_WORKSPACE, PlayState::Edit, true),
         ] {
             ui.workspace = ws;
             let info = info(Some(&file), play);
             let mut out = None;
-            for _ in 0..3 {
+            for frame in 0..12u32 {
+                let mut events = Vec::new();
+                if menu {
+                    let at = |x, y| egui::Event::PointerMoved(pos2(x, y));
+                    let click = |pressed| egui::Event::PointerButton {
+                        pos: pos2(64.0, TITLE_HEIGHT / 2.0),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    };
+                    match frame {
+                        0 => events.extend([at(64.0, TITLE_HEIGHT / 2.0), click(true)]),
+                        1 => events.push(click(false)),
+                        2.. => events.push(at(80.0, TITLE_HEIGHT + 44.0)),
+                    }
+                }
                 let input = egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(w as f32, h as f32))),
+                    events,
+                    time: Some(f64::from(frame) * 0.1),
                     ..Default::default()
                 };
                 let mut o = ctx.run_ui(input, |u| ui.draw(u, &info));
@@ -1428,7 +1583,8 @@ mod tests {
                 height: h as u32,
                 rgba,
             };
-            let name = format!("{}-{:?}.png", WORKSPACES[ws].name, play);
+            let menu = if menu { "-меню" } else { "" };
+            let name = format!("{}-{:?}{menu}.png", WORKSPACES[ws].name, play);
             crate::snapshot::save_png(&out_dir.join(name), &image).unwrap();
         }
     }
