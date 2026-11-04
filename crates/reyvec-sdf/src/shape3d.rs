@@ -1,0 +1,692 @@
+//! Объёмные формы из полей расстояний (этап 7.2): дерево из примитивов и операций, его
+//! «байт-код» для видеокарты и расчёт того же байт-кода на процессоре.
+//!
+//! Форма описывается данными ([`Shape3`]), а не кодом шейдера: так её можно менять на лету,
+//! читать из файла сцены (7.5) и собирать мышкой в будущем редакторе. Дерево:
+//!
+//! - **примитивы**: шар, коробка (со скруглением), капсула, цилиндр, тор, плоскость;
+//! - **операции**: объединить, вырезать, пересечь — резко или плавно (`smooth` — ширина
+//!   плавного перехода в метрах);
+//! - **сдвиг, поворот и масштаб** ([`Shape3::Move`]) и **материал** ([`Shape3::Paint`]).
+//!
+//! [`compile`] превращает дерево в короткую программу для стековой машины: каждый
+//! примитив кладёт на стек расстояние и материал, операция снимает два и кладёт одно.
+//! Сдвиги и повороты сворачиваются в одну матрицу на примитив, так что видеокарта не
+//! обходит дерево. Шейдер `include/sdf3d.slang` выполняет ту же программу, что и
+//! [`Program::distance`] здесь: формулы — зеркало друг друга, менять вместе.
+//!
+//! После плавных операций и масштаба поле остаётся «снизу» (не больше настоящего
+//! расстояния), поэтому по нему можно шагать лучом и не проскочить поверхность.
+
+use glam::{Mat3, Vec3};
+use serde::{Deserialize, Serialize};
+
+/// Объёмная форма: примитив, операция над формами, сдвиг или материал.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Shape3 {
+    /// Шар радиусом `radius` с серединой в начале координат.
+    Sphere { radius: f32 },
+    /// Коробка размером `size` (полная ширина, высота, глубина), углы скруглены на `round`.
+    Box {
+        size: [f32; 3],
+        #[serde(default)]
+        round: f32,
+    },
+    /// Капсула вдоль Y: отрезок длиной `height` (без полусфер) с радиусом `radius`.
+    Capsule { height: f32, radius: f32 },
+    /// Цилиндр вдоль Y высотой `height` и радиусом `radius`, края скруглены на `round`.
+    Cylinder {
+        height: f32,
+        radius: f32,
+        #[serde(default)]
+        round: f32,
+    },
+    /// Тор в плоскости XZ: радиус кольца `radius`, толщина `thickness` (радиус трубки).
+    Torus { radius: f32, thickness: f32 },
+    /// Плоскость: всё по ту сторону от `normal` дальше `offset` от начала — внутри.
+    /// `normal: (0, 1, 0), offset: 0` — пол на высоте 0.
+    Plane { normal: [f32; 3], offset: f32 },
+    /// Объединение: всё, что есть хотя бы в одной форме.
+    Union {
+        shapes: Vec<Shape3>,
+        #[serde(default)]
+        smooth: f32,
+    },
+    /// Из `base` вырезаны формы `cut`.
+    Subtract {
+        base: Box<Shape3>,
+        cut: Vec<Shape3>,
+        #[serde(default)]
+        smooth: f32,
+    },
+    /// Пересечение: только то, что есть во всех формах.
+    Intersect {
+        shapes: Vec<Shape3>,
+        #[serde(default)]
+        smooth: f32,
+    },
+    /// Форма, сдвинутая в `at`, повёрнутая на `turn` (градусы вокруг X, потом Y, потом Z)
+    /// и увеличенная в `scale` раз.
+    Move {
+        #[serde(default)]
+        at: [f32; 3],
+        #[serde(default)]
+        turn: [f32; 3],
+        #[serde(default = "one")]
+        scale: f32,
+        shape: Box<Shape3>,
+    },
+    /// Материал `material` (номер в списке материалов) для всех примитивов внутри.
+    Paint { material: u32, shape: Box<Shape3> },
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+impl Shape3 {
+    /// Сдвинутая копия формы.
+    pub fn at(self, at: [f32; 3]) -> Self {
+        Self::Move {
+            at,
+            turn: [0.0; 3],
+            scale: 1.0,
+            shape: Box::new(self),
+        }
+    }
+
+    /// Сдвинутая и повёрнутая копия (градусы вокруг X, Y, Z).
+    pub fn placed(self, at: [f32; 3], turn: [f32; 3]) -> Self {
+        Self::Move {
+            at,
+            turn,
+            scale: 1.0,
+            shape: Box::new(self),
+        }
+    }
+
+    /// Форма с материалом `material`.
+    pub fn paint(self, material: u32) -> Self {
+        Self::Paint {
+            material,
+            shape: Box::new(self),
+        }
+    }
+
+    /// Расстояние до формы прямо по дереву (медленно, для проверок): то же, что даёт
+    /// скомпилированная программа.
+    pub fn distance(&self, p: Vec3) -> f32 {
+        match self {
+            Self::Sphere { radius } => sd_sphere(p, *radius),
+            Self::Box { size, round } => sd_box(p, Vec3::from(*size) * 0.5, *round),
+            Self::Capsule { height, radius } => sd_capsule(p, *height * 0.5, *radius),
+            Self::Cylinder {
+                height,
+                radius,
+                round,
+            } => sd_cylinder(p, *height * 0.5, *radius, *round),
+            Self::Torus { radius, thickness } => sd_torus(p, *radius, *thickness),
+            Self::Plane { normal, offset } => sd_plane(p, Vec3::from(*normal), *offset),
+            Self::Union { shapes, smooth } => shapes
+                .iter()
+                .map(|s| s.distance(p))
+                .reduce(|a, b| op_union(a, b, *smooth))
+                .unwrap_or(f32::MAX),
+            Self::Subtract { base, cut, smooth } => cut.iter().fold(base.distance(p), |a, c| {
+                op_subtract(a, c.distance(p), *smooth)
+            }),
+            Self::Intersect { shapes, smooth } => shapes
+                .iter()
+                .map(|s| s.distance(p))
+                .reduce(|a, b| op_intersect(a, b, *smooth))
+                .unwrap_or(f32::MAX),
+            Self::Move {
+                at,
+                turn,
+                scale,
+                shape,
+            } => {
+                let local = rotation(*turn).transpose() * (p - Vec3::from(*at)) / *scale;
+                shape.distance(local) * *scale
+            }
+            Self::Paint { shape, .. } => shape.distance(p),
+        }
+    }
+}
+
+/// Поворот на `turn` градусов: сначала вокруг X, потом Y, потом Z.
+pub fn rotation(turn: [f32; 3]) -> Mat3 {
+    let [x, y, z] = turn.map(f32::to_radians);
+    Mat3::from_rotation_z(z) * Mat3::from_rotation_y(y) * Mat3::from_rotation_x(x)
+}
+
+// Формулы примитивов и операций: те же, что в include/sdf3d.slang.
+
+pub fn sd_sphere(p: Vec3, r: f32) -> f32 {
+    p.length() - r
+}
+
+pub fn sd_box(p: Vec3, half: Vec3, round: f32) -> f32 {
+    let q = p.abs() - half + Vec3::splat(round);
+    q.max(Vec3::ZERO).length() + q.max_element().min(0.0) - round
+}
+
+pub fn sd_capsule(p: Vec3, half_height: f32, r: f32) -> f32 {
+    let y = p.y.clamp(-half_height, half_height);
+    (p - Vec3::new(0.0, y, 0.0)).length() - r
+}
+
+pub fn sd_cylinder(p: Vec3, half_height: f32, r: f32, round: f32) -> f32 {
+    let d = glam::Vec2::new(
+        glam::Vec2::new(p.x, p.z).length() - r + round,
+        p.y.abs() - half_height + round,
+    );
+    d.max(glam::Vec2::ZERO).length() + d.max_element().min(0.0) - round
+}
+
+pub fn sd_torus(p: Vec3, big: f32, small: f32) -> f32 {
+    glam::Vec2::new(glam::Vec2::new(p.x, p.z).length() - big, p.y).length() - small
+}
+
+pub fn sd_plane(p: Vec3, normal: Vec3, offset: f32) -> f32 {
+    p.dot(normal.normalize_or(Vec3::Y)) - offset
+}
+
+pub fn op_union(a: f32, b: f32, k: f32) -> f32 {
+    if k <= 0.0 {
+        return a.min(b);
+    }
+    let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
+    lerp(b, a, h) - k * h * (1.0 - h)
+}
+
+pub fn op_subtract(a: f32, b: f32, k: f32) -> f32 {
+    -op_union(-a, b, k)
+}
+
+pub fn op_intersect(a: f32, b: f32, k: f32) -> f32 {
+    -op_union(-a, -b, k)
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Коды команд программы. Слово команды: код в младших 8 битах, вид примитива в следующих.
+pub mod op {
+    /// Примитив: слово команды, материал, 12 чисел матрицы «мир → форма» (три строки по
+    /// четыре: поворот и сдвиг), множитель расстояния (масштаб), затем 4 параметра.
+    pub const PRIM: u32 = 1;
+    /// Операции: слово команды и ширина плавного перехода.
+    pub const UNION: u32 = 2;
+    pub const SUBTRACT: u32 = 3;
+    pub const INTERSECT: u32 = 4;
+}
+
+/// Виды примитивов (биты 8–15 слова команды).
+pub mod prim {
+    pub const SPHERE: u32 = 0;
+    pub const BOX: u32 = 1;
+    pub const CAPSULE: u32 = 2;
+    pub const CYLINDER: u32 = 3;
+    pub const TORUS: u32 = 4;
+    pub const PLANE: u32 = 5;
+}
+
+/// Слов на примитив: команда, материал, 12 матрицы, масштаб, 4 параметра.
+pub const PRIM_WORDS: usize = 19;
+/// Слов на операцию.
+pub const OP_WORDS: usize = 2;
+/// Глубина стека машины в шейдере: столько форм может ждать операции одновременно.
+pub const STACK: usize = 8;
+
+/// Программа одной формы: слова для видеокарты.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Program {
+    pub words: Vec<u32>,
+}
+
+/// Почему форму нельзя превратить в программу.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CompileError {
+    #[error("форма слишком глубоко вложена: шейдеру хватает стека на {STACK} частей")]
+    TooDeep,
+    #[error("пустая операция: в объединении или пересечении нет форм")]
+    Empty,
+}
+
+/// Преобразование «мир → форма» для примитива: матрица поворота, сдвиг и масштаб.
+#[derive(Clone, Copy)]
+struct Placement {
+    /// Мир → форма: `local = rot · p + shift`.
+    rot: Mat3,
+    shift: Vec3,
+    /// Во сколько раз форма больше своих чисел: расстояние формы умножается на него.
+    scale: f32,
+}
+
+impl Placement {
+    const IDENTITY: Self = Self {
+        rot: Mat3::IDENTITY,
+        shift: Vec3::ZERO,
+        scale: 1.0,
+    };
+
+    /// Вложенный сдвиг: точка мира сначала переводится в систему родителя, потом в свою.
+    fn then(self, at: [f32; 3], turn: [f32; 3], scale: f32) -> Self {
+        // local' = R^T (local - at) / s, local = rot p + shift.
+        let inv = rotation(turn).transpose() / scale;
+        Self {
+            rot: inv * self.rot,
+            shift: inv * (self.shift - Vec3::from(at)),
+            scale: self.scale * scale,
+        }
+    }
+}
+
+/// Дерево формы → программа.
+pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
+    let mut words = Vec::new();
+    emit(shape, Placement::IDENTITY, 0, 0, &mut words)?;
+    Ok(Program { words })
+}
+
+/// Пишет команды формы и возвращает, сколько места на стеке ей понадобилось (`base` уже
+/// занято ждущими формами).
+fn emit(
+    shape: &Shape3,
+    at: Placement,
+    material: u32,
+    base: usize,
+    out: &mut Vec<u32>,
+) -> Result<usize, CompileError> {
+    if base >= STACK {
+        return Err(CompileError::TooDeep);
+    }
+    let prim = |kind: u32, params: [f32; 4], out: &mut Vec<u32>| {
+        out.push(op::PRIM | (kind << 8));
+        out.push(material);
+        for row in 0..3 {
+            let r = at.rot.row(row);
+            out.extend([r.x, r.y, r.z, at.shift[row]].map(f32::to_bits));
+        }
+        out.push(at.scale.to_bits());
+        out.extend(params.map(f32::to_bits));
+        Ok(1)
+    };
+    match shape {
+        Shape3::Sphere { radius } => prim(prim::SPHERE, [*radius, 0.0, 0.0, 0.0], out),
+        Shape3::Box { size, round } => prim(
+            prim::BOX,
+            [size[0] * 0.5, size[1] * 0.5, size[2] * 0.5, *round],
+            out,
+        ),
+        Shape3::Capsule { height, radius } => {
+            prim(prim::CAPSULE, [*height * 0.5, *radius, 0.0, 0.0], out)
+        }
+        Shape3::Cylinder {
+            height,
+            radius,
+            round,
+        } => prim(prim::CYLINDER, [*height * 0.5, *radius, *round, 0.0], out),
+        Shape3::Torus { radius, thickness } => {
+            prim(prim::TORUS, [*radius, *thickness, 0.0, 0.0], out)
+        }
+        Shape3::Plane { normal, offset } => {
+            let n = Vec3::from(*normal).normalize_or(Vec3::Y);
+            prim(prim::PLANE, [n.x, n.y, n.z, *offset], out)
+        }
+        Shape3::Union { shapes, smooth } => {
+            chain(shapes, op::UNION, *smooth, at, material, base, out)
+        }
+        Shape3::Intersect { shapes, smooth } => {
+            chain(shapes, op::INTERSECT, *smooth, at, material, base, out)
+        }
+        Shape3::Subtract {
+            base: b,
+            cut,
+            smooth,
+        } => {
+            let mut need = emit(b, at, material, base, out)?;
+            for c in cut {
+                need = need.max(1 + emit(c, at, material, base + 1, out)?);
+                out.extend([op::SUBTRACT, smooth.to_bits()]);
+            }
+            Ok(need)
+        }
+        Shape3::Move {
+            at: to,
+            turn,
+            scale,
+            shape,
+        } => emit(
+            shape,
+            at.then(*to, *turn, scale.max(1e-6)),
+            material,
+            base,
+            out,
+        ),
+        Shape3::Paint { material, shape } => emit(shape, at, *material, base, out),
+    }
+}
+
+fn chain(
+    shapes: &[Shape3],
+    code: u32,
+    smooth: f32,
+    at: Placement,
+    material: u32,
+    base: usize,
+    out: &mut Vec<u32>,
+) -> Result<usize, CompileError> {
+    let (first, rest) = shapes.split_first().ok_or(CompileError::Empty)?;
+    let mut need = emit(first, at, material, base, out)?;
+    for s in rest {
+        need = need.max(1 + emit(s, at, material, base + 1, out)?);
+        out.extend([code, smooth.to_bits()]);
+    }
+    Ok(need)
+}
+
+impl Program {
+    /// Расстояние до формы в точке `p` и материал ближайшей части: то же, что считает
+    /// шейдер по этой программе.
+    pub fn distance(&self, p: Vec3) -> (f32, u32) {
+        let w = &self.words;
+        let f = |i: usize| f32::from_bits(w[i]);
+        let mut stack: Vec<(f32, u32)> = Vec::with_capacity(STACK);
+        let mut i = 0;
+        while i < w.len() {
+            let code = w[i] & 0xff;
+            if code == op::PRIM {
+                let kind = (w[i] >> 8) & 0xff;
+                let material = w[i + 1];
+                let m = |r: usize| Vec3::new(f(i + 2 + 4 * r), f(i + 3 + 4 * r), f(i + 4 + 4 * r));
+                let local = Vec3::new(
+                    m(0).dot(p) + f(i + 5),
+                    m(1).dot(p) + f(i + 9),
+                    m(2).dot(p) + f(i + 13),
+                );
+                let scale = f(i + 14);
+                let a = [f(i + 15), f(i + 16), f(i + 17), f(i + 18)];
+                let d = match kind {
+                    prim::SPHERE => sd_sphere(local, a[0]),
+                    prim::BOX => sd_box(local, Vec3::new(a[0], a[1], a[2]), a[3]),
+                    prim::CAPSULE => sd_capsule(local, a[0], a[1]),
+                    prim::CYLINDER => sd_cylinder(local, a[0], a[1], a[2]),
+                    prim::TORUS => sd_torus(local, a[0], a[1]),
+                    _ => sd_plane(local, Vec3::new(a[0], a[1], a[2]), a[3]),
+                };
+                stack.push((d * scale, material));
+                i += PRIM_WORDS;
+            } else {
+                let k = f(i + 1);
+                let (b, a) = (
+                    stack.pop().unwrap_or((f32::MAX, 0)),
+                    stack.pop().unwrap_or((f32::MAX, 0)),
+                );
+                let d = match code {
+                    op::UNION => op_union(a.0, b.0, k),
+                    op::SUBTRACT => op_subtract(a.0, b.0, k),
+                    _ => op_intersect(a.0, b.0, k),
+                };
+                // Материал: у объединения — ближайшей части, иначе — основы.
+                let material = if code == op::UNION && b.0 < a.0 {
+                    b.1
+                } else {
+                    a.1
+                };
+                stack.push((d, material));
+                i += OP_WORDS;
+            }
+        }
+        stack.pop().unwrap_or((f32::MAX, 0))
+    }
+}
+
+/// Материал поверхности.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Material3 {
+    /// Цвет (линейный, 0…1).
+    pub color: [f32; 3],
+    /// Свечение: сколько своего света (0 — не светится). Учитывается со светом в 7.4.
+    #[serde(default)]
+    pub glow: f32,
+    /// Рисовать на поверхности сетку через 1 и 10 м (пол сцены «3D»).
+    #[serde(default)]
+    pub grid: bool,
+}
+
+/// Флаг материала: сетка на поверхности.
+pub const MATERIAL_GRID: u32 = 1;
+
+/// Сцена для видеокарты: объекты (у каждого своя программа) и материалы одним списком
+/// слов. Раскладка (читает `raymarch.slang`):
+///
+/// - слово 0: число объектов, 1: где начинаются объекты, 2: где материалы, 3: сколько их;
+/// - объекты по 4 слова: начало программы, её длина в словах, 2 запасных;
+/// - материалы по 4 слова: цвет (3 числа) и флаги ([`MATERIAL_GRID`]) со свечением
+///   (свечение в 7.4);
+/// - программы подряд.
+pub fn pack_scene(objects: &[Program], materials: &[Material3]) -> Vec<u32> {
+    let header = 4;
+    let objects_at = header;
+    let materials_at = objects_at + objects.len() * 4;
+    let code_at = materials_at + materials.len() * 4;
+    let mut out = vec![
+        objects.len() as u32,
+        objects_at as u32,
+        materials_at as u32,
+        materials.len() as u32,
+    ];
+    let mut start = code_at;
+    for p in objects {
+        out.extend([start as u32, p.words.len() as u32, 0, 0]);
+        start += p.words.len();
+    }
+    for m in materials {
+        out.extend(m.color.map(f32::to_bits));
+        out.push(u32::from(m.grid) * MATERIAL_GRID);
+    }
+    for p in objects {
+        out.extend(&p.words);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn points() -> Vec<Vec3> {
+        let mut out = Vec::new();
+        for x in -4..=4 {
+            for y in -2..=4 {
+                for z in -4..=4 {
+                    out.push(Vec3::new(x as f32 * 0.61, y as f32 * 0.53, z as f32 * 0.47));
+                }
+            }
+        }
+        out
+    }
+
+    fn sample() -> Shape3 {
+        Shape3::Union {
+            smooth: 0.0,
+            shapes: vec![
+                Shape3::Plane {
+                    normal: [0.0, 1.0, 0.0],
+                    offset: 0.0,
+                },
+                Shape3::Union {
+                    smooth: 0.4,
+                    shapes: vec![
+                        Shape3::Sphere { radius: 0.6 }.at([-0.5, 1.0, 0.0]),
+                        Shape3::Sphere { radius: 0.5 }.at([0.6, 1.1, 0.0]),
+                    ],
+                }
+                .paint(1),
+                Shape3::Subtract {
+                    base: Box::new(Shape3::Box {
+                        size: [1.2, 1.2, 1.2],
+                        round: 0.05,
+                    }),
+                    cut: vec![Shape3::Sphere { radius: 0.75 }],
+                    smooth: 0.0,
+                }
+                .placed([2.0, 0.6, -1.0], [0.0, 30.0, 0.0])
+                .paint(2),
+                Shape3::Move {
+                    at: [-2.0, 1.0, 1.0],
+                    turn: [90.0, 0.0, 20.0],
+                    scale: 1.5,
+                    shape: Box::new(Shape3::Torus {
+                        radius: 0.5,
+                        thickness: 0.15,
+                    }),
+                }
+                .paint(3),
+                Shape3::Intersect {
+                    smooth: 0.1,
+                    shapes: vec![
+                        Shape3::Cylinder {
+                            height: 1.0,
+                            radius: 0.4,
+                            round: 0.05,
+                        },
+                        Shape3::Capsule {
+                            height: 0.6,
+                            radius: 0.45,
+                        },
+                    ],
+                }
+                .at([0.0, 0.5, 2.5]),
+            ],
+        }
+    }
+
+    #[test]
+    fn primitives_measure_the_right_distance() {
+        assert!((sd_sphere(Vec3::new(3.0, 0.0, 0.0), 1.0) - 2.0).abs() < 1e-6);
+        assert!((sd_box(Vec3::new(2.0, 0.0, 0.0), Vec3::ONE, 0.0) - 1.0).abs() < 1e-6);
+        assert!(sd_box(Vec3::ZERO, Vec3::ONE, 0.0) < 0.0);
+        // Скругление не меняет середину грани, а угол отодвигает.
+        assert!((sd_box(Vec3::new(2.0, 0.0, 0.0), Vec3::ONE, 0.3) - 1.0).abs() < 1e-6);
+        assert!(sd_box(Vec3::splat(1.0), Vec3::ONE, 0.3) > 0.0);
+        assert!((sd_capsule(Vec3::new(0.0, 3.0, 0.0), 1.0, 0.5) - 1.5).abs() < 1e-6);
+        assert!((sd_cylinder(Vec3::new(2.0, 0.0, 0.0), 1.0, 1.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!((sd_cylinder(Vec3::new(0.0, 3.0, 0.0), 1.0, 1.0, 0.0) - 2.0).abs() < 1e-6);
+        assert!(sd_torus(Vec3::new(1.0, 0.0, 0.0), 1.0, 0.2) < 0.0);
+        assert!((sd_torus(Vec3::ZERO, 1.0, 0.2) - 0.8).abs() < 1e-6);
+        assert!((sd_plane(Vec3::new(0.0, 2.0, 0.0), Vec3::Y, 0.5) - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smooth_operations_join_softly_and_never_overshoot() {
+        // Плавное объединение не дальше резкого (поле «снизу»), а вдали от шва совпадает.
+        for (a, b) in [(0.3, 0.35), (1.0, -0.2), (2.0, 5.0)] {
+            assert!(op_union(a, b, 0.5) <= a.min(b) + 1e-6);
+            assert!(op_intersect(a, b, 0.5) >= a.max(b) - 1e-6 - 0.5);
+        }
+        assert!((op_union(1.0, 5.0, 0.5) - 1.0).abs() < 1e-6);
+        assert_eq!(op_subtract(1.0, -0.5, 0.0), 1.0);
+        assert_eq!(op_subtract(-1.0, -0.5, 0.0), 0.5);
+    }
+
+    #[test]
+    fn program_measures_the_same_as_the_tree() {
+        let shape = sample();
+        let program = compile(&shape).unwrap();
+        for p in points() {
+            let tree = shape.distance(p);
+            let (code, _) = program.distance(p);
+            assert!(
+                (tree - code).abs() < 1e-4,
+                "{p}: дерево {tree}, программа {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn program_reports_the_material_of_the_nearest_part() {
+        let program = compile(&sample()).unwrap();
+        // Над полом между шарами — шары (1); у коробки — 2; у тора — 3; у пола — 0.
+        assert_eq!(program.distance(Vec3::new(0.0, 1.2, 0.0)).1, 1);
+        // Угол коробки (середины граней вырезаны шаром).
+        let corner = rotation([0.0, 30.0, 0.0]) * Vec3::splat(0.62) + Vec3::new(2.0, 0.6, -1.0);
+        assert_eq!(program.distance(corner).1, 2);
+        // Точка на кольце тора.
+        let ring =
+            rotation([90.0, 0.0, 20.0]) * Vec3::new(0.0, 0.0, -0.75) + Vec3::new(-2.0, 1.0, 1.0);
+        assert_eq!(program.distance(ring).1, 3);
+        assert_eq!(program.distance(Vec3::new(5.0, 0.01, 5.0)).1, 0);
+    }
+
+    #[test]
+    fn scaled_and_turned_shapes_keep_true_distances() {
+        // Шар радиусом 1, увеличенный вдвое и сдвинутый: расстояние в метрах мира.
+        let s = Shape3::Move {
+            at: [1.0, 2.0, 3.0],
+            turn: [10.0, 20.0, 30.0],
+            scale: 2.0,
+            shape: Box::new(Shape3::Sphere { radius: 1.0 }),
+        };
+        let p = compile(&s).unwrap();
+        let d = p.distance(Vec3::new(1.0, 2.0, 8.0)).0;
+        assert!((d - 3.0).abs() < 1e-4, "{d}");
+        // Поворот: коробка 2×1×1, повёрнутая на 90° вокруг Z, стоит вертикально.
+        let tall = Shape3::Box {
+            size: [2.0, 1.0, 1.0],
+            round: 0.0,
+        }
+        .placed([0.0; 3], [0.0, 0.0, 90.0]);
+        assert!(tall.distance(Vec3::new(0.0, 0.9, 0.0)) < 0.0);
+        assert!(tall.distance(Vec3::new(0.9, 0.0, 0.0)) > 0.0);
+    }
+
+    #[test]
+    fn deep_nesting_is_refused_and_empty_unions_too() {
+        let mut s = Shape3::Sphere { radius: 1.0 };
+        for _ in 0..STACK + 1 {
+            s = Shape3::Union {
+                smooth: 0.0,
+                shapes: vec![Shape3::Sphere { radius: 1.0 }, s],
+            };
+        }
+        assert_eq!(compile(&s), Err(CompileError::TooDeep));
+        let empty = Shape3::Union {
+            shapes: vec![],
+            smooth: 0.0,
+        };
+        assert_eq!(compile(&empty), Err(CompileError::Empty));
+    }
+
+    #[test]
+    fn shapes_read_from_ron_like_the_scene_file_will() {
+        let text = "Union(smooth: 0.3, shapes: [\
+            Paint(material: 1, shape: Move(at: (0, 1, 0), shape: Sphere(radius: 1))),\
+            Move(at: (2, 0.5, 0), turn: (0, 45, 0), shape: Box(size: (1, 1, 1))),\
+        ])";
+        let s: Shape3 = ron::from_str(text).unwrap();
+        assert!(compile(&s).is_ok());
+        assert!(s.distance(Vec3::new(0.0, 1.0, 0.0)) < 0.0);
+    }
+
+    #[test]
+    fn scene_pack_lays_out_objects_materials_and_code() {
+        let a = compile(&Shape3::Sphere { radius: 1.0 }).unwrap();
+        let b = compile(&sample()).unwrap();
+        let materials = [Material3 {
+            color: [0.5, 0.5, 0.5],
+            glow: 0.0,
+            grid: true,
+        }];
+        let w = pack_scene(&[a.clone(), b.clone()], &materials);
+        assert_eq!(&w[..4], &[2, 4, 12, 1]);
+        let (start_b, len_b) = (w[8] as usize, w[9] as usize);
+        assert_eq!(len_b, b.words.len());
+        assert_eq!(&w[start_b..start_b + len_b], &b.words[..]);
+        assert_eq!(w[15], MATERIAL_GRID);
+        assert_eq!(w[w[4] as usize..][..a.words.len()], a.words[..]);
+    }
+}

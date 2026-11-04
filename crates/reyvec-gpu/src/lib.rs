@@ -45,6 +45,7 @@ mod pipeline;
 mod resources;
 mod shaders;
 mod slangc;
+mod space;
 mod timing;
 mod ui;
 mod vector;
