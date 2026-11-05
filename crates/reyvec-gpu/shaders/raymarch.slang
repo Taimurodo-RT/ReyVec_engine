@@ -39,18 +39,39 @@ float4 fs_main(VertexOut input) : SV_Target
     // лучей).
     float t = min(textures[pc.gbuffer].Load(int3(int2(input.position.xy) / 8, 0)).x, ray.limit);
     float2 hit = float2(-1.0, 0.0);
+    // Шаг с «перелётом» (over-relaxation, Keinert и др., «Enhanced Sphere Tracing»,
+    // 2014): шагаем в 1.6 раза дальше безопасного. Пока шары пустоты соседних точек
+    // перекрываются, между ними точно пусто и перелёт законен. Если не перекрылись —
+    // мы могли проскочить поверхность: откатываемся на последний шаг и дальше идём
+    // обычными шагами. Вдоль пола и боков предметов (луч скользит почти параллельно)
+    // это экономит пятую часть шагов (замер на процессоре по сцене «3D»).
+    float omega = 1.6;
+    float step = 0.0;
+    float previous = 0.0;
     for (int i = 0; i < 160; i++)
     {
         // Дальше 25 см (и ещё миллиметр на метр пути) от границы объекта его форма не
         // считается: это всегда больше точности попадания ниже.
         float2 s = scene_near(ray.origin + ray.dir * t, 0.25 + 0.001 * t);
+        float radius = abs(s.x);
+        if (omega > 1.0 && radius + previous < step)
+        {
+            // Могли перелететь: назад, на обычный безопасный шаг от прошлой точки
+            // (её пустота `previous` уже посчитана), дальше без перелёта.
+            t -= step - previous;
+            step = previous;
+            omega = 1.0;
+            continue;
+        }
         // Точность растёт к камере: половина миллиметра на метр пути.
         if (s.x < 0.0005 * max(t, 1.0))
         {
             hit = float2(t, s.y);
             break;
         }
-        t += s.x;
+        step = s.x * omega;
+        previous = radius;
+        t += step;
         if (t > ray.limit)
             break;
     }
