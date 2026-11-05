@@ -16,9 +16,12 @@ use reyvec_scene::{Background, NodeDesc, SceneFile};
 use winit::window::ResizeDirection;
 
 use super::assets::Assets;
+use super::doc::{Change, Edit};
+use super::geom;
 use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
 use super::outline::{self, Kind};
 use super::theme::*;
+use super::viewport::{self, TOOLBAR_HEIGHT, Tool, View, Viewport};
 
 /// Сколько строк журнала держать в консоли редактора.
 const LOG_LINES: usize = 500;
@@ -37,7 +40,7 @@ pub(crate) enum PlayState {
 }
 
 /// Что попросили сделать в интерфейсе.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Action {
     Play,
     Pause,
@@ -56,6 +59,25 @@ pub(crate) enum Action {
     ResetCamera,
     /// Прочитать файл сцены с диска заново.
     ReloadScene,
+    /// Правка предмета. `commit: false` — её ещё тянут мышью (видна сразу, в историю
+    /// попадёт одним шагом, когда отпустят).
+    Edit {
+        edit: Edit,
+        commit: bool,
+    },
+    /// Перетаскивание бросили (Esc): вернуть как было.
+    CancelEdit,
+    /// Перетаскивание кончилось: то, что уже видно, — один шаг истории.
+    EndEdit,
+    /// Записать сцену в файл (Ctrl+S).
+    Save,
+    Undo,
+    Redo,
+    /// Поставить камеру (кнопка F — показать выбранный предмет).
+    SetCamera {
+        center: [f64; 2],
+        zoom: f64,
+    },
 }
 
 /// Что интерфейсу показать в этом кадре.
@@ -76,6 +98,14 @@ pub(crate) struct Info<'a> {
     pub scene_name: &'a str,
     /// Ошибка в файле сцены или шейдере.
     pub error: Option<&'a str>,
+    /// Камера сцены в точках интерфейса (нет — окно ещё не открыто).
+    pub view: Option<View>,
+    /// Есть несохранённые правки.
+    pub dirty: bool,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    /// Сцену есть куда сохранить (это файл, а не встроенный пример).
+    pub can_save: bool,
 }
 
 /// Состояние интерфейса между кадрами.
@@ -97,6 +127,10 @@ pub(crate) struct EditorUi {
     frames: VecDeque<f32>,
     /// Ширина вкладок пространств в прошлом кадре: по ней они ставятся в середину полосы.
     tabs_width: f32,
+    /// Инструменты и ручки окна сцены.
+    vp: Viewport,
+    /// Имя предмета, которое сейчас печатают в инспекторе.
+    name_edit: Option<(Vec<usize>, String)>,
 }
 
 /// Элементы нижней строки, их можно выключить в меню «Вид». Порядок — как на экране.
@@ -133,6 +167,8 @@ impl EditorUi {
             status: [true; STATUS_ITEMS.len()],
             tabs_width: 0.0,
             frames: VecDeque::new(),
+            vp: Viewport::default(),
+            name_edit: None,
         }
     }
 
@@ -223,12 +259,8 @@ impl EditorUi {
     }
 
     fn hotkeys(&mut self, ctx: &egui::Context, info: &Info) {
-        let (f5, esc) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::F5),
-                i.key_pressed(egui::Key::Escape),
-            )
-        });
+        use egui::{Key, Modifiers};
+        let (f5, esc) = ctx.input(|i| (i.key_pressed(Key::F5), i.key_pressed(Key::Escape)));
         if f5 {
             self.actions.push(match info.play {
                 PlayState::Edit => Action::Play,
@@ -236,6 +268,67 @@ impl EditorUi {
             });
         } else if esc && info.play != PlayState::Edit {
             self.actions.push(Action::Stop);
+        }
+        if info.play != PlayState::Edit {
+            return;
+        }
+        let save = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S));
+        if save {
+            self.actions.push(Action::Save);
+        }
+        // Пока печатают в поле, буквы и Ctrl+Z принадлежат полю.
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (redo, undo) = ctx.input_mut(|i| {
+            let redo = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+                || i.consume_key(Modifiers::COMMAND, Key::Y);
+            (redo, i.consume_key(Modifiers::COMMAND, Key::Z))
+        });
+        if redo {
+            self.actions.push(Action::Redo);
+        } else if undo {
+            self.actions.push(Action::Undo);
+        }
+        let (q, w, e, r, f) = ctx.input(|i| {
+            let k = |key| i.modifiers.is_none() && i.key_pressed(key);
+            (k(Key::Q), k(Key::W), k(Key::E), k(Key::R), k(Key::F))
+        });
+        for (on, tool) in [
+            (q, Tool::Select),
+            (w, Tool::Move),
+            (e, Tool::Rotate),
+            (r, Tool::Scale),
+        ] {
+            if on {
+                self.vp.tool = tool;
+            }
+        }
+        if f {
+            self.focus_selected(info);
+        }
+        if esc && self.vp.drag.is_none() {
+            self.selected = None;
+        }
+    }
+
+    /// Камера на выбранный предмет (или на всю сцену, если ничего не выбрано).
+    fn focus_selected(&mut self, info: &Info) {
+        let (Some(file), Some(view), Some(rect)) = (info.scene, info.view, self.viewport) else {
+            return;
+        };
+        let placed = geom::place_all(file);
+        let bounds = match &self.selected {
+            Some(path) => geom::find(&placed, path).map(|p| p.all),
+            None => placed
+                .iter()
+                .filter(|p| p.path.len() == 1)
+                .map(|p| p.all)
+                .reduce(geom::Bounds::union),
+        };
+        if let Some(b) = bounds {
+            let (center, zoom) = view.focus(&b, rect);
+            self.actions.push(Action::SetCamera { center, zoom });
         }
     }
 
@@ -282,7 +375,7 @@ impl EditorUi {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = GAP_S;
             logo(ui);
-            ui.scope(|ui| self.menus(ui));
+            ui.scope(|ui| self.menus(ui, info));
             left = ui.min_rect().right();
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -313,7 +406,7 @@ impl EditorUi {
     }
 
     /// Меню под названием движка: «Файл», «Вид», «Справка» и их пункты.
-    fn menus(&mut self, ui: &mut Ui) {
+    fn menus(&mut self, ui: &mut Ui, info: &Info) {
         // Название — как подпись, без рамки; рамка только под мышью.
         let w = &mut ui.visuals_mut().widgets;
         w.inactive.weak_bg_fill = Color32::TRANSPARENT;
@@ -326,6 +419,11 @@ impl EditorUi {
         ui.menu_button(brand, |ui| {
             ui.set_min_width(180.0);
             ui.menu_button("Файл", |ui| {
+                let save = egui::Button::new("Сохранить сцену").shortcut_text("Ctrl+S");
+                if ui.add_enabled(info.can_save, save).clicked() {
+                    actions.push(Action::Save);
+                    ui.close();
+                }
                 if ui.button("Перечитать сцену с диска").clicked() {
                     actions.push(Action::ReloadScene);
                     ui.close();
@@ -333,6 +431,18 @@ impl EditorUi {
                 ui.separator();
                 if ui.button("Выход").clicked() {
                     actions.push(Action::Close);
+                    ui.close();
+                }
+            });
+            ui.menu_button("Правка", |ui| {
+                let undo = egui::Button::new("Отменить").shortcut_text("Ctrl+Z");
+                if ui.add_enabled(info.can_undo, undo).clicked() {
+                    actions.push(Action::Undo);
+                    ui.close();
+                }
+                let redo = egui::Button::new("Повторить").shortcut_text("Ctrl+Y");
+                if ui.add_enabled(info.can_redo, redo).clicked() {
+                    actions.push(Action::Redo);
                     ui.close();
                 }
             });
@@ -361,8 +471,14 @@ impl EditorUi {
             ui.menu_button("Справка", |ui| {
                 ui.label("F5 — играть или остановить");
                 ui.label("Esc во время игры — остановить");
+                ui.label("Щелчок по предмету — выбрать, двойной — выбрать вложенный");
+                ui.label("Q, W, E, R — выбор, сдвиг, поворот, размер");
+                ui.label("F — показать выбранный предмет");
+                ui.label("Ctrl+S — сохранить, Ctrl+Z — отменить, Ctrl+Y — повторить");
                 ui.label("Колесо над сценой — приблизить");
-                ui.label("Перетаскивание сцены — сдвинуть камеру");
+                ui.label(
+                    "Перетаскивание пустого места, средней или правой кнопкой — сдвинуть камеру",
+                );
                 ui.label("Двойной щелчок по верхней полосе — окно меньше или больше");
             });
         });
@@ -574,44 +690,149 @@ impl EditorUi {
             }
             return;
         };
+        let editing = info.play == PlayState::Edit;
         let node = self
             .selected
             .as_ref()
             .and_then(|p| outline::node_at(file, p).map(|n| (p, n)));
         match node {
-            Some((path, node)) => node_inspector(ui, path, node),
+            Some((path, node)) => node_inspector(
+                ui,
+                path,
+                node,
+                editing,
+                &mut self.name_edit,
+                &mut self.actions,
+            ),
             None => scene_inspector(ui, file, info.scene_name),
         }
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(
-                "Править свойства мышью можно будет в следующих шагах. Пока сцену меняют в \
-                 файле .ron: после сохранения редактор покажет новую версию.",
-            )
-            .small()
-            .color(MUTED),
-        );
+        if !editing {
+            ui.add_space(GAP_L);
+            ui.label(
+                RichText::new("Во время игры свойства не меняются: «Стоп» вернёт к правке.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
     }
 
     fn scene_view(&mut self, ui: &mut Ui, info: &Info) {
-        let rect = ui.max_rect();
+        let full = ui.max_rect();
+        let editing = info.play == PlayState::Edit;
+        let bar = Rect::from_min_size(full.min, vec2(full.width(), TOOLBAR_HEIGHT));
+        let rect = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
         self.viewport = Some(rect);
+
+        // Полоса инструментов над сценой, как в Unreal 5.
+        ui.painter().rect_filled(bar, 0, PANEL);
+        ui.painter()
+            .hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(LINE, BORDER));
+        let mut focus = false;
+        let vp = &mut self.vp;
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(bar.shrink2(vec2(GAP_L, 0.0)))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                vp.toolbar(ui, editing);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = GAP_M;
+                    if let Some(v) = info.view {
+                        ui.label(
+                            RichText::new(format!("{:.0}%", v.zoom * 100.0))
+                                .monospace()
+                                .size(FONT_SMALL)
+                                .color(MUTED),
+                        )
+                        .on_hover_text("Приближение камеры: колесо мыши над сценой");
+                    }
+                    let show = egui::Button::new(
+                        RichText::new("Показать").size(FONT_CHIP).color(TEXT_DIM),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE);
+                    if ui
+                        .add_enabled(editing && info.scene.is_some(), show)
+                        .on_hover_text("Камера на выбранный предмет или на всю сцену (F)")
+                        .clicked()
+                    {
+                        focus = true;
+                    }
+                });
+            },
+        );
+        if focus {
+            self.focus_selected(info);
+        }
+
         let response = ui.interact(
             rect,
             ui.scope_id().with("scene-view"),
             Sense::click_and_drag(),
         );
         self.viewport_hovered = response.hovered() || response.dragged();
-        if info.play == PlayState::Edit
-            && (response.dragged_by(egui::PointerButton::Primary)
-                || response.dragged_by(egui::PointerButton::Middle))
-        {
-            let d = response.drag_delta();
-            if d != Vec2::ZERO {
-                self.actions.push(Action::Pan(d));
+        let painter = ui.painter_at(rect);
+        let mut busy = false;
+        if editing && let (Some(file), Some(view)) = (info.scene, info.view) {
+            let placed = geom::place_all(file);
+            self.vp.grid(&painter, &view, rect);
+            let pointer = response.hover_pos();
+            // Предмет под мышью подсвечивается тонкой рамкой.
+            if self.vp.drag.is_none()
+                && let Some(m) = pointer
+                && let Some(path) = geom::pick(&placed, view.to_scene(m), false)
+                && Some(&path) != self.selected.as_ref()
+                && let Some(p) = geom::find(&placed, &path)
+            {
+                let r = Rect::from_two_pos(view.to_ui(p.all.min), view.to_ui(p.all.max));
+                painter.rect_stroke(
+                    r,
+                    0,
+                    Stroke::new(LINE, SELECT.gamma_multiply(0.5)),
+                    egui::StrokeKind::Middle,
+                );
+            }
+            let sel = self
+                .selected
+                .as_ref()
+                .and_then(|path| Some((geom::find(&placed, path)?, outline::node_at(file, path)?)));
+            if let Some((p, node)) = sel {
+                self.vp.selection(&painter, &view, p);
+                viewport::label(&painter, &view, p, file);
+                busy = ui
+                    .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.set_clip_rect(rect);
+                        self.vp.gizmo(ui, &view, p, node, &mut self.actions)
+                    })
+                    .inner;
+            } else if self.vp.drag.take().is_some() {
+                // Предмет пропал, пока его тянули.
+                self.actions.push(Action::CancelEdit);
+            }
+            if !busy
+                && let Some(m) = response.interact_pointer_pos()
+                && (response.clicked() || response.double_clicked())
+            {
+                let deep = response.double_clicked();
+                self.selected = geom::pick(&placed, view.to_scene(m), deep);
+                if let Some(path) = &self.selected {
+                    // Родители выбранного раскрываются в иерархии.
+                    for k in 1..path.len() {
+                        self.open.insert(path[..k].to_vec());
+                    }
+                }
             }
         }
-        let painter = ui.painter_at(rect);
+        if editing && !busy && self.vp.drag.is_none() {
+            let pan = response.dragged_by(egui::PointerButton::Primary)
+                || response.dragged_by(egui::PointerButton::Middle)
+                || response.dragged_by(egui::PointerButton::Secondary);
+            let d = response.drag_delta();
+            if pan && d != Vec2::ZERO {
+                self.actions.push(Action::Pan(d));
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            }
+        }
         if info.play == PlayState::Playing {
             // Рамка цвета акцента: сразу видно, что идёт игра, а не правка.
             painter.rect_stroke(
@@ -621,15 +842,21 @@ impl EditorUi {
                 egui::StrokeKind::Inside,
             );
         }
-        let (text, color) = match info.play {
-            PlayState::Edit => (
-                "Правка · колесо — масштаб, перетаскивание — сдвиг",
-                TEXT_DIM,
+        match info.play {
+            PlayState::Edit => {}
+            PlayState::Playing => chip(
+                &painter,
+                rect.left_top() + vec2(12.0, 12.0),
+                "Игра идёт · Esc или «Стоп» — вернуться к правке",
+                ACCENT,
             ),
-            PlayState::Playing => ("Игра идёт · Esc или «Стоп» — вернуться к правке", ACCENT),
-            PlayState::Paused => ("Пауза", ACCENT),
-        };
-        chip(&painter, rect.left_top() + vec2(12.0, 12.0), text, color);
+            PlayState::Paused => chip(
+                &painter,
+                rect.left_top() + vec2(12.0, 12.0),
+                "Пауза",
+                ACCENT,
+            ),
+        }
         if let Some(e) = info.error {
             chip(
                 &painter,
@@ -686,7 +913,14 @@ fn tab_strip(ui: &mut Ui, tabs: &[Tab], active: &mut usize) {
     }
 }
 
-fn node_inspector(ui: &mut Ui, path: &[usize], node: &NodeDesc) {
+fn node_inspector(
+    ui: &mut Ui,
+    path: &[usize],
+    node: &NodeDesc,
+    editing: bool,
+    name_edit: &mut Option<(Vec<usize>, String)>,
+    actions: &mut Vec<Action>,
+) {
     ui.horizontal(|ui| {
         let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
         ui.painter().rect_filled(dot, 3, Kind::of(node).color());
@@ -718,31 +952,79 @@ fn node_inspector(ui: &mut Ui, path: &[usize], node: &NodeDesc) {
         });
     }
     ui.add_space(4.0);
+    let edit = |change: Change, commit: bool| Action::Edit {
+        edit: Edit {
+            path: path.to_vec(),
+            change,
+        },
+        commit,
+    };
+    card(ui, "Предмет", |ui| {
+        ui.horizontal(|ui| {
+            prop(ui, "Имя");
+            let buf = match name_edit {
+                Some((p, text)) if p.as_slice() == path => text,
+                _ => &mut name_edit.insert((path.to_vec(), node.name.clone())).1,
+            };
+            let r = ui.add_enabled(
+                editing,
+                egui::TextEdit::singleline(buf)
+                    .hint_text("без имени")
+                    .margin(PAD_FIELD)
+                    .desired_width(f32::INFINITY),
+            );
+            if r.lost_focus() {
+                let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if !esc && *buf != node.name {
+                    actions.push(edit(Change::Name(buf.clone()), true));
+                } else {
+                    buf.clone_from(&node.name);
+                }
+            } else if !r.has_focus() && *buf != node.name {
+                // Имя поменяли не здесь (отмена, файл): показать новое.
+                buf.clone_from(&node.name);
+            }
+        });
+    });
     card(ui, "Положение", |ui| {
         egui::Grid::new("node-place")
             .num_columns(3)
             .spacing(vec2(6.0, 6.0))
             .show(ui, |ui| {
+                let at = [node.at.0, node.at.1];
                 prop(ui, "Место");
-                value(ui, &format!("{:.2}", node.at.0), Some(BAD));
-                value(ui, &format!("{:.2}", node.at.1), Some(GOOD));
+                let x = num_field(ui, at[0], 0.005, Some(BAD), "", editing);
+                let y = num_field(ui, at[1], 0.005, Some(GOOD), "", editing);
+                for (k, f) in [x, y].into_iter().enumerate() {
+                    if let Some(f) = f {
+                        actions.push(f.action(|v| {
+                            let mut a = at;
+                            a[k] = v;
+                            edit(Change::At(a), true)
+                        }));
+                    }
+                }
                 ui.end_row();
-                prop(ui, "Поворот");
-                value(ui, &format!("{:.1}°", node.angle), None);
-                ui.label("");
-                ui.end_row();
-                prop(ui, "Размер");
-                value(ui, &format!("{:.2}", node.scale), None);
-                ui.label("");
-                ui.end_row();
-                prop(ui, "Глубина");
-                value(ui, &format!("{:.2}", node.depth), None);
-                ui.label("");
-                ui.end_row();
-                prop(ui, "Прозрачность");
-                value(ui, &format!("{:.2}", node.opacity), None);
-                ui.label("");
-                ui.end_row();
+                let rows: [Row; 4] = [
+                    ("Поворот", node.angle, 0.5, "°", Change::Angle),
+                    ("Размер", node.scale, 0.005, "", Change::Scale),
+                    ("Глубина", node.depth, 0.01, "", Change::Depth),
+                    (
+                        "Прозрачность",
+                        f64::from(node.opacity),
+                        0.005,
+                        "",
+                        Change::Opacity,
+                    ),
+                ];
+                for (name, v, speed, suffix, make) in rows {
+                    prop(ui, name);
+                    if let Some(f) = num_field(ui, v, speed, None, suffix, editing) {
+                        actions.push(f.action(|v| edit(make(v), true)));
+                    }
+                    ui.label("");
+                    ui.end_row();
+                }
             });
     });
     let mut motion = Vec::new();
@@ -884,29 +1166,69 @@ fn prop(ui: &mut Ui, name: &str) {
     ui.label(RichText::new(name).color(TEXT_DIM));
 }
 
-/// Значение в тёмной рамке; `mark` — цветная полоска слева (оси x и y).
-fn value(ui: &mut Ui, text: &str, mark: Option<Color32>) {
-    let r = Frame::NONE
-        .fill(BG)
-        .corner_radius(RADIUS_S)
-        .inner_margin(PAD_FIELD)
-        .show(ui, |ui| {
-            ui.set_min_width(56.0);
-            ui.label(RichText::new(text).monospace().color(TEXT));
-        });
+/// Строка инспектора: подпись, значение, шаг мыши, единица, какая это правка.
+type Row = (&'static str, f64, f64, &'static str, fn(f64) -> Change);
+
+/// Что сделали с числовым полем в этом кадре.
+enum FieldEdit {
+    /// Новое значение; `commit: false` — его ещё тянут мышью.
+    Value(f64, bool),
+    /// Перетаскивание кончилось на прошлом значении.
+    End,
+}
+
+impl FieldEdit {
+    /// Действие для цикла окна; `make` строит правку с готовым значением.
+    fn action(self, make: impl FnOnce(f64) -> Action) -> Action {
+        match self {
+            FieldEdit::Value(v, commit) => match make(v) {
+                Action::Edit { edit, .. } => Action::Edit { edit, commit },
+                other => other,
+            },
+            FieldEdit::End => Action::EndEdit,
+        }
+    }
+}
+
+/// Число, которое тянут мышью или вводят с клавиатуры; `mark` — цветная полоска слева.
+fn num_field(
+    ui: &mut Ui,
+    v: f64,
+    speed: f64,
+    mark: Option<Color32>,
+    suffix: &str,
+    enabled: bool,
+) -> Option<FieldEdit> {
+    let mut x = v;
+    let r = ui.add_enabled(
+        enabled,
+        egui::DragValue::new(&mut x)
+            .speed(speed)
+            .min_decimals(2)
+            .max_decimals(3)
+            .suffix(suffix)
+            .update_while_editing(false),
+    );
     if let Some(c) = mark {
-        let rect = r.response.rect;
+        let rect = r.rect;
         let bar = Rect::from_min_max(rect.left_top(), pos2(rect.left() + 2.0, rect.bottom()));
         ui.painter().rect_filled(
             bar,
             CornerRadius {
-                nw: 6,
-                sw: 6,
+                nw: 4,
+                sw: 4,
                 ne: 0,
                 se: 0,
             },
             c,
         );
+    }
+    if r.changed() && x != v {
+        Some(FieldEdit::Value(x, !r.dragged()))
+    } else if r.drag_stopped() {
+        Some(FieldEdit::End)
+    } else {
+        None
     }
 }
 
@@ -1107,6 +1429,9 @@ fn status_bar(ui: &mut Ui, info: &Info, on: &[bool; STATUS_ITEMS.len()]) {
                 None => (GOOD, format!("Сцена {}", info.scene_name)),
             };
             ui.label(small(format!("● {text}"), dot));
+            if info.dirty {
+                ui.label(small("не сохранено · Ctrl+S".into(), ACCENT));
+            }
         }
         if on[ST_GPU] {
             ui.label(small(info.adapter.to_owned(), MUTED));
@@ -1364,6 +1689,15 @@ mod tests {
             scene,
             scene_name: "first-room.ron",
             error: None,
+            view: Some(View {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+                size: [1600.0, 900.0],
+            }),
+            dirty: false,
+            can_undo: false,
+            can_redo: false,
+            can_save: true,
         }
     }
 
@@ -1442,6 +1776,147 @@ mod tests {
         assert_eq!(ui.take_actions(), vec![Action::Stop]);
     }
 
+    fn pointer(pos: Pos2, pressed: Option<bool>) -> Vec<egui::Event> {
+        let mut e = vec![egui::Event::PointerMoved(pos)];
+        if let Some(pressed) = pressed {
+            e.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        e
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Камера, при которой герой посередине окна сцены.
+    fn hero_view(file: &SceneFile, hero: usize) -> View {
+        let placed = geom::place_all(file);
+        let p = geom::find(&placed, &[hero]).unwrap();
+        let c = p.xform.apply([0.0, 0.0]);
+        // Середина места под сцену (между панелями) правее и выше середины окна.
+        View {
+            center: [c[0] - 0.05, c[1] + 0.1],
+            zoom: 1.0,
+            size: [1600.0, 900.0],
+        }
+    }
+
+    #[test]
+    fn click_selects_and_handle_moves() {
+        let file = SceneFile::parse(reyvec_scene::EXAMPLE).unwrap();
+        let hero = file.nodes.iter().position(|n| n.player.is_some()).unwrap();
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut info = info(Some(&file), PlayState::Edit);
+        let view = hero_view(&file, hero);
+        info.view = Some(view);
+        let placed = geom::place_all(&file);
+        let origin = view.to_ui(
+            geom::find(&placed, &[hero])
+                .unwrap()
+                .xform
+                .apply([0.0, 0.0]),
+        );
+        frame(&ctx, &mut ui, &info, Vec::new());
+        let vp = ui.viewport().unwrap();
+        assert!(vp.contains(origin), "герой в окне сцены: {origin:?} {vp:?}");
+
+        // Щелчок по пустому месту снимает выбор, по герою — выбирает его.
+        ui.selected = Some(vec![0]);
+        let empty = vp.left_top() + vec2(4.0, 4.0);
+        frame(&ctx, &mut ui, &info, pointer(empty, Some(true)));
+        frame(&ctx, &mut ui, &info, pointer(empty, Some(false)));
+        let picked = geom::pick(&placed, view.to_scene(empty), false);
+        assert_eq!(ui.selected, picked);
+        frame(&ctx, &mut ui, &info, pointer(origin, Some(true)));
+        frame(&ctx, &mut ui, &info, pointer(origin, Some(false)));
+        let at_hero = geom::pick(&placed, view.to_scene(origin), false);
+        assert!(at_hero.is_some());
+        assert_eq!(ui.selected, at_hero);
+        ui.take_actions();
+
+        // Стрелка x: тянем на 100 точек вправо.
+        ui.selected = Some(vec![hero]);
+        let grab = origin + vec2(50.0, 0.0);
+        frame(&ctx, &mut ui, &info, pointer(grab, None));
+        frame(&ctx, &mut ui, &info, pointer(grab, Some(true)));
+        for k in 1..=5 {
+            let m = grab + vec2(20.0 * k as f32, 3.0);
+            frame(&ctx, &mut ui, &info, pointer(m, None));
+        }
+        frame(
+            &ctx,
+            &mut ui,
+            &info,
+            pointer(grab + vec2(100.0, 3.0), Some(false)),
+        );
+        let actions = ui.take_actions();
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Edit { commit: false, .. })),
+            "{actions:?}"
+        );
+        let Some(Action::Edit { edit, commit: true }) = actions.last() else {
+            panic!("последней идёт готовая правка: {actions:?}")
+        };
+        assert_eq!(edit.path, vec![hero]);
+        let Change::At(at) = edit.change else {
+            panic!("{edit:?}")
+        };
+        let node = &file.nodes[hero];
+        // 100 точек при 450 точках на единицу — 0.22, с привязкой к сетке 0.05.
+        let moved = at[0] - node.at.0;
+        assert!((moved - 0.2).abs() < 0.051, "{moved}");
+        assert!((at[1] - node.at.1).abs() < 1e-9, "y не сдвинулся");
+    }
+
+    #[test]
+    fn edit_hotkeys() {
+        use egui::{Key, Modifiers};
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let file = SceneFile::parse(reyvec_scene::EXAMPLE).unwrap();
+        let info = info(Some(&file), PlayState::Edit);
+        frame(&ctx, &mut ui, &info, vec![key(Key::S, Modifiers::COMMAND)]);
+        frame(&ctx, &mut ui, &info, vec![key(Key::Z, Modifiers::COMMAND)]);
+        frame(
+            &ctx,
+            &mut ui,
+            &info,
+            vec![key(Key::Z, Modifiers::COMMAND | Modifiers::SHIFT)],
+        );
+        frame(&ctx, &mut ui, &info, vec![key(Key::E, Modifiers::NONE)]);
+        assert_eq!(ui.vp.tool, Tool::Rotate);
+        frame(&ctx, &mut ui, &info, vec![key(Key::F, Modifiers::NONE)]);
+        let actions = ui.take_actions();
+        assert_eq!(actions[..3], [Action::Save, Action::Undo, Action::Redo]);
+        assert!(
+            matches!(actions[3], Action::SetCamera { .. }),
+            "{actions:?}"
+        );
+        // Во время игры клавиши правки не работают.
+        let playing = super::tests::info(Some(&file), PlayState::Playing);
+        frame(
+            &ctx,
+            &mut ui,
+            &playing,
+            vec![key(Key::Z, Modifiers::COMMAND)],
+        );
+        assert!(ui.take_actions().is_empty());
+    }
+
     #[test]
     fn window_edges() {
         let s = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0));
@@ -1502,7 +1977,9 @@ mod tests {
                     .map(|i| 3.0 + (i as f32 * 0.21).sin() + if i % 37 == 0 { 3.5 } else { 0.0 })
                     .collect();
             }
-            let info = info(Some(&file), play);
+            let mut info = info(Some(&file), play);
+            info.view = Some(hero_view(&file, hero));
+            info.dirty = true;
             let mut out = None;
             for frame in 0..12u32 {
                 let mut events = Vec::new();

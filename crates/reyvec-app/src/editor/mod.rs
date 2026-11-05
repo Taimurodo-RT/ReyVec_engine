@@ -6,22 +6,30 @@
 //! (раскладка описана данными в [`layout`]). «Играть» запускает игру прямо в окне сцены,
 //! «Стоп» возвращает сцену к началу.
 //!
-//! Слабое место каркаса: движок рисует сцену на всё окно, а панели лежат поверх неё.
-//! Камера сдвинута так, чтобы середина сцены была посередине свободного места. Отдельная
+//! В режиме правки (Р.4) предметы выбирают щелчком, двигают, поворачивают и меняют в
+//! размере ручками или числами в инспекторе; Ctrl+S пишет файл сцены. Правка меняет в
+//! тексте файла только нужное число ([`ron_edit`]), поэтому комментарии и порядок полей
+//! в файле остаются, а отмена — это просто прошлый текст ([`doc`]).
+//!
+//! Слабое место: движок рисует сцену на всё окно, а панели лежат поверх неё. Камера
+//! сдвинута так, чтобы середина сцены была посередине свободного места. Отдельная
 //! картинка сцены точно под размер середины — следующий шаг.
 
 mod assets;
+mod doc;
+mod geom;
 mod layout;
 mod outline;
+mod ron_edit;
 mod theme;
 mod ui;
+mod viewport;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reyvec_gpu::{DemoScene, FrameStatus, GpuOptions, RendererOptions, UiFrame, WindowRenderer};
-use reyvec_scene::SceneFile;
 use reyvec_vector::{Camera2D, Point, Vec2};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -31,12 +39,15 @@ use winit::window::{Window, WindowId};
 
 use crate::app::{AppError, RunSummary, input_of, to_screen};
 use crate::controls::{Controls, Input, controls_path};
+use doc::SceneDoc;
 use ui::{Action, EditorUi, Info, PlayState};
 
 /// Как часто пересчитывать счётчик кадров.
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
 /// Во сколько раз приближает один щелчок колеса мыши.
 const ZOOM_STEP: f64 = 1.2;
+/// Пока тянут ручку, сцена в движке пересобирается не чаще этого.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(60);
 
 /// Настройки запуска редактора.
 #[derive(Clone, Debug)]
@@ -78,6 +89,7 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
                 None
             }
         });
+    let doc = scene_text.map(|t| SceneDoc::new(config.scene_file.clone(), t));
     let mut editor = Editor {
         ui: EditorUi::new(config.project.as_deref()),
         config,
@@ -86,9 +98,9 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         egui_ctx: egui::Context::default(),
         egui_state: None,
         play: PlayState::Edit,
-        scene: None,
-        scene_text: None,
-        parse_error: None,
+        doc,
+        engine_stale: false,
+        engine_sent: Instant::now(),
         watcher: None,
         controls: Controls::load(&controls_path()),
         start: Instant::now(),
@@ -107,9 +119,6 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         cursor: None,
         snapshot_requested: false,
     };
-    if let Some(text) = scene_text {
-        editor.read_scene(text);
-    }
     event_loop
         .run_app(&mut editor)
         .map_err(|e| AppError::Window(e.to_string()))?;
@@ -138,12 +147,12 @@ struct Editor {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     play: PlayState,
-    /// Прочитанный файл сцены (для иерархии и инспектора).
-    scene: Option<SceneFile>,
-    /// Текст файла сцены: «Стоп» начинает сцену с него заново.
-    scene_text: Option<String>,
-    /// Ошибка в файле сцены, если он не читается.
-    parse_error: Option<String>,
+    /// Открытая сцена: текст с правками, разбор, отмена. «Стоп» начинает сцену с него.
+    doc: Option<SceneDoc>,
+    /// Текст сцены поменялся, а движок его ещё не получил (правку тянут мышью).
+    engine_stale: bool,
+    /// Когда движок последний раз получил текст сцены.
+    engine_sent: Instant,
     watcher: Option<reyvec_scene::SceneWatcher>,
     /// Клавиши героя из настроек игрока (`controls.ron`), как в песочнице.
     controls: Controls,
@@ -179,18 +188,43 @@ impl Editor {
         self.close(event_loop);
     }
 
-    /// Читает текст файла сцены для панелей. Ошибку запоминает, прошлая сцена остаётся.
-    fn read_scene(&mut self, text: String) {
-        let dir = self.config.scene_file.as_ref().and_then(|p| p.parent());
-        match SceneFile::parse_in(&text, dir) {
-            Ok(file) => {
-                self.ui.scene_changed(Some(&file));
-                self.scene = Some(file);
-                self.parse_error = None;
-            }
-            Err(e) => self.parse_error = Some(e.to_string()),
+    /// Отдаёт движку текст сцены из документа: предметы на местах из него. `now: false`
+    /// — правку ещё тянут, движок получит её не чаще [`PREVIEW_INTERVAL`].
+    fn send_scene(&mut self, now: bool) {
+        self.engine_stale = true;
+        if !now && self.engine_sent.elapsed() < PREVIEW_INTERVAL {
+            return;
         }
-        self.scene_text = Some(text);
+        let (Some(r), Some(doc)) = (self.renderer.as_mut(), &self.doc) else {
+            return;
+        };
+        let camera = r.camera();
+        r.switch_scene_file(doc.text());
+        r.set_camera(camera);
+        self.engine_stale = false;
+        self.engine_sent = Instant::now();
+        self.ui.scene_changed(doc.file());
+    }
+
+    /// Правка, отмена или повтор поменяли текст сцены.
+    fn doc_changed(&mut self, now: bool) {
+        if let Some(doc) = &self.doc {
+            self.ui.scene_changed(doc.file());
+        }
+        self.send_scene(now);
+    }
+
+    /// Камера сцены в точках интерфейса.
+    fn view(&self) -> Option<viewport::View> {
+        let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
+        let size = w.inner_size();
+        let ppp = f64::from(self.egui_ctx.pixels_per_point());
+        let c = r.camera();
+        Some(viewport::View {
+            center: [c.center.x, c.center.y],
+            zoom: c.zoom,
+            size: [f64::from(size.width) / ppp, f64::from(size.height) / ppp],
+        })
     }
 
     fn scene_name(&self) -> String {
@@ -218,7 +252,7 @@ impl Editor {
         );
         let size = window.inner_size();
         let files = reyvec_gpu::UserFiles {
-            scene: self.scene_text.as_deref().map(Into::into),
+            scene: self.doc.as_ref().map(|d| d.text().into()),
             scene_dir: self
                 .config
                 .scene_file
@@ -319,9 +353,9 @@ impl Editor {
                 self.play = PlayState::Edit;
                 r.release_game_input();
                 let camera = r.camera();
-                if let Some(text) = &self.scene_text {
-                    // Сцена с начала: герой, тела и враги на местах из файла.
-                    r.switch_scene_file(text);
+                if let Some(doc) = &self.doc {
+                    // Сцена с начала: герой, тела и враги на местах из файла (с правками).
+                    r.switch_scene_file(doc.text());
                 }
                 r.set_game_paused(true);
                 r.set_follow(false);
@@ -365,12 +399,106 @@ impl Editor {
                 };
                 match std::fs::read_to_string(&path) {
                     Ok(text) => {
-                        r.set_scene_file(&text);
-                        self.read_scene(text);
+                        if let Some(doc) = self.doc.as_mut() {
+                            doc.file_changed(text);
+                        } else {
+                            self.doc = Some(SceneDoc::new(Some(path.clone()), text));
+                        }
+                        self.doc_changed(true);
                         tracing::info!("Сцена перечитана: {}", path.display());
                     }
                     Err(e) => tracing::warn!("Не прочитать файл сцены: {e}"),
                 }
+            }
+            Action::SetCamera { center, zoom } => {
+                r.set_follow(false);
+                r.set_camera(Camera2D {
+                    center: Point::new(center[0], center[1]),
+                    zoom,
+                });
+            }
+            Action::Edit { .. }
+            | Action::CancelEdit
+            | Action::EndEdit
+            | Action::Undo
+            | Action::Redo
+            | Action::Save => self.apply_doc(action),
+        }
+    }
+
+    /// Правки сцены: только в режиме правки, когда сцена открыта.
+    fn apply_doc(&mut self, action: Action) {
+        if self.play != PlayState::Edit {
+            return;
+        }
+        let Some(doc) = self.doc.as_mut() else {
+            return;
+        };
+        let now = match action {
+            Action::Edit { edit, commit } => {
+                let done = if commit {
+                    doc.commit(&edit)
+                } else {
+                    doc.preview(&edit)
+                };
+                if let Err(e) = done {
+                    tracing::warn!("Правка не легла в файл сцены: {e}");
+                    return;
+                }
+                commit
+            }
+            Action::CancelEdit => {
+                doc.cancel_preview();
+                true
+            }
+            Action::EndEdit => {
+                doc.finish_preview();
+                true
+            }
+            Action::Undo => {
+                if !doc.undo() {
+                    return;
+                }
+                true
+            }
+            Action::Redo => {
+                if !doc.redo() {
+                    return;
+                }
+                true
+            }
+            Action::Save => {
+                match doc.save() {
+                    Ok(()) => tracing::info!("Сцена сохранена: {}", self.scene_name()),
+                    Err(e) => tracing::warn!("Сцена не сохранена: {e}"),
+                }
+                return;
+            }
+            _ => return,
+        };
+        self.doc_changed(now);
+    }
+
+    /// Файл сцены поменялся на диске: сохранили в блокноте или это наше же сохранение.
+    fn file_saved_outside(&mut self, text: String) {
+        let Some(doc) = self.doc.as_mut() else {
+            return;
+        };
+        if doc.dirty() && text != doc.text() {
+            // Свои правки не теряем: файл с диска можно взять через «Файл → Перечитать».
+            tracing::warn!(
+                "Файл сцены поменяли на диске, а в редакторе есть несохранённые правки. \
+                 Оставляю правки редактора; «ReyVec → Файл → Перечитать сцену» возьмёт файл с диска"
+            );
+            return;
+        }
+        if doc.file_changed(text) {
+            tracing::info!("Файл сцены сохранён, читаю заново");
+            if self.play == PlayState::Edit {
+                self.doc_changed(true);
+            } else if let Some(r) = self.renderer.as_mut() {
+                // Во время игры герой остаётся, где был (как в песочнице).
+                r.set_scene_file(doc.text());
             }
         }
     }
@@ -387,16 +515,13 @@ impl Editor {
         }
         if let Some(watcher) = self.watcher.as_mut() {
             match watcher.poll() {
-                Some(Ok(text)) => {
-                    tracing::info!("Файл сцены сохранён, читаю заново");
-                    if let Some(r) = self.renderer.as_mut() {
-                        r.set_scene_file(&text);
-                    }
-                    self.read_scene(text);
-                }
+                Some(Ok(text)) => self.file_saved_outside(text),
                 Some(Err(e)) => tracing::warn!("Файл сцены: {e}"),
                 None => {}
             }
+        }
+        if self.engine_stale {
+            self.send_scene(false);
         }
         if self.frames >= 2 && !self.centered && self.ui.viewport().is_some() {
             // Камера уже встала на героя: дальше она не идёт за ним, пока не нажмут «Играть».
@@ -408,6 +533,7 @@ impl Editor {
         }
         self.ui.push_log(crate::console::take_log());
 
+        let view = self.view();
         let (Some(window), Some(renderer), Some(state)) =
             (&self.window, &mut self.renderer, &mut self.egui_state)
         else {
@@ -434,7 +560,11 @@ impl Editor {
             .shader_error()
             .map(|e| format!("шейдер: {e}"))
             .or_else(|| renderer.scene_error());
-        let error = self.parse_error.clone().or(engine_error);
+        let doc = self.doc.as_ref();
+        let error = doc
+            .and_then(SceneDoc::error)
+            .map(ToOwned::to_owned)
+            .or(engine_error);
         let info = Info {
             play: self.play,
             maximized: window.is_maximized(),
@@ -443,9 +573,14 @@ impl Editor {
             frame_ms: self.frame_ms,
             gpu_ms: self.gpu_ms,
             adapter: &self.adapter,
-            scene: self.scene.as_ref(),
+            scene: doc.and_then(SceneDoc::file),
             scene_name: &scene_name,
             error: error.as_deref(),
+            view,
+            dirty: doc.is_some_and(SceneDoc::dirty),
+            can_undo: doc.is_some_and(SceneDoc::can_undo),
+            can_redo: doc.is_some_and(SceneDoc::can_redo),
+            can_save: self.config.scene_file.is_some(),
         };
         let input = state.take_egui_input(window);
         let editor_ui = &mut self.ui;
