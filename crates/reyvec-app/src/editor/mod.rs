@@ -108,6 +108,7 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         clipboard: None,
         hidden: HashSet::new(),
         ejected: false,
+        simulating: false,
         time_scale: 1.0,
         watcher: None,
         controls: Controls::load(&controls_path()),
@@ -167,6 +168,8 @@ struct Editor {
     hidden: HashSet<Vec<usize>>,
     /// Камера отцеплена от героя во время игры (F8).
     ejected: bool,
+    /// Симуляция: игра идёт, но герой не слушает клавиш, камера свободна.
+    simulating: bool,
     /// Скорость игры (замедление).
     time_scale: f64,
     watcher: Option<reyvec_scene::SceneWatcher>,
@@ -350,7 +353,9 @@ impl Editor {
             return;
         };
         match action {
-            Action::Play => {
+            Action::Play | Action::Simulate => {
+                let simulate = action == Action::Simulate;
+                let camera = r.camera();
                 if !self.hidden.is_empty()
                     && let Some(doc) = &self.doc
                 {
@@ -360,12 +365,22 @@ impl Editor {
                 self.play = PlayState::Playing;
                 self.ejected = false;
                 r.set_game_paused(false);
-                r.set_follow(true);
+                r.set_follow(!simulate);
+                if simulate {
+                    // Камера остаётся, где была: смотрим, как падают и катятся предметы.
+                    r.set_camera(camera);
+                }
+                self.simulating = simulate;
+                self.ejected = simulate;
                 if let Some(logic) = r.scene_logic() {
                     logic.set_debug_paused(false);
                     logic.set_time_scale(self.time_scale);
                 }
-                tracing::info!("Игра запущена");
+                if simulate {
+                    tracing::info!("Симуляция: физика и логика идут, герой стоит");
+                } else {
+                    tracing::info!("Игра запущена");
+                }
             }
             Action::Pause => {
                 self.play = PlayState::Paused;
@@ -385,6 +400,7 @@ impl Editor {
             Action::Stop => {
                 self.play = PlayState::Edit;
                 self.ejected = false;
+                self.simulating = false;
                 if let Some(logic) = r.scene_logic() {
                     logic.set_debug_paused(false);
                 }
@@ -479,6 +495,7 @@ impl Editor {
             | Action::Ungroup(_)
             | Action::AddPart { .. }
             | Action::RemovePart { .. } => self.apply_doc(action),
+            Action::SavePrefab(path) => self.save_prefab(&path),
             Action::Eject => {
                 if self.play != PlayState::Edit {
                     self.ejected = !self.ejected;
@@ -511,6 +528,43 @@ impl Editor {
     }
 
     /// Закрыть окно; если есть несохранённые правки — сначала спросить.
+    /// Предмет — в файл `assets/prefabs/<имя>.ron` (имя не занимает чужой файл).
+    fn save_prefab(&mut self, path: &[usize]) {
+        let (Some(doc), Some(project)) = (&self.doc, self.config.project.clone()) else {
+            tracing::warn!("Заготовку некуда записать: нет папки проекта");
+            return;
+        };
+        let text = match doc.node_text(path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Не записать заготовку: {e}");
+                return;
+            }
+        };
+        let name = doc
+            .file()
+            .and_then(|f| outline::node_at(f, path))
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
+        let dir = project.join("assets").join(assets::PREFABS);
+        let base = parts::prefab_file_name(&name);
+        let mut file = dir.join(format!("{base}.ron"));
+        let mut k = 2;
+        while file.exists() {
+            file = dir.join(format!("{base} {k}.ron"));
+            k += 1;
+        }
+        let written =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, format!("{text}\n")));
+        match written {
+            Ok(()) => {
+                tracing::info!("Заготовка записана: {}", file.display());
+                self.ui.rescan_assets(Some(&project));
+            }
+            Err(e) => tracing::warn!("Не записать заготовку «{}»: {e}", file.display()),
+        }
+    }
+
     fn close_or_ask(&mut self, event_loop: &ActiveEventLoop) {
         if self.doc.as_ref().is_some_and(SceneDoc::dirty) {
             self.ui.ask_close();
@@ -594,8 +648,24 @@ impl Editor {
                 true
             }
             Action::DropAsset { file, at, after } => {
-                let dir = doc.dir().unwrap_or(std::path::Path::new(".")).to_owned();
-                let item = parts::picture_item(&dir, &file, at);
+                let prefab = file
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ron"));
+                let item = if prefab {
+                    let made = std::fs::read_to_string(&file)
+                        .map_err(|e| ron_edit::EditError(e.to_string()))
+                        .and_then(|t| parts::prefab_item(&t, at));
+                    match made {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!("Заготовка «{}» не читается: {e}", file.display());
+                            return;
+                        }
+                    }
+                } else {
+                    let dir = doc.dir().unwrap_or(std::path::Path::new(".")).to_owned();
+                    parts::picture_item(&dir, &file, at)
+                };
                 let (parent, index) = (Vec::new(), after.map_or(usize::MAX, |p| p[0] + 1));
                 if !structural(doc.paste(&item, &parent, index), &mut select) {
                     return;
@@ -796,6 +866,7 @@ impl Editor {
             can_paste: self.clipboard.is_some(),
             ejected: self.ejected,
             time_scale: self.time_scale,
+            simulating: self.simulating,
         };
         let input = state.take_egui_input(window);
         let editor_ui = &mut self.ui;
@@ -881,7 +952,7 @@ impl Editor {
 
     /// Клавиши и кнопки мыши во время игры — герою.
     fn game_input(&mut self, event: &WindowEvent) {
-        if self.play != PlayState::Playing {
+        if self.play != PlayState::Playing || self.simulating {
             return;
         }
         let Some((input, down, repeat)) = input_of(event) else {

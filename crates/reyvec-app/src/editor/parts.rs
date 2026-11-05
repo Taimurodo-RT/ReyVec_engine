@@ -509,6 +509,36 @@ pub(crate) fn picture_item(scene_dir: &Path, file: &Path, at: [f64; 2]) -> Strin
     )
 }
 
+/// Предмет из заготовки (текст предмета в скобках) на месте `at`.
+pub(crate) fn prefab_item(text: &str, at: [f64; 2]) -> Result<String, super::ron_edit::EditError> {
+    use super::ron_edit;
+    let body = text.trim();
+    // Обёртка-сцена: поле `at` ставится так же, как в настоящей сцене.
+    let wrapped = format!("(nodes: [\n{body}\n])");
+    let t = ron_edit::set_field(&wrapped, &[0], "at", &pair(at))?;
+    ron_edit::node_text(&t, &[0])
+}
+
+/// Имя файла заготовки из имени предмета: только буквы, цифры, пробел, `-` и `_`.
+pub(crate) fn prefab_file_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, ' ' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        "предмет".to_owned()
+    } else {
+        clean.to_owned()
+    }
+}
+
 /// Путь от папки `from` до файла `to` через `/` (так его пишут в файле сцены).
 fn relative(from: &Path, to: &Path) -> String {
     let full = |p: &Path| {
@@ -645,6 +675,22 @@ mod tests {
         let f = SceneFile::parse(&super::super::ron_edit::insert_node(base, &[], 9, &pic).unwrap())
             .unwrap();
         assert_eq!(f.nodes[1].name, "shapes");
+        let item =
+            prefab_item("(name: \"ящик\", at: (9.0, 9.0), shapes: [])", [0.5, 0.25]).unwrap();
+        let f =
+            SceneFile::parse(&super::super::ron_edit::insert_node(base, &[], 9, &item).unwrap())
+                .unwrap();
+        assert_eq!(f.nodes[1].at, (0.5, 0.25));
+        assert_eq!(prefab_file_name("ящик/2?"), "ящик_2_");
+        assert_eq!(prefab_file_name(" "), "предмет");
+        // Заготовки проекта встают в сцену.
+        for e in std::fs::read_dir(root.join("assets/prefabs")).unwrap() {
+            let path = e.unwrap().path();
+            let t = std::fs::read_to_string(&path).unwrap();
+            let item = prefab_item(&t, [0.1, 0.1]).unwrap();
+            let text = super::super::ron_edit::insert_node(base, &[], 9, &item).unwrap();
+            SceneFile::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        }
         let text = super::super::ron_edit::set_field(base, &[0], "body", &t).unwrap();
         let f = SceneFile::parse(&text).unwrap();
         let got = f.nodes[0].body.as_ref().unwrap();

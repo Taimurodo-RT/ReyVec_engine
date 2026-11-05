@@ -99,6 +99,20 @@ impl Assets {
         }
     }
 
+    /// Перечитать папки с диска; открытая папка остаётся, если она ещё есть.
+    pub(crate) fn rescan(&mut self, project: Option<&Path>) {
+        let fresh = Self::scan(project);
+        self.root = fresh.root;
+        if self
+            .root
+            .as_ref()
+            .and_then(|r| r.at(&self.current))
+            .is_none()
+        {
+            self.current = fresh.current;
+        }
+    }
+
     /// Нашлась ли папка проекта и есть ли в ней хоть что-то.
     #[cfg(test)]
     pub(crate) fn root(&self) -> Option<&Dir> {
@@ -146,15 +160,17 @@ impl Assets {
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing = vec2(GAP_XL, GAP_XL);
                             for (i, d) in dir.dirs.iter().enumerate() {
-                                if tile(ui, &d.name, true).double_clicked() {
+                                if tile(ui, &d.name, true, false).double_clicked() {
                                     let mut p = self.current.clone();
                                     p.push(i);
                                     go = Some(p);
                                 }
                             }
+                            let prefabs = dir.name == PREFABS;
                             for f in &dir.files {
-                                let r = tile(ui, f, false);
-                                if droppable(f) {
+                                let drag = droppable(f) || (prefabs && is_prefab(f));
+                                let r = tile(ui, f, false, drag);
+                                if drag {
                                     r.dnd_set_drag_payload(AssetFile(dir.path.join(f)));
                                 }
                             }
@@ -266,14 +282,22 @@ fn crumbs(ui: &mut Ui, root: &Dir, current: &[usize], go: &mut Option<Vec<usize>
 #[derive(Clone, Debug)]
 pub(crate) struct AssetFile(pub PathBuf);
 
+/// Папка заготовок в `assets`.
+pub(crate) const PREFABS: &str = "prefabs";
+
+/// Заготовка: предмет, записанный в свой файл `.ron` в папке `assets/prefabs`.
+fn is_prefab(name: &str) -> bool {
+    name.to_lowercase().ends_with(".ron")
+}
+
 /// Такой файл можно бросить в сцену: рисунок SVG станет предметом.
 fn droppable(name: &str) -> bool {
     name.to_lowercase().ends_with(".svg")
 }
 
 /// Плитка файла или папки.
-fn tile(ui: &mut Ui, name: &str, folder: bool) -> egui::Response {
-    let sense = if !folder && droppable(name) {
+fn tile(ui: &mut Ui, name: &str, folder: bool, drag: bool) -> egui::Response {
+    let sense = if drag {
         Sense::click_and_drag()
     } else {
         Sense::click()
@@ -315,8 +339,10 @@ fn tile(ui: &mut Ui, name: &str, folder: bool) -> egui::Response {
     );
     let hint = if folder {
         format!("{name}\nДвойной щелчок — открыть папку")
-    } else if droppable(name) {
+    } else if drag && droppable(name) {
         format!("{name}\nПеретащите в сцену — появится предмет с этим рисунком")
+    } else if drag {
+        format!("{name}\nЗаготовка: перетащите в сцену — появится такой же предмет")
     } else {
         name.to_owned()
     };

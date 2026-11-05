@@ -46,6 +46,8 @@ pub(crate) enum PlayState {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Action {
     Play,
+    /// Играть без героя: физика и логика идут, клавиши герою не идут, камера свободна.
+    Simulate,
     Pause,
     Resume,
     Stop,
@@ -120,6 +122,8 @@ pub(crate) enum Action {
         at: [f64; 2],
         after: Option<Vec<usize>>,
     },
+    /// Записать предмет заготовкой в `assets/prefabs` (её потом тащат из Ассетов в сцену).
+    SavePrefab(Vec<usize>),
     /// Новые места нескольких предметов (выравнивание) — один шаг истории.
     MoveMany(Vec<(Vec<usize>, [f64; 2])>),
     /// Вложить предметы одного уровня в новый предмет «группа» (Ctrl+G).
@@ -174,6 +178,8 @@ pub(crate) struct Info<'a> {
     pub ejected: bool,
     /// Скорость игры.
     pub time_scale: f64,
+    /// Идёт симуляция (без управления героем).
+    pub simulating: bool,
 }
 
 /// Состояние интерфейса между кадрами.
@@ -279,6 +285,11 @@ impl EditorUi {
             ruler: None,
             log_filter: LogFilter::All,
         }
+    }
+
+    /// Папки проекта поменялись (записали заготовку): перечитать Ассеты.
+    pub(crate) fn rescan_assets(&mut self, project: Option<&Path>) {
+        self.assets.rescan(project);
     }
 
     /// Что попросили сделать с прошлого вызова.
@@ -812,6 +823,15 @@ impl EditorUi {
                 if icon_button(ui, Icon::Play, "Играть", true).clicked() {
                     self.actions.push(Action::Play);
                 }
+                if icon_button(ui, Icon::Play, "Симуляция", false)
+                    .on_hover_text(
+                        "Физика и логика идут, а герой стоит: смотреть, как падают и катятся \
+                         предметы. Камера свободна.",
+                    )
+                    .clicked()
+                {
+                    self.actions.push(Action::Simulate);
+                }
             }
             PlayState::Playing => {
                 if icon_button(ui, Icon::Stop, "Стоп", false).clicked() {
@@ -1218,6 +1238,14 @@ impl EditorUi {
         }
         if item(ui, "Дублировать", "Ctrl+D") {
             self.actions.push(Action::Duplicate(p.clone()));
+            ui.close();
+        }
+        if ui
+            .button("Сохранить как заготовку")
+            .on_hover_text("Файл в assets/prefabs: его можно перетащить из Ассетов в любую сцену")
+            .clicked()
+        {
+            self.actions.push(Action::SavePrefab(p.clone()));
             ui.close();
         }
         ui.separator();
@@ -1672,6 +1700,23 @@ impl EditorUi {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
             }
         }
+        if self.ov.show.map
+            && (editing || info.ejected)
+            && let (Some(file), Some(view)) = (info.scene, info.view)
+        {
+            let all = geom::place_all(file);
+            if let Some(center) = overlay::minimap(ui, rect, view, &all, self.selected.as_deref()) {
+                // Середина окна сцены — не середина всего окна (панели по бокам).
+                let mid = view.to_scene(rect.center());
+                self.actions.push(Action::SetCamera {
+                    center: [
+                        center[0] + view.center[0] - mid[0],
+                        center[1] + view.center[1] - mid[1],
+                    ],
+                    zoom: view.zoom,
+                });
+            }
+        }
         if info.play == PlayState::Playing {
             // Рамка цвета акцента: сразу видно, что идёт игра, а не правка.
             painter.rect_stroke(
@@ -1686,7 +1731,11 @@ impl EditorUi {
             PlayState::Playing => chip(
                 &painter,
                 rect.left_top() + vec2(12.0, 12.0),
-                "Игра идёт · Esc или «Стоп» — вернуться к правке",
+                if info.simulating {
+                    "Симуляция · герой не управляется · Esc — вернуться к правке"
+                } else {
+                    "Игра идёт · Esc или «Стоп» — вернуться к правке"
+                },
                 ACCENT,
             ),
             PlayState::Paused => chip(
@@ -2697,6 +2746,7 @@ mod tests {
             can_paste: false,
             ejected: false,
             time_scale: 1.0,
+            simulating: false,
         }
     }
 
