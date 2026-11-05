@@ -64,6 +64,12 @@ pub(crate) enum Action {
     ResetCamera,
     /// Прочитать файл сцены с диска заново.
     ReloadScene,
+    /// Открыть другую сцену из той же папки.
+    OpenScene(std::path::PathBuf),
+    /// Создать сцену «новая сцена.ron» рядом с открытой и открыть её.
+    NewScene,
+    /// Вернуть правки из автосохранения.
+    RestoreAutosave,
     /// Правка предмета. `commit: false` — её ещё тянут мышью (видна сразу, в историю
     /// попадёт одним шагом, когда отпустят).
     Edit {
@@ -174,6 +180,10 @@ pub(crate) struct Info<'a> {
     pub hidden: &'a HashSet<Vec<usize>>,
     /// В буфере обмена есть предмет.
     pub can_paste: bool,
+    /// Сцены в папке открытой: «Файл → Открыть».
+    pub scenes: &'a [std::path::PathBuf],
+    /// Есть автосохранение, которое можно вернуть.
+    pub can_restore: bool,
     /// Камера отцеплена от героя во время игры (F8).
     pub ejected: bool,
     /// Скорость игры.
@@ -721,6 +731,52 @@ impl EditorUi {
         ui.menu_button(brand, |ui| {
             ui.set_min_width(180.0);
             ui.menu_button("Файл", |ui| {
+                // Другую сцену — только когда правки этой сохранены и идёт правка.
+                let free = !info.dirty && info.play == PlayState::Edit && info.can_save;
+                let why = "Сначала сохраните правки (Ctrl+S) и остановите игру";
+                if ui
+                    .add_enabled(free, egui::Button::new("Новая сцена"))
+                    .on_disabled_hover_text(why)
+                    .clicked()
+                {
+                    actions.push(Action::NewScene);
+                    ui.close();
+                }
+                ui.add_enabled_ui(free, |ui| {
+                    ui.menu_button("Открыть сцену", |ui| {
+                        ui.set_min_width(200.0);
+                        if info.scenes.is_empty() {
+                            ui.label(RichText::new("Других сцен нет").color(MUTED));
+                        }
+                        for p in info.scenes {
+                            let name = p
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let current = name == info.scene_name;
+                            if ui.selectable_label(current, name).clicked() && !current {
+                                actions.push(Action::OpenScene(p.clone()));
+                                ui.close();
+                            }
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text(why);
+                });
+                if ui
+                    .add_enabled(
+                        info.can_restore,
+                        egui::Button::new("Восстановить автосохранение"),
+                    )
+                    .on_hover_text(
+                        "Вернуть правки, которые редактор сам записал, но в файл они не попали",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::RestoreAutosave);
+                    ui.close();
+                }
+                ui.separator();
                 let save = egui::Button::new("Сохранить сцену").shortcut_text("Ctrl+S");
                 if ui.add_enabled(info.can_save, save).clicked() {
                     actions.push(Action::Save);
@@ -2046,24 +2102,35 @@ fn node_inspector(
                     }
                 }
                 ui.end_row();
-                let rows: [Row; 4] = [
-                    ("Поворот", node.angle, 0.5, "°", Change::Angle),
-                    ("Размер", node.scale, 0.005, "", Change::Scale),
-                    ("Глубина", node.depth, 0.01, "", Change::Depth),
+                // Подпись, значение, шаг мыши, единица, правка, значение «как было».
+                let rows: [(Row, f64); 4] = [
+                    (("Поворот", node.angle, 0.5, "°", Change::Angle), 0.0),
+                    (("Размер", node.scale, 0.005, "", Change::Scale), 1.0),
+                    (("Глубина", node.depth, 0.01, "", Change::Depth), 0.0),
                     (
-                        "Прозрачность",
-                        f64::from(node.opacity),
-                        0.005,
-                        "",
-                        Change::Opacity,
+                        (
+                            "Прозрачность",
+                            f64::from(node.opacity),
+                            0.005,
+                            "",
+                            Change::Opacity,
+                        ),
+                        1.0,
                     ),
                 ];
-                for (name, v, speed, suffix, make) in rows {
+                for ((name, v, speed, suffix, make), default) in rows {
                     prop(ui, name);
                     if let Some(f) = num_field(ui, v, speed, None, suffix, editing) {
                         actions.push(f.action(|v| edit(make(v), true)));
                     }
-                    ui.label("");
+                    // Значение поменяли: стрелка-«сброс» возвращает обычное.
+                    if editing && (v - default).abs() > 1e-9 {
+                        if reset_button(ui).clicked() {
+                            actions.push(edit(make(default), true));
+                        }
+                    } else {
+                        ui.label("");
+                    }
                     ui.end_row();
                 }
             });
@@ -2147,6 +2214,29 @@ pub(crate) fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
             });
         });
     ui.add_space(GAP_M);
+}
+
+/// Маленькая круговая стрелка «сбросить к обычному значению».
+fn reset_button(ui: &mut Ui) -> Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+    let color = if resp.hovered() {
+        Color32::WHITE
+    } else {
+        MUTED
+    };
+    let c = r.center();
+    let s = Stroke::new(1.3, color);
+    let pts: Vec<Pos2> = (0..=16)
+        .map(|k| {
+            let t = 0.6 + k as f32 * 0.32;
+            c + vec2(t.cos(), t.sin()) * 5.0
+        })
+        .collect();
+    let tip = pts[0];
+    ui.painter().add(egui::Shape::line(pts, s));
+    ui.painter().line_segment([tip, tip + vec2(3.0, -1.0)], s);
+    ui.painter().line_segment([tip, tip + vec2(-0.5, -3.2)], s);
+    resp.on_hover_text("Вернуть обычное значение")
 }
 
 pub(crate) fn prop(ui: &mut Ui, name: &str) {
@@ -2744,6 +2834,8 @@ mod tests {
             can_save: true,
             hidden: &NO_HIDDEN,
             can_paste: false,
+            scenes: &[],
+            can_restore: false,
             ejected: false,
             time_scale: 1.0,
             simulating: false,

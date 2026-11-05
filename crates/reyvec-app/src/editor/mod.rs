@@ -18,6 +18,7 @@
 mod arrange;
 mod assets;
 mod doc;
+mod files;
 mod geom;
 mod layout;
 mod outline;
@@ -94,6 +95,22 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
             }
         });
     let doc = scene_text.map(|t| SceneDoc::new(config.scene_file.clone(), t));
+    let restore = config
+        .scene_file
+        .as_ref()
+        .zip(doc.as_ref())
+        .and_then(|(p, d)| files::pending_autosave(p, d.text()));
+    if restore.is_some() {
+        tracing::warn!(
+            "Есть автосохранение с несохранёнными правками: «Файл → Восстановить автосохранение»"
+        );
+    }
+    let scenes = config
+        .scene_file
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(files::list_scenes)
+        .unwrap_or_default();
     let mut editor = Editor {
         ui: EditorUi::new(config.project.as_deref()),
         config,
@@ -127,6 +144,10 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         centered: false,
         cursor: None,
         snapshot_requested: false,
+        scenes,
+        restore,
+        autosave_at: Instant::now(),
+        autosaved: String::new(),
     };
     event_loop
         .run_app(&mut editor)
@@ -191,6 +212,14 @@ struct Editor {
     centered: bool,
     cursor: Option<PhysicalPosition<f64>>,
     snapshot_requested: bool,
+    /// Сцены в папке открытой (меню «Файл → Открыть»).
+    scenes: Vec<PathBuf>,
+    /// Автосохранение с правками, которых нет в файле (можно восстановить).
+    restore: Option<String>,
+    /// Когда последний раз проверяли, не пора ли автосохранить.
+    autosave_at: Instant,
+    /// Что записано в автосохранение последним.
+    autosaved: String,
 }
 
 impl Editor {
@@ -496,6 +525,33 @@ impl Editor {
             | Action::AddPart { .. }
             | Action::RemovePart { .. } => self.apply_doc(action),
             Action::SavePrefab(path) => self.save_prefab(&path),
+            Action::OpenScene(path) => self.open_scene(path),
+            Action::NewScene => {
+                let Some(dir) = self.config.scene_file.as_deref().and_then(|p| p.parent()) else {
+                    return;
+                };
+                let path = files::new_scene_path(dir);
+                match std::fs::write(&path, files::NEW_SCENE) {
+                    Ok(()) => self.open_scene(path),
+                    Err(e) => tracing::warn!("Не создать сцену «{}»: {e}", path.display()),
+                }
+            }
+            Action::RestoreAutosave => {
+                if let (Some(t), Some(doc)) = (self.restore.take(), self.doc.as_mut()) {
+                    match doc.change(|_| Ok(t)) {
+                        Ok(()) => {
+                            self.hidden.clear();
+                            self.ui.structure_changed();
+                            self.ui.select(None);
+                            self.doc_changed(true);
+                            tracing::info!(
+                                "Правки из автосохранения вернулись (Ctrl+Z — отменить)"
+                            );
+                        }
+                        Err(e) => tracing::warn!("Автосохранение не читается: {e}"),
+                    }
+                }
+            }
             Action::Eject => {
                 if self.play != PlayState::Edit {
                     self.ejected = !self.ejected;
@@ -528,6 +584,64 @@ impl Editor {
     }
 
     /// Закрыть окно; если есть несохранённые правки — сначала спросить.
+    /// Несохранённые правки раз в минуту — в `.autosave` рядом со сценой (сам файл сцены
+    /// не трогается). Сохранили сцену — автосохранение убирается.
+    fn autosave(&mut self) {
+        const EVERY: Duration = Duration::from_secs(60);
+        if self.autosave_at.elapsed() < EVERY {
+            return;
+        }
+        self.autosave_at = Instant::now();
+        let (Some(doc), Some(path)) = (&self.doc, &self.config.scene_file) else {
+            return;
+        };
+        if !doc.dirty() || doc.text() == self.autosaved {
+            return;
+        }
+        match files::write_autosave(path, doc.text()) {
+            Ok(()) => self.autosaved = doc.text().to_owned(),
+            Err(e) => tracing::warn!("Автосохранение не записалось: {e}"),
+        }
+    }
+
+    /// Открыть другую сцену той же папки (правки прошлой уже сохранены).
+    fn open_scene(&mut self, path: PathBuf) {
+        if self.doc.as_ref().is_some_and(SceneDoc::dirty) {
+            tracing::warn!("Сначала сохраните правки (Ctrl+S), потом открывайте другую сцену");
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Не прочитать сцену «{}»: {e}", path.display());
+                return;
+            }
+        };
+        self.restore = files::pending_autosave(&path, &text);
+        self.doc = Some(SceneDoc::new(Some(path.clone()), text));
+        self.watcher = reyvec_scene::SceneWatcher::new(&path)
+            .map_err(|e| tracing::warn!("Не следить за файлом сцены: {e}"))
+            .ok();
+        self.config.scene_file = Some(path.clone());
+        self.scenes = path.parent().map(files::list_scenes).unwrap_or_default();
+        self.hidden.clear();
+        self.autosaved.clear();
+        self.ui.structure_changed();
+        self.ui.select(None);
+        // Камера встанет на героя новой сцены и потом — серединой в свободное место.
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_follow(true);
+        }
+        self.centered = false;
+        self.doc_changed(true);
+        tracing::info!("Сцена открыта: {}", self.scene_name());
+        if self.restore.is_some() {
+            tracing::warn!(
+                "Есть автосохранение с несохранёнными правками: «Файл → Восстановить автосохранение»"
+            );
+        }
+    }
+
     /// Предмет — в файл `assets/prefabs/<имя>.ron` (имя не занимает чужой файл).
     fn save_prefab(&mut self, path: &[usize]) {
         let (Some(doc), Some(project)) = (&self.doc, self.config.project.clone()) else {
@@ -744,7 +858,13 @@ impl Editor {
             }
             Action::Save => {
                 match doc.save() {
-                    Ok(()) => tracing::info!("Сцена сохранена: {}", self.scene_name()),
+                    Ok(()) => {
+                        if let Some(p) = &self.config.scene_file {
+                            files::drop_autosave(p);
+                        }
+                        self.restore = None;
+                        tracing::info!("Сцена сохранена: {}", self.scene_name());
+                    }
                     Err(e) => tracing::warn!("Сцена не сохранена: {e}"),
                 }
                 return;
@@ -804,6 +924,7 @@ impl Editor {
         if self.engine_stale {
             self.send_scene(false);
         }
+        self.autosave();
         if self.frames >= 2 && !self.centered && self.ui.viewport().is_some() {
             // Камера уже встала на героя: дальше она не идёт за ним, пока не нажмут «Играть».
             if let Some(r) = self.renderer.as_mut() {
@@ -864,6 +985,8 @@ impl Editor {
             can_save: self.config.scene_file.is_some(),
             hidden: &self.hidden,
             can_paste: self.clipboard.is_some(),
+            scenes: &self.scenes,
+            can_restore: self.restore.is_some(),
             ejected: self.ejected,
             time_scale: self.time_scale,
             simulating: self.simulating,
