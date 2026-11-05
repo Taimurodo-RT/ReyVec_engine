@@ -18,8 +18,10 @@
 //! После плавных операций и масштаба поле остаётся «снизу» (не больше настоящего
 //! расстояния), поэтому по нему можно шагать лучом и не проскочить поверхность.
 
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
+
+use crate::profile2d::{FIELD_HEADER_WORDS, Profile, field_distance};
 
 /// Объёмная форма: примитив, операция над формами, сдвиг или материал.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -46,6 +48,21 @@ pub enum Shape3 {
     /// Плоскость: всё по ту сторону от `normal` дальше `offset` от начала — внутри.
     /// `normal: (0, 1, 0), offset: 0` — пол на высоте 0.
     Plane { normal: [f32; 3], offset: f32 },
+    /// Выдавленная 2D-фигура (7.7): контур `profile` в плоскости XY (как в SVG, только
+    /// в метрах и Y вверх) толщиной `depth` по Z, рёбра скруглены на `round`.
+    Extrude {
+        profile: Profile,
+        depth: f32,
+        #[serde(default)]
+        round: f32,
+    },
+    /// Тело вращения (7.7): контур `profile` (X — от оси, Y — вверх) повёрнут вокруг
+    /// оси Y. `offset` отодвигает контур от оси: с ним круг становится бубликом.
+    Revolve {
+        profile: Profile,
+        #[serde(default)]
+        offset: f32,
+    },
     /// Объединение: всё, что есть хотя бы в одной форме.
     Union {
         shapes: Vec<Shape3>,
@@ -174,6 +191,17 @@ impl Shape3 {
             } => sd_cylinder(p, *height * 0.5, *radius, *round),
             Self::Torus { radius, thickness } => sd_torus(p, *radius, *thickness),
             Self::Plane { normal, offset } => sd_plane(p, Vec3::from(*normal), *offset),
+            Self::Extrude {
+                profile,
+                depth,
+                round,
+            } => sd_extrude(
+                p,
+                profile.distance(Vec2::new(p.x, p.y)),
+                *depth * 0.5,
+                *round,
+            ),
+            Self::Revolve { profile, offset } => profile.distance(revolve_point(p, *offset)),
             Self::Union { shapes, smooth } => shapes
                 .iter()
                 .map(|s| s.distance(p))
@@ -267,6 +295,20 @@ impl Shape3 {
             )),
             Self::Torus { radius, thickness } => Some((Vec3::ZERO, radius.abs() + thickness.abs())),
             Self::Plane { .. } => None,
+            Self::Extrude { profile, depth, .. } => {
+                let (lo, hi) = profile.bounds();
+                let half = ((hi - lo) * 0.5).extend(depth.abs() * 0.5);
+                Some((((lo + hi) * 0.5).extend(0.0), half.length()))
+            }
+            Self::Revolve { profile, offset } => {
+                let (lo, hi) = profile.bounds();
+                let r = (offset + lo.x.abs().max(hi.x.abs())).abs();
+                let half = (hi.y - lo.y) * 0.5;
+                Some((
+                    Vec3::new(0.0, (lo.y + hi.y) * 0.5, 0.0),
+                    (r * r + half * half).sqrt(),
+                ))
+            }
             Self::Union { shapes, smooth } => {
                 // Плавное объединение выпирает между частями не больше чем на smooth/4;
                 // берём с запасом.
@@ -350,6 +392,17 @@ pub fn sd_plane(p: Vec3, normal: Vec3, offset: f32) -> f32 {
     p.dot(normal.normalize_or(Vec3::Y)) - offset
 }
 
+/// Выдавливание: `d2` — расстояние до 2D-фигуры в точке (x, y), толщина ±`half` по Z.
+pub fn sd_extrude(p: Vec3, d2: f32, half: f32, round: f32) -> f32 {
+    let w = Vec2::new(d2 + round, p.z.abs() - half + round);
+    w.max(Vec2::ZERO).length() + w.max_element().min(0.0) - round
+}
+
+/// Точка контура тела вращения: расстояние от оси Y (минус `offset`) и высота.
+pub fn revolve_point(p: Vec3, offset: f32) -> Vec2 {
+    Vec2::new(Vec2::new(p.x, p.z).length() - offset, p.y)
+}
+
 pub fn op_union(a: f32, b: f32, k: f32) -> f32 {
     if k <= 0.0 {
         return a.min(b);
@@ -373,7 +426,9 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 {
 /// Коды команд программы. Слово команды: код в младших 8 битах, вид примитива в следующих.
 pub mod op {
     /// Примитив: слово команды, материал, 12 чисел матрицы «мир → форма» (три строки по
-    /// четыре: поворот и сдвиг), множитель расстояния (масштаб), затем 4 параметра.
+    /// четыре: поворот и сдвиг), множитель расстояния (масштаб), затем 4 параметра. Биты
+    /// 16–31 слова команды — сколько слов данных идёт следом (поле 2D-фигуры у
+    /// выдавливания и вращения, 7.7); у остальных примитивов ноль.
     pub const PRIM: u32 = 1;
     /// Операции: слово команды и ширина плавного перехода.
     pub const UNION: u32 = 2;
@@ -389,10 +444,16 @@ pub mod prim {
     pub const CYLINDER: u32 = 3;
     pub const TORUS: u32 = 4;
     pub const PLANE: u32 = 5;
+    pub const EXTRUDE: u32 = 6;
+    pub const REVOLVE: u32 = 7;
 }
 
-/// Слов на примитив: команда, материал, 12 матрицы, масштаб, 4 параметра.
+/// Слов на примитив: команда, материал, 12 матрицы, масштаб, 4 параметра (без данных
+/// поля 2D-фигуры).
 pub const PRIM_WORDS: usize = 19;
+/// Длиннее программа одной формы не бывает: шейдер дальше не читает (MAX_PROGRAM_WORDS
+/// в `include/space.slang`, менять вместе).
+pub const MAX_PROGRAM_WORDS: usize = 16384;
 /// Слов на операцию.
 pub const OP_WORDS: usize = 2;
 /// Глубина стека машины в шейдере: столько форм может ждать операции одновременно.
@@ -416,6 +477,8 @@ pub enum CompileError {
     TooDeep,
     #[error("пустая операция: в объединении или пересечении нет форм")]
     Empty,
+    #[error("форма слишком большая: больше {MAX_PROGRAM_WORDS} слов (много выдавленных фигур?)")]
+    TooLong,
 }
 
 /// Преобразование «мир → форма» для примитива: матрица поворота, сдвиг и масштаб.
@@ -451,6 +514,9 @@ impl Placement {
 pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
     let mut words = Vec::new();
     emit(shape, Placement::IDENTITY, 0, 0, &mut words)?;
+    if words.len() > MAX_PROGRAM_WORDS {
+        return Err(CompileError::TooLong);
+    }
     Ok(Program {
         words,
         bounds: shape.bounds(),
@@ -470,8 +536,11 @@ fn emit(
     if base >= STACK {
         return Err(CompileError::TooDeep);
     }
-    let prim = |kind: u32, params: [f32; 4], out: &mut Vec<u32>| {
-        out.push(op::PRIM | (kind << 8));
+    let prim_with = |kind: u32, params: [f32; 4], data: &[u32], out: &mut Vec<u32>| {
+        if data.len() > 0xffff {
+            return Err(CompileError::TooLong);
+        }
+        out.push(op::PRIM | (kind << 8) | ((data.len() as u32) << 16));
         out.push(material);
         for row in 0..3 {
             let r = at.rot.row(row);
@@ -479,8 +548,10 @@ fn emit(
         }
         out.push(at.scale.to_bits());
         out.extend(params.map(f32::to_bits));
+        out.extend_from_slice(data);
         Ok(1)
     };
+    let prim = |kind: u32, params: [f32; 4], out: &mut Vec<u32>| prim_with(kind, params, &[], out);
     match shape {
         Shape3::Sphere { radius } => prim(prim::SPHERE, [*radius, 0.0, 0.0, 0.0], out),
         Shape3::Box { size, round } => prim(
@@ -503,6 +574,22 @@ fn emit(
             let n = Vec3::from(*normal).normalize_or(Vec3::Y);
             prim(prim::PLANE, [n.x, n.y, n.z, *offset], out)
         }
+        Shape3::Extrude {
+            profile,
+            depth,
+            round,
+        } => prim_with(
+            prim::EXTRUDE,
+            [*depth * 0.5, *round, 0.0, 0.0],
+            profile.words(),
+            out,
+        ),
+        Shape3::Revolve { profile, offset } => prim_with(
+            prim::REVOLVE,
+            [*offset, 0.0, 0.0, 0.0],
+            profile.words(),
+            out,
+        ),
         Shape3::Union { shapes, smooth } => {
             chain(shapes, op::UNION, *smooth, at, material, base, out)
         }
@@ -577,16 +664,27 @@ impl Program {
                 );
                 let scale = f(i + 14);
                 let a = [f(i + 15), f(i + 16), f(i + 17), f(i + 18)];
+                let data = (w[i] >> 16) as usize;
+                let field = &w[(i + PRIM_WORDS).min(w.len())..];
                 let d = match kind {
                     prim::SPHERE => sd_sphere(local, a[0]),
                     prim::BOX => sd_box(local, Vec3::new(a[0], a[1], a[2]), a[3]),
                     prim::CAPSULE => sd_capsule(local, a[0], a[1]),
                     prim::CYLINDER => sd_cylinder(local, a[0], a[1], a[2]),
                     prim::TORUS => sd_torus(local, a[0], a[1]),
+                    prim::EXTRUDE if data >= FIELD_HEADER_WORDS => sd_extrude(
+                        local,
+                        field_distance(field, Vec2::new(local.x, local.y)),
+                        a[0],
+                        a[1],
+                    ),
+                    prim::REVOLVE if data >= FIELD_HEADER_WORDS => {
+                        field_distance(field, revolve_point(local, a[0]))
+                    }
                     _ => sd_plane(local, Vec3::new(a[0], a[1], a[2]), a[3]),
                 };
                 stack.push((d * scale, material));
-                i += PRIM_WORDS;
+                i += PRIM_WORDS + data;
             } else {
                 let k = f(i + 1);
                 let (b, a) = (
@@ -766,6 +864,24 @@ mod tests {
                 }
                 .placed([2.0, 0.6, -1.0], [0.0, 30.0, 0.0])
                 .paint(2),
+                // Выдавленная звезда и тело вращения: у них после примитива идут данные
+                // поля, следующие команды должны читаться с правильного места.
+                Shape3::Extrude {
+                    profile: Profile::new(
+                        "M 0 1 L 0.22 0.3 L 0.95 0.31 L 0.36 -0.12 L 0.59 -0.81 \
+                         L 0 -0.38 L -0.59 -0.81 L -0.36 -0.12 L -0.95 0.31 L -0.22 0.3 Z",
+                    )
+                    .unwrap(),
+                    depth: 0.3,
+                    round: 0.05,
+                }
+                .placed([-2.5, 1.0, -2.0], [0.0, 40.0, 0.0])
+                .paint(4),
+                Shape3::Revolve {
+                    profile: Profile::new("M 0 0 L 0.4 0 Q 0.5 0.4 0.1 0.8 Z").unwrap(),
+                    offset: 0.2,
+                }
+                .at([2.5, 0.0, 2.5]),
                 Shape3::Move {
                     at: [-2.0, 1.0, 1.0],
                     turn: [90.0, 0.0, 20.0],

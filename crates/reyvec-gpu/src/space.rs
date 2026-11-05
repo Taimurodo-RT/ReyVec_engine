@@ -116,6 +116,30 @@ mod tests {
     }
 
     #[test]
+    fn vector_scene_compiles_and_fits() {
+        // 7.7: выдавленные и повёрнутые контуры, поле фигуры идёт в программе формы.
+        let text = include_str!("../../../scenes/3d/vector.ron");
+        let scene = reyvec_sdf::SpaceScene::parse(text).unwrap();
+        let frame = scene.frame(0.0);
+        let words = pack(&frame, &scene.materials, true).words;
+        assert!(words.len() < MAX_WORDS);
+        let inside = |object: usize, p: [f32; 3]| {
+            let program = compile(&frame.shapes[object]).unwrap();
+            program.distance(glam::Vec3::from(p)).0
+        };
+        // Звезда с дырой, сердце, ваза пустая внутри, бублик пустой в середине, облако
+        // выпуклое вверх.
+        assert!(inside(1, [-2.2, 1.6, 0.0]) < 0.0);
+        assert!(inside(1, [-2.2, 1.1, 0.0]) > 0.05, "дыра в звезде");
+        assert!(inside(2, [-0.6, 1.2, 0.8]) < -0.1);
+        assert!(inside(3, [0.9, 0.6, 0.3]) > 0.0, "ваза пустая");
+        assert!(inside(3, [0.9, 0.03, 0.3]) < 0.0, "дно вазы");
+        assert!(inside(5, [-0.4, 0.15, -1.4]) > 0.2, "дырка бублика");
+        assert!(inside(5, [0.05, 0.15, -1.4]) < 0.0);
+        assert!(inside(7, [0.0, 2.75, -3.0]) < 0.0, "облако выгнуто вверх");
+    }
+
+    #[test]
     fn mixed_scene_packs_meshes_and_proxies() {
         // Опыт совмещения 7.6ж: модели и их невидимые заменители для теней.
         let text = include_str!("../../../scenes/3d/mixed.ron");

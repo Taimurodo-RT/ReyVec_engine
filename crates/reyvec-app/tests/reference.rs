@@ -270,6 +270,18 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
+        // 7.7: векторные контуры, выдавленные и повёрнутые в объёмные формы
+        // (`scenes/3d/vector.ron`).
+        Case {
+            name: "space-vector-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/vector.ron").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
     ]
 }
 
