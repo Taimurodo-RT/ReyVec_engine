@@ -364,6 +364,7 @@ pub(crate) struct Demo {
     sdf: vk::Pipeline,
     /// Сцена «3D» (7.3): шагание лучей в буфер геометрии (`raymarch.slang`)…
     space_march: vk::Pipeline,
+    space_cone: vk::Pipeline,
     /// …тени и затенение в углах по нему (7.4, `raymarch_shadow.slang`)…
     space_shadow: vk::Pipeline,
     /// …и его освещение в проходе «сцена» (`raymarch_shade.slang`).
@@ -623,6 +624,7 @@ impl Demo {
             triangle: vk::Pipeline::null(),
             sdf: vk::Pipeline::null(),
             space_march: vk::Pipeline::null(),
+            space_cone: vk::Pipeline::null(),
             space_shadow: vk::Pipeline::null(),
             space_shade: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
@@ -745,6 +747,15 @@ impl Demo {
                 shaders,
                 "raymarch",
                 GBUFFER_FORMAT,
+                Msaa::Off,
+                None,
+            )?;
+            demo.space_cone = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_cone",
+                CONE_FORMAT,
                 Msaa::Off,
                 None,
             )?;
@@ -1559,6 +1570,7 @@ impl Demo {
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
                 "raymarch_shade" => (&mut self.space_shade, self.scene_format, self.msaa, stencil),
                 "raymarch" => (&mut self.space_march, GBUFFER_FORMAT, Msaa::Off, None),
+                "raymarch_cone" => (&mut self.space_cone, CONE_FORMAT, Msaa::Off, None),
                 "raymarch_shadow" => (&mut self.space_shadow, SHADOW3D_FORMAT, Msaa::Off, None),
                 "particles" => {
                     match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
@@ -2111,11 +2123,16 @@ impl Demo {
         // Сцена «3D» (7.3): лучи шагают своим проходом в буфер геометрии (по точке на
         // пиксель и без MSAA: шагание — самое дорогое), а «сцена» его освещает.
         let gbuffer = (frame.scene == DemoScene::Space).then(|| {
-            let gbuffer = graph.create("буфер геометрии 3D", frame.extent, GBUFFER_FORMAT);
             let camera = self.space_camera;
+            // Предварительное шагание конусами (7.8): точка на квадрат 8×8 пикселей.
+            let tiles = vk::Extent2D {
+                width: frame.extent.width.div_ceil(CONE_TILE),
+                height: frame.extent.height.div_ceil(CONE_TILE),
+            };
+            let cone = graph.create("конусы 3D", tiles, CONE_FORMAT);
             graph.add_pass(
-                "реймарчинг",
-                &[(gbuffer, Access::ColorAttachment)],
+                "лучи 3D грубо",
+                &[(cone, Access::ColorAttachment)],
                 move |p| {
                     let push = space_push(
                         &camera,
@@ -2123,6 +2140,31 @@ impl Demo {
                         frame.time,
                         frame.space_address,
                         [0, 0],
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинку конусов в цель рисования; буфер сцены
+                    // этого кадра жив, пока кадр рисуется.
+                    unsafe {
+                        begin_color_pass(d, cmd, p.view(cone), tiles);
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_cone);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                },
+            );
+            let gbuffer = graph.create("буфер геометрии 3D", frame.extent, GBUFFER_FORMAT);
+            graph.add_pass(
+                "реймарчинг",
+                &[(cone, Access::Sampled), (gbuffer, Access::ColorAttachment)],
+                move |p| {
+                    let push = space_push(
+                        &camera,
+                        frame.extent,
+                        frame.time,
+                        frame.space_address,
+                        [p.texture(cone), 0],
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
@@ -2748,6 +2790,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.space_march, None);
+            ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.light, None);
@@ -2767,6 +2810,7 @@ impl Demo {
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
         self.space_march = vk::Pipeline::null();
+        self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
@@ -2945,6 +2989,11 @@ const LIGHT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Буфер геометрии сцены «3D» (7.3): расстояние вдоль луча, материал и нормаль (две
 /// координаты) — по 32 бита, чтобы расстояние до дальних точек не теряло точность.
 const GBUFFER_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
+/// Длины, с которых начинать лучи сцены «3D» (7.8): по точке на квадрат
+/// [`CONE_TILE`]×[`CONE_TILE`] пикселей.
+const CONE_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
+/// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
+const CONE_TILE: u32 = 8;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
 const SHADOW3D_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Каскады лучей (опыт 4.6): цвет, принесённый лучом, и пропустил ли он свет дальше.

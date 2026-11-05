@@ -803,7 +803,7 @@ fn zoom_text(zoom: f64) -> String {
 
 /// Проходы, которые шагают лучами по сцене «3D»: вместе у них свой бюджет
 /// (`docs/decisions/0003-performance-targets.md`).
-const RAYMARCH_PASSES: [&str; 2] = ["реймарчинг", "тени 3D"];
+const RAYMARCH_PASSES: [&str; 3] = ["лучи 3D грубо", "реймарчинг", "тени 3D"];
 const RAYMARCH_BUDGET_MS: f64 = 2.0;
 
 /// Зелёный, пока время укладывается в бюджет с запасом, жёлтый у края, красный сверх.
