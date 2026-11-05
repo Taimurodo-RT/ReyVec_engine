@@ -116,6 +116,9 @@ float2 sdf_program(uint* code, uint start, uint len, float3 p)
         }
         else
         {
+            // Неизвестная команда — испорченная программа: дальше не читаем.
+            if (op < OP_UNION || op > OP_INTERSECT)
+                break;
             float k = asfloat(code[i + 1]);
             top--;
             float2 b = stack[max(top, 0)];

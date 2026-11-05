@@ -50,16 +50,20 @@ float3 unproject(float2 s, float depth)
     return p.xyz / p.w;
 }
 
+static const uint MAX_OBJECTS = 1024;
+static const uint MAX_PROGRAM_WORDS = 4096;
+
 // Расстояние до ближайшего объекта (x) и его материал (y).
 float2 scene(float3 p)
 {
-    uint count = pc.scene[0];
+    // Числа из буфера ограничены сверху: испорченный буфер не должен вешать видеокарту.
+    uint count = min(pc.scene[0], MAX_OBJECTS);
     uint objects = pc.scene[1];
     float2 best = float2(1e9, 0.0);
     for (uint o = 0; o < count; o++)
     {
         uint start = pc.scene[objects + o * 4];
-        uint len = pc.scene[objects + o * 4 + 1];
+        uint len = min(pc.scene[objects + o * 4 + 1], MAX_PROGRAM_WORDS);
         float2 s = sdf_program(pc.scene, start, len, p);
         if (s.x < best.x)
             best = s;
@@ -69,12 +73,17 @@ float2 scene(float3 p)
 
 float3 normal_at(float3 p)
 {
-    // Наклон поля по четырём точкам тетраэдра: дешевле шести и без перекоса.
+    // Наклон поля по четырём точкам тетраэдра: дешевле шести и без перекоса. Точки
+    // перебираются циклом, а не четырьмя вызовами подряд: так scene() встраивается в
+    // шейдер один раз, и драйверы (особенно программный lavapipe) собирают его быстро.
     const float e = 0.001;
-    const float2 k = float2(1.0, -1.0);
-    return normalize(
-        k.xyy * scene(p + k.xyy * e).x + k.yyx * scene(p + k.yyx * e).x +
-        k.yxy * scene(p + k.yxy * e).x + k.xxx * scene(p + k.xxx * e).x);
+    float3 n = float3(0.0, 0.0, 0.0);
+    for (uint k = 0; k < 4; k++)
+    {
+        float3 dir = float3(float(((k + 3) >> 1) & 1), float((k >> 1) & 1), float(k & 1)) * 2.0 - 1.0;
+        n += dir * scene(p + dir * e).x;
+    }
+    return normalize(n);
 }
 
 // Небо: к горизонту светлее.

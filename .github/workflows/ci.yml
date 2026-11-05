@@ -102,6 +102,8 @@ jobs:
         run: cargo test -p reyvec-gpu -- --include-ignored
       # Кадры без окна сравниваются с эталонными картинками (crates/reyvec-app/tests/reference).
       - name: Frames match reference images
+        # Обычно около минуты; зависший шейдер не должен держать CI часами.
+        timeout-minutes: 20
         run: cargo test -p reyvec-app --test reference -- --include-ignored
       - name: Upload frames that did not match
         if: failure()
