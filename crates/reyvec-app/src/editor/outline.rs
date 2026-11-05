@@ -122,6 +122,50 @@ pub(crate) fn rows(file: &SceneFile, open: &HashSet<Vec<usize>>) -> Vec<Row> {
     out
 }
 
+/// Строки поиска: предметы, в имени которых есть `query` (без учёта регистра), и их
+/// родители — всё раскрыто.
+pub(crate) fn rows_matching(file: &SceneFile, query: &str) -> Vec<Row> {
+    fn walk(
+        nodes: &[NodeDesc],
+        depth: usize,
+        prefix: &mut Vec<usize>,
+        query: &str,
+        out: &mut Vec<Row>,
+    ) -> bool {
+        let mut any = false;
+        for (i, n) in nodes.iter().enumerate() {
+            prefix.push(i);
+            let name = display_name(n);
+            let at = out.len();
+            let inside = walk(&n.children, depth + 1, prefix, query, out);
+            if inside || name.to_lowercase().contains(query) {
+                out.insert(
+                    at,
+                    Row {
+                        name,
+                        kind: Kind::of(n),
+                        depth,
+                        path: prefix.clone(),
+                        has_children: !n.children.is_empty(),
+                    },
+                );
+                any = true;
+            }
+            prefix.pop();
+        }
+        any
+    }
+    let mut out = Vec::new();
+    walk(
+        &file.nodes,
+        0,
+        &mut Vec::new(),
+        &query.to_lowercase(),
+        &mut out,
+    );
+    out
+}
+
 /// Из чего состоит предмет: короткие метки для инспектора.
 pub(crate) fn parts(n: &NodeDesc) -> Vec<String> {
     let mut out = Vec::new();
@@ -171,6 +215,16 @@ mod tests {
 
     fn example() -> SceneFile {
         SceneFile::parse(reyvec_scene::EXAMPLE).expect("пример сцены читается")
+    }
+
+    #[test]
+    fn search_keeps_parents() {
+        let file = SceneFile::parse(reyvec_scene::EXAMPLE).unwrap();
+        let rows = rows_matching(&file, "НОГА");
+        assert!(rows.len() >= 2, "{rows:?}");
+        assert!(rows.iter().any(|r| r.depth == 0 && r.name == "герой"));
+        assert!(rows.iter().skip(1).all(|r| r.depth > 0));
+        assert!(rows_matching(&file, "нет такого").is_empty());
     }
 
     #[test]

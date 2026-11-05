@@ -78,6 +78,33 @@ pub(crate) enum Action {
         center: [f64; 2],
         zoom: f64,
     },
+    /// Предмет — в буфер обмена (Ctrl+C); с `cut` — и убрать (Ctrl+X).
+    Copy {
+        path: Vec<usize>,
+        cut: bool,
+    },
+    /// Вставить из буфера за предметом `after` (или в конец сцены). `text` — текст из
+    /// буфера системы, если там предмет (скопирован в блокноте или другим редактором).
+    Paste {
+        after: Option<Vec<usize>>,
+        text: Option<String>,
+    },
+    /// Копия рядом (Ctrl+D).
+    Duplicate(Vec<usize>),
+    /// Убрать вместе с вложенными (Delete).
+    Delete(Vec<usize>),
+    /// Перенести в список `parent` на место `index` (перетаскивание в иерархии).
+    Move {
+        from: Vec<usize>,
+        parent: Vec<usize>,
+        index: usize,
+    },
+    /// Скрыть в редакторе или показать снова (глаз в иерархии; в файл не пишется).
+    ToggleHidden(Vec<usize>),
+    /// Закрыть, сохранив правки.
+    SaveAndClose,
+    /// Закрыть без сохранения.
+    ForceClose,
 }
 
 /// Что интерфейсу показать в этом кадре.
@@ -106,6 +133,10 @@ pub(crate) struct Info<'a> {
     pub can_redo: bool,
     /// Сцену есть куда сохранить (это файл, а не встроенный пример).
     pub can_save: bool,
+    /// Скрытые в редакторе предметы.
+    pub hidden: &'a HashSet<Vec<usize>>,
+    /// В буфере обмена есть предмет.
+    pub can_paste: bool,
 }
 
 /// Состояние интерфейса между кадрами.
@@ -131,6 +162,18 @@ pub(crate) struct EditorUi {
     vp: Viewport,
     /// Имя предмета, которое сейчас печатают в инспекторе.
     name_edit: Option<(Vec<usize>, String)>,
+    /// Закреплённые предметы: мышью в сцене их не выбрать и не сдвинуть.
+    locked: HashSet<Vec<usize>>,
+    /// Поиск в иерархии.
+    search: String,
+    /// Переименование в строке иерархии (F2): путь и текст.
+    renaming: Option<(Vec<usize>, String)>,
+    /// Предмет, который тянут в иерархии.
+    dragging: Option<Vec<usize>>,
+    /// Куда бросят предмет, который тянут в иерархии.
+    drop_target: Option<(Vec<usize>, Drop)>,
+    /// Спросить, сохранить ли правки перед закрытием.
+    asking_close: bool,
 }
 
 /// Элементы нижней строки, их можно выключить в меню «Вид». Порядок — как на экране.
@@ -169,6 +212,12 @@ impl EditorUi {
             frames: VecDeque::new(),
             vp: Viewport::default(),
             name_edit: None,
+            locked: HashSet::new(),
+            search: String::new(),
+            renaming: None,
+            dragging: None,
+            drop_target: None,
+            asking_close: false,
         }
     }
 
@@ -195,6 +244,29 @@ impl EditorUi {
             }
             self.log.push_back(line);
         }
+    }
+
+    /// Выбрать предмет (после вставки или переноса).
+    pub(crate) fn select(&mut self, path: Option<Vec<usize>>) {
+        if let Some(p) = &path {
+            for k in 1..p.len() {
+                self.open.insert(p[..k].to_vec());
+            }
+        }
+        self.selected = path;
+    }
+
+    /// Предметы добавили, убрали или переставили: старые номера больше не те.
+    pub(crate) fn structure_changed(&mut self) {
+        self.locked.clear();
+        self.open.clear();
+        self.renaming = None;
+        self.name_edit = None;
+    }
+
+    /// Окно просят закрыть, а правки не сохранены.
+    pub(crate) fn ask_close(&mut self) {
+        self.asking_close = true;
     }
 
     /// Файл сцены перечитан: выбранный предмет мог пропасть.
@@ -256,6 +328,47 @@ impl EditorUi {
         if info.frameless && !info.maximized {
             self.window_edges(&ctx);
         }
+        if self.asking_close {
+            self.close_dialog(&ctx, info);
+        }
+    }
+
+    /// «Сохранить правки перед закрытием?»
+    fn close_dialog(&mut self, ctx: &egui::Context, info: &Info) {
+        let modal = egui::Modal::new(Id::unique("editor-close")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(
+                RichText::new("Сохранить правки?")
+                    .size(FONT_HEADING)
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(GAP_M);
+            ui.label(
+                RichText::new(format!(
+                    "В сцене {} есть несохранённые правки. Без сохранения они пропадут.",
+                    info.scene_name
+                ))
+                .color(TEXT_DIM),
+            );
+            ui.add_space(GAP_XL);
+            ui.horizontal(|ui| {
+                let save = egui::Button::new(RichText::new("Сохранить").color(BG)).fill(ACCENT);
+                if ui.add_enabled(info.can_save, save).clicked() {
+                    self.actions.push(Action::SaveAndClose);
+                    self.asking_close = false;
+                }
+                if ui.button("Не сохранять").clicked() {
+                    self.actions.push(Action::ForceClose);
+                    self.asking_close = false;
+                }
+                if ui.button("Отмена").clicked() {
+                    self.asking_close = false;
+                }
+            });
+        });
+        if modal.should_close() {
+            self.asking_close = false;
+        }
     }
 
     fn hotkeys(&mut self, ctx: &egui::Context, info: &Info) {
@@ -289,6 +402,54 @@ impl EditorUi {
             self.actions.push(Action::Redo);
         } else if undo {
             self.actions.push(Action::Undo);
+        }
+        // Ctrl+C, X, V приходят от окна событиями «копировать», «вырезать», «вставить».
+        let (copy, cut, paste, dup, del, f2) = ctx.input_mut(|i| {
+            let ev =
+                |i: &egui::InputState, want: fn(&egui::Event) -> bool| i.events.iter().any(want);
+            let paste_text = i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(t) if t.trim_start().starts_with('(') => Some(t.clone()),
+                _ => None,
+            });
+            let copy = ev(i, |e| matches!(e, egui::Event::Copy));
+            let cut = ev(i, |e| matches!(e, egui::Event::Cut));
+            let paste = ev(i, |e| matches!(e, egui::Event::Paste(_)));
+            let mut cmd = |key| i.consume_key(Modifiers::COMMAND, key);
+            let (c, x, v, d) = (cmd(Key::C), cmd(Key::X), cmd(Key::V), cmd(Key::D));
+            (
+                copy || c,
+                cut || x,
+                (paste || v).then_some(paste_text),
+                d,
+                i.consume_key(Modifiers::NONE, Key::Delete),
+                i.consume_key(Modifiers::NONE, Key::F2),
+            )
+        });
+        if let Some(text) = paste {
+            self.actions.push(Action::Paste {
+                after: self.selected.clone(),
+                text,
+            });
+        }
+        if let Some(path) = self.selected.clone() {
+            if copy || cut {
+                self.actions.push(Action::Copy {
+                    path: path.clone(),
+                    cut,
+                });
+            }
+            if dup {
+                self.actions.push(Action::Duplicate(path.clone()));
+            }
+            if del {
+                self.actions.push(Action::Delete(path.clone()));
+            }
+            if f2
+                && let Some(file) = info.scene
+                && let Some(n) = outline::node_at(file, &path)
+            {
+                self.renaming = Some((path, n.name.clone()));
+            }
         }
         let (q, w, e, r, f) = ctx.input(|i| {
             let k = |key| i.modifiers.is_none() && i.key_pressed(key);
@@ -611,64 +772,201 @@ impl EditorUi {
     }
 
     fn hierarchy(&mut self, ui: &mut Ui, info: &Info) {
-        ui.label(
-            RichText::new(info.scene_name.to_uppercase())
-                .small()
-                .color(MUTED),
-        );
         let Some(file) = info.scene else {
+            ui.label(
+                RichText::new(info.scene_name.to_uppercase())
+                    .small()
+                    .color(MUTED),
+            );
             ui.label(RichText::new("Сцена не прочитана").color(BAD));
             return;
         };
+        let editing = info.play == PlayState::Edit;
+        Frame::NONE
+            .fill(BG)
+            .corner_radius(RADIUS_S)
+            .inner_margin(PAD_FIELD)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    paint_search(ui);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Поиск")
+                            .frame(Frame::NONE)
+                            .desired_width(ui.available_width() - 24.0),
+                    );
+                    if !self.search.is_empty()
+                        && ui
+                            .small_button("×")
+                            .on_hover_text("Сбросить поиск")
+                            .clicked()
+                    {
+                        self.search.clear();
+                    }
+                });
+            });
+        ui.add_space(GAP_S);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(info.scene_name.to_uppercase())
+                    .small()
+                    .color(MUTED),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("предметов: {}", outline::count(file)))
+                        .small()
+                        .color(MUTED),
+                );
+            });
+        });
         ui.spacing_mut().item_spacing.y = 1.0;
-        for row in outline::rows(file, &self.open) {
+        let query = self.search.trim().to_owned();
+        let rows = if query.is_empty() {
+            outline::rows(file, &self.open)
+        } else {
+            outline::rows_matching(file, &query)
+        };
+        if rows.is_empty() && !query.is_empty() {
+            ui.label(RichText::new("Ничего не нашлось").color(MUTED));
+        }
+        let pointer = ui.ctx().pointer_interact_pos();
+        let mut drop: Option<(Rect, Drop)> = None;
+        for row in &rows {
             let selected = self.selected.as_ref() == Some(&row.path);
+            let hidden = covered(&row.path, info.hidden);
+            let sense = if editing {
+                Sense::click_and_drag()
+            } else {
+                Sense::click()
+            };
             let (rect, response) =
-                ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
-            let painter = ui.painter();
+                ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), sense);
+            let painter = ui.painter().clone();
             if selected {
                 painter.rect(
                     rect,
-                    6,
+                    RADIUS_S,
                     SELECT_BG,
                     Stroke::new(LINE, SELECT),
                     egui::StrokeKind::Inside,
                 );
             } else if response.hovered() {
-                painter.rect_filled(rect, 6, HOVER);
+                painter.rect_filled(rect, RADIUS_S, HOVER);
             }
             let indent = rect.left() + GAP_M + row.depth as f32 * INDENT;
             let arrow = Rect::from_min_size(pos2(indent, rect.top()), vec2(14.0, rect.height()));
             if row.has_children {
-                let open = self.open.contains(&row.path);
-                paint_icon(
-                    painter,
-                    arrow.center(),
-                    if open {
-                        Icon::ChevronDown
-                    } else {
-                        Icon::ChevronRight
-                    },
-                    MUTED,
-                );
+                let open = !query.is_empty() || self.open.contains(&row.path);
+                let icon = if open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                };
+                paint_icon(&painter, arrow.center(), icon, MUTED);
             }
             let dot =
                 Rect::from_center_size(pos2(arrow.right() + 8.0, rect.center().y), vec2(8.0, 8.0));
             let round = if row.kind == Kind::Light { 4 } else { 2 };
-            painter.rect_filled(dot, round, row.kind.color());
-            painter.text(
-                pos2(dot.right() + 8.0, rect.center().y),
-                Align2::LEFT_CENTER,
-                &row.name,
-                FontId::proportional(FONT_BODY),
-                if selected { Color32::WHITE } else { TEXT_DIM },
+            let dot_color = if hidden {
+                row.kind.color().gamma_multiply(0.35)
+            } else {
+                row.kind.color()
+            };
+            painter.rect_filled(dot, round, dot_color);
+            // Глаз и замок справа: видны под мышью или когда включены.
+            let eye = Rect::from_center_size(
+                pos2(rect.right() - 14.0, rect.center().y),
+                vec2(20.0, 20.0),
             );
+            let lock = eye.translate(vec2(-22.0, 0.0));
+            let text_x = dot.right() + 8.0;
+            let renaming = matches!(&self.renaming, Some((p, _)) if *p == row.path);
+            if renaming {
+                let r = Rect::from_min_max(
+                    pos2(text_x - 4.0, rect.top() + 2.0),
+                    pos2(lock.left() - 4.0, rect.bottom() - 2.0),
+                );
+                if let Some((_, text)) = self.renaming.as_mut() {
+                    let edit = ui.put(
+                        r,
+                        egui::TextEdit::singleline(text)
+                            .font(FontId::proportional(FONT_BODY))
+                            .margin(Margin::symmetric(4, 1)),
+                    );
+                    if !edit.lost_focus() {
+                        edit.request_focus();
+                    }
+                    if edit.lost_focus() {
+                        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if let Some((path, text)) = self.renaming.take()
+                            && !esc
+                            && outline::node_at(file, &path).is_some_and(|n| n.name != text)
+                        {
+                            self.actions.push(Action::Edit {
+                                edit: Edit {
+                                    path,
+                                    change: Change::Name(text),
+                                },
+                                commit: true,
+                            });
+                        }
+                    }
+                }
+            } else {
+                let color = if hidden {
+                    MUTED
+                } else if selected {
+                    Color32::WHITE
+                } else {
+                    TEXT_DIM
+                };
+                painter.text(
+                    pos2(text_x, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    &row.name,
+                    FontId::proportional(FONT_BODY),
+                    color,
+                );
+            }
+            let own_hidden = info.hidden.contains(&row.path);
+            let own_locked = self.locked.contains(&row.path);
+            let hover_eye = response.hovered() && pointer.is_some_and(|p| eye.contains(p));
+            let hover_lock = response.hovered() && pointer.is_some_and(|p| lock.contains(p));
+            if editing && (response.hovered() || own_hidden || own_locked) {
+                let c = |on: bool, hot: bool| {
+                    if hot {
+                        Color32::WHITE
+                    } else if on {
+                        ACCENT
+                    } else {
+                        MUTED
+                    }
+                };
+                paint_eye(
+                    &painter,
+                    eye.center(),
+                    !own_hidden,
+                    c(own_hidden, hover_eye),
+                );
+                paint_lock(
+                    &painter,
+                    lock.center(),
+                    own_locked,
+                    c(own_locked, hover_lock),
+                );
+            }
             if response.clicked() {
-                let on_arrow = row.has_children
-                    && response
-                        .interact_pointer_pos()
-                        .is_some_and(|p| arrow.expand2(vec2(4.0, 0.0)).contains(p));
-                if on_arrow {
+                let p = response.interact_pointer_pos();
+                let on = |r: Rect| p.is_some_and(|p| r.contains(p));
+                if editing && on(eye) {
+                    self.actions.push(Action::ToggleHidden(row.path.clone()));
+                } else if editing && on(lock) {
+                    if !self.locked.remove(&row.path) {
+                        self.locked.insert(row.path.clone());
+                    }
+                } else if row.has_children && on(arrow.expand2(vec2(4.0, 0.0))) {
                     if !self.open.remove(&row.path) {
                         self.open.insert(row.path.clone());
                     }
@@ -679,6 +977,144 @@ impl EditorUi {
             if response.double_clicked() && row.has_children && !self.open.remove(&row.path) {
                 self.open.insert(row.path.clone());
             }
+            if response.drag_started() && !renaming {
+                self.dragging = Some(row.path.clone());
+            }
+            if let (Some(from), Some(p)) = (&self.dragging, pointer)
+                && rect.contains(p)
+                && !row.path.starts_with(from)
+            {
+                let y = (p.y - rect.top()) / rect.height();
+                let open_parent = row.has_children && self.open.contains(&row.path);
+                let d = if y < 0.25 {
+                    Drop::Before
+                } else if y > 0.75 && !open_parent {
+                    Drop::After
+                } else {
+                    Drop::Into
+                };
+                drop = Some((rect, d));
+                self.drop_target = Some((row.path.clone(), d));
+            }
+            if editing {
+                let path = row.path.clone();
+                response.context_menu(|ui| {
+                    self.selected = Some(path.clone());
+                    self.node_menu(ui, &path, file, info);
+                });
+            }
+        }
+        if self.dragging.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            match drop {
+                Some((r, d)) => {
+                    let p = ui.painter();
+                    let s = Stroke::new(LINE_FOCUS, ACCENT);
+                    match d {
+                        Drop::Before => {
+                            p.hline(r.x_range(), r.top(), s);
+                        }
+                        Drop::After => {
+                            p.hline(r.x_range(), r.bottom(), s);
+                        }
+                        Drop::Into => {
+                            p.rect_stroke(r, RADIUS_S, s, egui::StrokeKind::Inside);
+                        }
+                    }
+                }
+                None => self.drop_target = None,
+            }
+            if !ui.input(|i| i.pointer.any_down()) {
+                if let (Some(from), Some((to, d))) = (self.dragging.take(), self.drop_target.take())
+                    && let Some((parent, index)) = drop_place(&to, d)
+                {
+                    self.actions.push(Action::Move {
+                        from,
+                        parent,
+                        index,
+                    });
+                }
+                self.dragging = None;
+            }
+        }
+    }
+
+    /// Пункты меню предмета (правая кнопка в иерархии или в сцене).
+    fn node_menu(&mut self, ui: &mut Ui, path: &[usize], file: &SceneFile, info: &Info) {
+        ui.set_min_width(230.0);
+        let item = |ui: &mut Ui, text: &str, keys: &str| {
+            ui.add(egui::Button::new(text).shortcut_text(keys))
+                .clicked()
+        };
+        let p = path.to_vec();
+        if item(ui, "Переименовать", "F2") {
+            if let Some(n) = outline::node_at(file, path) {
+                self.renaming = Some((p.clone(), n.name.clone()));
+            }
+            ui.close();
+        }
+        if item(ui, "Дублировать", "Ctrl+D") {
+            self.actions.push(Action::Duplicate(p.clone()));
+            ui.close();
+        }
+        ui.separator();
+        if item(ui, "Копировать", "Ctrl+C") {
+            self.actions.push(Action::Copy {
+                path: p.clone(),
+                cut: false,
+            });
+            ui.close();
+        }
+        if item(ui, "Вырезать", "Ctrl+X") {
+            self.actions.push(Action::Copy {
+                path: p.clone(),
+                cut: true,
+            });
+            ui.close();
+        }
+        let paste = egui::Button::new("Вставить после").shortcut_text("Ctrl+V");
+        if ui.add_enabled(info.can_paste, paste).clicked() {
+            self.actions.push(Action::Paste {
+                after: Some(p.clone()),
+                text: None,
+            });
+            ui.close();
+        }
+        ui.separator();
+        if item(ui, "Показать в сцене", "F") {
+            self.selected = Some(p.clone());
+            self.focus_selected(info);
+            ui.close();
+        }
+        let hidden = info.hidden.contains(path);
+        let text = if hidden {
+            "Показать в редакторе"
+        } else {
+            "Скрыть в редакторе"
+        };
+        if item(ui, text, "") {
+            self.actions.push(Action::ToggleHidden(p.clone()));
+            ui.close();
+        }
+        let locked = self.locked.contains(path);
+        if item(
+            ui,
+            if locked {
+                "Открепить"
+            } else {
+                "Закрепить"
+            },
+            "",
+        ) {
+            if !self.locked.remove(path) {
+                self.locked.insert(p.clone());
+            }
+            ui.close();
+        }
+        ui.separator();
+        if item(ui, "Удалить", "Delete") {
+            self.actions.push(Action::Delete(p));
+            ui.close();
         }
     }
 
@@ -774,7 +1210,13 @@ impl EditorUi {
         let painter = ui.painter_at(rect);
         let mut busy = false;
         if editing && let (Some(file), Some(view)) = (info.scene, info.view) {
-            let placed = geom::place_all(file);
+            let all = geom::place_all(file);
+            // Скрытые и закреплённые мышью в сцене не выбираются.
+            let placed: Vec<geom::Placed> = all
+                .iter()
+                .filter(|p| !covered(&p.path, info.hidden) && !covered(&p.path, &self.locked))
+                .cloned()
+                .collect();
             self.vp.grid(&painter, &view, rect);
             let pointer = response.hover_pos();
             // Предмет под мышью подсвечивается тонкой рамкой.
@@ -795,16 +1237,18 @@ impl EditorUi {
             let sel = self
                 .selected
                 .as_ref()
-                .and_then(|path| Some((geom::find(&placed, path)?, outline::node_at(file, path)?)));
+                .and_then(|path| Some((geom::find(&all, path)?, outline::node_at(file, path)?)));
             if let Some((p, node)) = sel {
                 self.vp.selection(&painter, &view, p);
                 viewport::label(&painter, &view, p, file);
-                busy = ui
-                    .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                        ui.set_clip_rect(rect);
-                        self.vp.gizmo(ui, &view, p, node, &mut self.actions)
-                    })
-                    .inner;
+                let locked = covered(&p.path, &self.locked) || covered(&p.path, info.hidden);
+                busy = !locked
+                    && ui
+                        .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                            ui.set_clip_rect(rect);
+                            self.vp.gizmo(ui, &view, p, node, &mut self.actions)
+                        })
+                        .inner;
             } else if self.vp.drag.take().is_some() {
                 // Предмет пропал, пока его тянули.
                 self.actions.push(Action::CancelEdit);
@@ -821,6 +1265,16 @@ impl EditorUi {
                         self.open.insert(path[..k].to_vec());
                     }
                 }
+            }
+            // Правая кнопка без перетаскивания: выбрать предмет под мышью и показать меню.
+            if response.secondary_clicked()
+                && let Some(m) = response.interact_pointer_pos()
+                && let Some(path) = geom::pick(&placed, view.to_scene(m), false)
+            {
+                self.selected = Some(path);
+            }
+            if let Some(path) = self.selected.clone() {
+                response.context_menu(|ui| self.node_menu(ui, &path, file, info));
             }
         }
         if editing && !busy && self.vp.drag.is_none() {
@@ -866,6 +1320,72 @@ impl EditorUi {
             );
         }
     }
+}
+
+/// Предмет или один из его родителей есть в наборе (скрытых, закреплённых).
+fn covered(path: &[usize], set: &HashSet<Vec<usize>>) -> bool {
+    (1..=path.len()).any(|k| set.contains(&path[..k]))
+}
+
+/// Куда бросить предмет относительно строки иерархии.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drop {
+    Before,
+    After,
+    /// Внутрь, последним вложенным.
+    Into,
+}
+
+/// Список и место в нём для броска на строку `to`.
+fn drop_place(to: &[usize], d: Drop) -> Option<(Vec<usize>, usize)> {
+    let (last, parent) = to.split_last()?;
+    Some(match d {
+        Drop::Before => (parent.to_vec(), *last),
+        Drop::After => (parent.to_vec(), last + 1),
+        Drop::Into => (to.to_vec(), usize::MAX),
+    })
+}
+
+/// Лупа поиска.
+fn paint_search(ui: &mut Ui) {
+    let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+    let p = ui.painter();
+    let c = r.center() + vec2(-1.5, -1.5);
+    p.circle_stroke(c, 4.5, Stroke::new(1.3, MUTED));
+    p.line_segment(
+        [c + vec2(3.2, 3.2), c + vec2(6.5, 6.5)],
+        Stroke::new(1.5, MUTED),
+    );
+}
+
+/// Глаз: открытый — предмет виден, перечёркнутый — скрыт в редакторе.
+fn paint_eye(p: &egui::Painter, c: Pos2, open: bool, color: Color32) {
+    let s = Stroke::new(1.3, color);
+    let arc = |sign: f32| {
+        (0..=12).map(move |i| {
+            let t = std::f32::consts::PI * i as f32 / 12.0;
+            c + vec2(-7.0 * sign * t.cos(), -4.0 * sign * t.sin())
+        })
+    };
+    let pts: Vec<Pos2> = arc(1.0).chain(arc(-1.0)).collect();
+    p.add(egui::Shape::closed_line(pts, s));
+    p.circle_filled(c, 1.8, color);
+    if !open {
+        p.line_segment([c + vec2(-7.0, 5.0), c + vec2(7.0, -5.0)], s);
+    }
+}
+
+/// Замок: закрытый — предмет закреплён, открытый — дужка приподнята.
+fn paint_lock(p: &egui::Painter, c: Pos2, closed: bool, color: Color32) {
+    let s = Stroke::new(1.3, color);
+    let body = Rect::from_center_size(c + vec2(0.0, 2.5), vec2(10.0, 7.0));
+    p.rect_stroke(body, 1, s, egui::StrokeKind::Middle);
+    let lift = if closed { 0.0 } else { 2.5 };
+    let top = body.top() - 4.5 - lift;
+    let (l, r) = (body.left() + 2.0, body.right() - 2.0);
+    p.line_segment([pos2(l, body.top()), pos2(l, top)], s);
+    p.line_segment([pos2(l, top), pos2(r, top)], s);
+    p.line_segment([pos2(r, top), pos2(r, body.top() - lift)], s);
 }
 
 /// Строка вкладок наверху области.
@@ -1677,6 +2197,9 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
 mod tests {
     use super::*;
 
+    static NO_HIDDEN: std::sync::LazyLock<HashSet<Vec<usize>>> =
+        std::sync::LazyLock::new(HashSet::new);
+
     fn info<'a>(scene: Option<&'a SceneFile>, play: PlayState) -> Info<'a> {
         Info {
             play,
@@ -1698,6 +2221,8 @@ mod tests {
             can_undo: false,
             can_redo: false,
             can_save: true,
+            hidden: &NO_HIDDEN,
+            can_paste: false,
         }
     }
 
@@ -1918,6 +2443,69 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_keys_and_hierarchy() {
+        use egui::{Key, Modifiers};
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let file = SceneFile::parse(reyvec_scene::EXAMPLE).unwrap();
+        let mut info = info(Some(&file), PlayState::Edit);
+        info.can_paste = true;
+        // Без выбранного — только вставка в конец сцены.
+        frame(&ctx, &mut ui, &info, vec![egui::Event::Copy]);
+        assert!(ui.take_actions().is_empty());
+        ui.selected = Some(vec![1]);
+        frame(&ctx, &mut ui, &info, vec![egui::Event::Copy]);
+        frame(&ctx, &mut ui, &info, vec![egui::Event::Cut]);
+        let pasted = "(name: \"ящик\")".to_owned();
+        frame(
+            &ctx,
+            &mut ui,
+            &info,
+            vec![egui::Event::Paste(pasted.clone())],
+        );
+        frame(&ctx, &mut ui, &info, vec![key(Key::D, Modifiers::COMMAND)]);
+        frame(
+            &ctx,
+            &mut ui,
+            &info,
+            vec![key(Key::Delete, Modifiers::NONE)],
+        );
+        assert_eq!(
+            ui.take_actions(),
+            [
+                Action::Copy {
+                    path: vec![1],
+                    cut: false
+                },
+                Action::Copy {
+                    path: vec![1],
+                    cut: true
+                },
+                Action::Paste {
+                    after: Some(vec![1]),
+                    text: Some(pasted)
+                },
+                Action::Duplicate(vec![1]),
+                Action::Delete(vec![1]),
+            ]
+        );
+        // F2 — переименование в строке иерархии; поиск, скрытые и окно «сохранить?» рисуются.
+        frame(&ctx, &mut ui, &info, vec![key(Key::F2, Modifiers::NONE)]);
+        assert_eq!(ui.renaming.as_ref().map(|r| r.0.clone()), Some(vec![1]));
+        ui.renaming = None;
+        ui.search = "нога".into();
+        let hidden: HashSet<Vec<usize>> = [vec![0]].into();
+        info.hidden = &hidden;
+        info.dirty = true;
+        ui.ask_close();
+        frame(&ctx, &mut ui, &info, Vec::new());
+        assert!(ui.asking_close);
+        assert_eq!(drop_place(&[2, 1], Drop::Before), Some((vec![2], 1)));
+        assert_eq!(drop_place(&[2, 1], Drop::After), Some((vec![2], 2)));
+        assert_eq!(drop_place(&[2], Drop::Into), Some((vec![2], usize::MAX)));
+    }
+
+    #[test]
     fn window_edges() {
         let s = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 600.0));
         use ResizeDirection as D;
@@ -1951,6 +2539,9 @@ mod tests {
         let hero = file.nodes.iter().position(|n| n.player.is_some()).unwrap();
         ui.selected = Some(vec![hero]);
         ui.open.insert(vec![hero]);
+        // Один предмет скрыт, другой закреплён: в иерархии видны глаз и замок.
+        let hidden: HashSet<Vec<usize>> = [vec![4]].into();
+        ui.locked.insert(vec![5]);
         let (w, h) = (1600usize, 900usize);
         let mut textures: HashMap<egui::TextureId, (usize, usize, Vec<Color32>)> = HashMap::new();
         // Время только растёт: egui считает по нему анимации и частоту кадров.
@@ -1980,6 +2571,7 @@ mod tests {
             let mut info = info(Some(&file), play);
             info.view = Some(hero_view(&file, hero));
             info.dirty = true;
+            info.hidden = &hidden;
             let mut out = None;
             for frame in 0..12u32 {
                 let mut events = Vec::new();

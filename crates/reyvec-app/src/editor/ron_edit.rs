@@ -302,6 +302,174 @@ pub(crate) fn set_field(
     Ok(out)
 }
 
+/// Конец предмета, открытого в `open` (за закрывающей скобкой).
+fn node_end(s: &[u8], open: usize) -> Result<usize, EditError> {
+    group_end(s, open).ok_or_else(|| EditError("не закрыта скобка предмета".into()))
+}
+
+/// Начало строки, в которой стоит байт `at`.
+fn line_start(s: &[u8], at: usize) -> usize {
+    s[..at]
+        .iter()
+        .rposition(|&c| c == b'\n')
+        .map_or(0, |p| p + 1)
+}
+
+/// Текст предмета `path` для буфера обмена: без отступа его строки, так что его можно
+/// вставить на любой уровень.
+pub(crate) fn node_text(text: &str, path: &[usize]) -> Result<String, EditError> {
+    let s = text.as_bytes();
+    let open = node_open(s, path)?;
+    let end = node_end(s, open)?;
+    let indent = indent_of(s, open);
+    let mut out = String::new();
+    for (i, line) in text[open..end].split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            out.push_str(line.strip_prefix(indent).unwrap_or(line));
+        } else {
+            out.push_str(line);
+        }
+    }
+    Ok(out)
+}
+
+/// Убирает предмет `path` вместе с вложенными (и запятую за ним, и комментарий в конце
+/// его строки).
+pub(crate) fn remove_node(text: &str, path: &[usize]) -> Result<String, EditError> {
+    let s = text.as_bytes();
+    let open = node_open(s, path)?;
+    let end = node_end(s, open)?;
+    let spaces = |mut i: usize| {
+        while i < s.len() && matches!(s[i], b' ' | b'\t') {
+            i += 1;
+        }
+        i
+    };
+    let mut j = spaces(end);
+    if s.get(j) == Some(&b',') {
+        j = spaces(j + 1);
+    }
+    let ls = line_start(s, open);
+    let alone_before = s[ls..open].iter().all(|c| matches!(c, b' ' | b'\t'));
+    if s[j..].starts_with(b"//") {
+        while j < s.len() && s[j] != b'\n' {
+            j += 1;
+        }
+    }
+    let (from, to) = if alone_before && (j == s.len() || s[j] == b'\n') {
+        // Предмет занимал свои строки: убираем их целиком.
+        (ls, (j + 1).min(s.len()))
+    } else {
+        (open, j)
+    };
+    Ok(format!("{}{}", &text[..from], &text[to..]))
+}
+
+/// Скобка `[` списка предметов: `nodes` сцены (`parent` пустой) или `children` предмета.
+fn list_open(s: &[u8], parent: &[usize]) -> Result<Option<usize>, EditError> {
+    let (open, name) = if parent.is_empty() {
+        let root = skip_ws(s, 0);
+        if s.get(root) != Some(&b'(') {
+            return Err(EditError(
+                "файл сцены должен начинаться со скобки «(»".into(),
+            ));
+        }
+        (root, "nodes")
+    } else {
+        (node_open(s, parent)?, "children")
+    };
+    let f = fields(s, open).ok_or_else(|| EditError("не разобрать поля".into()))?;
+    match f.iter().find(|f| f.name == name) {
+        Some(list) if s.get(list.value.start) == Some(&b'[') => Ok(Some(list.value.start)),
+        Some(_) => Err(EditError(
+            "список предметов должен быть в скобках [ ]".into(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Вставляет предмет (текст в скобках, как из [`node_text`]) в список `parent` на место
+/// `index` (дальше конца — в конец). У предмета без вложенных появляется `children`.
+pub(crate) fn insert_node(
+    text: &str,
+    parent: &[usize],
+    index: usize,
+    item: &str,
+) -> Result<String, EditError> {
+    let s = text.as_bytes();
+    let Some(open) = list_open(s, parent)? else {
+        if parent.is_empty() {
+            return Err(EditError("в файле сцены нет списка nodes".into()));
+        }
+        let t = set_field(text, parent, "children", "[]")?;
+        return insert_node(&t, parent, index, item);
+    };
+    let close = group_end(s, open).ok_or_else(|| EditError("не закрыт список".into()))? - 1;
+    let it = items(s, open).ok_or_else(|| EditError("не разобрать список предметов".into()))?;
+    let base = indent_of(s, open).to_owned();
+    let multiline = it.is_empty() || s[open..close].contains(&b'\n');
+    let indent = match it.first() {
+        Some(&first) if multiline => indent_of(s, first).to_owned(),
+        _ => format!("{base}    "),
+    };
+    let item = item.replace('\n', &format!("\n{indent}"));
+    let mut out = String::with_capacity(text.len() + item.len() + 16);
+    if let Some(&at) = it.get(index) {
+        out.push_str(&text[..at]);
+        if multiline {
+            let _ = write!(out, "{item},\n{indent}");
+        } else {
+            let _ = write!(out, "{item}, ");
+        }
+        out.push_str(&text[at..]);
+    } else if let Some(&last) = it.last() {
+        let end = value_end(s, last).ok_or_else(|| EditError("не разобрать предмет".into()))?;
+        let mut j = end;
+        while j < close && matches!(s[j], b' ' | b'\t') {
+            j += 1;
+        }
+        let comma = s.get(j) == Some(&b',');
+        if multiline {
+            // За концом строки последнего предмета (после его комментария, если есть).
+            let mut at = if comma { j + 1 } else { end };
+            let nl = s[at..close]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map(|p| at + p);
+            out.push_str(&text[..end]);
+            if !comma {
+                out.push(',');
+            }
+            if let Some(nl) = nl {
+                out.push_str(&text[end..nl]);
+                at = nl;
+            }
+            let _ = write!(out, "\n{indent}{item},");
+            out.push_str(&text[at..]);
+        } else {
+            let at = if comma { j + 1 } else { end };
+            out.push_str(&text[..at]);
+            out.push_str(if comma { " " } else { ", " });
+            out.push_str(&item);
+            out.push_str(&text[at..]);
+        }
+    } else {
+        let inner = &text[open + 1..close];
+        out.push_str(&text[..=open]);
+        if inner.trim().is_empty() {
+            let _ = write!(out, "\n{indent}{item},\n{base}");
+            out.push_str(&text[close..]);
+        } else {
+            // В пустом списке только комментарии: предмет — перед закрывающей скобкой.
+            out.push_str(inner.trim_end());
+            let _ = write!(out, "\n{indent}{item},\n{base}");
+            out.push_str(&text[close..]);
+        }
+    }
+    Ok(out)
+}
+
 /// Число для файла: не больше 4 знаков после запятой, всегда с точкой (`1.0`, `-0.25`).
 pub(crate) fn num(x: f64) -> String {
     let x = (x * 10_000.0).round() / 10_000.0;
@@ -432,5 +600,80 @@ mod tests {
             }
         }
         walk(&text, &file.nodes, &mut Vec::new());
+    }
+
+    #[test]
+    fn remove_keeps_neighbours_and_comments() {
+        let t = remove_node(SMALL, &[0, 0]).unwrap();
+        let f = SceneFile::parse(&t).unwrap();
+        assert_eq!(f.nodes[0].children.len(), 1);
+        assert!(!t.contains("банка") && t.contains("// имя"));
+        assert_eq!(t.lines().count(), SMALL.lines().count() - 1);
+        let t = remove_node(SMALL, &[0]).unwrap();
+        let f = SceneFile::parse(&t).unwrap();
+        assert_eq!(f.nodes.len(), 1);
+        assert_eq!(f.nodes[0].name, "пусто");
+        let t = remove_node(&t, &[0]).unwrap();
+        assert!(SceneFile::parse(&t).unwrap().nodes.is_empty());
+        // В одну строку.
+        let line = r#"(format: "reyvec-scene", version: 1, nodes: [(name: "а"), (name: "б")])"#;
+        let t = remove_node(line, &[0]).unwrap();
+        assert_eq!(
+            t,
+            r#"(format: "reyvec-scene", version: 1, nodes: [(name: "б")])"#
+        );
+    }
+
+    #[test]
+    fn copy_and_insert_anywhere() {
+        let table = node_text(SMALL, &[0]).unwrap();
+        assert!(table.starts_with('(') && table.ends_with(')'));
+        assert!(table.contains("\n    name: \"стол\""), "{table}");
+        // В конец, в начало и внутрь предмета без вложенных.
+        let t = insert_node(SMALL, &[], 99, &table).unwrap();
+        let t = insert_node(&t, &[], 0, "(name: \"первый\")").unwrap();
+        let t = insert_node(&t, &[2], 0, "(name: \"внутри\")").unwrap();
+        let jar = node_text(&t, &[1, 0]).unwrap();
+        let t = insert_node(&t, &[1], 1, &jar).unwrap();
+        let f = SceneFile::parse(&t).unwrap();
+        let names: Vec<_> = f.nodes.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names, ["первый", "стол", "пусто", "стол"], "{t}");
+        assert_eq!(f.nodes[2].children[0].name, "внутри");
+        assert_eq!(f.nodes[1].children.len(), 3);
+        assert_eq!(f.nodes[1].children[1].name, "банка");
+        assert_eq!(f.nodes[3].children.len(), 2);
+        // Вставленное выровнено, как соседи.
+        assert!(t.contains("\n        (\n            name: \"стол\""), "{t}");
+        let line = r#"(format: "reyvec-scene", version: 1, nodes: [(name: "а")])"#;
+        let t = insert_node(line, &[], 5, "(name: \"б\")").unwrap();
+        assert_eq!(
+            t,
+            r#"(format: "reyvec-scene", version: 1, nodes: [(name: "а"), (name: "б")])"#
+        );
+        let t = insert_node(SMALL, &[], 99, "(name: \"в\")").unwrap();
+        assert!(
+            t.contains("(name: \"пусто\"),\n        (name: \"в\"),\n    ],"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn real_scene_survives_cut_and_paste() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenes/first-room.ron"),
+        )
+        .unwrap();
+        let file = SceneFile::parse(&text).unwrap();
+        for i in 0..file.nodes.len() {
+            let item = node_text(&text, &[i]).unwrap();
+            let cut = remove_node(&text, &[i]).unwrap();
+            let f = SceneFile::parse(&cut).unwrap();
+            assert_eq!(f.nodes.len(), file.nodes.len() - 1);
+            let back = insert_node(&cut, &[], i, &item).unwrap();
+            let f = SceneFile::parse(&back).unwrap();
+            assert_eq!(f.nodes.len(), file.nodes.len());
+            assert_eq!(f.nodes[i].name, file.nodes[i].name);
+            assert_eq!(f.nodes[i].children.len(), file.nodes[i].children.len());
+        }
     }
 }
