@@ -20,6 +20,7 @@ mod doc;
 mod geom;
 mod layout;
 mod outline;
+mod overlay;
 mod ron_edit;
 mod theme;
 mod ui;
@@ -104,6 +105,8 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         engine_sent: Instant::now(),
         clipboard: None,
         hidden: HashSet::new(),
+        ejected: false,
+        time_scale: 1.0,
         watcher: None,
         controls: Controls::load(&controls_path()),
         start: Instant::now(),
@@ -160,6 +163,10 @@ struct Editor {
     clipboard: Option<String>,
     /// Скрытые в редакторе предметы: движку они не отдаются, в файле остаются.
     hidden: HashSet<Vec<usize>>,
+    /// Камера отцеплена от героя во время игры (F8).
+    ejected: bool,
+    /// Скорость игры (замедление).
+    time_scale: f64,
     watcher: Option<reyvec_scene::SceneWatcher>,
     /// Клавиши героя из настроек игрока (`controls.ron`), как в песочнице.
     controls: Controls,
@@ -349,21 +356,36 @@ impl Editor {
                     r.switch_scene_file(doc.text());
                 }
                 self.play = PlayState::Playing;
+                self.ejected = false;
                 r.set_game_paused(false);
                 r.set_follow(true);
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                    logic.set_time_scale(self.time_scale);
+                }
                 tracing::info!("Игра запущена");
             }
             Action::Pause => {
                 self.play = PlayState::Paused;
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                }
                 r.release_game_input();
                 r.set_game_paused(true);
             }
             Action::Resume => {
                 self.play = PlayState::Playing;
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                }
                 r.set_game_paused(false);
             }
             Action::Stop => {
                 self.play = PlayState::Edit;
+                self.ejected = false;
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                }
                 r.release_game_input();
                 let camera = r.camera();
                 if let Some(doc) = &self.doc {
@@ -449,6 +471,28 @@ impl Editor {
             | Action::Duplicate(_)
             | Action::Delete(_)
             | Action::Move { .. } => self.apply_doc(action),
+            Action::Eject => {
+                if self.play != PlayState::Edit {
+                    self.ejected = !self.ejected;
+                    r.set_follow(!self.ejected);
+                }
+            }
+            Action::Step => {
+                if self.play == PlayState::Paused
+                    && let Some(logic) = r.scene_logic()
+                {
+                    // Пауза консоли умеет шагать: обычную снимаем, шаг — один.
+                    logic.set_debug_paused(true);
+                    logic.set_paused(false);
+                    logic.step(1);
+                }
+            }
+            Action::SetTimeScale(k) => {
+                self.time_scale = match r.scene_logic() {
+                    Some(logic) => logic.set_time_scale(k),
+                    None => k,
+                };
+            }
             Action::ToggleHidden(path) => {
                 if !self.hidden.remove(&path) {
                     self.hidden.insert(path);
@@ -699,6 +743,8 @@ impl Editor {
             can_save: self.config.scene_file.is_some(),
             hidden: &self.hidden,
             can_paste: self.clipboard.is_some(),
+            ejected: self.ejected,
+            time_scale: self.time_scale,
         };
         let input = state.take_egui_input(window);
         let editor_ui = &mut self.ui;
@@ -796,6 +842,8 @@ impl Editor {
         let over_scene = self.ui.viewport_hovered();
         match input {
             Input::Key(_) if self.egui_ctx.egui_wants_keyboard_input() => return,
+            // Камера отцеплена: мышью двигают сцену, а не бьют.
+            Input::Mouse(_) | Input::Wheel(_) if self.ejected => return,
             Input::Mouse(_) | Input::Wheel(_) if !over_scene && down => return,
             _ => {}
         }
@@ -862,7 +910,9 @@ impl ApplicationHandler for Editor {
             WindowEvent::CursorMoved { position, .. } => self.cursor = Some(position),
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::MouseWheel { delta, .. }
-                if self.play == PlayState::Edit && self.ui.viewport_hovered() && !egui_took =>
+                if (self.play == PlayState::Edit || self.ejected)
+                    && self.ui.viewport_hovered()
+                    && !egui_took =>
             {
                 let steps = match delta {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
