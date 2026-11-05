@@ -20,6 +20,7 @@ use super::doc::{Change, Edit};
 use super::geom;
 use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
 use super::outline::{self, Kind};
+use super::overlay::{self, Overlay, ViewMode};
 use super::theme::*;
 use super::viewport::{self, TOOLBAR_HEIGHT, Tool, View, Viewport};
 
@@ -105,6 +106,12 @@ pub(crate) enum Action {
     SaveAndClose,
     /// Закрыть без сохранения.
     ForceClose,
+    /// Во время игры: камера перестаёт следить за героем, сцену можно двигать (F8).
+    Eject,
+    /// На паузе: один шаг игры.
+    Step,
+    /// Скорость игры (замедление).
+    SetTimeScale(f64),
 }
 
 /// Что интерфейсу показать в этом кадре.
@@ -137,6 +144,10 @@ pub(crate) struct Info<'a> {
     pub hidden: &'a HashSet<Vec<usize>>,
     /// В буфере обмена есть предмет.
     pub can_paste: bool,
+    /// Камера отцеплена от героя во время игры (F8).
+    pub ejected: bool,
+    /// Скорость игры.
+    pub time_scale: f64,
 }
 
 /// Состояние интерфейса между кадрами.
@@ -172,6 +183,8 @@ pub(crate) struct EditorUi {
     dragging: Option<Vec<usize>>,
     /// Куда бросят предмет, который тянут в иерархии.
     drop_target: Option<(Vec<usize>, Drop)>,
+    /// Режим просмотра, метки и закладки камеры.
+    ov: Overlay,
     /// Спросить, сохранить ли правки перед закрытием.
     asking_close: bool,
 }
@@ -217,6 +230,7 @@ impl EditorUi {
             renaming: None,
             dragging: None,
             drop_target: None,
+            ov: Overlay::default(),
             asking_close: false,
         }
     }
@@ -383,6 +397,9 @@ impl EditorUi {
             self.actions.push(Action::Stop);
         }
         if info.play != PlayState::Edit {
+            if ctx.input(|i| i.key_pressed(Key::F8)) {
+                self.actions.push(Action::Eject);
+            }
             return;
         }
         let save = ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S));
@@ -467,6 +484,31 @@ impl EditorUi {
         }
         if f {
             self.focus_selected(info);
+        }
+        // Закладки камеры: Ctrl+цифра — запомнить, цифра — вернуться.
+        const DIGITS: [Key; 9] = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+            Key::Num8,
+            Key::Num9,
+        ];
+        for (k, key) in DIGITS.into_iter().enumerate() {
+            let (save, go) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::COMMAND, key),
+                    i.consume_key(Modifiers::NONE, key),
+                )
+            });
+            if save && let Some(v) = info.view {
+                self.ov.bookmarks[k] = Some((v.center, v.zoom));
+            } else if go && let Some((center, zoom)) = self.ov.bookmarks[k] {
+                self.actions.push(Action::SetCamera { center, zoom });
+            }
         }
         if esc && self.vp.drag.is_none() {
             self.selected = None;
@@ -1165,6 +1207,7 @@ impl EditorUi {
             .hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(LINE, BORDER));
         let mut focus = false;
         let vp = &mut self.vp;
+        let actions = &mut self.actions;
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(bar.shrink2(vec2(GAP_L, 0.0)))
@@ -1182,18 +1225,55 @@ impl EditorUi {
                         )
                         .on_hover_text("Приближение камеры: колесо мыши над сценой");
                     }
-                    let show = egui::Button::new(
-                        RichText::new("Показать").size(FONT_CHIP).color(TEXT_DIM),
-                    )
-                    .fill(Color32::TRANSPARENT)
-                    .stroke(Stroke::NONE);
-                    if ui
-                        .add_enabled(editing && info.scene.is_some(), show)
-                        .on_hover_text("Камера на выбранный предмет или на всю сцену (F)")
-                        .clicked()
-                    {
-                        focus = true;
+                    let ov = &mut self.ov;
+                    let flat = |t: &str| {
+                        egui::Button::new(RichText::new(t).size(FONT_CHIP).color(TEXT_DIM))
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::NONE)
+                    };
+                    if editing {
+                        if ui
+                            .add_enabled(info.scene.is_some(), flat("Фокус"))
+                            .on_hover_text("Камера на выбранный предмет или на всю сцену (F)")
+                            .clicked()
+                        {
+                            focus = true;
+                        }
+                        ui.menu_button(RichText::new("Камера").size(FONT_CHIP), |ui| {
+                            camera_menu(ui, ov, info, actions);
+                        });
+                    } else {
+                        play_controls(ui, info, actions);
                     }
+                    ui.menu_button(RichText::new("Метки").size(FONT_CHIP), |ui| {
+                        for (name, on) in ov.show.items() {
+                            ui.checkbox(on, name);
+                        }
+                    })
+                    .response
+                    .on_hover_text("Что показывать поверх сцены");
+                    let mode = RichText::new(format!("Вид: {}", ov.mode.label())).size(FONT_CHIP);
+                    ui.menu_button(mode, |ui| {
+                        for m in ViewMode::ALL {
+                            if ui
+                                .selectable_label(ov.mode == m, m.label())
+                                .on_hover_text(m.hint())
+                                .clicked()
+                            {
+                                ov.mode = m;
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        ui.label(
+                            RichText::new(
+                                "Режимы «без света», «только свет» и «поле расстояний SDF» \
+                                 появятся вместе с отладочными проходами движка.",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                    });
                 });
             },
         );
@@ -1209,6 +1289,46 @@ impl EditorUi {
         self.viewport_hovered = response.hovered() || response.dragged();
         let painter = ui.painter_at(rect);
         let mut busy = false;
+        if let (Some(file), Some(view)) = (info.scene, info.view) {
+            let all = geom::place_all(file);
+            self.ov.draw(&overlay::Ctx {
+                painter: &painter,
+                view,
+                rect,
+                file,
+                placed: &all,
+                hidden: info.hidden,
+            });
+            if self.ov.show.stats {
+                let on_screen = all
+                    .iter()
+                    .filter(|p| {
+                        let r = Rect::from_two_pos(view.to_ui(p.own.min), view.to_ui(p.own.max));
+                        r.intersects(rect)
+                    })
+                    .count();
+                let selected = self
+                    .selected
+                    .as_ref()
+                    .and_then(|p| outline::node_at(file, p))
+                    .map_or_else(|| "—".to_owned(), outline::display_name);
+                overlay::stats(
+                    &painter,
+                    rect,
+                    &[
+                        format!("{:.0} к/с · кадр {:.1} мс", info.fps, info.frame_ms),
+                        format!("предметов {} · на экране {on_screen}", all.len()),
+                        format!("выбран: {selected}"),
+                        format!(
+                            "камера ({:.2}, {:.2}) · {:.0}%",
+                            view.center[0],
+                            view.center[1],
+                            view.zoom * 100.0
+                        ),
+                    ],
+                );
+            }
+        }
         if editing && let (Some(file), Some(view)) = (info.scene, info.view) {
             let all = geom::place_all(file);
             // Скрытые и закреплённые мышью в сцене не выбираются.
@@ -1277,7 +1397,7 @@ impl EditorUi {
                 response.context_menu(|ui| self.node_menu(ui, &path, file, info));
             }
         }
-        if editing && !busy && self.vp.drag.is_none() {
+        if (editing || info.ejected) && !busy && self.vp.drag.is_none() {
             let pan = response.dragged_by(egui::PointerButton::Primary)
                 || response.dragged_by(egui::PointerButton::Middle)
                 || response.dragged_by(egui::PointerButton::Secondary);
@@ -1320,6 +1440,87 @@ impl EditorUi {
             );
         }
     }
+}
+
+/// Меню «Камера»: закладки Ctrl+1…9.
+fn camera_menu(ui: &mut Ui, ov: &mut Overlay, info: &Info, actions: &mut Vec<Action>) {
+    ui.set_min_width(240.0);
+    ui.label(
+        RichText::new("Ctrl+цифра — запомнить, цифра — вернуться")
+            .small()
+            .color(MUTED),
+    );
+    for k in 0..ov.bookmarks.len() {
+        ui.horizontal(|ui| {
+            let text = match ov.bookmarks[k] {
+                Some((c, z)) => format!("{} · ({:.2}, {:.2}) {:.0}%", k + 1, c[0], c[1], z * 100.0),
+                None => format!("{} · пусто", k + 1),
+            };
+            let go = ui.add_enabled(ov.bookmarks[k].is_some(), egui::Button::new(text));
+            if go.clicked()
+                && let Some((center, zoom)) = ov.bookmarks[k]
+            {
+                actions.push(Action::SetCamera { center, zoom });
+                ui.close();
+            }
+            if ui
+                .add_enabled(info.view.is_some(), egui::Button::new("запомнить").small())
+                .clicked()
+                && let Some(v) = info.view
+            {
+                ov.bookmarks[k] = Some((v.center, v.zoom));
+            }
+        });
+    }
+    ui.separator();
+    if ui.button("Камера в начало сцены").clicked() {
+        actions.push(Action::ResetCamera);
+        ui.close();
+    }
+}
+
+/// Кнопки игры над сценой: скорость, шаг кадра на паузе, отцепить камеру.
+fn play_controls(ui: &mut Ui, info: &Info, actions: &mut Vec<Action>) {
+    let eject = if info.ejected {
+        "Камера за героем"
+    } else {
+        "Отцепить камеру"
+    };
+    if ui
+        .button(RichText::new(eject).size(FONT_CHIP))
+        .on_hover_text("F8: камера перестаёт следить за героем, сцену можно двигать мышью")
+        .clicked()
+    {
+        actions.push(Action::Eject);
+    }
+    let step = egui::Button::new(RichText::new("Шаг кадра").size(FONT_CHIP));
+    if ui
+        .add_enabled(info.play == PlayState::Paused, step)
+        .on_hover_text("На паузе: игра делает один шаг (1/60 секунды)")
+        .clicked()
+    {
+        actions.push(Action::Step);
+    }
+    let speed = RichText::new(format!("Скорость {}×", fmt_scale(info.time_scale))).size(FONT_CHIP);
+    ui.menu_button(speed, |ui| {
+        for k in [0.1, 0.25, 0.5, 1.0, 2.0] {
+            if ui
+                .selectable_label(
+                    (info.time_scale - k).abs() < 1e-6,
+                    format!("{}×", fmt_scale(k)),
+                )
+                .clicked()
+            {
+                actions.push(Action::SetTimeScale(k));
+                ui.close();
+            }
+        }
+    });
+}
+
+fn fmt_scale(k: f64) -> String {
+    let t = format!("{k}");
+    t.replace('.', ",")
 }
 
 /// Предмет или один из его родителей есть в наборе (скрытых, закреплённых).
@@ -2223,6 +2424,8 @@ mod tests {
             can_save: true,
             hidden: &NO_HIDDEN,
             can_paste: false,
+            ejected: false,
+            time_scale: 1.0,
         }
     }
 
@@ -2561,6 +2764,15 @@ mod tests {
             if play == PlayState::Paused {
                 ui.tabs[ws][Side::Bottom.index()] = 2;
             }
+            // Пауза — заодно режим «Физика» со сводкой, игра — «Контуры» с метками.
+            ui.ov.mode = match play {
+                PlayState::Edit => ViewMode::Lit,
+                PlayState::Paused => ViewMode::Physics,
+                PlayState::Playing => ViewMode::Outlines,
+            };
+            ui.ov.show.stats = play != PlayState::Edit;
+            ui.ov.show.lights = play == PlayState::Playing;
+            ui.ov.show.bones = play == PlayState::Playing;
             ui.workspace = ws;
             if ws == 5 {
                 // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.
