@@ -28,8 +28,8 @@ use crate::graph::{Access, ImageHandle, PassContext, RenderGraph};
 use crate::lights::{LIGHT_SIZE, MAX_LIGHTS};
 use crate::pipeline::Blend;
 use crate::pipeline::{
-    CLEAR_COLOR, Stencil, StencilUse, begin_color_pass, begin_color_pass_with, begin_scene_pass,
-    graphics_pipeline_stencil,
+    CLEAR_COLOR, Stencil, StencilUse, begin_color_pass, begin_color_pass_with, begin_depth_pass,
+    begin_scene_pass, graphics_pipeline_stencil,
 };
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
@@ -343,6 +343,9 @@ pub(crate) struct FrameData {
     sprite_count: u32,
     /// Сцена «3D» (7.2): объекты, материалы и программы форм в буфере кадра.
     space_address: vk::DeviceAddress,
+    /// Вершин полигональных моделей сцены «3D» (7.6ж; 0 — моделей нет, проход
+    /// «полигоны 3D» не нужен).
+    space_vertices: u32,
     /// Источники света сцены «лампы и тени» в буфере кадра (адрес и сколько их).
     lights_address: vk::DeviceAddress,
     light_count: u32,
@@ -364,6 +367,8 @@ pub(crate) struct Demo {
     sdf: vk::Pipeline,
     /// Сцена «3D» (7.3): шагание лучей в буфер геометрии (`raymarch.slang`)…
     space_march: vk::Pipeline,
+    /// Полигональные модели сцены «3D» (7.6ж, `mesh3d.slang`) в свой буфер геометрии.
+    space_mesh: vk::Pipeline,
     space_cone: vk::Pipeline,
     /// …тени и затенение в углах по нему (7.4, `raymarch_shadow.slang`)…
     space_shadow: vk::Pipeline,
@@ -624,6 +629,7 @@ impl Demo {
             triangle: vk::Pipeline::null(),
             sdf: vk::Pipeline::null(),
             space_march: vk::Pipeline::null(),
+            space_mesh: vk::Pipeline::null(),
             space_cone: vk::Pipeline::null(),
             space_shadow: vk::Pipeline::null(),
             space_shade: vk::Pipeline::null(),
@@ -749,6 +755,15 @@ impl Demo {
                 GBUFFER_FORMAT,
                 Msaa::Off,
                 None,
+            )?;
+            demo.space_mesh = build(
+                ctx,
+                res,
+                shaders,
+                "mesh3d",
+                GBUFFER_FORMAT,
+                Msaa::Off,
+                Some(MESH_DEPTH_FORMAT),
             )?;
             demo.space_cone = build(
                 ctx,
@@ -1576,6 +1591,12 @@ impl Demo {
                 "raymarch_shade" => (&mut self.space_shade, self.scene_format, self.msaa, stencil),
                 "raymarch" => (&mut self.space_march, GBUFFER_FORMAT, Msaa::Off, None),
                 "raymarch_cone" => (&mut self.space_cone, CONE_FORMAT, Msaa::Off, None),
+                "mesh3d" => (
+                    &mut self.space_mesh,
+                    GBUFFER_FORMAT,
+                    Msaa::Off,
+                    Some(MESH_DEPTH_FORMAT),
+                ),
                 "raymarch_shadow" => (&mut self.space_shadow, SHADOW3D_FORMAT, Msaa::Off, None),
                 "particles" => {
                     match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
@@ -1928,15 +1949,14 @@ impl Demo {
         res.write_buffer(object_buffer, 0, &object_bytes);
         res.write_buffer(blob_buffer, 0, &blob_bytes);
         let space_buffer = self.space_buffers[slot];
+        let mut space_vertices = 0;
         if scene == DemoScene::Space {
             let frame = self.space.frame(time);
-            let words = crate::space::pack(
-                &frame.shapes,
-                &self.space.materials,
-                &frame.lamps,
-                !self.space.culling_off,
-            );
-            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+            let mut packed =
+                crate::space::pack(&frame, &self.space.materials, !self.space.culling_off);
+            crate::space::set_view_proj(&mut packed.words, self.space_camera.view_proj(aspect));
+            space_vertices = packed.vertices;
+            let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
         }
         FrameData {
@@ -1947,6 +1967,7 @@ impl Demo {
             sprites_address: res.buffer_address(buffer),
             sprite_count: count as u32,
             space_address: res.buffer_address(space_buffer),
+            space_vertices,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
             objects_address: res.buffer_address(object_buffer),
@@ -2150,6 +2171,7 @@ impl Demo {
                         frame.time,
                         frame.space_address,
                         [0, 0],
+                        0,
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл картинку конусов в цель рисования; буфер сцены
@@ -2164,31 +2186,79 @@ impl Demo {
                     }
                 },
             );
+            // Полигональные модели (7.6ж): растеризация с глубиной в свой буфер геометрии
+            // той же раскладки. «Реймарчинг» не шагает дальше них и берёт их точку, если
+            // луч ни во что не попал раньше.
+            let meshes = (frame.space_vertices > 0).then(|| {
+                let meshes = graph.create("полигоны 3D", frame.extent, GBUFFER_FORMAT);
+                let depth = graph.create("глубина полигонов 3D", frame.extent, MESH_DEPTH_FORMAT);
+                graph.add_pass(
+                    "полигоны 3D",
+                    &[
+                        (meshes, Access::ColorAttachment),
+                        (depth, Access::StencilAttachment),
+                    ],
+                    move |p| {
+                        let push = space_push(
+                            &camera,
+                            frame.extent,
+                            frame.time,
+                            frame.space_address,
+                            [0, 0],
+                            0,
+                        );
+                        let (d, cmd) = (p.device, p.cmd);
+                        // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
+                        // этого кадра жив, пока кадр рисуется.
+                        unsafe {
+                            begin_depth_pass(
+                                d,
+                                cmd,
+                                p.view(meshes),
+                                p.view(depth),
+                                frame.extent,
+                                [-1.0, 0.0, 0.0, 0.0],
+                            );
+                            bindless.bind(d, cmd);
+                            d.cmd_bind_pipeline(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                self.space_mesh,
+                            );
+                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                            d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
+                            d.cmd_end_rendering(cmd);
+                        }
+                    },
+                );
+                meshes
+            });
             let gbuffer = graph.create("буфер геометрии 3D", frame.extent, GBUFFER_FORMAT);
-            graph.add_pass(
-                "реймарчинг",
-                &[(cone, Access::Sampled), (gbuffer, Access::ColorAttachment)],
-                move |p| {
-                    let push = space_push(
-                        &camera,
-                        frame.extent,
-                        frame.time,
-                        frame.space_address,
-                        [p.texture(cone), 0],
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
-                    // этого кадра жив, пока кадр рисуется.
-                    unsafe {
-                        begin_color_pass(d, cmd, p.view(gbuffer), frame.extent);
-                        bindless.bind(d, cmd);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_march);
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_draw(cmd, 3, 1, 0, 0);
-                        d.cmd_end_rendering(cmd);
-                    }
-                },
-            );
+            let mut march_uses = vec![(cone, Access::Sampled), (gbuffer, Access::ColorAttachment)];
+            if let Some(m) = meshes {
+                march_uses.push((m, Access::Sampled));
+            }
+            graph.add_pass("реймарчинг", &march_uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    frame.extent,
+                    frame.time,
+                    frame.space_address,
+                    [p.texture(cone), meshes.map_or(0, |m| p.texture(m))],
+                    u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
+                // этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(gbuffer), frame.extent);
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_march);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            });
             // Тени и затенение в углах (7.4): мягкие, поэтому в половинном разрешении —
             // точка на квадрат 2×2 пикселя, вчетверо меньше лучей (7.6б). «Сцена»
             // растягивает их обратно с оглядкой на глубину и нормаль.
@@ -2210,6 +2280,7 @@ impl Demo {
                         frame.time,
                         frame.space_address,
                         [p.texture(gbuffer), 0],
+                        0,
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл буфер геометрии в чтение, а тени в цель
@@ -2298,6 +2369,7 @@ impl Demo {
                         frame.time,
                         frame.space_address,
                         [p.texture(g), p.texture(s)],
+                        0,
                     );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_shade);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
@@ -2800,6 +2872,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.space_march, None);
+            ctx.device.destroy_pipeline(self.space_mesh, None);
             ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
@@ -2820,6 +2893,7 @@ impl Demo {
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
         self.space_march = vk::Pipeline::null();
+        self.space_mesh = vk::Pipeline::null();
         self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
@@ -2935,6 +3009,7 @@ fn space_push(
     time: f32,
     scene: vk::DeviceAddress,
     textures: [u32; 2],
+    flags: u32,
 ) -> [u8; 112] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let inv = camera.inverse_view_proj(aspect).to_cols_array();
@@ -2949,7 +3024,7 @@ fn space_push(
     push[80..88].copy_from_slice(&scene.to_ne_bytes());
     push[88..92].copy_from_slice(&aspect.to_ne_bytes());
     push[92..96].copy_from_slice(&(extent.height.max(1) as f32).to_ne_bytes());
-    // Флаги (96..100) пока 0.
+    push[96..100].copy_from_slice(&flags.to_ne_bytes());
     push[100..104].copy_from_slice(&textures[0].to_ne_bytes());
     push[104..108].copy_from_slice(&textures[1].to_ne_bytes());
     push
@@ -3002,6 +3077,10 @@ const GBUFFER_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
 /// Длины, с которых начинать лучи сцены «3D» (7.8): по точке на квадрат
 /// [`CONE_TILE`]×[`CONE_TILE`] пикселей.
 const CONE_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
+/// Глубина прохода «полигоны 3D» (7.6ж). D32 видеокарты умеют все.
+const MESH_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+/// Флаг сцены «3D»: у «реймарчинга» есть буфер геометрии полигонов (как в raymarch.slang).
+const SPACE_FLAG_MESHES: u32 = 1;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
 const CONE_TILE: u32 = 8;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
@@ -3196,7 +3275,12 @@ fn build(
         msaa.samples(),
         stencil.map(|format| Stencil {
             format,
-            usage: StencilUse::Ignore,
+            // Полигоны сцены «3D» (7.6ж) — с глубиной, остальным трафарет не нужен.
+            usage: if name == "mesh3d" {
+                StencilUse::Depth
+            } else {
+                StencilUse::Ignore
+            },
         }),
     )
 }

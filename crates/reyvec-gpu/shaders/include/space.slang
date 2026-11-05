@@ -28,6 +28,9 @@ struct Push
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
+// Треугольник на весь экран для проходов-лучей. Файл со своим вершинным шейдером
+// (mesh3d.slang) определяет SPACE_OWN_VERTEX до подключения.
+#ifndef SPACE_OWN_VERTEX
 struct VertexOut
 {
     float4 position : SV_Position;
@@ -45,6 +48,7 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID)
     o.screen = float2(ndc.x, -ndc.y);
     return o;
 }
+#endif
 
 float3 unproject(float2 s, float depth)
 {
@@ -75,6 +79,9 @@ static const uint MAX_OBJECTS = 1024;
 static const uint MAX_PROGRAM_WORDS = 4096;
 
 static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
+static const uint OBJECT_SHADOW_ONLY = 1; // как shape3d::OBJECT_SHADOW_ONLY
+// Флаги констант (pc.flags) сцены «3D», как SPACE_FLAG_* в demo.rs.
+static const uint SPACE_FLAG_MESHES = 1; // у «реймарчинга» есть буфер геометрии полигонов
 
 // Расстояние до ближайшего объекта (x) и его материал (y).
 //
@@ -92,7 +99,10 @@ static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
 // оценка — расстояние до коробки, где лежат все шары-границы. Без сетки (слово 6
 // заголовка 0) перебираются все объекты. Список один проход: тело цикла встраивается
 // в шейдер один раз.
-float2 scene_near(float3 p, float near)
+//
+// Заменители полигональных моделей (7.6ж, флаг OBJECT_SHADOW_ONLY) видны только при
+// `proxies`: тени и углы их считают, лучи глаза и нормали — нет.
+float2 scene_near(float3 p, float near, bool proxies)
 {
     // Числа из буфера ограничены сверху: испорченный буфер не должен вешать видеокарту.
     uint count = min(pc.scene[0], MAX_OBJECTS);
@@ -135,6 +145,8 @@ float2 scene_near(float3 p, float near)
         if (o >= count)
             continue;
         uint w = objects + o * OBJECT_WORDS;
+        if (!proxies && (pc.scene[w + 2] & OBJECT_SHADOW_ONLY) != 0)
+            continue;
         float radius = asfloat(pc.scene[w + 7]);
         if (radius >= 0.0)
         {
