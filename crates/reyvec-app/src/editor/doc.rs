@@ -158,6 +158,112 @@ impl SceneDoc {
         }
     }
 
+    /// Новый текст целиком — один шаг истории. Текст, который не читается как сцена, не
+    /// принимается.
+    fn replace(&mut self, text: String) -> Result<(), EditError> {
+        if let Err(e) = SceneFile::parse_in(&text, self.dir()) {
+            return Err(EditError(format!("после правки сцена не читается: {e}")));
+        }
+        self.preview_base = None;
+        if text != self.text {
+            let old = std::mem::replace(&mut self.text, text);
+            self.push_undo(old);
+            self.redo.clear();
+            self.reparse();
+        }
+        Ok(())
+    }
+
+    /// Текст предмета для буфера обмена.
+    pub(crate) fn node_text(&self, path: &[usize]) -> Result<String, EditError> {
+        ron_edit::node_text(&self.text, path)
+    }
+
+    /// Убирает предмет вместе с вложенными.
+    pub(crate) fn delete(&mut self, path: &[usize]) -> Result<(), EditError> {
+        let t = ron_edit::remove_node(&self.text, path)?;
+        self.replace(t)
+    }
+
+    /// Вставляет предмет из буфера в список `parent` на место `index`. Возвращает его путь.
+    pub(crate) fn paste(
+        &mut self,
+        item: &str,
+        parent: &[usize],
+        index: usize,
+    ) -> Result<Vec<usize>, EditError> {
+        let index = index.min(self.list_len(parent));
+        let t = ron_edit::insert_node(&self.text, parent, index, item)?;
+        self.replace(t)?;
+        Ok(child(parent, index))
+    }
+
+    /// Копия предмета сразу за ним, с именем «ящик 2». Возвращает путь копии.
+    pub(crate) fn duplicate(&mut self, path: &[usize]) -> Result<Vec<usize>, EditError> {
+        let (parent, i) = split(path)?;
+        let item = ron_edit::node_text(&self.text, path)?;
+        let mut t = ron_edit::insert_node(&self.text, parent, i + 1, &item)?;
+        let new = child(parent, i + 1);
+        let name = self
+            .file
+            .as_ref()
+            .and_then(|f| super::outline::node_at(f, path))
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
+        if !name.is_empty() {
+            t = ron_edit::set_field(&t, &new, "name", &ron_edit::string(&next_name(&name)))?;
+        }
+        self.replace(t)?;
+        Ok(new)
+    }
+
+    /// Переносит предмет в список `parent` на место `index` (номер — как до переноса).
+    /// Возвращает новый путь.
+    pub(crate) fn move_node(
+        &mut self,
+        from: &[usize],
+        parent: &[usize],
+        index: usize,
+    ) -> Result<Vec<usize>, EditError> {
+        if parent.starts_with(from) {
+            return Err(EditError("предмет нельзя вложить в самого себя".into()));
+        }
+        let (from_parent, i) = split(from)?;
+        let item = ron_edit::node_text(&self.text, from)?;
+        let cut = ron_edit::remove_node(&self.text, from)?;
+        // После выреза номера в том же списке за ним сдвигаются на один.
+        let parent_before = parent;
+        let mut parent = parent.to_vec();
+        let mut index = index;
+        let n = from_parent.len();
+        if parent.len() > n && parent[..n] == *from_parent && parent[n] > i {
+            parent[n] -= 1;
+        }
+        if parent == from_parent && index > i {
+            index -= 1;
+        }
+        let len = self.list_len(parent_before) - usize::from(parent_before == from_parent);
+        let index = index.min(len);
+        let t = ron_edit::insert_node(&cut, &parent, index, &item)?;
+        if t == self.text {
+            return Ok(from.to_vec());
+        }
+        self.replace(t)?;
+        Ok(child(&parent, index))
+    }
+
+    /// Сколько предметов в списке `parent`.
+    fn list_len(&self, parent: &[usize]) -> usize {
+        let Some(f) = &self.file else {
+            return 0;
+        };
+        if parent.is_empty() {
+            f.nodes.len()
+        } else {
+            super::outline::node_at(f, parent).map_or(0, |n| n.children.len())
+        }
+    }
+
     /// Перетаскивание бросили (Esc): текст как до него.
     pub(crate) fn cancel_preview(&mut self) {
         if let Some(base) = self.preview_base.take() {
@@ -222,6 +328,29 @@ impl SceneDoc {
     }
 }
 
+/// Родитель и номер в его списке.
+fn split(path: &[usize]) -> Result<(&[usize], usize), EditError> {
+    path.split_last()
+        .map(|(i, p)| (p, *i))
+        .ok_or_else(|| EditError("пустой путь к предмету".into()))
+}
+
+fn child(parent: &[usize], i: usize) -> Vec<usize> {
+    let mut p = parent.to_vec();
+    p.push(i);
+    p
+}
+
+/// Имя копии: «ящик» → «ящик 2», «ящик 2» → «ящик 3».
+pub(crate) fn next_name(name: &str) -> String {
+    let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let (head, num) = name.split_at(name.len() - digits);
+    match num.parse::<u64>() {
+        Ok(n) if head.ends_with(' ') => format!("{head}{}", n + 1),
+        _ => format!("{name} 2"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +401,74 @@ mod tests {
         .unwrap();
         assert_eq!(d.file().unwrap().nodes[0].name, "большой ящик");
         assert!(d.save().is_err(), "встроенный пример некуда сохранить");
+    }
+
+    const TREE: &str = r##"(
+    format: "reyvec-scene",
+    version: 1,
+    nodes: [
+        (name: "стол", children: [(name: "банка"), (name: "кружка")]),
+        (name: "ящик 2"),
+        (name: "лампа"),
+    ],
+)
+"##;
+
+    impl SceneDoc {
+        fn names_at(&self, i: usize) -> Vec<String> {
+            let n = &self.file().unwrap().nodes[i];
+            let mut v = vec![n.name.clone()];
+            v.extend(n.children.iter().map(|c| format!("-{}", c.name)));
+            v
+        }
+    }
+
+    fn names(d: &SceneDoc) -> Vec<String> {
+        fn walk(nodes: &[reyvec_scene::NodeDesc], out: &mut Vec<String>, depth: usize) {
+            for n in nodes {
+                out.push(format!("{}{}", "-".repeat(depth), n.name));
+                walk(&n.children, out, depth + 1);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&d.file().unwrap().nodes, &mut out, 0);
+        out
+    }
+
+    #[test]
+    fn copy_paste_duplicate_delete_move() {
+        let mut d = SceneDoc::new(None, TREE.into());
+        assert_eq!(d.duplicate(&[1]).unwrap(), vec![2]);
+        assert_eq!(
+            names(&d),
+            ["стол", "-банка", "-кружка", "ящик 2", "ящик 3", "лампа"]
+        );
+        let jar = d.node_text(&[0, 0]).unwrap();
+        assert_eq!(d.paste(&jar, &[3], 0).unwrap(), vec![3, 0]);
+        assert_eq!(d.names_at(3), ["лампа", "-банка"]);
+        d.delete(&[0, 1]).unwrap();
+        assert_eq!(names(&d)[..2], ["стол", "-банка"]);
+        // Лампу — первой в стол, стол — в конец.
+        assert_eq!(d.move_node(&[3], &[0], 0).unwrap(), vec![0, 0]);
+        assert_eq!(d.move_node(&[0], &[], 99).unwrap(), vec![2]);
+        assert_eq!(
+            names(&d),
+            ["ящик 2", "ящик 3", "стол", "-лампа", "--банка", "-банка"]
+        );
+        assert!(
+            d.move_node(&[2], &[2, 0], 0).is_err(),
+            "в самого себя нельзя"
+        );
+        assert!(
+            d.paste("(name: ", &[], 0).is_err(),
+            "сломанный текст не вставляется"
+        );
+        assert_eq!(d.history_len(), 5);
+        while d.undo() {}
+        assert_eq!(d.text(), TREE);
+        assert_eq!(next_name("ящик"), "ящик 2");
+        assert_eq!(next_name("ящик 9"), "ящик 10");
+        assert_eq!(next_name("x2"), "x2 2");
     }
 
     #[test]

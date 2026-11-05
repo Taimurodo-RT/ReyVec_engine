@@ -25,6 +25,7 @@ mod theme;
 mod ui;
 mod viewport;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -101,6 +102,8 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         doc,
         engine_stale: false,
         engine_sent: Instant::now(),
+        clipboard: None,
+        hidden: HashSet::new(),
         watcher: None,
         controls: Controls::load(&controls_path()),
         start: Instant::now(),
@@ -153,6 +156,10 @@ struct Editor {
     engine_stale: bool,
     /// Когда движок последний раз получил текст сцены.
     engine_sent: Instant,
+    /// Предмет, скопированный в редакторе (текст из файла сцены).
+    clipboard: Option<String>,
+    /// Скрытые в редакторе предметы: движку они не отдаются, в файле остаются.
+    hidden: HashSet<Vec<usize>>,
     watcher: Option<reyvec_scene::SceneWatcher>,
     /// Клавиши героя из настроек игрока (`controls.ron`), как в песочнице.
     controls: Controls,
@@ -199,7 +206,7 @@ impl Editor {
             return;
         };
         let camera = r.camera();
-        r.switch_scene_file(doc.text());
+        r.switch_scene_file(&engine_text(doc.text(), &self.hidden));
         r.set_camera(camera);
         self.engine_stale = false;
         self.engine_sent = Instant::now();
@@ -335,6 +342,12 @@ impl Editor {
         };
         match action {
             Action::Play => {
+                if !self.hidden.is_empty()
+                    && let Some(doc) = &self.doc
+                {
+                    // Скрытое — только в редакторе: в игре сцена целиком.
+                    r.switch_scene_file(doc.text());
+                }
                 self.play = PlayState::Playing;
                 r.set_game_paused(false);
                 r.set_follow(true);
@@ -355,7 +368,7 @@ impl Editor {
                 let camera = r.camera();
                 if let Some(doc) = &self.doc {
                     // Сцена с начала: герой, тела и враги на местах из файла (с правками).
-                    r.switch_scene_file(doc.text());
+                    r.switch_scene_file(&engine_text(doc.text(), &self.hidden));
                 }
                 r.set_game_paused(true);
                 r.set_follow(false);
@@ -364,7 +377,15 @@ impl Editor {
             }
             Action::Minimize => w.set_minimized(true),
             Action::ToggleMaximize => w.set_maximized(!w.is_maximized()),
-            Action::Close => self.close(event_loop),
+            Action::Close => self.close_or_ask(event_loop),
+            Action::ForceClose => self.close(event_loop),
+            Action::SaveAndClose => {
+                let saved = self.doc.as_mut().map(SceneDoc::save);
+                match saved {
+                    Some(Err(e)) => tracing::warn!("Сцена не сохранена, окно остаётся: {e}"),
+                    _ => self.close(event_loop),
+                }
+            }
             Action::DragWindow => {
                 if let Err(e) = w.drag_window() {
                     tracing::debug!("Окно не тащится: {e}");
@@ -422,7 +443,30 @@ impl Editor {
             | Action::EndEdit
             | Action::Undo
             | Action::Redo
-            | Action::Save => self.apply_doc(action),
+            | Action::Save
+            | Action::Copy { .. }
+            | Action::Paste { .. }
+            | Action::Duplicate(_)
+            | Action::Delete(_)
+            | Action::Move { .. } => self.apply_doc(action),
+            Action::ToggleHidden(path) => {
+                if !self.hidden.remove(&path) {
+                    self.hidden.insert(path);
+                }
+                self.send_scene(true);
+            }
+        }
+    }
+
+    /// Закрыть окно; если есть несохранённые правки — сначала спросить.
+    fn close_or_ask(&mut self, event_loop: &ActiveEventLoop) {
+        if self.doc.as_ref().is_some_and(SceneDoc::dirty) {
+            self.ui.ask_close();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        } else {
+            self.close(event_loop);
         }
     }
 
@@ -434,7 +478,73 @@ impl Editor {
         let Some(doc) = self.doc.as_mut() else {
             return;
         };
+        let shape_before = doc.file().map(shape);
+        let mut select = None;
+        let structural = |r: Result<Vec<usize>, ron_edit::EditError>,
+                          select: &mut Option<Vec<usize>>| match r {
+            Ok(p) => {
+                *select = Some(p);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Не вышло: {e}");
+                false
+            }
+        };
         let now = match action {
+            Action::Copy { path, cut } => {
+                match doc.node_text(&path) {
+                    Ok(t) => {
+                        self.egui_ctx.copy_text(t.clone());
+                        self.clipboard = Some(t);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Не скопировать: {e}");
+                        return;
+                    }
+                }
+                if !cut || !structural(doc.delete(&path).map(|()| Vec::new()), &mut select) {
+                    return;
+                }
+                select = None;
+                true
+            }
+            Action::Paste { after, text } => {
+                let Some(item) = text.or_else(|| self.clipboard.clone()) else {
+                    return;
+                };
+                let (parent, index) = match after.as_deref().and_then(<[usize]>::split_last) {
+                    Some((i, p)) => (p.to_vec(), i + 1),
+                    None => (Vec::new(), usize::MAX),
+                };
+                if !structural(doc.paste(&item, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::Duplicate(path) => {
+                if !structural(doc.duplicate(&path), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::Delete(path) => {
+                if let Err(e) = doc.delete(&path) {
+                    tracing::warn!("Не удалить: {e}");
+                    return;
+                }
+                true
+            }
+            Action::Move {
+                from,
+                parent,
+                index,
+            } => {
+                if !structural(doc.move_node(&from, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
             Action::Edit { edit, commit } => {
                 let done = if commit {
                     doc.commit(&edit)
@@ -476,6 +586,12 @@ impl Editor {
             }
             _ => return,
         };
+        if doc.file().map(shape) != shape_before {
+            // Номера предметов сдвинулись: скрытые, закреплённые и раскрытые — заново.
+            self.hidden.clear();
+            self.ui.structure_changed();
+            self.ui.select(select);
+        }
         self.doc_changed(now);
     }
 
@@ -581,6 +697,8 @@ impl Editor {
             can_undo: doc.is_some_and(SceneDoc::can_undo),
             can_redo: doc.is_some_and(SceneDoc::can_redo),
             can_save: self.config.scene_file.is_some(),
+            hidden: &self.hidden,
+            can_paste: self.clipboard.is_some(),
         };
         let input = state.take_egui_input(window);
         let editor_ui = &mut self.ui;
@@ -725,7 +843,7 @@ impl ApplicationHandler for Editor {
         }
         self.game_input(&event);
         match event {
-            WindowEvent::CloseRequested => self.close(event_loop),
+            WindowEvent::CloseRequested => self.close_or_ask(event_loop),
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::Resized(size) => {
                 self.minimized = size.width == 0 || size.height == 0;
@@ -762,5 +880,57 @@ impl ApplicationHandler for Editor {
             }
             _ => {}
         }
+    }
+}
+
+/// Форма дерева предметов: сколько вложенных у каждого по порядку. Поменялась — значит,
+/// предметы добавили, убрали или переставили.
+fn shape(file: &reyvec_scene::SceneFile) -> Vec<usize> {
+    fn walk(nodes: &[reyvec_scene::NodeDesc], out: &mut Vec<usize>) {
+        out.push(nodes.len());
+        for n in nodes {
+            walk(&n.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&file.nodes, &mut out);
+    out
+}
+
+/// Текст сцены для движка: без скрытых в редакторе предметов.
+fn engine_text(text: &str, hidden: &HashSet<Vec<usize>>) -> String {
+    let mut paths: Vec<&Vec<usize>> = hidden
+        .iter()
+        // Вложенный в скрытого уйдёт вместе с ним.
+        .filter(|p| !(1..p.len()).any(|k| hidden.contains(&p[..k])))
+        .collect();
+    // С конца: вырезанный предмет не сдвигает номера тех, что ещё впереди.
+    paths.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = text.to_owned();
+    for p in paths {
+        match ron_edit::remove_node(&out, p) {
+            Ok(t) => out = t,
+            Err(e) => tracing::debug!("Скрытый предмет не убран: {e}"),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_nodes_leave_engine_text() {
+        let text = reyvec_scene::EXAMPLE;
+        let file = reyvec_scene::SceneFile::parse(text).unwrap();
+        let hero = file.nodes.iter().position(|n| n.player.is_some()).unwrap();
+        let hidden: HashSet<Vec<usize>> = [vec![0], vec![hero], vec![hero, 0], vec![2]].into();
+        let t = engine_text(text, &hidden);
+        let f = reyvec_scene::SceneFile::parse(&t).unwrap();
+        let gone = if hero == 0 || hero == 2 { 2 } else { 3 };
+        assert_eq!(f.nodes.len(), file.nodes.len() - gone);
+        assert!(f.nodes.iter().all(|n| n.player.is_none()));
+        assert_eq!(shape(&file)[0], file.nodes.len());
     }
 }
