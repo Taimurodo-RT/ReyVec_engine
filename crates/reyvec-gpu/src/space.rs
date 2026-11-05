@@ -167,4 +167,3 @@ mod tests {
         assert!((m as usize) < MATERIALS.len());
     }
 }
-
