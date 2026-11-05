@@ -109,7 +109,13 @@ float2 scene_near(float3 p, float near)
         }
         uint start = pc.scene[w];
         uint len = min(pc.scene[w + 1], MAX_PROGRAM_WORDS);
-        float2 s = sdf_program(pc.scene, start, len, p);
+        // Объект из одного примитива (шар, коробка, пол — их большинство) считается
+        // напрямую: без стека машины, который видеокарта держит в медленной памяти (7.6в).
+        float2 s;
+        if (len == PRIM_WORDS && (pc.scene[start] & 0xff) == OP_PRIM)
+            s = sdf_primitive(pc.scene, start, p);
+        else
+            s = sdf_program(pc.scene, start, len, p);
         if (s.x < best.x)
             best = s;
     }

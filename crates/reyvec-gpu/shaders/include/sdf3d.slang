@@ -74,6 +74,33 @@ float op3_intersect(float a, float b, float k)
     return -op3_union(-a, -b, k);
 }
 
+// Один примитив, записанный с слова `i`: расстояние (уже с масштабом) и материал.
+float2 sdf_primitive(uint* code, uint i, float3 p)
+{
+    uint kind = (code[i] >> 8) & 0xff;
+    float material = float(code[i + 1]);
+    float4 r0 = float4(asfloat(code[i + 2]), asfloat(code[i + 3]), asfloat(code[i + 4]), asfloat(code[i + 5]));
+    float4 r1 = float4(asfloat(code[i + 6]), asfloat(code[i + 7]), asfloat(code[i + 8]), asfloat(code[i + 9]));
+    float4 r2 = float4(asfloat(code[i + 10]), asfloat(code[i + 11]), asfloat(code[i + 12]), asfloat(code[i + 13]));
+    float3 q = float3(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w);
+    float scale = asfloat(code[i + 14]);
+    float4 a = float4(asfloat(code[i + 15]), asfloat(code[i + 16]), asfloat(code[i + 17]), asfloat(code[i + 18]));
+    float d;
+    if (kind == PRIM_SPHERE)
+        d = sd3_sphere(q, a.x);
+    else if (kind == PRIM_BOX)
+        d = sd3_box(q, a.xyz, a.w);
+    else if (kind == PRIM_CAPSULE)
+        d = sd3_capsule(q, a.x, a.y);
+    else if (kind == PRIM_CYLINDER)
+        d = sd3_cylinder(q, a.x, a.y, a.z);
+    else if (kind == PRIM_TORUS)
+        d = sd3_torus(q, a.x, a.y);
+    else
+        d = sd3_plane(q, a.xyz, a.w);
+    return float2(d * scale, material);
+}
+
 // Расстояние до формы (x) и материал ближайшей части (y, номер как float) по программе
 // из `len` слов, начиная с `start`.
 float2 sdf_program(uint* code, uint start, uint len, float3 p)
@@ -88,29 +115,9 @@ float2 sdf_program(uint* code, uint start, uint len, float3 p)
         uint op = word & 0xff;
         if (op == OP_PRIM)
         {
-            uint kind = (word >> 8) & 0xff;
-            float material = float(code[i + 1]);
-            float4 r0 = float4(asfloat(code[i + 2]), asfloat(code[i + 3]), asfloat(code[i + 4]), asfloat(code[i + 5]));
-            float4 r1 = float4(asfloat(code[i + 6]), asfloat(code[i + 7]), asfloat(code[i + 8]), asfloat(code[i + 9]));
-            float4 r2 = float4(asfloat(code[i + 10]), asfloat(code[i + 11]), asfloat(code[i + 12]), asfloat(code[i + 13]));
-            float3 q = float3(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w);
-            float scale = asfloat(code[i + 14]);
-            float4 a = float4(asfloat(code[i + 15]), asfloat(code[i + 16]), asfloat(code[i + 17]), asfloat(code[i + 18]));
-            float d;
-            if (kind == PRIM_SPHERE)
-                d = sd3_sphere(q, a.x);
-            else if (kind == PRIM_BOX)
-                d = sd3_box(q, a.xyz, a.w);
-            else if (kind == PRIM_CAPSULE)
-                d = sd3_capsule(q, a.x, a.y);
-            else if (kind == PRIM_CYLINDER)
-                d = sd3_cylinder(q, a.x, a.y, a.z);
-            else if (kind == PRIM_TORUS)
-                d = sd3_torus(q, a.x, a.y);
-            else
-                d = sd3_plane(q, a.xyz, a.w);
+            float2 s = sdf_primitive(code, i, p);
             if (top < int(SDF_STACK))
-                stack[top] = float2(d * scale, material);
+                stack[top] = s;
             top++;
             i += PRIM_WORDS;
         }
