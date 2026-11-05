@@ -109,6 +109,13 @@ pub struct SpaceFile {
     pub lamps: Vec<LampEntry>,
     #[serde(default)]
     pub objects: Vec<ObjectEntry>,
+    /// Сетка отсева (7.6е): `false` выключает её для сравнения замеров.
+    #[serde(default = "yes")]
+    pub culling: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Сцена, готовая к кадрам: материалы по номерам, лампы и предметы с номерами материалов.
@@ -122,6 +129,8 @@ pub struct SpaceScene {
     bulbs: Vec<Option<u32>>,
     objects: Vec<ObjectEntry>,
     object_materials: Vec<u32>,
+    /// Сетка отсева выключена в файле (`culling: false`).
+    pub culling_off: bool,
 }
 
 /// Что сцена «3D» рисует в один момент.
@@ -201,6 +210,7 @@ impl SpaceScene {
             bulbs,
             objects: file.objects,
             object_materials,
+            culling_off: !file.culling,
         })
     }
 

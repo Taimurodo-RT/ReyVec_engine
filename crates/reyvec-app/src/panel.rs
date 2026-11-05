@@ -102,6 +102,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_file: Option<&'a str>,
     pub space_error: Option<String>,
     pub space_objects: usize,
+    /// Сетка отсева сцены «3D» включена (в файле `culling: false` выключает).
+    pub space_culling: bool,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -345,6 +347,11 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — смотреть \
              вокруг, колесо — скорость, Tab — перспектива или плоская, R — в начало",
         );
+        let culling = if info.space_culling {
+            "сетка отсева включена"
+        } else {
+            "сетка отсева выключена (culling: false)"
+        };
         match (&info.space_error, info.space_file) {
             (Some(err), _) => {
                 ui.label(
@@ -354,13 +361,13 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             }
             (None, Some(path)) => {
                 ui.label(format!(
-                    "Файл сцены 3D: {path}, предметов {} (правка видна сразу)",
+                    "Файл сцены 3D: {path}, предметов {}, {culling} (правка видна сразу)",
                     info.space_objects
                 ));
             }
             (None, None) => {
                 ui.label(format!(
-                    "Файл сцены 3D: встроенный пример (файл не найден), предметов {}",
+                    "Файл сцены 3D: встроенный пример (файл не найден), предметов {}, {culling}",
                     info.space_objects
                 ));
             }
@@ -938,6 +945,7 @@ mod tests {
             space_file: None,
             space_error: None,
             space_objects: 0,
+            space_culling: true,
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {
