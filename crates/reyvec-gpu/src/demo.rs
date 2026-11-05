@@ -360,8 +360,10 @@ pub(crate) struct Demo {
     triangle: vk::Pipeline,
     /// Сцена «свет»: SDF-фигуры одним треугольником на весь экран (`sdf_demo.slang`).
     sdf: vk::Pipeline,
-    /// Сцена «3D» (7.1): лучи от камеры на весь экран (`raymarch.slang`).
-    raymarch: vk::Pipeline,
+    /// Сцена «3D» (7.3): шагание лучей в буфер геометрии (`raymarch.slang`)…
+    space_march: vk::Pipeline,
+    /// …и его освещение в проходе «сцена» (`raymarch_shade.slang`).
+    space_shade: vk::Pipeline,
     /// Камера сцены «3D».
     space_camera: reyvec_sdf::Camera3D,
     /// Поле расстояний сцены «свет» (4.2): маска теней и проходы jump flooding.
@@ -612,7 +614,8 @@ impl Demo {
         let mut demo = Self {
             triangle: vk::Pipeline::null(),
             sdf: vk::Pipeline::null(),
-            raymarch: vk::Pipeline::null(),
+            space_march: vk::Pipeline::null(),
+            space_shade: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
             field: FieldPipelines::default(),
             light_field: false,
@@ -710,14 +713,23 @@ impl Demo {
                 Msaa::Off,
                 Some(stencil_format),
             )?;
-            demo.raymarch = build(
+            demo.space_shade = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_shade",
+                scene_format,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.space_march = build(
                 ctx,
                 res,
                 shaders,
                 "raymarch",
-                scene_format,
+                GBUFFER_FORMAT,
                 Msaa::Off,
-                Some(stencil_format),
+                None,
             )?;
             demo.resolve = build(ctx, res, shaders, "resolve", scene_format, Msaa::Off, None)?;
             for name in FIELD_SHADERS {
@@ -1402,7 +1414,7 @@ impl Demo {
                 ("sdf_demo", msaa, stencil),
                 ("sdf_object", msaa, stencil),
                 ("particles", msaa, stencil),
-                ("raymarch", msaa, stencil),
+                ("raymarch_shade", msaa, stencil),
             ] {
                 made.push(build(ctx, res, shaders, name, format, samples, stencil)?);
             }
@@ -1423,7 +1435,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.object, None);
             ctx.device.destroy_pipeline(self.particle_draw, None);
-            ctx.device.destroy_pipeline(self.raymarch, None);
+            ctx.device.destroy_pipeline(self.space_shade, None);
         }
         self.triangle = made[0];
         self.sprites = made[1];
@@ -1431,7 +1443,7 @@ impl Demo {
         self.sdf = made[3];
         self.object = made[4];
         self.particle_draw = made[5];
-        self.raymarch = made[6];
+        self.space_shade = made[6];
         self.msaa = msaa;
         self.scene_format = format;
         Ok(())
@@ -1493,7 +1505,8 @@ impl Demo {
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
-                "raymarch" => (&mut self.raymarch, self.scene_format, self.msaa, stencil),
+                "raymarch_shade" => (&mut self.space_shade, self.scene_format, self.msaa, stencil),
+                "raymarch" => (&mut self.space_march, GBUFFER_FORMAT, Msaa::Off, None),
                 "particles" => {
                     match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
                         Ok(new) => {
@@ -2042,10 +2055,40 @@ impl Demo {
             });
         }
 
+        // Сцена «3D» (7.3): лучи шагают своим проходом в буфер геометрии (по точке на
+        // пиксель и без MSAA: шагание — самое дорогое), а «сцена» его освещает.
+        let gbuffer = (frame.scene == DemoScene::Space).then(|| {
+            let gbuffer = graph.create("буфер геометрии 3D", frame.extent, GBUFFER_FORMAT);
+            let camera = self.space_camera;
+            graph.add_pass(
+                "реймарчинг",
+                &[(gbuffer, Access::ColorAttachment)],
+                move |p| {
+                    let push =
+                        space_push(&camera, frame.extent, frame.time, frame.space_address, 0);
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
+                    // этого кадра жив, пока кадр рисуется.
+                    unsafe {
+                        begin_color_pass(d, cmd, p.view(gbuffer), frame.extent);
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_march);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                },
+            );
+            gbuffer
+        });
+
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
             (stencil, Access::StencilAttachment),
         ];
+        if let Some(g) = gbuffer {
+            uses.push((g, Access::Sampled));
+        }
         if let Some(f) = field {
             uses.push((f, Access::Sampled));
         }
@@ -2098,14 +2141,15 @@ impl Demo {
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
-                if frame.scene == DemoScene::Space {
+                if let Some(g) = gbuffer {
                     let push = space_push(
                         &self.space_camera,
                         frame.extent,
                         frame.time,
                         frame.space_address,
+                        p.texture(g),
                     );
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.raymarch);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_shade);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
@@ -2605,7 +2649,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.present, None);
             ctx.device.destroy_pipeline(self.resolve, None);
             ctx.device.destroy_pipeline(self.sdf, None);
-            ctx.device.destroy_pipeline(self.raymarch, None);
+            ctx.device.destroy_pipeline(self.space_march, None);
+            ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.light, None);
             ctx.device.destroy_pipeline(self.object, None);
             ctx.device.destroy_pipeline(self.object_mask, None);
@@ -2622,7 +2667,8 @@ impl Demo {
         }
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();
-        self.raymarch = vk::Pipeline::null();
+        self.space_march = vk::Pipeline::null();
+        self.space_shade = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
         self.object = vk::Pipeline::null();
         self.object_mask = vk::Pipeline::null();
@@ -2726,13 +2772,15 @@ fn sdf_push(
     push
 }
 
-/// Константы для `raymarch.slang` (7.1) в раскладке его `Push`: столбцы обратной матрицы
-/// камеры, глаз, время, адрес сцены (7.2), соотношение сторон, высота кадра и флаги.
+/// Константы сцены «3D» в раскладке `Push` из `include/space.slang`: столбцы обратной
+/// матрицы камеры, глаз, время, адрес сцены (7.2), соотношение сторон, высота кадра, флаги
+/// и номер буфера геометрии в общем списке текстур (7.3, его читает только освещение).
 fn space_push(
     camera: &reyvec_sdf::Camera3D,
     extent: vk::Extent2D,
     time: f32,
     scene: vk::DeviceAddress,
+    gbuffer: u32,
 ) -> [u8; 104] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let inv = camera.inverse_view_proj(aspect).to_cols_array();
@@ -2748,6 +2796,7 @@ fn space_push(
     push[88..92].copy_from_slice(&aspect.to_ne_bytes());
     push[92..96].copy_from_slice(&(extent.height.max(1) as f32).to_ne_bytes());
     // Флаги (96..100) пока 0.
+    push[100..104].copy_from_slice(&gbuffer.to_ne_bytes());
     push
 }
 
@@ -2792,6 +2841,9 @@ fn build_object_mask(
 
 /// Формат картинки света (4.3): свет может быть ярче 1, поэтому с плавающей точкой.
 const LIGHT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// Буфер геометрии сцены «3D» (7.3): расстояние вдоль луча, материал и нормаль (две
+/// координаты) — по 32 бита, чтобы расстояние до дальних точек не теряло точность.
+const GBUFFER_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
 /// Каскады лучей (опыт 4.6): цвет, принесённый лучом, и пропустил ли он свет дальше.
 const RC_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Яркость поверхности источника в каскадах на единицу его цвета и размера: свет на

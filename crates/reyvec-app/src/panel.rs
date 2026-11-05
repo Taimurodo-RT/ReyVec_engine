@@ -270,7 +270,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
 
     match info.gpu {
         Some(gpu) => {
-            let color = budget_color(gpu.total_ms);
+            let color = budget_color(gpu.total_ms, GPU_BUDGET_MS);
             ui.label(
                 mono(format!(
                     "Видеокарта {:.3} мс (бюджет {GPU_BUDGET_MS:.0} мс)",
@@ -279,7 +279,16 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 .color(color),
             );
             for p in &gpu.passes {
-                ui.label(mono(format!("  {:<8} {:.3} мс", p.name, p.ms)));
+                match pass_budget(p.name) {
+                    Some(budget) => ui.label(
+                        mono(format!(
+                            "  {:<8} {:.3} мс (бюджет {budget:.0} мс)",
+                            p.name, p.ms
+                        ))
+                        .color(budget_color(p.ms, budget)),
+                    ),
+                    None => ui.label(mono(format!("  {:<8} {:.3} мс", p.name, p.ms))),
+                };
             }
             gpu_chart(ui, history);
         }
@@ -761,11 +770,22 @@ fn zoom_text(zoom: f64) -> String {
     }
 }
 
-/// Зелёный, пока видеокарта укладывается в бюджет с запасом, жёлтый у края, красный сверх.
-fn budget_color(ms: f64) -> Color32 {
-    if ms <= GPU_BUDGET_MS * 0.75 {
+/// Проходы со своим бюджетом времени (`docs/decisions/0003-performance-targets.md`).
+const PASS_BUDGETS_MS: &[(&str, f64)] = &[("реймарчинг", 2.0)];
+
+/// Бюджет прохода `name`, если он у него свой.
+fn pass_budget(name: &str) -> Option<f64> {
+    PASS_BUDGETS_MS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, ms)| ms)
+}
+
+/// Зелёный, пока время укладывается в бюджет с запасом, жёлтый у края, красный сверх.
+fn budget_color(ms: f64, budget: f64) -> Color32 {
+    if ms <= budget * 0.75 {
         Color32::from_rgb(110, 210, 120)
-    } else if ms <= GPU_BUDGET_MS {
+    } else if ms <= budget {
         Color32::from_rgb(240, 200, 80)
     } else {
         Color32::from_rgb(255, 90, 80)
@@ -789,7 +809,7 @@ fn gpu_chart(ui: &mut egui::Ui, history: &VecDeque<f32>) {
         let x = rect.left() + (start + i) as f32 * bar;
         let r =
             egui::Rect::from_min_max(egui::pos2(x, y_of(ms)), egui::pos2(x + bar, rect.bottom()));
-        painter.rect_filled(r, 0.0, budget_color(f64::from(ms)));
+        painter.rect_filled(r, 0.0, budget_color(f64::from(ms), GPU_BUDGET_MS));
     }
     let budget_y = y_of(GPU_BUDGET_MS as f32);
     painter.line_segment(
@@ -840,9 +860,26 @@ mod tests {
 
     #[test]
     fn budget_colors() {
-        assert_eq!(budget_color(1.0), Color32::from_rgb(110, 210, 120));
-        assert_eq!(budget_color(3.5), Color32::from_rgb(240, 200, 80));
-        assert_eq!(budget_color(5.0), Color32::from_rgb(255, 90, 80));
+        assert_eq!(
+            budget_color(1.0, GPU_BUDGET_MS),
+            Color32::from_rgb(110, 210, 120)
+        );
+        assert_eq!(
+            budget_color(3.5, GPU_BUDGET_MS),
+            Color32::from_rgb(240, 200, 80)
+        );
+        assert_eq!(
+            budget_color(5.0, GPU_BUDGET_MS),
+            Color32::from_rgb(255, 90, 80)
+        );
+    }
+
+    #[test]
+    fn raymarching_has_its_own_budget() {
+        assert_eq!(pass_budget("реймарчинг"), Some(2.0));
+        assert_eq!(pass_budget("сцена"), None);
+        // 1,8 мс — уже у края своих 2 мс, хотя для всего кадра (4 мс) это мало.
+        assert_eq!(budget_color(1.8, 2.0), Color32::from_rgb(240, 200, 80));
     }
 
     /// Панель раскладывается без окна: шрифты читаются, кириллица и цифры есть в атласе.
