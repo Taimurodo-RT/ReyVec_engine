@@ -14,6 +14,7 @@
 pub mod camera3d;
 pub mod grid3d;
 pub mod mesh3d;
+pub mod profile2d;
 pub mod shape3d;
 pub mod space_file;
 pub use camera3d::{Camera3D, FlyInput, Projection};

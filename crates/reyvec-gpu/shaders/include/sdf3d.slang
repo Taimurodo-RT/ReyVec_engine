@@ -4,7 +4,9 @@
 //
 // Программа — слова подряд. Примитив (19 слов): команда (код 1 и вид в битах 8–15),
 // материал, матрица «мир → форма» тремя строками по 4 числа (поворот и сдвиг), множитель
-// расстояния (масштаб), 4 параметра. Операция (2 слова): код (2 — объединить, 3 —
+// расстояния (масштаб), 4 параметра. Биты 16–31 команды — сколько слов данных идёт после
+// примитива: поле 2D-фигуры у выдавливания и вращения (7.7, раскладка — в
+// crates/reyvec-sdf/src/profile2d.rs). Операция (2 слова): код (2 — объединить, 3 —
 // вырезать, 4 — пересечь) и ширина плавного перехода.
 
 static const uint OP_PRIM = 1;
@@ -18,8 +20,11 @@ static const uint PRIM_CAPSULE = 2;
 static const uint PRIM_CYLINDER = 3;
 static const uint PRIM_TORUS = 4;
 static const uint PRIM_PLANE = 5;
+static const uint PRIM_EXTRUDE = 6;
+static const uint PRIM_REVOLVE = 7;
 
 static const uint PRIM_WORDS = 19;
+static const uint FIELD_HEADER_WORDS = 8;
 static const uint OP_WORDS = 2;
 static const uint SDF_STACK = 8;
 
@@ -54,6 +59,42 @@ float sd3_torus(float3 p, float big, float small)
 float sd3_plane(float3 p, float3 n, float offset)
 {
     return dot(p, n) - offset;
+}
+
+// Расстояние до 2D-фигуры по её запечённому полю с слова `at` (зеркало field_distance
+// в profile2d.rs): внутри сетки — смесь четырёх соседних точек, снаружи — оценка снизу
+// от края сетки и от прямоугольника фигуры.
+float sd2_field(uint* code, uint at, float2 p)
+{
+    float2 corner = float2(asfloat(code[at]), asfloat(code[at + 1]));
+    float cell = asfloat(code[at + 2]);
+    uint nx = code[at + 3] & 0xffff;
+    uint ny = code[at + 3] >> 16;
+    float2 g = (p - corner) / cell - 0.5;
+    float2 top = float2(float(nx) - 1.0, float(ny) - 1.0);
+    float2 gc = clamp(g, float2(0.0, 0.0), top);
+    float e = length(g - gc) * cell;
+    float2 i0 = min(floor(gc), top - 1.0);
+    float2 t = gc - i0;
+    uint base = at + FIELD_HEADER_WORDS + uint(i0.y) * nx + uint(i0.x);
+    float v = lerp(lerp(asfloat(code[base]), asfloat(code[base + 1]), t.x),
+                   lerp(asfloat(code[base + nx]), asfloat(code[base + nx + 1]), t.x), t.y);
+    if (e > 0.0)
+    {
+        float2 lo = float2(asfloat(code[at + 4]), asfloat(code[at + 5]));
+        float2 hi = float2(asfloat(code[at + 6]), asfloat(code[at + 7]));
+        float to_box = length(max(max(lo - p, p - hi), 0.0));
+        float vp = max(v, 0.0);
+        return max(sqrt(e * e + vp * vp), to_box);
+    }
+    return v;
+}
+
+// Выдавливание: d2 — расстояние до 2D-фигуры в точке (x, y), толщина ±half по Z.
+float sd3_extrude(float3 p, float d2, float half_depth, float round)
+{
+    float2 w = float2(d2 + round, abs(p.z) - half_depth + round);
+    return length(max(w, 0.0)) + min(max(w.x, w.y), 0.0) - round;
 }
 
 float op3_union(float a, float b, float k)
@@ -96,6 +137,10 @@ float2 sdf_primitive(uint* code, uint i, float3 p)
         d = sd3_cylinder(q, a.x, a.y, a.z);
     else if (kind == PRIM_TORUS)
         d = sd3_torus(q, a.x, a.y);
+    else if (kind == PRIM_EXTRUDE)
+        d = sd3_extrude(q, sd2_field(code, i + PRIM_WORDS, q.xy), a.x, a.y);
+    else if (kind == PRIM_REVOLVE)
+        d = sd2_field(code, i + PRIM_WORDS, float2(length(q.xz) - a.x, q.y));
     else
         d = sd3_plane(q, a.xyz, a.w);
     return float2(d * scale, material);
@@ -119,7 +164,7 @@ float2 sdf_program(uint* code, uint start, uint len, float3 p)
             if (top < int(SDF_STACK))
                 stack[top] = s;
             top++;
-            i += PRIM_WORDS;
+            i += PRIM_WORDS + (word >> 16);
         }
         else
         {

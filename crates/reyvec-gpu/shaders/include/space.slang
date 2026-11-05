@@ -76,7 +76,7 @@ Ray screen_ray(float2 s)
 }
 
 static const uint MAX_OBJECTS = 1024;
-static const uint MAX_PROGRAM_WORDS = 4096;
+static const uint MAX_PROGRAM_WORDS = 16384;
 
 static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
 static const uint OBJECT_SHADOW_ONLY = 1; // как shape3d::OBJECT_SHADOW_ONLY
@@ -165,7 +165,8 @@ float2 scene_near(float3 p, float near, bool proxies)
         // Объект из одного примитива (шар, коробка, пол — их большинство) считается
         // напрямую: без стека машины, который видеокарта держит в медленной памяти (7.6в).
         float2 s;
-        if (len == PRIM_WORDS && (pc.scene[start] & 0xff) == OP_PRIM)
+        uint head = pc.scene[start];
+        if (len == PRIM_WORDS + (head >> 16) && (head & 0xff) == OP_PRIM)
             s = sdf_primitive(pc.scene, start, p);
         else
             s = sdf_program(pc.scene, start, len, p);
