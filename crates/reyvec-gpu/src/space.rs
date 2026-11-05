@@ -1,179 +1,12 @@
-//! Сцена «3D» (этап 7): объекты и материалы примера, собранные из форм `reyvec_sdf::Shape3`.
-//! Каждый кадр формы собираются заново (они двигаются), превращаются в программы для
-//! видеокарты и едут в буфер кадра одним списком слов (`reyvec_sdf::shape3d::pack_scene`)
-//! вместе с материалами и лампами (7.4).
+//! Сцена «3D» (этап 7): предметы из файла сцены (`reyvec_sdf::SpaceScene`, 7.5). Каждый
+//! кадр формы собираются заново (они двигаются), превращаются в программы для видеокарты
+//! и едут в буфер кадра одним списком слов (`reyvec_sdf::shape3d::pack_scene`) вместе с
+//! материалами и лампами (7.4).
 
 use reyvec_sdf::shape3d::{Lamp3, Material3, Program, Shape3, compile, pack_scene};
 
 /// Сколько слов помещается в буфер сцены кадра (256 КБ).
 pub(crate) const MAX_WORDS: usize = 64 * 1024;
-
-/// Материалы примера по номерам.
-pub(crate) const MATERIALS: [Material3; 8] = [
-    // 0: пол с сеткой.
-    Material3 {
-        color: [0.18, 0.19, 0.21],
-        glow: 0.0,
-        grid: true,
-    },
-    // 1: оранжевый шар.
-    Material3 {
-        color: [0.85, 0.35, 0.20],
-        glow: 0.0,
-        grid: false,
-    },
-    // 2: синяя коробка.
-    Material3 {
-        color: [0.25, 0.55, 0.85],
-        glow: 0.0,
-        grid: false,
-    },
-    // 3: золотой тор.
-    Material3 {
-        color: [0.90, 0.75, 0.25],
-        glow: 0.0,
-        grid: false,
-    },
-    // 4: зелёная слизь.
-    Material3 {
-        color: [0.30, 0.80, 0.35],
-        glow: 0.0,
-        grid: false,
-    },
-    // 5: светлый камень.
-    Material3 {
-        color: [0.70, 0.68, 0.64],
-        glow: 0.0,
-        grid: false,
-    },
-    // 6: тёплая лампочка (светится сама).
-    Material3 {
-        color: [1.0, 0.62, 0.30],
-        glow: 4.0,
-        grid: false,
-    },
-    // 7: холодная лампочка.
-    Material3 {
-        color: [0.35, 0.65, 1.0],
-        glow: 4.0,
-        grid: false,
-    },
-];
-
-/// Лампы примера в момент `time`: тёплая кружит над слизью, холодная висит между
-/// кубиками. Каждая видна как светящийся шарик (см. [`demo_shapes`]).
-pub(crate) fn demo_lamps(time: f32) -> [Lamp3; 2] {
-    [
-        Lamp3 {
-            at: warm_lamp_at(time),
-            color: MATERIALS[6].color,
-            power: 6.0,
-            range: 6.0,
-        },
-        Lamp3 {
-            at: COLD_LAMP_AT,
-            color: MATERIALS[7].color,
-            power: 5.0,
-            range: 5.0,
-        },
-    ]
-}
-
-fn warm_lamp_at(time: f32) -> [f32; 3] {
-    [
-        1.3 * (time * 0.7).cos(),
-        1.5,
-        3.0 + 1.0 * (time * 0.7).sin(),
-    ]
-}
-
-const COLD_LAMP_AT: [f32; 3] = [2.4, 1.9, 1.1];
-
-/// Объекты примера в момент `time`: пол, шар, коробка, тор (как в 7.1), капля слизи,
-/// которая перетекает между двумя шарами, коробка с вырезанным шаром и колонна из
-/// цилиндра с капсулами.
-pub(crate) fn demo_shapes(time: f32) -> Vec<Shape3> {
-    let bob = 0.15 * (time * 1.3).sin();
-    // Капля бегает туда-сюда между двумя шарами слизи и плавно сливается с ними.
-    let drop_x = 1.1 * (time * 0.9).sin();
-    vec![
-        Shape3::Plane {
-            normal: [0.0, 1.0, 0.0],
-            offset: 0.0,
-        }
-        .paint(0),
-        Shape3::Sphere { radius: 1.0 }
-            .at([0.0, 1.0 + bob, 0.0])
-            .paint(1),
-        Shape3::Box {
-            size: [1.5, 1.5, 1.5],
-            round: 0.08,
-        }
-        .at([3.0, 0.75, -0.5])
-        .paint(2),
-        // Тор стоит на ребре и медленно крутится вокруг вертикали.
-        Shape3::Torus {
-            radius: 0.75,
-            thickness: 0.25,
-        }
-        .placed([-3.2, 1.0, 0.3], [90.0, (time * 0.5).to_degrees(), 0.0])
-        .paint(3),
-        Shape3::Union {
-            smooth: 0.45,
-            shapes: vec![
-                Shape3::Sphere { radius: 0.55 }.at([-1.4, 0.55, 3.0]),
-                Shape3::Sphere { radius: 0.55 }.at([1.4, 0.55, 3.0]),
-                Shape3::Sphere { radius: 0.32 }.at([drop_x, 0.45, 3.0]),
-                // Лужица, на которой они стоят.
-                Shape3::Cylinder {
-                    height: 0.06,
-                    radius: 1.9,
-                    round: 0.03,
-                }
-                .at([0.0, 0.03, 3.0]),
-            ],
-        }
-        .paint(4),
-        Shape3::Subtract {
-            base: Box::new(Shape3::Box {
-                size: [1.2, 1.2, 1.2],
-                round: 0.04,
-            }),
-            cut: vec![Shape3::Sphere { radius: 0.78 }],
-            smooth: 0.05,
-        }
-        .placed([3.4, 0.6, 2.6], [0.0, time.to_degrees() * 0.3, 0.0])
-        .paint(2),
-        Shape3::Union {
-            smooth: 0.15,
-            shapes: vec![
-                Shape3::Cylinder {
-                    height: 3.0,
-                    radius: 0.3,
-                    round: 0.02,
-                }
-                .at([0.0, 1.5, 0.0]),
-                Shape3::Box {
-                    size: [1.0, 0.2, 1.0],
-                    round: 0.03,
-                }
-                .at([0.0, 0.1, 0.0]),
-                Shape3::Box {
-                    size: [0.9, 0.2, 0.9],
-                    round: 0.03,
-                }
-                .at([0.0, 3.0, 0.0]),
-            ],
-        }
-        .at([-1.5, 0.0, -3.0])
-        .paint(5),
-        // Лампочки там же, где лампы.
-        Shape3::Sphere { radius: 0.09 }
-            .at(warm_lamp_at(time))
-            .paint(6),
-        Shape3::Sphere { radius: 0.09 }.at(COLD_LAMP_AT).paint(7),
-    ]
-}
 
 /// Список слов сцены для видеокарты: программы объектов, материалы и лампы.
 pub(crate) fn pack(shapes: &[Shape3], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
@@ -203,14 +36,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demo_scene_compiles_and_fits() {
-        let shapes = demo_shapes(1.0);
-        let words = pack(&shapes, &MATERIALS, &demo_lamps(1.0));
-        assert_eq!(words[0] as usize, shapes.len(), "все формы собрались");
+    fn example_scene_compiles_and_fits() {
+        let scene = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE).unwrap();
+        let frame = scene.frame(1.0);
+        let words = pack(&frame.shapes, &scene.materials, &frame.lamps);
+        assert_eq!(words[0] as usize, frame.shapes.len(), "все формы собрались");
         assert!(words.len() < MAX_WORDS);
         // Материалы всех форм есть в списке.
-        let program = compile(&shapes[4]).unwrap();
-        let (_, m) = program.distance(glam::Vec3::new(-1.4, 0.55, 3.0));
-        assert!((m as usize) < MATERIALS.len());
+        for shape in &frame.shapes {
+            let program = compile(shape).unwrap();
+            let (_, m) = program.distance(glam::Vec3::ZERO);
+            assert!((m as usize) < scene.materials.len());
+        }
     }
 }

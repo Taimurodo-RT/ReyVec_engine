@@ -97,6 +97,11 @@ pub(crate) struct PanelInfo<'a> {
     pub physics: Option<reyvec_scene::game::physics::PhysicsStats>,
     /// Камера сцены «3D» (7.1), строкой.
     pub space: Option<String>,
+    /// Файл сцены «3D» (7.5, если за ним следим), ошибка последнего сохранения и сколько
+    /// в сцене предметов.
+    pub space_file: Option<&'a str>,
+    pub space_error: Option<String>,
+    pub space_objects: usize,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -340,6 +345,26 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — смотреть \
              вокруг, колесо — скорость, Tab — перспектива или плоская, R — в начало",
         );
+        match (&info.space_error, info.space_file) {
+            (Some(err), _) => {
+                ui.label(
+                    RichText::new(format!("Ошибка в файле сцены 3D: {err}"))
+                        .color(Color32::from_rgb(255, 90, 80)),
+                );
+            }
+            (None, Some(path)) => {
+                ui.label(format!(
+                    "Файл сцены 3D: {path}, предметов {} (правка видна сразу)",
+                    info.space_objects
+                ));
+            }
+            (None, None) => {
+                ui.label(format!(
+                    "Файл сцены 3D: встроенный пример (файл не найден), предметов {}",
+                    info.space_objects
+                ));
+            }
+        }
     }
     if info.scene_id == DemoScene::File {
         match (&info.scene_error, info.scene_file) {
@@ -910,6 +935,9 @@ mod tests {
             shader_error: None,
             scene_file: None,
             scene_error: None,
+            space_file: None,
+            space_error: None,
+            space_objects: 0,
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {

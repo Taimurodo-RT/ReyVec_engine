@@ -486,6 +486,15 @@ impl WindowRenderer {
         }
     }
 
+    /// Новый текст файла сцены «3D» (7.5, после сохранения файла). Если в нём ошибка,
+    /// рисуется прошлая сцена, а ошибка видна в [`WindowRenderer::space_error`].
+    pub fn set_space_file(&mut self, text: &str) {
+        self.files.space = Some(text.into());
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_file(text);
+        }
+    }
+
     /// Другой файл сцены той же папки (N в сцене из файла, 6.13): персонаж встаёт на
     /// место из нового файла.
     pub fn switch_scene_file(&mut self, text: &str) {
@@ -616,6 +625,18 @@ impl WindowRenderer {
         self.demo
             .as_ref()
             .and_then(|d| d.scene_error().map(ToOwned::to_owned))
+    }
+
+    /// Ошибка в последнем сохранении файла сцены «3D».
+    pub fn space_error(&self) -> Option<String> {
+        self.demo
+            .as_ref()
+            .and_then(|d| d.space_error().map(ToOwned::to_owned))
+    }
+
+    /// Сколько предметов в сцене «3D».
+    pub fn space_objects(&self) -> usize {
+        self.demo.as_ref().map_or(0, Demo::space_objects)
     }
 
     /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
