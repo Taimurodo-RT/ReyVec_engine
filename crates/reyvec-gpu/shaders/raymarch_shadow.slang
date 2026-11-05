@@ -6,6 +6,9 @@
 //
 // Точка результата (RGBA16F): x — солнце, y — затенение в углах (1 — открыто),
 // z и w — две первые лампы (остальные светят без теней).
+//
+// Результат в половинном разрешении (7.6б): точка (x, y) считается для пикселя кадра
+// (2x, 2y) — левого верхнего в квадрате 2×2. Растягивает обратно raymarch_shade.slang.
 
 #include "include/space.slang"
 
@@ -60,10 +63,15 @@ float ambient_occlusion(float3 p, float3 n)
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
-    Surface s = read_surface(textures[pc.gbuffer].Load(int3(int2(input.position.xy), 0)));
+    uint w, h;
+    textures[pc.gbuffer].GetDimensions(w, h);
+    int2 px = min(int2(input.position.xy) * 2, int2(w, h) - 1);
+    Surface s = read_surface(textures[pc.gbuffer].Load(int3(px, 0)));
     if (s.t < 0.0)
         return float4(1.0, 1.0, 1.0, 1.0);
-    Ray ray = screen_ray(input.screen);
+    // Луч того же пикселя кадра, что и точка буфера геометрии.
+    float2 screen = float2((float(px.x) + 0.5) / float(w) * 2.0 - 1.0, 1.0 - (float(px.y) + 0.5) / float(h) * 2.0);
+    Ray ray = screen_ray(screen);
     // Над поверхностью: иначе луч тени сразу «упирается» в саму точку, и по формам идёт
     // рябь. Шагание останавливается с точностью 0,5 мм на метр пути, поэтому дальние
     // точки поднимаются выше.

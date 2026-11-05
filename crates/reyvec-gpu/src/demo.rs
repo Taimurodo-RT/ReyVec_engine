@@ -2137,8 +2137,14 @@ impl Demo {
                     }
                 },
             );
-            // Тени и затенение в углах (7.4): по точке на пиксель, как буфер геометрии.
-            let shadows = graph.create("тени 3D", frame.extent, SHADOW3D_FORMAT);
+            // Тени и затенение в углах (7.4): мягкие, поэтому в половинном разрешении —
+            // точка на квадрат 2×2 пикселя, вчетверо меньше лучей (7.6б). «Сцена»
+            // растягивает их обратно с оглядкой на глубину и нормаль.
+            let half = vk::Extent2D {
+                width: frame.extent.width.div_ceil(2),
+                height: frame.extent.height.div_ceil(2),
+            };
+            let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
             graph.add_pass(
                 "тени 3D",
                 &[
@@ -2157,7 +2163,7 @@ impl Demo {
                     // SAFETY: граф перевёл буфер геометрии в чтение, а тени в цель
                     // рисования; буфер сцены этого кадра жив, пока кадр рисуется.
                     unsafe {
-                        begin_color_pass(d, cmd, p.view(shadows), frame.extent);
+                        begin_color_pass(d, cmd, p.view(shadows), half);
                         bindless.bind(d, cmd);
                         d.cmd_bind_pipeline(
                             cmd,
