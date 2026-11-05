@@ -271,8 +271,39 @@ pub(crate) fn set_field(
     field: &str,
     value: &str,
 ) -> Result<String, EditError> {
+    let open = node_open(text.as_bytes(), path)?;
+    set_field_at(text, open, field, value)
+}
+
+/// Как [`set_field`], но у самой сцены (`background`, `ambient`).
+pub(crate) fn set_root_field(text: &str, field: &str, value: &str) -> Result<String, EditError> {
+    let open = root_open(text.as_bytes())?;
+    set_field_at(text, open, field, value)
+}
+
+/// Скобка `(` всей сцены.
+fn root_open(s: &[u8]) -> Result<usize, EditError> {
+    let root = skip_ws(s, 0);
+    if s.get(root) != Some(&b'(') {
+        return Err(EditError(
+            "файл сцены должен начинаться со скобки «(»".into(),
+        ));
+    }
+    Ok(root)
+}
+
+/// Скобка `(` предмета `path` или всей сцены (`path` пустой).
+fn owner_open(s: &[u8], path: &[usize]) -> Result<usize, EditError> {
+    if path.is_empty() {
+        root_open(s)
+    } else {
+        node_open(s, path)
+    }
+}
+
+/// Поле `field` структуры в скобках, открытых в `open`.
+fn set_field_at(text: &str, open: usize, field: &str, value: &str) -> Result<String, EditError> {
     let s = text.as_bytes();
-    let open = node_open(s, path)?;
     let f = fields(s, open).ok_or_else(|| EditError("не разобрать поля предмета".into()))?;
     let mut out = String::with_capacity(text.len() + value.len() + 16);
     if let Some(found) = f.iter().find(|f| f.name == field) {
@@ -340,6 +371,13 @@ pub(crate) fn remove_node(text: &str, path: &[usize]) -> Result<String, EditErro
     let s = text.as_bytes();
     let open = node_open(s, path)?;
     let end = node_end(s, open)?;
+    Ok(remove_span(text, open, end))
+}
+
+/// Вырезает кусок `open..end` (элемент списка или поле), запятую за ним и комментарий в
+/// конце строки; если он занимал свои строки — строки целиком.
+fn remove_span(text: &str, open: usize, end: usize) -> String {
+    let s = text.as_bytes();
     let spaces = |mut i: usize| {
         while i < s.len() && matches!(s[i], b' ' | b'\t') {
             i += 1;
@@ -363,22 +401,69 @@ pub(crate) fn remove_node(text: &str, path: &[usize]) -> Result<String, EditErro
     } else {
         (open, j)
     };
-    Ok(format!("{}{}", &text[..from], &text[to..]))
+    format!("{}{}", &text[..from], &text[to..])
 }
 
-/// Скобка `[` списка предметов: `nodes` сцены (`parent` пустой) или `children` предмета.
-fn list_open(s: &[u8], parent: &[usize]) -> Result<Option<usize>, EditError> {
-    let (open, name) = if parent.is_empty() {
-        let root = skip_ws(s, 0);
-        if s.get(root) != Some(&b'(') {
-            return Err(EditError(
-                "файл сцены должен начинаться со скобки «(»".into(),
-            ));
+/// Список `field` предмета `path` (или сцены): начала его элементов.
+fn list_items(s: &[u8], path: &[usize], field: &str) -> Result<Vec<usize>, EditError> {
+    let open = list_in(s, path, field)?
+        .ok_or_else(|| EditError(format!("у предмета нет списка {field}")))?;
+    items(s, open).ok_or_else(|| EditError("не разобрать список".into()))
+}
+
+/// Убирает элемент `index` списка `field` предмета `path` (фигуру, свет, часть).
+pub(crate) fn remove_item(
+    text: &str,
+    path: &[usize],
+    field: &str,
+    index: usize,
+) -> Result<String, EditError> {
+    let s = text.as_bytes();
+    let it = list_items(s, path, field)?;
+    let at = *it
+        .get(index)
+        .ok_or_else(|| EditError(format!("в списке {field} нет №{}", index + 1)))?;
+    let end = value_end(s, at).ok_or_else(|| EditError("не разобрать элемент".into()))?;
+    Ok(remove_span(text, at, end))
+}
+
+/// Убирает поле `field` предмета `path` (например, `body` или `touch`).
+pub(crate) fn remove_field(text: &str, path: &[usize], field: &str) -> Result<String, EditError> {
+    let s = text.as_bytes();
+    let open = owner_open(s, path)?;
+    let f = fields(s, open).ok_or_else(|| EditError("не разобрать поля".into()))?;
+    match f.iter().find(|f| f.name == field) {
+        Some(found) => Ok(remove_span(text, found.name_start, found.value.end)),
+        None => Ok(text.to_owned()),
+    }
+}
+
+/// Ставит поле `sub` элементу `index` списка `field` (`Rect(…)`, `Point(…)`, `(…)`).
+pub(crate) fn set_item_field(
+    text: &str,
+    path: &[usize],
+    field: &str,
+    index: usize,
+    sub: &str,
+    value: &str,
+) -> Result<String, EditError> {
+    let s = text.as_bytes();
+    let it = list_items(s, path, field)?;
+    let mut at = *it
+        .get(index)
+        .ok_or_else(|| EditError(format!("в списке {field} нет №{}", index + 1)))?;
+    if s[at] != b'(' {
+        // `Rect(` — имя, а за ним скобки.
+        while at < s.len() && s[at] != b'(' {
+            at += 1;
         }
-        (root, "nodes")
-    } else {
-        (node_open(s, parent)?, "children")
-    };
+    }
+    set_field_at(text, at, sub, value)
+}
+
+/// Скобка `[` списка `name` у предмета `path` (или у сцены, если `path` пустой).
+fn list_in(s: &[u8], path: &[usize], name: &str) -> Result<Option<usize>, EditError> {
+    let open = owner_open(s, path)?;
     let f = fields(s, open).ok_or_else(|| EditError("не разобрать поля".into()))?;
     match f.iter().find(|f| f.name == name) {
         Some(list) if s.get(list.value.start) == Some(&b'[') => Ok(Some(list.value.start)),
@@ -397,13 +482,28 @@ pub(crate) fn insert_node(
     index: usize,
     item: &str,
 ) -> Result<String, EditError> {
+    let field = if parent.is_empty() {
+        "nodes"
+    } else {
+        "children"
+    };
+    insert_item(text, parent, field, index, item)
+}
+
+/// Вставляет элемент в список `field` предмета `path` (или сцены) на место `index`;
+/// списка нет — он появляется.
+pub(crate) fn insert_item(
+    text: &str,
+    path: &[usize],
+    field: &str,
+    index: usize,
+    item: &str,
+) -> Result<String, EditError> {
     let s = text.as_bytes();
-    let Some(open) = list_open(s, parent)? else {
-        if parent.is_empty() {
-            return Err(EditError("в файле сцены нет списка nodes".into()));
-        }
-        let t = set_field(text, parent, "children", "[]")?;
-        return insert_node(&t, parent, index, item);
+    let Some(open) = list_in(s, path, field)? else {
+        let owner = owner_open(s, path)?;
+        let t = set_field_at(text, owner, field, "[]")?;
+        return insert_item(&t, path, field, index, item);
     };
     let close = group_end(s, open).ok_or_else(|| EditError("не закрыт список".into()))? - 1;
     let it = items(s, open).ok_or_else(|| EditError("не разобрать список предметов".into()))?;
@@ -675,5 +775,42 @@ mod tests {
             assert_eq!(f.nodes[i].name, file.nodes[i].name);
             assert_eq!(f.nodes[i].children.len(), file.nodes[i].children.len());
         }
+    }
+
+    #[test]
+    fn parts_and_scene_fields() {
+        let t = insert_item(
+            SMALL,
+            &[1],
+            "shapes",
+            0,
+            "Circle(at: (0.0, 0.0), r: 0.1, color: \"#ffffff\")",
+        )
+        .unwrap();
+        let t = insert_item(
+            &t,
+            &[0],
+            "lights",
+            9,
+            "Point(at: (0.0, 0.1), color: \"#ffcc88\", reach: 0.5)",
+        )
+        .unwrap();
+        let t = set_item_field(&t, &[0], "shapes", 0, "color", &string("#123456")).unwrap();
+        let t = set_item_field(&t, &[1], "shapes", 0, "r", &num(0.25)).unwrap();
+        let t = set_field(&t, &[1], "body", "(size: (0.1, 0.1))").unwrap();
+        let t = set_root_field(&t, "ambient", &string("#101010")).unwrap();
+        let f = SceneFile::parse(&t).unwrap();
+        assert_eq!(f.nodes[1].shapes.len(), 1);
+        assert_eq!(f.nodes[0].lights.len(), 1);
+        assert!(f.nodes[1].body.is_some());
+        assert!(t.contains("color: \"#123456\"") && t.contains("r: 0.25"));
+        assert!(t.contains("ambient: \"#101010\""));
+        let t = remove_item(&t, &[1], "shapes", 0).unwrap();
+        let t = remove_field(&t, &[1], "body").unwrap();
+        let t = remove_item(&t, &[0], "lights", 0).unwrap();
+        let f = SceneFile::parse(&t).unwrap();
+        assert!(f.nodes[1].shapes.is_empty() && f.nodes[1].body.is_none());
+        assert!(f.nodes[0].lights.is_empty());
+        assert!(remove_item(&t, &[0], "shapes", 5).is_err());
     }
 }

@@ -22,7 +22,48 @@ pub(crate) enum Change {
     Depth(f64),
     Opacity(f64),
     Name(String),
+    /// Поле `sub` элемента `index` списка `field` (цвет фигуры, сила света); значение
+    /// уже записано по правилам RON.
+    Item {
+        field: &'static str,
+        index: usize,
+        sub: &'static str,
+        value: String,
+    },
+    /// Поле предмета целиком (`body`, `touch`); `None` — убрать.
+    Field {
+        field: &'static str,
+        value: Option<String>,
+    },
+    /// Поле самой сцены (`background`, `ambient`); путь предмета не нужен.
+    Scene {
+        field: &'static str,
+        value: String,
+    },
 }
+
+impl Change {
+    /// Что именно меняется: правки одного и того же подряд сливаются в один шаг отмены.
+    fn key(&self) -> String {
+        match self {
+            Change::At(_) => "at".into(),
+            Change::Angle(_) => "angle".into(),
+            Change::Scale(_) => "scale".into(),
+            Change::Depth(_) => "depth".into(),
+            Change::Opacity(_) => "opacity".into(),
+            Change::Name(_) => "name".into(),
+            Change::Item {
+                field, index, sub, ..
+            } => format!("{field}.{index}.{sub}"),
+            Change::Field { field, .. } => format!("field.{field}"),
+            Change::Scene { field, .. } => format!("scene.{field}"),
+        }
+    }
+}
+
+/// Правки одного поля чаще этого сливаются в один шаг отмены (цвет из палитры, число с
+/// клавиатуры).
+const MERGE: std::time::Duration = std::time::Duration::from_millis(1200);
 
 /// Правка предмета `path`.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,6 +86,8 @@ pub(crate) struct SceneDoc {
     /// Текст до начала перетаскивания: пока тянут ручку, правки идут от него, а в историю
     /// попадает один шаг.
     preview_base: Option<String>,
+    /// Последняя готовая правка: что и когда (для слияния частых правок одного поля).
+    last: Option<(Vec<usize>, String, std::time::Instant)>,
 }
 
 impl SceneDoc {
@@ -58,12 +101,13 @@ impl SceneDoc {
             undo: Vec::new(),
             redo: Vec::new(),
             preview_base: None,
+            last: None,
         };
         doc.reparse();
         doc
     }
 
-    fn dir(&self) -> Option<&Path> {
+    pub(crate) fn dir(&self) -> Option<&Path> {
         self.path.as_deref().and_then(Path::parent)
     }
 
@@ -120,6 +164,17 @@ impl SceneDoc {
                 ron_edit::set_field(base, p, "opacity", &ron_edit::num(o.clamp(0.0, 1.0)))
             }
             Change::Name(n) => ron_edit::set_field(base, p, "name", &ron_edit::string(n)),
+            Change::Item {
+                field,
+                index,
+                sub,
+                value,
+            } => ron_edit::set_item_field(base, p, field, *index, sub, value),
+            Change::Field { field, value } => match value {
+                Some(v) => ron_edit::set_field(base, p, field, v),
+                None => ron_edit::remove_field(base, p, field),
+            },
+            Change::Scene { field, value } => ron_edit::set_root_field(base, field, value),
         }
     }
 
@@ -134,15 +189,24 @@ impl SceneDoc {
 
     /// Готовая правка: шаг истории. Если перед ней шло перетаскивание — от его начала.
     pub(crate) fn commit(&mut self, edit: &Edit) -> Result<(), EditError> {
+        let dragged = self.preview_base.is_some();
         let base = self
             .preview_base
             .take()
             .unwrap_or_else(|| self.text.clone());
         let text = Self::patched(&base, edit)?;
-        if text != base {
+        let key = edit.change.key();
+        let merge = !dragged
+            && !self.undo.is_empty()
+            && self
+                .last
+                .as_ref()
+                .is_some_and(|(p, k, at)| *p == edit.path && *k == key && at.elapsed() < MERGE);
+        if text != base && !merge {
             self.push_undo(base);
             self.redo.clear();
         }
+        self.last = Some((edit.path.clone(), key, std::time::Instant::now()));
         self.text = text;
         self.reparse();
         Ok(())
@@ -172,6 +236,16 @@ impl SceneDoc {
             self.reparse();
         }
         Ok(())
+    }
+
+    /// Любая правка текста целиком (добавить или убрать часть предмета) — один шаг.
+    pub(crate) fn change(
+        &mut self,
+        f: impl FnOnce(&str) -> Result<String, EditError>,
+    ) -> Result<(), EditError> {
+        let t = f(&self.text)?;
+        self.last = None;
+        self.replace(t)
     }
 
     /// Текст предмета для буфера обмена.
@@ -386,6 +460,49 @@ mod tests {
         assert!(!d.dirty());
         assert!(d.redo());
         assert_eq!(d.file().unwrap().nodes[0].at, (0.3, 0.0));
+    }
+
+    #[test]
+    fn quick_edits_of_one_field_merge() {
+        let mut d = SceneDoc::new(None, TEXT.into());
+        for x in [0.1, 0.2, 0.3] {
+            d.commit(&Edit {
+                path: vec![0],
+                change: Change::At([x, 0.0]),
+            })
+            .unwrap();
+        }
+        assert_eq!(d.history_len(), 1, "три быстрых правки места — один шаг");
+        d.commit(&Edit {
+            path: vec![0],
+            change: Change::Depth(2.0),
+        })
+        .unwrap();
+        assert_eq!(d.history_len(), 2);
+        d.commit(&Edit {
+            path: vec![0],
+            change: Change::Scene {
+                field: "ambient",
+                value: ron_edit::string("#202020"),
+            },
+        })
+        .unwrap();
+        assert!(d.text().contains("ambient: \"#202020\""));
+        let rect = "Rect(at: (0.0, 0.0), size: (0.1, 0.1), color: \"#ffffff\")";
+        d.change(|t| ron_edit::insert_item(t, &[0], "shapes", 0, rect))
+            .unwrap();
+        assert_eq!(d.file().unwrap().nodes[0].shapes.len(), 1);
+        d.commit(&Edit {
+            path: vec![0],
+            change: Change::Item {
+                field: "shapes",
+                index: 0,
+                sub: "color",
+                value: ron_edit::string("#ff0000"),
+            },
+        })
+        .unwrap();
+        assert!(d.text().contains("color: \"#ff0000\""));
     }
 
     #[test]
