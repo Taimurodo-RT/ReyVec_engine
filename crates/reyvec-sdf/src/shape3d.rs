@@ -250,6 +250,68 @@ impl Shape3 {
     }
 }
 
+impl Shape3 {
+    /// Шар, в котором форма целиком (середина и радиус), или `None` для бесконечной
+    /// формы (плоскость). Снаружи шара расстояние до формы не меньше расстояния до шара:
+    /// шейдер по этому пропускает дальние объекты (7.6).
+    pub fn bounds(&self) -> Option<(Vec3, f32)> {
+        match self {
+            Self::Sphere { radius } => Some((Vec3::ZERO, radius.abs())),
+            Self::Box { size, .. } => Some((Vec3::ZERO, (Vec3::from(*size) * 0.5).length())),
+            Self::Capsule { height, radius } => {
+                Some((Vec3::ZERO, height.abs() * 0.5 + radius.abs()))
+            }
+            Self::Cylinder { height, radius, .. } => Some((
+                Vec3::ZERO,
+                (height * height * 0.25 + radius * radius).sqrt(),
+            )),
+            Self::Torus { radius, thickness } => Some((Vec3::ZERO, radius.abs() + thickness.abs())),
+            Self::Plane { .. } => None,
+            Self::Union { shapes, smooth } => {
+                // Плавное объединение выпирает между частями не больше чем на smooth/4;
+                // берём с запасом.
+                let mut all = shapes.iter().map(Shape3::bounds);
+                let first = all.next()??;
+                let (c, r) = all.try_fold(first, |a, b| Some(enclose(a, b?)))?;
+                Some((c, r + smooth.abs() * 0.5))
+            }
+            // Вырезание и пересечение только уменьшают форму.
+            Self::Subtract { base, .. } => base.bounds(),
+            Self::Intersect { shapes, .. } => shapes
+                .iter()
+                .filter_map(Shape3::bounds)
+                .min_by(|a, b| a.1.total_cmp(&b.1)),
+            Self::Move {
+                at,
+                turn,
+                scale,
+                shape,
+            } => {
+                let s = scale.max(1e-6);
+                shape
+                    .bounds()
+                    .map(|(c, r)| (Vec3::from(*at) + rotation(*turn) * (c * s), r * s))
+            }
+            Self::Paint { shape, .. } => shape.bounds(),
+            Self::Animate { .. } => self.at_time(0.0).bounds(),
+        }
+    }
+}
+
+/// Наименьший шар, в котором оба шара.
+fn enclose(a: (Vec3, f32), b: (Vec3, f32)) -> (Vec3, f32) {
+    let between = b.0 - a.0;
+    let d = between.length();
+    if d + b.1 <= a.1 {
+        return a;
+    }
+    if d + a.1 <= b.1 {
+        return b;
+    }
+    let r = (d + a.1 + b.1) * 0.5;
+    (a.0 + between * ((r - a.1) / d), r)
+}
+
 /// Поворот на `turn` градусов: сначала вокруг X, потом Y, потом Z.
 pub fn rotation(turn: [f32; 3]) -> Mat3 {
     let [x, y, z] = turn.map(f32::to_radians);
@@ -340,6 +402,8 @@ pub const STACK: usize = 8;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Program {
     pub words: Vec<u32>,
+    /// Шар, в котором форма целиком (середина, радиус); `None` — форма бесконечна.
+    pub bounds: Option<(Vec3, f32)>,
 }
 
 /// Почему форму нельзя превратить в программу.
@@ -384,7 +448,10 @@ impl Placement {
 pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
     let mut words = Vec::new();
     emit(shape, Placement::IDENTITY, 0, 0, &mut words)?;
-    Ok(Program { words })
+    Ok(Program {
+        words,
+        bounds: shape.bounds(),
+    })
 }
 
 /// Пишет команды формы и возвращает, сколько места на стеке ей понадобилось (`base` уже
@@ -578,6 +645,8 @@ pub const SHADOW_LAMPS: usize = 2;
 /// Слов в записи материала и лампы.
 const MATERIAL_WORDS: usize = 8;
 const LAMP_WORDS: usize = 8;
+/// Слов в записи объекта.
+pub const OBJECT_WORDS: usize = 8;
 /// Слов в заголовке сцены.
 const HEADER_WORDS: usize = 8;
 
@@ -586,13 +655,15 @@ const HEADER_WORDS: usize = 8;
 ///
 /// - заголовок, 8 слов: число объектов, где начинаются объекты, где материалы, сколько
 ///   их, где лампы, сколько их, 2 запасных;
-/// - объекты по 4 слова: начало программы, её длина в словах, 2 запасных;
+/// - объекты по 8 слов ([`OBJECT_WORDS`]): начало программы, её длина в словах,
+///   2 запасных, шар-граница (середина и радиус; радиус -1 — граница не нужна, форма
+///   бесконечна);
 /// - материалы по 8 слов: цвет (3 числа), флаги ([`MATERIAL_GRID`]), свечение, 3 запасных;
 /// - лампы по 8 слов: место (3 числа), дальность, цвет (3 числа), яркость;
 /// - программы подряд.
 pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
     let objects_at = HEADER_WORDS;
-    let materials_at = objects_at + objects.len() * 4;
+    let materials_at = objects_at + objects.len() * OBJECT_WORDS;
     let lamps_at = materials_at + materials.len() * MATERIAL_WORDS;
     let code_at = lamps_at + lamps.len() * LAMP_WORDS;
     let mut out = vec![
@@ -608,6 +679,8 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
     let mut start = code_at;
     for p in objects {
         out.extend([start as u32, p.words.len() as u32, 0, 0]);
+        let (c, r) = p.bounds.unwrap_or((Vec3::ZERO, -1.0));
+        out.extend([c.x, c.y, c.z, r].map(f32::to_bits));
         start += p.words.len();
     }
     for m in materials {
@@ -830,14 +903,57 @@ mod tests {
             range: 6.0,
         }];
         let w = pack_scene(&[a.clone(), b.clone()], &materials, &lamps);
-        assert_eq!(&w[..6], &[2, 8, 16, 1, 24, 1]);
-        let (start_b, len_b) = (w[12] as usize, w[13] as usize);
+        assert_eq!(&w[..6], &[2, 8, 24, 1, 32, 1]);
+        let (start_b, len_b) = (w[16] as usize, w[17] as usize);
         assert_eq!(len_b, b.words.len());
         assert_eq!(&w[start_b..start_b + len_b], &b.words[..]);
-        assert_eq!(w[19], MATERIAL_GRID);
-        assert_eq!(f32::from_bits(w[24 + 3]), 6.0, "дальность лампы");
-        assert_eq!(f32::from_bits(w[24 + 7]), 4.0, "яркость лампы");
+        assert_eq!(f32::from_bits(w[8 + 7]), 1.0, "граница шара");
+        assert_eq!(
+            f32::from_bits(w[16 + 7]),
+            -1.0,
+            "у формы с полом границы нет"
+        );
+        assert_eq!(w[27], MATERIAL_GRID);
+        assert_eq!(f32::from_bits(w[32 + 3]), 6.0, "дальность лампы");
+        assert_eq!(f32::from_bits(w[32 + 7]), 4.0, "яркость лампы");
         assert_eq!(w[w[8] as usize..][..a.words.len()], a.words[..]);
+    }
+
+    /// Граница честная: снаружи шара расстояние до формы не меньше расстояния до шара.
+    #[test]
+    fn bounds_hold_the_whole_shape() {
+        let Shape3::Union { shapes, .. } = sample() else {
+            unreachable!()
+        };
+        let mut tested = 0;
+        for shape in shapes.iter().skip(1) {
+            let (c, r) = shape.bounds().expect("конечная форма");
+            for p in points() {
+                let p = p * 2.5;
+                let outside = (p - c).length() - r;
+                if outside > 0.0 {
+                    assert!(
+                        shape.distance(p) >= outside - 1e-4,
+                        "{shape:?} в {p}: до формы {}, до границы {outside}",
+                        shape.distance(p)
+                    );
+                    tested += 1;
+                }
+            }
+            // И граница не слишком велика: точка на шаре недалеко от формы.
+            assert!(r < 3.0, "{shape:?}: радиус {r}");
+        }
+        assert!(tested > 1000);
+        assert_eq!(sample().bounds(), None, "с полом граница бесконечна");
+        let two = Shape3::Union {
+            smooth: 0.0,
+            shapes: vec![
+                Shape3::Sphere { radius: 1.0 }.at([-2.0, 0.0, 0.0]),
+                Shape3::Sphere { radius: 1.0 }.at([2.0, 0.0, 0.0]),
+            ],
+        };
+        let (c, r) = two.bounds().unwrap();
+        assert!(c.length() < 1e-6 && (r - 3.0).abs() < 1e-6);
     }
 
     #[test]

@@ -74,8 +74,18 @@ Ray screen_ray(float2 s)
 static const uint MAX_OBJECTS = 1024;
 static const uint MAX_PROGRAM_WORDS = 4096;
 
+static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
+
 // Расстояние до ближайшего объекта (x) и его материал (y).
-float2 scene(float3 p)
+//
+// У каждого конечного объекта есть шар-граница (7.6): снаружи шара до формы не ближе,
+// чем до шара. Поэтому объект, чей шар дальше уже найденного, не считается вовсе (это
+// точно), а объект, чей шар дальше `near`, отвечает расстоянием до шара (это меньше
+// настоящего, но шагать по лучу на него безопасно). Программа формы выполняется только
+// вблизи объекта. `near` выбирает вызывающий: шагание берёт больше своей точности
+// попадания, чтобы попадание всегда считалось по настоящей форме; нормаль и углы —
+// бесконечность (только точный пропуск). Ответ по шару помечен материалом -1.
+float2 scene_near(float3 p, float near)
 {
     // Числа из буфера ограничены сверху: испорченный буфер не должен вешать видеокарту.
     uint count = min(pc.scene[0], MAX_OBJECTS);
@@ -83,8 +93,22 @@ float2 scene(float3 p)
     float2 best = float2(1e9, 0.0);
     for (uint o = 0; o < count; o++)
     {
-        uint start = pc.scene[objects + o * 4];
-        uint len = min(pc.scene[objects + o * 4 + 1], MAX_PROGRAM_WORDS);
+        uint w = objects + o * OBJECT_WORDS;
+        float radius = asfloat(pc.scene[w + 7]);
+        if (radius >= 0.0)
+        {
+            float3 center = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
+            float outside = length(p - center) - radius;
+            if (outside >= best.x)
+                continue;
+            if (outside > near)
+            {
+                best = float2(outside, -1.0);
+                continue;
+            }
+        }
+        uint start = pc.scene[w];
+        uint len = min(pc.scene[w + 1], MAX_PROGRAM_WORDS);
         float2 s = sdf_program(pc.scene, start, len, p);
         if (s.x < best.x)
             best = s;
