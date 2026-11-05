@@ -327,6 +327,112 @@ impl SceneDoc {
     }
 
     /// Сколько предметов в списке `parent`.
+    /// Новые места нескольких предметов (выравнивание) — один шаг истории.
+    pub(crate) fn move_many(&mut self, moves: &[(Vec<usize>, [f64; 2])]) -> Result<(), EditError> {
+        let mut t = self.text.clone();
+        for (path, at) in moves {
+            t = ron_edit::set_field(&t, path, "at", &ron_edit::pair(*at))?;
+        }
+        self.last = None;
+        self.replace(t)
+    }
+
+    /// Вкладывает предметы `paths` (из одного списка) в новый предмет «группа» посередине
+    /// их мест; места вложенных становятся от группы. Возвращает путь группы.
+    pub(crate) fn group(&mut self, paths: &[Vec<usize>]) -> Result<Vec<usize>, EditError> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| EditError("сцена не прочитана".into()))?;
+        let (parent, _) = split(
+            paths
+                .first()
+                .ok_or_else(|| EditError("ничего не выбрано".into()))?,
+        )?;
+        let parent = parent.to_vec();
+        let mut idx: Vec<usize> = Vec::new();
+        let mut ats = Vec::new();
+        for p in paths {
+            let (pp, i) = split(p)?;
+            if pp != parent.as_slice() {
+                return Err(EditError(
+                    "сгруппировать можно предметы одного уровня".into(),
+                ));
+            }
+            let n = super::outline::node_at(file, p)
+                .ok_or_else(|| EditError("нет такого предмета".into()))?;
+            idx.push(i);
+            ats.push([n.at.0, n.at.1]);
+        }
+        idx.sort_unstable();
+        idx.dedup();
+        let lo = |k: usize| ats.iter().map(|a| a[k]).fold(f64::INFINITY, f64::min);
+        let hi = |k: usize| ats.iter().map(|a| a[k]).fold(f64::NEG_INFINITY, f64::max);
+        let round = |v: f64| (v * 1000.0).round() / 1000.0;
+        let c = [round((lo(0) + hi(0)) / 2.0), round((lo(1) + hi(1)) / 2.0)];
+        // Места от середины группы, потом тексты предметов по порядку.
+        let mut t = self.text.clone();
+        let mut items = Vec::new();
+        for &i in &idx {
+            let p = child(&parent, i);
+            let n = &super::outline::node_at(file, &p).expect("проверено").at;
+            let at = [round(n.0 - c[0]), round(n.1 - c[1])];
+            t = ron_edit::set_field(&t, &p, "at", &ron_edit::pair(at))?;
+            items.push(ron_edit::node_text(&t, &p)?);
+        }
+        for &i in idx.iter().rev() {
+            t = ron_edit::remove_node(&t, &child(&parent, i))?;
+        }
+        let first = idx[0];
+        let group = format!("(name: \"группа\", at: {})", ron_edit::pair(c));
+        t = ron_edit::insert_node(&t, &parent, first, &group)?;
+        let g = child(&parent, first);
+        for item in &items {
+            t = ron_edit::insert_node(&t, &g, usize::MAX, item)?;
+        }
+        self.last = None;
+        self.replace(t)?;
+        Ok(g)
+    }
+
+    /// Достаёт вложенные из предмета `path` на его место и убирает его. Места, повороты и
+    /// размеры вложенных пересчитываются, чтобы в сцене ничего не сдвинулось.
+    pub(crate) fn ungroup(&mut self, path: &[usize]) -> Result<Vec<usize>, EditError> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| EditError("сцена не прочитана".into()))?;
+        let g = super::outline::node_at(file, path)
+            .ok_or_else(|| EditError("нет такого предмета".into()))?;
+        if g.children.is_empty() {
+            return Err(EditError("внутри ничего нет".into()));
+        }
+        let x = super::geom::Xform::placement([g.at.0, g.at.1], g.angle, g.scale);
+        let round = |v: f64| (v * 10000.0).round() / 10000.0;
+        let mut t = self.text.clone();
+        let mut items = Vec::new();
+        for (i, c) in g.children.iter().enumerate() {
+            let p = child(path, i);
+            let at = x.apply([c.at.0, c.at.1]);
+            t = ron_edit::set_field(&t, &p, "at", &ron_edit::pair([round(at[0]), round(at[1])]))?;
+            if g.angle != 0.0 {
+                t = ron_edit::set_field(&t, &p, "angle", &ron_edit::num(round(c.angle + g.angle)))?;
+            }
+            if g.scale != 1.0 {
+                t = ron_edit::set_field(&t, &p, "scale", &ron_edit::num(round(c.scale * g.scale)))?;
+            }
+            items.push(ron_edit::node_text(&t, &p)?);
+        }
+        let (parent, i) = split(path)?;
+        t = ron_edit::remove_node(&t, path)?;
+        for (k, item) in items.iter().enumerate() {
+            t = ron_edit::insert_node(&t, parent, i + k, item)?;
+        }
+        self.last = None;
+        self.replace(t)?;
+        Ok(child(parent, i))
+    }
+
     fn list_len(&self, parent: &[usize]) -> usize {
         let Some(f) = &self.file else {
             return 0;
@@ -586,6 +692,62 @@ mod tests {
         assert_eq!(next_name("ящик"), "ящик 2");
         assert_eq!(next_name("ящик 9"), "ящик 10");
         assert_eq!(next_name("x2"), "x2 2");
+    }
+
+    #[test]
+    fn group_ungroup_and_align() {
+        let text = r##"(
+    format: "reyvec-scene",
+    version: 1,
+    nodes: [
+        (name: "a", at: (0.0, 0.0)),
+        // комментарий остаётся
+        (name: "b", at: (1.0, 0.5)),
+        (name: "c", at: (2.0, 0.0)),
+    ],
+)
+"##;
+        let mut d = SceneDoc::new(None, text.into());
+        assert_eq!(d.group(&[vec![2], vec![0]]).unwrap(), vec![0]);
+        let f = d.file().unwrap();
+        assert_eq!(f.nodes.len(), 2);
+        assert_eq!(f.nodes[0].name, "группа");
+        assert_eq!(f.nodes[0].at, (1.0, 0.0));
+        let kids: Vec<_> = f.nodes[0]
+            .children
+            .iter()
+            .map(|n| (n.name.as_str(), n.at))
+            .collect();
+        assert_eq!(kids, [("a", (-1.0, 0.0)), ("c", (1.0, 0.0))]);
+        assert!(d.text().contains("// комментарий остаётся"));
+        // Повернём группу на 90° и разгруппируем: в сцене всё на тех же местах.
+        d.commit(&Edit {
+            path: vec![0],
+            change: Change::Angle(90.0),
+        })
+        .unwrap();
+        assert_eq!(d.ungroup(&[0]).unwrap(), vec![0]);
+        let f = d.file().unwrap();
+        let got: Vec<_> = f
+            .nodes
+            .iter()
+            .map(|n| (n.name.as_str(), n.at, n.angle))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("a", (1.0, -1.0), 90.0),
+                ("c", (1.0, 1.0), 90.0),
+                ("b", (1.0, 0.5), 0.0)
+            ]
+        );
+        assert!(d.group(&[vec![0], vec![2]]).is_ok());
+        d.move_many(&[(vec![0], [0.5, 0.5]), (vec![1], [0.25, 0.0])])
+            .unwrap();
+        assert_eq!(d.file().unwrap().nodes[1].at, (0.25, 0.0));
+        let steps = d.history_len();
+        assert!(d.undo());
+        assert_eq!(d.history_len(), steps - 1);
     }
 
     #[test]

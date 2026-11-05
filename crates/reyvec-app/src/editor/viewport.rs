@@ -78,6 +78,8 @@ pub(crate) enum Tool {
     Move,
     Rotate,
     Scale,
+    /// Линейка: протянуть мышью — длина и угол (T).
+    Measure,
 }
 
 /// Привязки: шаг сетки (единиц сцены), поворота (градусов), размера.
@@ -251,6 +253,7 @@ impl Viewport {
                 (Tool::Move, "Сдвиг", "W"),
                 (Tool::Rotate, "Поворот", "E"),
                 (Tool::Scale, "Размер", "R"),
+                (Tool::Measure, "Линейка", "T"),
             ] {
                 let hint = format!("клавиша {key}");
                 if tool_button(ui, self.tool == tool, label, &hint, |p, c, col| {
@@ -414,7 +417,7 @@ impl Viewport {
         node: &reyvec_scene::NodeDesc,
         actions: &mut Vec<Action>,
     ) -> bool {
-        if self.tool == Tool::Select {
+        if matches!(self.tool, Tool::Select | Tool::Measure) {
             return false;
         }
         let origin = p.xform.apply([0.0, 0.0]);
@@ -496,7 +499,7 @@ impl Viewport {
                 painter.line_segment([o, end], Stroke::new(2.0, col));
                 painter.rect_filled(Rect::from_center_size(end, vec2(14.0, 14.0)), 2, col);
             }
-            Tool::Select => {}
+            Tool::Select | Tool::Measure => {}
         }
         painter.circle_filled(o, 4.5, Color32::WHITE);
 
@@ -602,7 +605,7 @@ impl Viewport {
                     .contains(m)
                     .then_some(HitKind::Scale)
             }
-            Tool::Select => None,
+            Tool::Select | Tool::Measure => None,
         }
     }
 }
@@ -738,6 +741,17 @@ fn paint_tool(p: &egui::Painter, c: Pos2, tool: Tool, col: Color32) {
             p.line_segment([c + vec2(0.0, -6.0), c + vec2(6.0, -6.0)], s);
             p.line_segment([c + vec2(6.0, -6.0), c + vec2(6.0, 0.0)], s);
             p.line_segment([c + vec2(6.0, -6.0), c + vec2(1.0, -1.0)], s);
+        }
+        Tool::Measure => {
+            // Линейка наискосок с делениями.
+            let (a, b) = (c + vec2(-7.0, 4.0), c + vec2(7.0, -4.0));
+            p.line_segment([a, b], s);
+            let n = (b - a).normalized().rot90() * 3.0;
+            for k in 0..=4 {
+                let q = a + (b - a) * (k as f32 / 4.0);
+                let len = if k % 2 == 0 { 1.0 } else { 0.6 };
+                p.line_segment([q, q + n * len], s);
+            }
         }
     }
 }

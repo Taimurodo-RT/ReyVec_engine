@@ -15,6 +15,7 @@
 //! сдвинута так, чтобы середина сцены была посередине свободного места. Отдельная
 //! картинка сцены точно под размер середины — следующий шаг.
 
+mod arrange;
 mod assets;
 mod doc;
 mod geom;
@@ -473,6 +474,9 @@ impl Editor {
             | Action::Delete(_)
             | Action::Move { .. }
             | Action::DropAsset { .. }
+            | Action::MoveMany(_)
+            | Action::Group(_)
+            | Action::Ungroup(_)
             | Action::AddPart { .. }
             | Action::RemovePart { .. } => self.apply_doc(action),
             Action::Eject => {
@@ -566,6 +570,25 @@ impl Editor {
                     None => (Vec::new(), usize::MAX),
                 };
                 if !structural(doc.paste(&item, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::MoveMany(moves) => {
+                if let Err(e) = doc.move_many(&moves) {
+                    tracing::warn!("Не выровнять: {e}");
+                    return;
+                }
+                true
+            }
+            Action::Group(paths) => {
+                if !structural(doc.group(&paths), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::Ungroup(path) => {
+                if !structural(doc.ungroup(&path), &mut select) {
                     return;
                 }
                 true
