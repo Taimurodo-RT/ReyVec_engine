@@ -1,6 +1,6 @@
-// Сцена «3D», освещение в проходе «сцена» (этап 7.3): читает буфер геометрии, который
-// записал проход «реймарчинг» (raymarch.slang), и красит точку: материал, сетка пола,
-// солнце, свет неба, блик и дымка. Мягкие тени и затенение в углах — 7.4.
+// Сцена «3D», освещение в проходе «сцена» (этапы 7.3–7.4): читает буфер геометрии
+// (raymarch.slang) и тени (raymarch_shadow.slang) и красит точку: материал, сетка пола,
+// солнце с мягкой тенью, свет неба с затенением в углах, лампы, свечение, блик и дымка.
 
 #include "include/space.slang"
 
@@ -40,10 +40,12 @@ float4 fs_main(VertexOut input) : SV_Target
     float3 p = ray.origin + ray.dir * t;
 
     uint material = min(uint(g.y + 0.5), max(pc.scene[3], 1) - 1);
-    uint m = pc.scene[2] + material * 4;
+    uint m = pc.scene[2] + material * 8;
     float3 albedo = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 1]), asfloat(pc.scene[m + 2]));
     bool grid_on = (pc.scene[m + 3] & MATERIAL_GRID) != 0;
+    float glow = asfloat(pc.scene[m + 4]);
     float3 n = oct_decode(g.zw);
+    float4 shadows = textures[pc.shadows].Load(int3(int2(input.position.xy), 0));
     if (grid_on)
     {
         // Сколько метров пола в пикселе: соседний луч пересекается с той же плоскостью.
@@ -63,17 +65,31 @@ float4 fs_main(VertexOut input) : SV_Target
         albedo = lerp(albedo, float3(0.15, 0.35, 0.95), axis.y); // ось Z (вдоль x = 0)
     }
 
-    // Простой свет: солнце сбоку сверху и рассеянный свет неба. Тени — в 7.4.
-    float3 sun = normalize(float3(0.5, 0.8, 0.35));
-    float diffuse = saturate(dot(n, sun));
-    float3 light = float3(1.0, 0.95, 0.85) * diffuse + float3(0.25, 0.30, 0.40) * (0.5 + 0.5 * n.y);
+    // Солнце с мягкой тенью и свет неба, который затеняют углы.
+    float sun_light = saturate(dot(n, SUN)) * shadows.x;
+    float3 light = float3(1.0, 0.95, 0.85) * sun_light;
+    light += float3(0.25, 0.30, 0.40) * (0.5 + 0.5 * n.y) * shadows.y;
+    // Лампы: у двух первых тени из прохода «тени 3D», остальные светят без теней.
+    float3 h = normalize(SUN - ray.dir);
+    float specular = pow(saturate(dot(n, h)), 48.0) * shadows.x;
+    uint lamps = lamp_count();
+    for (uint i = 0; i < lamps; i++)
+    {
+        Lamp l = read_lamp(i);
+        float3 to = l.at - p;
+        float distance = length(to);
+        float3 dir = to / max(distance, 1e-4);
+        float shadow = i == 0 ? shadows.z : (i == 1 ? shadows.w : 1.0);
+        float amount = lamp_falloff(l, distance) * saturate(dot(n, dir)) * shadow;
+        light += l.color * amount;
+        specular += amount * pow(saturate(dot(n, normalize(dir - ray.dir))), 48.0);
+    }
     float3 color = albedo * light;
     // Блик у форм (не у пола с сеткой).
     if (!grid_on)
-    {
-        float3 h = normalize(sun - ray.dir);
-        color += 0.25 * pow(saturate(dot(n, h)), 48.0);
-    }
+        color += 0.25 * specular;
+    // Свечение: своя яркость, тень и свет на неё не влияют. Ярче 1 — ореол при выводе.
+    color += albedo * glow;
     // Даль уходит в дымку неба (сетка не рябит у горизонта).
     float fog = 1.0 - exp(-0.0025 * t * t * 0.1);
     return float4(lerp(color, sky(ray.dir), saturate(fog)), 1.0);

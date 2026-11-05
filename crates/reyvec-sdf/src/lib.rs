@@ -14,7 +14,7 @@
 pub mod camera3d;
 pub mod shape3d;
 pub use camera3d::{Camera3D, FlyInput, Projection};
-pub use shape3d::{Material3, Program, Shape3};
+pub use shape3d::{Lamp3, Material3, Program, Shape3};
 
 /// Точка или вектор на плоскости. Y смотрит вверх (соглашение движка).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

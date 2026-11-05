@@ -279,16 +279,22 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 .color(color),
             );
             for p in &gpu.passes {
-                match pass_budget(p.name) {
-                    Some(budget) => ui.label(
-                        mono(format!(
-                            "  {:<8} {:.3} мс (бюджет {budget:.0} мс)",
-                            p.name, p.ms
-                        ))
-                        .color(budget_color(p.ms, budget)),
-                    ),
-                    None => ui.label(mono(format!("  {:<8} {:.3} мс", p.name, p.ms))),
-                };
+                ui.label(mono(format!("  {:<8} {:.3} мс", p.name, p.ms)));
+            }
+            let raymarch: Vec<f64> = gpu
+                .passes
+                .iter()
+                .filter(|p| RAYMARCH_PASSES.contains(&p.name))
+                .map(|p| p.ms)
+                .collect();
+            if !raymarch.is_empty() {
+                let ms: f64 = raymarch.iter().sum();
+                ui.label(
+                    mono(format!(
+                        "  лучи 3D {ms:.3} мс (бюджет {RAYMARCH_BUDGET_MS:.0} мс)"
+                    ))
+                    .color(budget_color(ms, RAYMARCH_BUDGET_MS)),
+                );
             }
             gpu_chart(ui, history);
         }
@@ -770,16 +776,10 @@ fn zoom_text(zoom: f64) -> String {
     }
 }
 
-/// Проходы со своим бюджетом времени (`docs/decisions/0003-performance-targets.md`).
-const PASS_BUDGETS_MS: &[(&str, f64)] = &[("реймарчинг", 2.0)];
-
-/// Бюджет прохода `name`, если он у него свой.
-fn pass_budget(name: &str) -> Option<f64> {
-    PASS_BUDGETS_MS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .map(|&(_, ms)| ms)
-}
+/// Проходы, которые шагают лучами по сцене «3D»: вместе у них свой бюджет
+/// (`docs/decisions/0003-performance-targets.md`).
+const RAYMARCH_PASSES: [&str; 2] = ["реймарчинг", "тени 3D"];
+const RAYMARCH_BUDGET_MS: f64 = 2.0;
 
 /// Зелёный, пока время укладывается в бюджет с запасом, жёлтый у края, красный сверх.
 fn budget_color(ms: f64, budget: f64) -> Color32 {
@@ -876,10 +876,12 @@ mod tests {
 
     #[test]
     fn raymarching_has_its_own_budget() {
-        assert_eq!(pass_budget("реймарчинг"), Some(2.0));
-        assert_eq!(pass_budget("сцена"), None);
         // 1,8 мс — уже у края своих 2 мс, хотя для всего кадра (4 мс) это мало.
-        assert_eq!(budget_color(1.8, 2.0), Color32::from_rgb(240, 200, 80));
+        assert_eq!(
+            budget_color(1.8, RAYMARCH_BUDGET_MS),
+            Color32::from_rgb(240, 200, 80)
+        );
+        assert!(RAYMARCH_PASSES.contains(&"реймарчинг"));
     }
 
     /// Панель раскладывается без окна: шрифты читаются, кириллица и цифры есть в атласе.
