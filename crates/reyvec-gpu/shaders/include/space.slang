@@ -1,6 +1,7 @@
-// Общее для двух проходов сцены «3D» (этап 7.3): константы, луч из точки экрана и поле
-// сцены. Проход «реймарчинг» (raymarch.slang) шагает лучами и пишет буфер геометрии,
-// проход «сцена» (raymarch_shade.slang) освещает его.
+// Общее для проходов сцены «3D» (этапы 7.3–7.4): константы, луч из точки экрана, поле
+// сцены и лампы. Проход «реймарчинг» (raymarch.slang) шагает лучами и пишет буфер
+// геометрии, «тени 3D» (raymarch_shadow.slang) считают по нему тени и затенение в углах,
+// «сцена» (raymarch_shade.slang) освещает.
 //
 // Луч строится так же, как Camera3D::ray в crates/reyvec-sdf/src/camera3d.rs: точка
 // экрана через обратную матрицу камеры ложится на ближнюю (глубина 1) и дальнюю
@@ -21,7 +22,9 @@ struct Push
     float aspect; // ширина / высота
     float height; // высота кадра в пикселях
     uint flags;
-    uint gbuffer; // буфер геометрии в общем списке текстур (читает только освещение)
+    uint gbuffer; // буфер геометрии в общем списке текстур (читают тени и освещение)
+    uint shadows; // тени и затенение в углах (7.4, читает освещение)
+    uint pad;
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -107,3 +110,60 @@ float3 oct_decode(float2 e)
         n.xy = (1.0 - abs(n.yx)) * select(n.xy >= 0.0, float2(1.0), float2(-1.0));
     return normalize(n);
 }
+
+// Буфер геометрии одной точки экрана (см. raymarch.slang).
+struct Surface
+{
+    float t;        // расстояние вдоль луча; меньше нуля — небо
+    float material;
+    float3 normal;
+};
+
+Surface read_surface(float4 g)
+{
+    Surface s;
+    s.t = g.x;
+    s.material = g.y;
+    s.normal = oct_decode(g.zw);
+    return s;
+}
+
+// Лампы (7.4): заголовок сцены, слова 4 и 5 — где и сколько. Запись лампы — 8 слов:
+// место, дальность, цвет, яркость (Lamp3 в crates/reyvec-sdf/src/shape3d.rs).
+static const uint MAX_LAMPS = 64;
+static const uint SHADOW_LAMPS = 2; // как shape3d::SHADOW_LAMPS
+
+struct Lamp
+{
+    float3 at;
+    float range;
+    float3 color;
+    float power;
+};
+
+uint lamp_count()
+{
+    return min(pc.scene[5], MAX_LAMPS);
+}
+
+Lamp read_lamp(uint i)
+{
+    uint w = pc.scene[4] + i * 8;
+    Lamp l;
+    l.at = float3(asfloat(pc.scene[w]), asfloat(pc.scene[w + 1]), asfloat(pc.scene[w + 2]));
+    l.range = asfloat(pc.scene[w + 3]);
+    l.color = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
+    l.power = asfloat(pc.scene[w + 7]);
+    return l;
+}
+
+// Обратный квадрат, плавно гаснущий к дальности. Зеркало shape3d::lamp_falloff.
+float lamp_falloff(Lamp l, float distance)
+{
+    float x = min(distance / max(l.range, 1e-3), 1.0);
+    float fade = max(1.0 - x * x * x * x, 0.0);
+    return l.power * fade * fade / (distance * distance + 1.0);
+}
+
+// Солнце: сбоку сверху.
+static const float3 SUN = float3(0.4969, 0.7950, 0.3478); // normalize(0.5, 0.8, 0.35)

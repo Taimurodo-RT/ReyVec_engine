@@ -449,7 +449,8 @@ impl Program {
 pub struct Material3 {
     /// Цвет (линейный, 0…1).
     pub color: [f32; 3],
-    /// Свечение: сколько своего света (0 — не светится). Учитывается со светом в 7.4.
+    /// Свечение: сколько своего света (0 — не светится). Светящаяся поверхность не
+    /// темнеет в тени, а ярче 1 даёт ореол свечения (bloom) при выводе.
     #[serde(default)]
     pub glow: f32,
     /// Рисовать на поверхности сетку через 1 и 10 м (пол сцены «3D»).
@@ -460,24 +461,52 @@ pub struct Material3 {
 /// Флаг материала: сетка на поверхности.
 pub const MATERIAL_GRID: u32 = 1;
 
-/// Сцена для видеокарты: объекты (у каждого своя программа) и материалы одним списком
-/// слов. Раскладка (читает `raymarch.slang`):
+/// Лампа: точечный источник света с мягкой тенью.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Lamp3 {
+    /// Где стоит.
+    pub at: [f32; 3],
+    /// Цвет света (линейный).
+    pub color: [f32; 3],
+    /// Яркость на расстоянии 1 м.
+    pub power: f32,
+    /// Дальше этого расстояния (м) лампа не светит: свет плавно гаснет к границе.
+    pub range: f32,
+}
+
+/// Сколько ламп отбрасывают тени (остальные светят без теней): тень — это ещё один
+/// проход лучом по сцене на каждую точку экрана.
+pub const SHADOW_LAMPS: usize = 2;
+
+/// Слов в записи материала и лампы.
+const MATERIAL_WORDS: usize = 8;
+const LAMP_WORDS: usize = 8;
+/// Слов в заголовке сцены.
+const HEADER_WORDS: usize = 8;
+
+/// Сцена для видеокарты: объекты (у каждого своя программа), материалы и лампы одним
+/// списком слов. Раскладка (читает `include/space.slang`):
 ///
-/// - слово 0: число объектов, 1: где начинаются объекты, 2: где материалы, 3: сколько их;
+/// - заголовок, 8 слов: число объектов, где начинаются объекты, где материалы, сколько
+///   их, где лампы, сколько их, 2 запасных;
 /// - объекты по 4 слова: начало программы, её длина в словах, 2 запасных;
-/// - материалы по 4 слова: цвет (3 числа) и флаги ([`MATERIAL_GRID`]) со свечением
-///   (свечение в 7.4);
+/// - материалы по 8 слов: цвет (3 числа), флаги ([`MATERIAL_GRID`]), свечение, 3 запасных;
+/// - лампы по 8 слов: место (3 числа), дальность, цвет (3 числа), яркость;
 /// - программы подряд.
-pub fn pack_scene(objects: &[Program], materials: &[Material3]) -> Vec<u32> {
-    let header = 4;
-    let objects_at = header;
+pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
+    let objects_at = HEADER_WORDS;
     let materials_at = objects_at + objects.len() * 4;
-    let code_at = materials_at + materials.len() * 4;
+    let lamps_at = materials_at + materials.len() * MATERIAL_WORDS;
+    let code_at = lamps_at + lamps.len() * LAMP_WORDS;
     let mut out = vec![
         objects.len() as u32,
         objects_at as u32,
         materials_at as u32,
         materials.len() as u32,
+        lamps_at as u32,
+        lamps.len() as u32,
+        0,
+        0,
     ];
     let mut start = code_at;
     for p in objects {
@@ -487,11 +516,27 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3]) -> Vec<u32> {
     for m in materials {
         out.extend(m.color.map(f32::to_bits));
         out.push(u32::from(m.grid) * MATERIAL_GRID);
+        out.extend([m.glow.to_bits(), 0, 0, 0]);
+    }
+    for l in lamps {
+        out.extend(l.at.map(f32::to_bits));
+        out.push(l.range.to_bits());
+        out.extend(l.color.map(f32::to_bits));
+        out.push(l.power.to_bits());
     }
     for p in objects {
         out.extend(&p.words);
     }
     out
+}
+
+/// Освещённость от лампы `lamp` в точке на расстоянии `distance` (без тени и наклона):
+/// обратный квадрат, плавно гаснущий к дальности. Зеркало `lamp_falloff` в
+/// `include/space.slang`.
+pub fn lamp_falloff(lamp: &Lamp3, distance: f32) -> f32 {
+    let x = (distance / lamp.range.max(1e-3)).min(1.0);
+    let fade = (1.0 - x * x * x * x).max(0.0);
+    lamp.power * fade * fade / (distance * distance + 1.0)
 }
 
 #[cfg(test)]
@@ -681,12 +726,36 @@ mod tests {
             glow: 0.0,
             grid: true,
         }];
-        let w = pack_scene(&[a.clone(), b.clone()], &materials);
-        assert_eq!(&w[..4], &[2, 4, 12, 1]);
-        let (start_b, len_b) = (w[8] as usize, w[9] as usize);
+        let lamps = [Lamp3 {
+            at: [1.0, 2.0, 3.0],
+            color: [1.0, 0.5, 0.25],
+            power: 4.0,
+            range: 6.0,
+        }];
+        let w = pack_scene(&[a.clone(), b.clone()], &materials, &lamps);
+        assert_eq!(&w[..6], &[2, 8, 16, 1, 24, 1]);
+        let (start_b, len_b) = (w[12] as usize, w[13] as usize);
         assert_eq!(len_b, b.words.len());
         assert_eq!(&w[start_b..start_b + len_b], &b.words[..]);
-        assert_eq!(w[15], MATERIAL_GRID);
-        assert_eq!(w[w[4] as usize..][..a.words.len()], a.words[..]);
+        assert_eq!(w[19], MATERIAL_GRID);
+        assert_eq!(f32::from_bits(w[24 + 3]), 6.0, "дальность лампы");
+        assert_eq!(f32::from_bits(w[24 + 7]), 4.0, "яркость лампы");
+        assert_eq!(w[w[8] as usize..][..a.words.len()], a.words[..]);
+    }
+
+    #[test]
+    fn lamp_light_fades_to_zero_at_its_range() {
+        let lamp = Lamp3 {
+            at: [0.0; 3],
+            color: [1.0; 3],
+            power: 10.0,
+            range: 5.0,
+        };
+        assert!(lamp_falloff(&lamp, 1.0) > lamp_falloff(&lamp, 2.0));
+        assert!(lamp_falloff(&lamp, 4.9) > 0.0);
+        assert_eq!(lamp_falloff(&lamp, 5.0), 0.0);
+        assert_eq!(lamp_falloff(&lamp, 9.0), 0.0);
+        // Вблизи не бесконечность.
+        assert!(lamp_falloff(&lamp, 0.0) <= 10.0);
     }
 }

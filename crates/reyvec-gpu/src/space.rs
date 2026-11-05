@@ -1,14 +1,15 @@
 //! Сцена «3D» (этап 7): объекты и материалы примера, собранные из форм `reyvec_sdf::Shape3`.
 //! Каждый кадр формы собираются заново (они двигаются), превращаются в программы для
-//! видеокарты и едут в буфер кадра одним списком слов (`reyvec_sdf::shape3d::pack_scene`).
+//! видеокарты и едут в буфер кадра одним списком слов (`reyvec_sdf::shape3d::pack_scene`)
+//! вместе с материалами и лампами (7.4).
 
-use reyvec_sdf::shape3d::{Material3, Program, Shape3, compile, pack_scene};
+use reyvec_sdf::shape3d::{Lamp3, Material3, Program, Shape3, compile, pack_scene};
 
 /// Сколько слов помещается в буфер сцены кадра (256 КБ).
 pub(crate) const MAX_WORDS: usize = 64 * 1024;
 
 /// Материалы примера по номерам.
-pub(crate) const MATERIALS: [Material3; 6] = [
+pub(crate) const MATERIALS: [Material3; 8] = [
     // 0: пол с сеткой.
     Material3 {
         color: [0.18, 0.19, 0.21],
@@ -45,7 +46,48 @@ pub(crate) const MATERIALS: [Material3; 6] = [
         glow: 0.0,
         grid: false,
     },
+    // 6: тёплая лампочка (светится сама).
+    Material3 {
+        color: [1.0, 0.62, 0.30],
+        glow: 4.0,
+        grid: false,
+    },
+    // 7: холодная лампочка.
+    Material3 {
+        color: [0.35, 0.65, 1.0],
+        glow: 4.0,
+        grid: false,
+    },
 ];
+
+/// Лампы примера в момент `time`: тёплая кружит над слизью, холодная висит между
+/// кубиками. Каждая видна как светящийся шарик (см. [`demo_shapes`]).
+pub(crate) fn demo_lamps(time: f32) -> [Lamp3; 2] {
+    [
+        Lamp3 {
+            at: warm_lamp_at(time),
+            color: MATERIALS[6].color,
+            power: 6.0,
+            range: 6.0,
+        },
+        Lamp3 {
+            at: COLD_LAMP_AT,
+            color: MATERIALS[7].color,
+            power: 5.0,
+            range: 5.0,
+        },
+    ]
+}
+
+fn warm_lamp_at(time: f32) -> [f32; 3] {
+    [
+        1.3 * (time * 0.7).cos(),
+        1.5,
+        3.0 + 1.0 * (time * 0.7).sin(),
+    ]
+}
+
+const COLD_LAMP_AT: [f32; 3] = [2.4, 1.9, 1.1];
 
 /// Объекты примера в момент `time`: пол, шар, коробка, тор (как в 7.1), капля слизи,
 /// которая перетекает между двумя шарами, коробка с вырезанным шаром и колонна из
@@ -125,11 +167,16 @@ pub(crate) fn demo_shapes(time: f32) -> Vec<Shape3> {
         }
         .at([-1.5, 0.0, -3.0])
         .paint(5),
+        // Лампочки там же, где лампы.
+        Shape3::Sphere { radius: 0.09 }
+            .at(warm_lamp_at(time))
+            .paint(6),
+        Shape3::Sphere { radius: 0.09 }.at(COLD_LAMP_AT).paint(7),
     ]
 }
 
-/// Список слов сцены для видеокарты: программы объектов и материалы.
-pub(crate) fn pack(shapes: &[Shape3], materials: &[Material3]) -> Vec<u32> {
+/// Список слов сцены для видеокарты: программы объектов, материалы и лампы.
+pub(crate) fn pack(shapes: &[Shape3], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
     let programs: Vec<Program> = shapes
         .iter()
         .filter_map(|s| match compile(s) {
@@ -140,13 +187,13 @@ pub(crate) fn pack(shapes: &[Shape3], materials: &[Material3]) -> Vec<u32> {
             }
         })
         .collect();
-    let mut words = pack_scene(&programs, materials);
+    let mut words = pack_scene(&programs, materials, lamps);
     if words.len() > MAX_WORDS {
         tracing::warn!(
             "сцена 3D не помещается в буфер ({} слов из {MAX_WORDS}), рисую пустую",
             words.len()
         );
-        words = pack_scene(&[], materials);
+        words = pack_scene(&[], materials, lamps);
     }
     words
 }
@@ -158,7 +205,7 @@ mod tests {
     #[test]
     fn demo_scene_compiles_and_fits() {
         let shapes = demo_shapes(1.0);
-        let words = pack(&shapes, &MATERIALS);
+        let words = pack(&shapes, &MATERIALS, &demo_lamps(1.0));
         assert_eq!(words[0] as usize, shapes.len(), "все формы собрались");
         assert!(words.len() < MAX_WORDS);
         // Материалы всех форм есть в списке.
