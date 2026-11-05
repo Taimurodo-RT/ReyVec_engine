@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Shape, Stroke, pos2, vec2};
 use reyvec_scene::{LightDesc, NodeDesc, PartDesc, SceneFile, ShapeDesc};
 
-use super::geom::{Placed, Xform};
+use super::geom::{Bounds, Placed, Xform};
 use super::outline;
 use super::theme::*;
 use super::viewport::View;
@@ -62,6 +62,8 @@ pub(crate) struct Show {
     pub spawns: bool,
     pub icons: bool,
     pub stats: bool,
+    /// Карта всей сцены в углу: где камера, щелчок — перелететь.
+    pub map: bool,
 }
 
 impl Default for Show {
@@ -73,13 +75,14 @@ impl Default for Show {
             spawns: true,
             icons: true,
             stats: false,
+            map: true,
         }
     }
 }
 
 impl Show {
     /// Пункты меню: название и флажок.
-    pub fn items(&mut self) -> [(&'static str, &mut bool); 6] {
+    pub fn items(&mut self) -> [(&'static str, &mut bool); 7] {
         [
             ("Границы сцены", &mut self.bounds),
             ("Радиусы света", &mut self.lights),
@@ -87,8 +90,83 @@ impl Show {
             ("Места появления", &mut self.spawns),
             ("Значки невидимых предметов", &mut self.icons),
             ("Сводка в углу", &mut self.stats),
+            ("Карта сцены", &mut self.map),
         ]
     }
+}
+
+/// Карта всей сцены в правом нижнем углу окна сцены: верхние предметы рамками, выбранный
+/// цветом, видимая часть — белой рамкой. Возвращает точку сцены, куда щёлкнули или тянут.
+pub(crate) fn minimap(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    view: View,
+    placed: &[Placed],
+    selected: Option<&[usize]>,
+) -> Option<[f64; 2]> {
+    let top: Vec<&Placed> = placed.iter().filter(|p| p.path.len() == 1).collect();
+    let world = top.iter().map(|p| p.all).reduce(Bounds::union)?;
+    let cam = Bounds {
+        min: view.to_scene(egui::pos2(rect.left(), rect.bottom())),
+        max: view.to_scene(egui::pos2(rect.right(), rect.top())),
+    };
+    let world = world.union(cam);
+    let size = world.size();
+    if size[0] <= 0.0 || size[1] <= 0.0 {
+        return None;
+    }
+    let w = 200.0_f32;
+    let h = (w * (size[1] / size[0]) as f32).clamp(60.0, 150.0);
+    let map = Rect::from_min_size(
+        egui::pos2(rect.right() - w - 12.0, rect.bottom() - h - 12.0),
+        egui::vec2(w, h),
+    );
+    if map.top() < rect.top() + 40.0 {
+        return None;
+    }
+    let inner = map.shrink(6.0);
+    // Масштаб один по обеим осям: пропорции сцены не искажаются.
+    let k = (f64::from(inner.width()) / size[0]).min(f64::from(inner.height()) / size[1]);
+    let c = world.center();
+    let to = |p: [f64; 2]| {
+        inner.center() + egui::vec2(((p[0] - c[0]) * k) as f32, (-(p[1] - c[1]) * k) as f32)
+    };
+    let from = |q: egui::Pos2| {
+        let d = q - inner.center();
+        [c[0] + f64::from(d.x) / k, c[1] - f64::from(d.y) / k]
+    };
+    let painter = ui.painter_at(map);
+    painter.rect(
+        map,
+        RADIUS_M,
+        PANEL.gamma_multiply(0.92),
+        Stroke::new(LINE, BORDER_STRONG),
+        egui::StrokeKind::Inside,
+    );
+    for p in &top {
+        let on = selected.is_some_and(|s| s.first() == p.path.first());
+        let r = Rect::from_two_pos(to(p.all.min), to(p.all.max));
+        let color = if on { ACCENT } else { MUTED };
+        painter.rect_stroke(r, 0, Stroke::new(LINE, color), egui::StrokeKind::Middle);
+    }
+    let cr = Rect::from_two_pos(to(cam.min), to(cam.max));
+    painter.rect_stroke(
+        cr,
+        0,
+        Stroke::new(LINE_FOCUS, egui::Color32::WHITE),
+        egui::StrokeKind::Middle,
+    );
+    let resp = ui
+        .interact(
+            map,
+            ui.scope_id().with("minimap"),
+            egui::Sense::click_and_drag(),
+        )
+        .on_hover_text("Карта сцены: щёлкните или тяните, чтобы перелететь камерой");
+    if resp.clicked() || resp.dragged() {
+        return resp.interact_pointer_pos().map(from);
+    }
+    None
 }
 
 /// Закладки камеры: Ctrl+1…9 — запомнить, 1…9 — вернуться.
