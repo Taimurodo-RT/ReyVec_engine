@@ -1,7 +1,7 @@
 //! Тема редактора: тёмный графит, один тёплый акцент (цвет света в движке) и синий цвет
 //! выделения. Цвета те же, что на макете.
 
-use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
+use egui::{Color32, CornerRadius, FontFamily, FontId, Margin, Stroke, TextStyle};
 
 /// Фон под всем.
 pub(crate) const BG: Color32 = Color32::from_rgb(16, 18, 23);
@@ -47,12 +47,71 @@ pub(crate) const KIND_BODY: Color32 = SELECT;
 pub(crate) const KIND_SCRIPT: Color32 = Color32::from_rgb(192, 132, 252);
 pub(crate) const KIND_PLAIN: Color32 = Color32::from_rgb(111, 120, 145);
 
-/// Высота верхней полосы, точек.
+// ---- Токены размеров. Все размеры в точках интерфейса (на экране 150 % точка — 1,5
+// пикселя). Панели всех рабочих пространств берут одни и те же размеры отсюда, поэтому при
+// переходе между вкладками ничего не прыгает.
+
+/// Верхняя полоса (название, вкладки, «Играть», кнопки окна).
 pub(crate) const TITLE_HEIGHT: f32 = 44.0;
-/// Высота строки состояния, точек.
+/// Строка состояния внизу окна.
 pub(crate) const STATUS_HEIGHT: f32 = 24.0;
-/// Высота строки вкладок панели, точек.
+/// Строка вкладок панели.
 pub(crate) const TAB_HEIGHT: f32 = 32.0;
+/// Строка списка (иерархия, файлы).
+pub(crate) const ROW_HEIGHT: f32 = 26.0;
+/// Кнопка с подписью в верхней полосе («Играть»).
+pub(crate) const BUTTON_HEIGHT: f32 = 30.0;
+/// Кнопка окна (свернуть, развернуть, закрыть).
+pub(crate) const WINDOW_BUTTON_WIDTH: f32 = 46.0;
+
+/// Левая панель, начальная ширина и пределы.
+pub(crate) const LEFT_WIDTH: f32 = 280.0;
+/// Правая панель, начальная ширина.
+pub(crate) const RIGHT_WIDTH: f32 = 320.0;
+/// Нижняя панель, начальная высота.
+pub(crate) const BOTTOM_HEIGHT: f32 = 220.0;
+/// Пределы ширины боковых панелей, когда их тянут мышью.
+pub(crate) const SIDE_RANGE: std::ops::RangeInclusive<f32> = 200.0..=560.0;
+/// Пределы высоты нижней панели.
+pub(crate) const BOTTOM_RANGE: std::ops::RangeInclusive<f32> = 120.0..=560.0;
+
+/// Промежутки: от самого маленького к большому.
+pub(crate) const GAP_XS: f32 = 2.0;
+pub(crate) const GAP_S: f32 = 4.0;
+pub(crate) const GAP_M: f32 = 6.0;
+pub(crate) const GAP_L: f32 = 8.0;
+pub(crate) const GAP_XL: f32 = 12.0;
+pub(crate) const GAP_XXL: f32 = 16.0;
+/// Сдвиг вложенного уровня в дереве.
+pub(crate) const INDENT: f32 = 16.0;
+
+/// Поля внутри панели.
+pub(crate) const PAD_PANEL: Margin = Margin::symmetric(10, 8);
+/// Поля внутри карточки инспектора.
+pub(crate) const PAD_CARD: Margin = Margin::symmetric(12, 10);
+/// Поля верхней полосы и строки состояния.
+pub(crate) const PAD_BAR: Margin = Margin::symmetric(8, 0);
+/// Поля значения в рамке и метки.
+pub(crate) const PAD_FIELD: Margin = Margin::symmetric(8, 3);
+
+/// Скругления: поля и строки, кнопки, карточки и группы.
+pub(crate) const RADIUS_S: u8 = 6;
+pub(crate) const RADIUS_M: u8 = 8;
+pub(crate) const RADIUS_L: u8 = 10;
+
+/// Шрифты: подписи, метки на сцене, основной, заголовок карточки, название движка,
+/// заголовок панели, цифры.
+pub(crate) const FONT_SMALL: f32 = 11.5;
+pub(crate) const FONT_CHIP: f32 = 12.5;
+pub(crate) const FONT_BODY: f32 = 13.5;
+pub(crate) const FONT_TITLE: f32 = 14.0;
+pub(crate) const FONT_BRAND: f32 = 15.0;
+pub(crate) const FONT_HEADING: f32 = 16.0;
+pub(crate) const FONT_MONO: f32 = 12.5;
+
+/// Толщина линий и рамок; рамка «идёт игра».
+pub(crate) const LINE: f32 = 1.0;
+pub(crate) const LINE_FOCUS: f32 = 2.0;
 
 /// Ставит тему в `ctx`.
 pub(crate) fn apply(ctx: &egui::Context) {
@@ -62,9 +121,9 @@ pub(crate) fn apply(ctx: &egui::Context) {
         v.dark_mode = true;
         v.panel_fill = PANEL;
         v.window_fill = CARD;
-        v.window_stroke = Stroke::new(1.0, BORDER_STRONG);
-        v.window_corner_radius = CornerRadius::same(10);
-        v.menu_corner_radius = CornerRadius::same(8);
+        v.window_stroke = Stroke::new(LINE, BORDER_STRONG);
+        v.window_corner_radius = CornerRadius::same(RADIUS_L);
+        v.menu_corner_radius = CornerRadius::same(RADIUS_M);
         v.extreme_bg_color = BG;
         v.faint_bg_color = CARD;
         v.code_bg_color = BG;
@@ -72,15 +131,15 @@ pub(crate) fn apply(ctx: &egui::Context) {
         v.warn_fg_color = ACCENT;
         v.error_fg_color = BAD;
         v.selection.bg_fill = SELECT_BG;
-        v.selection.stroke = Stroke::new(1.0, SELECT);
+        v.selection.stroke = Stroke::new(LINE, SELECT);
         v.override_text_color = None;
 
         let w = &mut v.widgets;
         w.noninteractive.bg_fill = PANEL;
         w.noninteractive.weak_bg_fill = PANEL;
-        w.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-        w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
-        w.noninteractive.corner_radius = CornerRadius::same(6);
+        w.noninteractive.bg_stroke = Stroke::new(LINE, BORDER);
+        w.noninteractive.fg_stroke = Stroke::new(LINE, TEXT_DIM);
+        w.noninteractive.corner_radius = CornerRadius::same(RADIUS_S);
         for (wv, fill, stroke) in [
             (&mut w.inactive, RAISED, BORDER_STRONG),
             (&mut w.hovered, HOVER, BORDER_STRONG),
@@ -89,39 +148,42 @@ pub(crate) fn apply(ctx: &egui::Context) {
         ] {
             wv.bg_fill = fill;
             wv.weak_bg_fill = fill;
-            wv.bg_stroke = Stroke::new(1.0, stroke);
-            wv.corner_radius = CornerRadius::same(6);
+            wv.bg_stroke = Stroke::new(LINE, stroke);
+            wv.corner_radius = CornerRadius::same(RADIUS_S);
             wv.expansion = 0.0;
         }
-        w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
-        w.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-        w.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-        w.open.fg_stroke = Stroke::new(1.0, TEXT);
+        w.inactive.fg_stroke = Stroke::new(LINE, TEXT);
+        w.hovered.fg_stroke = Stroke::new(LINE, Color32::WHITE);
+        w.active.fg_stroke = Stroke::new(LINE, Color32::WHITE);
+        w.open.fg_stroke = Stroke::new(LINE, TEXT);
 
         let s = &mut style.spacing;
-        s.item_spacing = egui::vec2(8.0, 6.0);
+        s.item_spacing = egui::vec2(GAP_L, GAP_M);
         s.button_padding = egui::vec2(10.0, 5.0);
-        s.interact_size.y = 26.0;
-        s.window_margin = egui::Margin::same(12);
-        s.menu_margin = egui::Margin::same(6);
+        s.interact_size.y = ROW_HEIGHT;
+        s.window_margin = egui::Margin::same(GAP_XL as i8);
+        s.menu_margin = egui::Margin::same(GAP_M as i8);
 
         style.text_styles = [
             (
                 TextStyle::Small,
-                FontId::new(11.5, FontFamily::Proportional),
+                FontId::new(FONT_SMALL, FontFamily::Proportional),
             ),
-            (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+            (
+                TextStyle::Body,
+                FontId::new(FONT_BODY, FontFamily::Proportional),
+            ),
             (
                 TextStyle::Button,
-                FontId::new(13.5, FontFamily::Proportional),
+                FontId::new(FONT_BODY, FontFamily::Proportional),
             ),
             (
                 TextStyle::Heading,
-                FontId::new(16.0, FontFamily::Proportional),
+                FontId::new(FONT_HEADING, FontFamily::Proportional),
             ),
             (
                 TextStyle::Monospace,
-                FontId::new(12.5, FontFamily::Monospace),
+                FontId::new(FONT_MONO, FontFamily::Monospace),
             ),
         ]
         .into();

@@ -6,21 +6,35 @@
 //! (раскладка описана данными в [`layout`]). «Играть» запускает игру прямо в окне сцены,
 //! «Стоп» возвращает сцену к началу.
 //!
-//! Слабое место каркаса: движок рисует сцену на всё окно, а панели лежат поверх неё.
-//! Камера сдвинута так, чтобы середина сцены была посередине свободного места. Отдельная
+//! В режиме правки (Р.4) предметы выбирают щелчком, двигают, поворачивают и меняют в
+//! размере ручками или числами в инспекторе; Ctrl+S пишет файл сцены. Правка меняет в
+//! тексте файла только нужное число ([`ron_edit`]), поэтому комментарии и порядок полей
+//! в файле остаются, а отмена — это просто прошлый текст ([`doc`]).
+//!
+//! Слабое место: движок рисует сцену на всё окно, а панели лежат поверх неё. Камера
+//! сдвинута так, чтобы середина сцены была посередине свободного места. Отдельная
 //! картинка сцены точно под размер середины — следующий шаг.
 
+mod arrange;
+mod assets;
+mod doc;
+mod files;
+mod geom;
 mod layout;
 mod outline;
+mod overlay;
+mod parts;
+mod ron_edit;
 mod theme;
 mod ui;
+mod viewport;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reyvec_gpu::{DemoScene, FrameStatus, GpuOptions, RendererOptions, UiFrame, WindowRenderer};
-use reyvec_scene::SceneFile;
 use reyvec_vector::{Camera2D, Point, Vec2};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -30,12 +44,15 @@ use winit::window::{Window, WindowId};
 
 use crate::app::{AppError, RunSummary, input_of, to_screen};
 use crate::controls::{Controls, Input, controls_path};
+use doc::SceneDoc;
 use ui::{Action, EditorUi, Info, PlayState};
 
 /// Как часто пересчитывать счётчик кадров.
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
 /// Во сколько раз приближает один щелчок колеса мыши.
 const ZOOM_STEP: f64 = 1.2;
+/// Пока тянут ручку, сцена в движке пересобирается не чаще этого.
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(60);
 
 /// Настройки запуска редактора.
 #[derive(Clone, Debug)]
@@ -77,6 +94,23 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
                 None
             }
         });
+    let doc = scene_text.map(|t| SceneDoc::new(config.scene_file.clone(), t));
+    let restore = config
+        .scene_file
+        .as_ref()
+        .zip(doc.as_ref())
+        .and_then(|(p, d)| files::pending_autosave(p, d.text()));
+    if restore.is_some() {
+        tracing::warn!(
+            "Есть автосохранение с несохранёнными правками: «Файл → Восстановить автосохранение»"
+        );
+    }
+    let scenes = config
+        .scene_file
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(files::list_scenes)
+        .unwrap_or_default();
     let mut editor = Editor {
         ui: EditorUi::new(config.project.as_deref()),
         config,
@@ -85,9 +119,14 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         egui_ctx: egui::Context::default(),
         egui_state: None,
         play: PlayState::Edit,
-        scene: None,
-        scene_text: None,
-        parse_error: None,
+        doc,
+        engine_stale: false,
+        engine_sent: Instant::now(),
+        clipboard: None,
+        hidden: HashSet::new(),
+        ejected: false,
+        simulating: false,
+        time_scale: 1.0,
         watcher: None,
         controls: Controls::load(&controls_path()),
         start: Instant::now(),
@@ -105,10 +144,11 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         centered: false,
         cursor: None,
         snapshot_requested: false,
+        scenes,
+        restore,
+        autosave_at: Instant::now(),
+        autosaved: String::new(),
     };
-    if let Some(text) = scene_text {
-        editor.read_scene(text);
-    }
     event_loop
         .run_app(&mut editor)
         .map_err(|e| AppError::Window(e.to_string()))?;
@@ -137,12 +177,22 @@ struct Editor {
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     play: PlayState,
-    /// Прочитанный файл сцены (для иерархии и инспектора).
-    scene: Option<SceneFile>,
-    /// Текст файла сцены: «Стоп» начинает сцену с него заново.
-    scene_text: Option<String>,
-    /// Ошибка в файле сцены, если он не читается.
-    parse_error: Option<String>,
+    /// Открытая сцена: текст с правками, разбор, отмена. «Стоп» начинает сцену с него.
+    doc: Option<SceneDoc>,
+    /// Текст сцены поменялся, а движок его ещё не получил (правку тянут мышью).
+    engine_stale: bool,
+    /// Когда движок последний раз получил текст сцены.
+    engine_sent: Instant,
+    /// Предмет, скопированный в редакторе (текст из файла сцены).
+    clipboard: Option<String>,
+    /// Скрытые в редакторе предметы: движку они не отдаются, в файле остаются.
+    hidden: HashSet<Vec<usize>>,
+    /// Камера отцеплена от героя во время игры (F8).
+    ejected: bool,
+    /// Симуляция: игра идёт, но герой не слушает клавиш, камера свободна.
+    simulating: bool,
+    /// Скорость игры (замедление).
+    time_scale: f64,
     watcher: Option<reyvec_scene::SceneWatcher>,
     /// Клавиши героя из настроек игрока (`controls.ron`), как в песочнице.
     controls: Controls,
@@ -162,6 +212,14 @@ struct Editor {
     centered: bool,
     cursor: Option<PhysicalPosition<f64>>,
     snapshot_requested: bool,
+    /// Сцены в папке открытой (меню «Файл → Открыть»).
+    scenes: Vec<PathBuf>,
+    /// Автосохранение с правками, которых нет в файле (можно восстановить).
+    restore: Option<String>,
+    /// Когда последний раз проверяли, не пора ли автосохранить.
+    autosave_at: Instant,
+    /// Что записано в автосохранение последним.
+    autosaved: String,
 }
 
 impl Editor {
@@ -178,18 +236,43 @@ impl Editor {
         self.close(event_loop);
     }
 
-    /// Читает текст файла сцены для панелей. Ошибку запоминает, прошлая сцена остаётся.
-    fn read_scene(&mut self, text: String) {
-        let dir = self.config.scene_file.as_ref().and_then(|p| p.parent());
-        match SceneFile::parse_in(&text, dir) {
-            Ok(file) => {
-                self.ui.scene_changed(Some(&file));
-                self.scene = Some(file);
-                self.parse_error = None;
-            }
-            Err(e) => self.parse_error = Some(e.to_string()),
+    /// Отдаёт движку текст сцены из документа: предметы на местах из него. `now: false`
+    /// — правку ещё тянут, движок получит её не чаще [`PREVIEW_INTERVAL`].
+    fn send_scene(&mut self, now: bool) {
+        self.engine_stale = true;
+        if !now && self.engine_sent.elapsed() < PREVIEW_INTERVAL {
+            return;
         }
-        self.scene_text = Some(text);
+        let (Some(r), Some(doc)) = (self.renderer.as_mut(), &self.doc) else {
+            return;
+        };
+        let camera = r.camera();
+        r.switch_scene_file(&engine_text(doc.text(), &self.hidden));
+        r.set_camera(camera);
+        self.engine_stale = false;
+        self.engine_sent = Instant::now();
+        self.ui.scene_changed(doc.file());
+    }
+
+    /// Правка, отмена или повтор поменяли текст сцены.
+    fn doc_changed(&mut self, now: bool) {
+        if let Some(doc) = &self.doc {
+            self.ui.scene_changed(doc.file());
+        }
+        self.send_scene(now);
+    }
+
+    /// Камера сцены в точках интерфейса.
+    fn view(&self) -> Option<viewport::View> {
+        let (r, w) = (self.renderer.as_ref()?, self.window.as_ref()?);
+        let size = w.inner_size();
+        let ppp = f64::from(self.egui_ctx.pixels_per_point());
+        let c = r.camera();
+        Some(viewport::View {
+            center: [c.center.x, c.center.y],
+            zoom: c.zoom,
+            size: [f64::from(size.width) / ppp, f64::from(size.height) / ppp],
+        })
     }
 
     fn scene_name(&self) -> String {
@@ -217,7 +300,7 @@ impl Editor {
         );
         let size = window.inner_size();
         let files = reyvec_gpu::UserFiles {
-            scene: self.scene_text.as_deref().map(Into::into),
+            scene: self.doc.as_ref().map(|d| d.text().into()),
             scene_dir: self
                 .config
                 .scene_file
@@ -299,28 +382,62 @@ impl Editor {
             return;
         };
         match action {
-            Action::Play => {
+            Action::Play | Action::Simulate => {
+                let simulate = action == Action::Simulate;
+                let camera = r.camera();
+                if !self.hidden.is_empty()
+                    && let Some(doc) = &self.doc
+                {
+                    // Скрытое — только в редакторе: в игре сцена целиком.
+                    r.switch_scene_file(doc.text());
+                }
                 self.play = PlayState::Playing;
+                self.ejected = false;
                 r.set_game_paused(false);
-                r.set_follow(true);
-                tracing::info!("Игра запущена");
+                r.set_follow(!simulate);
+                if simulate {
+                    // Камера остаётся, где была: смотрим, как падают и катятся предметы.
+                    r.set_camera(camera);
+                }
+                self.simulating = simulate;
+                self.ejected = simulate;
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                    logic.set_time_scale(self.time_scale);
+                }
+                if simulate {
+                    tracing::info!("Симуляция: физика и логика идут, герой стоит");
+                } else {
+                    tracing::info!("Игра запущена");
+                }
             }
             Action::Pause => {
                 self.play = PlayState::Paused;
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                }
                 r.release_game_input();
                 r.set_game_paused(true);
             }
             Action::Resume => {
                 self.play = PlayState::Playing;
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                }
                 r.set_game_paused(false);
             }
             Action::Stop => {
                 self.play = PlayState::Edit;
+                self.ejected = false;
+                self.simulating = false;
+                if let Some(logic) = r.scene_logic() {
+                    logic.set_debug_paused(false);
+                }
                 r.release_game_input();
                 let camera = r.camera();
-                if let Some(text) = &self.scene_text {
-                    // Сцена с начала: герой, тела и враги на местах из файла.
-                    r.switch_scene_file(text);
+                if let Some(doc) = &self.doc {
+                    // Сцена с начала: герой, тела и враги на местах из файла (с правками).
+                    r.switch_scene_file(&engine_text(doc.text(), &self.hidden));
                 }
                 r.set_game_paused(true);
                 r.set_follow(false);
@@ -329,7 +446,15 @@ impl Editor {
             }
             Action::Minimize => w.set_minimized(true),
             Action::ToggleMaximize => w.set_maximized(!w.is_maximized()),
-            Action::Close => self.close(event_loop),
+            Action::Close => self.close_or_ask(event_loop),
+            Action::ForceClose => self.close(event_loop),
+            Action::SaveAndClose => {
+                let saved = self.doc.as_mut().map(SceneDoc::save);
+                match saved {
+                    Some(Err(e)) => tracing::warn!("Сцена не сохранена, окно остаётся: {e}"),
+                    _ => self.close(event_loop),
+                }
+            }
             Action::DragWindow => {
                 if let Err(e) = w.drag_window() {
                     tracing::debug!("Окно не тащится: {e}");
@@ -364,12 +489,417 @@ impl Editor {
                 };
                 match std::fs::read_to_string(&path) {
                     Ok(text) => {
-                        r.set_scene_file(&text);
-                        self.read_scene(text);
+                        if let Some(doc) = self.doc.as_mut() {
+                            doc.file_changed(text);
+                        } else {
+                            self.doc = Some(SceneDoc::new(Some(path.clone()), text));
+                        }
+                        self.doc_changed(true);
                         tracing::info!("Сцена перечитана: {}", path.display());
                     }
                     Err(e) => tracing::warn!("Не прочитать файл сцены: {e}"),
                 }
+            }
+            Action::SetCamera { center, zoom } => {
+                r.set_follow(false);
+                r.set_camera(Camera2D {
+                    center: Point::new(center[0], center[1]),
+                    zoom,
+                });
+            }
+            Action::Edit { .. }
+            | Action::CancelEdit
+            | Action::EndEdit
+            | Action::Undo
+            | Action::Redo
+            | Action::Save
+            | Action::Copy { .. }
+            | Action::Paste { .. }
+            | Action::Duplicate(_)
+            | Action::Delete(_)
+            | Action::Move { .. }
+            | Action::DropAsset { .. }
+            | Action::MoveMany(_)
+            | Action::Group(_)
+            | Action::Ungroup(_)
+            | Action::AddPart { .. }
+            | Action::RemovePart { .. } => self.apply_doc(action),
+            Action::SavePrefab(path) => self.save_prefab(&path),
+            Action::OpenScene(path) => self.open_scene(path),
+            Action::NewScene => {
+                let Some(dir) = self.config.scene_file.as_deref().and_then(|p| p.parent()) else {
+                    return;
+                };
+                let path = files::new_scene_path(dir);
+                match std::fs::write(&path, files::NEW_SCENE) {
+                    Ok(()) => self.open_scene(path),
+                    Err(e) => tracing::warn!("Не создать сцену «{}»: {e}", path.display()),
+                }
+            }
+            Action::RestoreAutosave => {
+                if let (Some(t), Some(doc)) = (self.restore.take(), self.doc.as_mut()) {
+                    match doc.change(|_| Ok(t)) {
+                        Ok(()) => {
+                            self.hidden.clear();
+                            self.ui.structure_changed();
+                            self.ui.select(None);
+                            self.doc_changed(true);
+                            tracing::info!(
+                                "Правки из автосохранения вернулись (Ctrl+Z — отменить)"
+                            );
+                        }
+                        Err(e) => tracing::warn!("Автосохранение не читается: {e}"),
+                    }
+                }
+            }
+            Action::Eject => {
+                if self.play != PlayState::Edit {
+                    self.ejected = !self.ejected;
+                    r.set_follow(!self.ejected);
+                }
+            }
+            Action::Step => {
+                if self.play == PlayState::Paused
+                    && let Some(logic) = r.scene_logic()
+                {
+                    // Пауза консоли умеет шагать: обычную снимаем, шаг — один.
+                    logic.set_debug_paused(true);
+                    logic.set_paused(false);
+                    logic.step(1);
+                }
+            }
+            Action::SetTimeScale(k) => {
+                self.time_scale = match r.scene_logic() {
+                    Some(logic) => logic.set_time_scale(k),
+                    None => k,
+                };
+            }
+            Action::ToggleHidden(path) => {
+                if !self.hidden.remove(&path) {
+                    self.hidden.insert(path);
+                }
+                self.send_scene(true);
+            }
+        }
+    }
+
+    /// Закрыть окно; если есть несохранённые правки — сначала спросить.
+    /// Несохранённые правки раз в минуту — в `.autosave` рядом со сценой (сам файл сцены
+    /// не трогается). Сохранили сцену — автосохранение убирается.
+    fn autosave(&mut self) {
+        const EVERY: Duration = Duration::from_secs(60);
+        if self.autosave_at.elapsed() < EVERY {
+            return;
+        }
+        self.autosave_at = Instant::now();
+        let (Some(doc), Some(path)) = (&self.doc, &self.config.scene_file) else {
+            return;
+        };
+        if !doc.dirty() || doc.text() == self.autosaved {
+            return;
+        }
+        match files::write_autosave(path, doc.text()) {
+            Ok(()) => self.autosaved = doc.text().to_owned(),
+            Err(e) => tracing::warn!("Автосохранение не записалось: {e}"),
+        }
+    }
+
+    /// Открыть другую сцену той же папки (правки прошлой уже сохранены).
+    fn open_scene(&mut self, path: PathBuf) {
+        if self.doc.as_ref().is_some_and(SceneDoc::dirty) {
+            tracing::warn!("Сначала сохраните правки (Ctrl+S), потом открывайте другую сцену");
+            return;
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Не прочитать сцену «{}»: {e}", path.display());
+                return;
+            }
+        };
+        self.restore = files::pending_autosave(&path, &text);
+        self.doc = Some(SceneDoc::new(Some(path.clone()), text));
+        self.watcher = reyvec_scene::SceneWatcher::new(&path)
+            .map_err(|e| tracing::warn!("Не следить за файлом сцены: {e}"))
+            .ok();
+        self.config.scene_file = Some(path.clone());
+        self.scenes = path.parent().map(files::list_scenes).unwrap_or_default();
+        self.hidden.clear();
+        self.autosaved.clear();
+        self.ui.structure_changed();
+        self.ui.select(None);
+        // Камера встанет на героя новой сцены и потом — серединой в свободное место.
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_follow(true);
+        }
+        self.centered = false;
+        self.doc_changed(true);
+        tracing::info!("Сцена открыта: {}", self.scene_name());
+        if self.restore.is_some() {
+            tracing::warn!(
+                "Есть автосохранение с несохранёнными правками: «Файл → Восстановить автосохранение»"
+            );
+        }
+    }
+
+    /// Предмет — в файл `assets/prefabs/<имя>.ron` (имя не занимает чужой файл).
+    fn save_prefab(&mut self, path: &[usize]) {
+        let (Some(doc), Some(project)) = (&self.doc, self.config.project.clone()) else {
+            tracing::warn!("Заготовку некуда записать: нет папки проекта");
+            return;
+        };
+        let text = match doc.node_text(path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Не записать заготовку: {e}");
+                return;
+            }
+        };
+        let name = doc
+            .file()
+            .and_then(|f| outline::node_at(f, path))
+            .map(|n| n.name.clone())
+            .unwrap_or_default();
+        let dir = project.join("assets").join(assets::PREFABS);
+        let base = parts::prefab_file_name(&name);
+        let mut file = dir.join(format!("{base}.ron"));
+        let mut k = 2;
+        while file.exists() {
+            file = dir.join(format!("{base} {k}.ron"));
+            k += 1;
+        }
+        let written =
+            std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, format!("{text}\n")));
+        match written {
+            Ok(()) => {
+                tracing::info!("Заготовка записана: {}", file.display());
+                self.ui.rescan_assets(Some(&project));
+            }
+            Err(e) => tracing::warn!("Не записать заготовку «{}»: {e}", file.display()),
+        }
+    }
+
+    fn close_or_ask(&mut self, event_loop: &ActiveEventLoop) {
+        if self.doc.as_ref().is_some_and(SceneDoc::dirty) {
+            self.ui.ask_close();
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        } else {
+            self.close(event_loop);
+        }
+    }
+
+    /// Правки сцены: только в режиме правки, когда сцена открыта.
+    fn apply_doc(&mut self, action: Action) {
+        if self.play != PlayState::Edit {
+            return;
+        }
+        let Some(doc) = self.doc.as_mut() else {
+            return;
+        };
+        let shape_before = doc.file().map(shape);
+        let mut select = None;
+        let structural = |r: Result<Vec<usize>, ron_edit::EditError>,
+                          select: &mut Option<Vec<usize>>| match r {
+            Ok(p) => {
+                *select = Some(p);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Не вышло: {e}");
+                false
+            }
+        };
+        let now = match action {
+            Action::Copy { path, cut } => {
+                match doc.node_text(&path) {
+                    Ok(t) => {
+                        self.egui_ctx.copy_text(t.clone());
+                        self.clipboard = Some(t);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Не скопировать: {e}");
+                        return;
+                    }
+                }
+                if !cut || !structural(doc.delete(&path).map(|()| Vec::new()), &mut select) {
+                    return;
+                }
+                select = None;
+                true
+            }
+            Action::Paste { after, text } => {
+                let Some(item) = text.or_else(|| self.clipboard.clone()) else {
+                    return;
+                };
+                let (parent, index) = match after.as_deref().and_then(<[usize]>::split_last) {
+                    Some((i, p)) => (p.to_vec(), i + 1),
+                    None => (Vec::new(), usize::MAX),
+                };
+                if !structural(doc.paste(&item, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::MoveMany(moves) => {
+                if let Err(e) = doc.move_many(&moves) {
+                    tracing::warn!("Не выровнять: {e}");
+                    return;
+                }
+                true
+            }
+            Action::Group(paths) => {
+                if !structural(doc.group(&paths), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::Ungroup(path) => {
+                if !structural(doc.ungroup(&path), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::DropAsset { file, at, after } => {
+                let prefab = file
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ron"));
+                let item = if prefab {
+                    let made = std::fs::read_to_string(&file)
+                        .map_err(|e| ron_edit::EditError(e.to_string()))
+                        .and_then(|t| parts::prefab_item(&t, at));
+                    match made {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!("Заготовка «{}» не читается: {e}", file.display());
+                            return;
+                        }
+                    }
+                } else {
+                    let dir = doc.dir().unwrap_or(std::path::Path::new(".")).to_owned();
+                    parts::picture_item(&dir, &file, at)
+                };
+                let (parent, index) = (Vec::new(), after.map_or(usize::MAX, |p| p[0] + 1));
+                if !structural(doc.paste(&item, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::Duplicate(path) => {
+                if !structural(doc.duplicate(&path), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::Delete(path) => {
+                if let Err(e) = doc.delete(&path) {
+                    tracing::warn!("Не удалить: {e}");
+                    return;
+                }
+                true
+            }
+            Action::Move {
+                from,
+                parent,
+                index,
+            } => {
+                if !structural(doc.move_node(&from, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::AddPart { path, field, item } => {
+                let r = doc.change(|t| ron_edit::insert_item(t, &path, field, usize::MAX, &item));
+                if let Err(e) = r {
+                    tracing::warn!("Часть не добавилась: {e}");
+                    return;
+                }
+                true
+            }
+            Action::RemovePart { path, field, index } => {
+                if let Err(e) = doc.change(|t| ron_edit::remove_item(t, &path, field, index)) {
+                    tracing::warn!("Часть не убралась: {e}");
+                    return;
+                }
+                true
+            }
+            Action::Edit { edit, commit } => {
+                let done = if commit {
+                    doc.commit(&edit)
+                } else {
+                    doc.preview(&edit)
+                };
+                if let Err(e) = done {
+                    tracing::warn!("Правка не легла в файл сцены: {e}");
+                    return;
+                }
+                commit
+            }
+            Action::CancelEdit => {
+                doc.cancel_preview();
+                true
+            }
+            Action::EndEdit => {
+                doc.finish_preview();
+                true
+            }
+            Action::Undo => {
+                if !doc.undo() {
+                    return;
+                }
+                true
+            }
+            Action::Redo => {
+                if !doc.redo() {
+                    return;
+                }
+                true
+            }
+            Action::Save => {
+                match doc.save() {
+                    Ok(()) => {
+                        if let Some(p) = &self.config.scene_file {
+                            files::drop_autosave(p);
+                        }
+                        self.restore = None;
+                        tracing::info!("Сцена сохранена: {}", self.scene_name());
+                    }
+                    Err(e) => tracing::warn!("Сцена не сохранена: {e}"),
+                }
+                return;
+            }
+            _ => return,
+        };
+        if doc.file().map(shape) != shape_before {
+            // Номера предметов сдвинулись: скрытые, закреплённые и раскрытые — заново.
+            self.hidden.clear();
+            self.ui.structure_changed();
+            self.ui.select(select);
+        }
+        self.doc_changed(now);
+    }
+
+    /// Файл сцены поменялся на диске: сохранили в блокноте или это наше же сохранение.
+    fn file_saved_outside(&mut self, text: String) {
+        let Some(doc) = self.doc.as_mut() else {
+            return;
+        };
+        if doc.dirty() && text != doc.text() {
+            // Свои правки не теряем: файл с диска можно взять через «Файл → Перечитать».
+            tracing::warn!(
+                "Файл сцены поменяли на диске, а в редакторе есть несохранённые правки. \
+                 Оставляю правки редактора; «ReyVec → Файл → Перечитать сцену» возьмёт файл с диска"
+            );
+            return;
+        }
+        if doc.file_changed(text) {
+            tracing::info!("Файл сцены сохранён, читаю заново");
+            if self.play == PlayState::Edit {
+                self.doc_changed(true);
+            } else if let Some(r) = self.renderer.as_mut() {
+                // Во время игры герой остаётся, где был (как в песочнице).
+                r.set_scene_file(doc.text());
             }
         }
     }
@@ -386,17 +916,15 @@ impl Editor {
         }
         if let Some(watcher) = self.watcher.as_mut() {
             match watcher.poll() {
-                Some(Ok(text)) => {
-                    tracing::info!("Файл сцены сохранён, читаю заново");
-                    if let Some(r) = self.renderer.as_mut() {
-                        r.set_scene_file(&text);
-                    }
-                    self.read_scene(text);
-                }
+                Some(Ok(text)) => self.file_saved_outside(text),
                 Some(Err(e)) => tracing::warn!("Файл сцены: {e}"),
                 None => {}
             }
         }
+        if self.engine_stale {
+            self.send_scene(false);
+        }
+        self.autosave();
         if self.frames >= 2 && !self.centered && self.ui.viewport().is_some() {
             // Камера уже встала на героя: дальше она не идёт за ним, пока не нажмут «Играть».
             if let Some(r) = self.renderer.as_mut() {
@@ -407,6 +935,7 @@ impl Editor {
         }
         self.ui.push_log(crate::console::take_log());
 
+        let view = self.view();
         let (Some(window), Some(renderer), Some(state)) =
             (&self.window, &mut self.renderer, &mut self.egui_state)
         else {
@@ -433,7 +962,11 @@ impl Editor {
             .shader_error()
             .map(|e| format!("шейдер: {e}"))
             .or_else(|| renderer.scene_error());
-        let error = self.parse_error.clone().or(engine_error);
+        let doc = self.doc.as_ref();
+        let error = doc
+            .and_then(SceneDoc::error)
+            .map(ToOwned::to_owned)
+            .or(engine_error);
         let info = Info {
             play: self.play,
             maximized: window.is_maximized(),
@@ -442,9 +975,21 @@ impl Editor {
             frame_ms: self.frame_ms,
             gpu_ms: self.gpu_ms,
             adapter: &self.adapter,
-            scene: self.scene.as_ref(),
+            scene: doc.and_then(SceneDoc::file),
             scene_name: &scene_name,
             error: error.as_deref(),
+            view,
+            dirty: doc.is_some_and(SceneDoc::dirty),
+            can_undo: doc.is_some_and(SceneDoc::can_undo),
+            can_redo: doc.is_some_and(SceneDoc::can_redo),
+            can_save: self.config.scene_file.is_some(),
+            hidden: &self.hidden,
+            can_paste: self.clipboard.is_some(),
+            scenes: &self.scenes,
+            can_restore: self.restore.is_some(),
+            ejected: self.ejected,
+            time_scale: self.time_scale,
+            simulating: self.simulating,
         };
         let input = state.take_egui_input(window);
         let editor_ui = &mut self.ui;
@@ -530,7 +1075,7 @@ impl Editor {
 
     /// Клавиши и кнопки мыши во время игры — герою.
     fn game_input(&mut self, event: &WindowEvent) {
-        if self.play != PlayState::Playing {
+        if self.play != PlayState::Playing || self.simulating {
             return;
         }
         let Some((input, down, repeat)) = input_of(event) else {
@@ -542,6 +1087,8 @@ impl Editor {
         let over_scene = self.ui.viewport_hovered();
         match input {
             Input::Key(_) if self.egui_ctx.egui_wants_keyboard_input() => return,
+            // Камера отцеплена: мышью двигают сцену, а не бьют.
+            Input::Mouse(_) | Input::Wheel(_) if self.ejected => return,
             Input::Mouse(_) | Input::Wheel(_) if !over_scene && down => return,
             _ => {}
         }
@@ -589,7 +1136,7 @@ impl ApplicationHandler for Editor {
         }
         self.game_input(&event);
         match event {
-            WindowEvent::CloseRequested => self.close(event_loop),
+            WindowEvent::CloseRequested => self.close_or_ask(event_loop),
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::Resized(size) => {
                 self.minimized = size.width == 0 || size.height == 0;
@@ -608,7 +1155,9 @@ impl ApplicationHandler for Editor {
             WindowEvent::CursorMoved { position, .. } => self.cursor = Some(position),
             WindowEvent::CursorLeft { .. } => self.cursor = None,
             WindowEvent::MouseWheel { delta, .. }
-                if self.play == PlayState::Edit && self.ui.viewport_hovered() && !egui_took =>
+                if (self.play == PlayState::Edit || self.ejected)
+                    && self.ui.viewport_hovered()
+                    && !egui_took =>
             {
                 let steps = match delta {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
@@ -626,5 +1175,57 @@ impl ApplicationHandler for Editor {
             }
             _ => {}
         }
+    }
+}
+
+/// Форма дерева предметов: сколько вложенных у каждого по порядку. Поменялась — значит,
+/// предметы добавили, убрали или переставили.
+fn shape(file: &reyvec_scene::SceneFile) -> Vec<usize> {
+    fn walk(nodes: &[reyvec_scene::NodeDesc], out: &mut Vec<usize>) {
+        out.push(nodes.len());
+        for n in nodes {
+            walk(&n.children, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(&file.nodes, &mut out);
+    out
+}
+
+/// Текст сцены для движка: без скрытых в редакторе предметов.
+fn engine_text(text: &str, hidden: &HashSet<Vec<usize>>) -> String {
+    let mut paths: Vec<&Vec<usize>> = hidden
+        .iter()
+        // Вложенный в скрытого уйдёт вместе с ним.
+        .filter(|p| !(1..p.len()).any(|k| hidden.contains(&p[..k])))
+        .collect();
+    // С конца: вырезанный предмет не сдвигает номера тех, что ещё впереди.
+    paths.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = text.to_owned();
+    for p in paths {
+        match ron_edit::remove_node(&out, p) {
+            Ok(t) => out = t,
+            Err(e) => tracing::debug!("Скрытый предмет не убран: {e}"),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_nodes_leave_engine_text() {
+        let text = reyvec_scene::EXAMPLE;
+        let file = reyvec_scene::SceneFile::parse(text).unwrap();
+        let hero = file.nodes.iter().position(|n| n.player.is_some()).unwrap();
+        let hidden: HashSet<Vec<usize>> = [vec![0], vec![hero], vec![hero, 0], vec![2]].into();
+        let t = engine_text(text, &hidden);
+        let f = reyvec_scene::SceneFile::parse(&t).unwrap();
+        let gone = if hero == 0 || hero == 2 { 2 } else { 3 };
+        assert_eq!(f.nodes.len(), file.nodes.len() - gone);
+        assert!(f.nodes.iter().all(|n| n.player.is_none()));
+        assert_eq!(shape(&file)[0], file.nodes.len());
     }
 }
