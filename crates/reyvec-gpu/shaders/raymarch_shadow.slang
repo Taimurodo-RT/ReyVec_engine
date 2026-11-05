@@ -27,7 +27,7 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
             break;
         // Граница объекта вместо формы, только если она так далеко, что полутени не даёт:
         // k · h / t заметно больше 1 (см. scene_near).
-        float2 s = scene_near(from + dir * t, max(0.15, 2.0 * t / k));
+        float2 s = scene_near(from + dir * t, max(0.15, 2.0 * t / k), true);
         float h = s.x;
         // Уточнение по двум последним шагам: меньше полос в полутени.
         float y = h * h / (2.0 * last);
@@ -60,7 +60,7 @@ float ambient_occlusion(float3 p, float3 n)
     for (uint i = 0; i < 5; i++)
     {
         float h = 0.02 + 0.12 * float(i);
-        float d = scene_near(p + n * h, 1e9).x;
+        float d = scene_near(p + n * h, 1e9, true).x;
         occlusion += (h - d) * weight;
         weight *= 0.85;
     }

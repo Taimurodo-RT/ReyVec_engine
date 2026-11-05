@@ -258,6 +258,18 @@ fn cases() -> Vec<Case> {
             name: "space-1s",
             scene: at(DemoScene::Space, 1.0, false),
         },
+        // Опыт 7.6ж: полигональные модели рядом с формами SDF (`scenes/3d/mixed.ron`) —
+        // общий буфер геометрии, тени от заменителей, проход с глубиной.
+        Case {
+            name: "space-mixed-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/mixed.ron").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
     ]
 }
 

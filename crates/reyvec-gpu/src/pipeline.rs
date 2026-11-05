@@ -41,6 +41,9 @@ pub(crate) enum StencilUse {
     CountEvenOdd,
     /// Красит пиксели, где трафарет не ноль, и сразу обнуляет трафарет для следующей фигуры.
     Cover,
+    /// Не трафарет, а глубина (формат без трафарета, например D32): ближнее закрывает
+    /// дальнее. Глубина обратная (решение 0004): ближе — больше.
+    Depth,
 }
 
 /// Трафарет прохода: формат картинки и что с ним делает конвейер.
@@ -149,8 +152,12 @@ pub(crate) fn graphics_pipeline_stencil(
     let formats = [format];
     let mut rendering =
         vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
-    if let Some(s) = stencil {
-        rendering = rendering.stencil_attachment_format(s.format);
+    match stencil {
+        Some(s) if s.usage == StencilUse::Depth => {
+            rendering = rendering.depth_attachment_format(s.format);
+        }
+        Some(s) => rendering = rendering.stencil_attachment_format(s.format),
+        None => {}
     }
     let op = |pass: vk::StencilOp, compare: vk::CompareOp, write: u32| {
         vk::StencilOpState::default()
@@ -183,13 +190,20 @@ pub(crate) fn graphics_pipeline_stencil(
             let o = op(vk::StencilOp::ZERO, vk::CompareOp::NOT_EQUAL, 0xff);
             (o, o)
         }
-        Some(StencilUse::Ignore) | None => {
+        Some(StencilUse::Ignore | StencilUse::Depth) | None => {
             let o = op(vk::StencilOp::KEEP, vk::CompareOp::ALWAYS, 0);
             (o, o)
         }
     };
+    let depth = usage == Some(StencilUse::Depth);
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .stencil_test_enable(!matches!(usage, Some(StencilUse::Ignore) | None))
+        .stencil_test_enable(!matches!(
+            usage,
+            Some(StencilUse::Ignore | StencilUse::Depth) | None
+        ))
+        .depth_test_enable(depth)
+        .depth_write_enable(depth)
+        .depth_compare_op(vk::CompareOp::GREATER)
         .front(front)
         .back(back);
 
@@ -288,6 +302,56 @@ pub(crate) unsafe fn begin_color_pass_with(
         })];
     // SAFETY: условия описаны в контракте функции.
     unsafe { begin_rendering(device, cmd, &attachments, extent) };
+}
+
+/// Проход рисования с глубиной (полигоны сцены «3D», 7.6ж): цвет в `view` очищается
+/// цветом `clear`, глубина в `depth_view` — нулём (обратная глубина: ноль — дальше всего).
+/// Обе картинки в раскладках целей рисования.
+///
+/// # Safety
+/// `cmd` в состоянии записи, картинки живы до конца выполнения команд.
+pub(crate) unsafe fn begin_depth_pass(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    view: vk::ImageView,
+    depth_view: vk::ImageView,
+    extent: vk::Extent2D,
+    clear: [f32; 4],
+) {
+    let colors = [vk::RenderingAttachmentInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .clear_value(vk::ClearValue {
+            color: vk::ClearColorValue { float32: clear },
+        })];
+    let depth = vk::RenderingAttachmentInfo::default()
+        .image_view(depth_view)
+        .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .clear_value(vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 0.0,
+                stencil: 0,
+            },
+        });
+    let rendering = vk::RenderingInfo::default()
+        .render_area(vk::Rect2D::default().extent(extent))
+        .layer_count(1)
+        .color_attachments(&colors)
+        .depth_attachment(&depth);
+    let viewport = vk::Viewport::default()
+        .width(extent.width as f32)
+        .height(extent.height as f32)
+        .max_depth(1.0);
+    // SAFETY: условия описаны в контракте функции.
+    unsafe {
+        device.cmd_begin_rendering(cmd, &rendering);
+        device.cmd_set_viewport(cmd, 0, &[viewport]);
+        device.cmd_set_scissor(cmd, 0, &[vk::Rect2D::default().extent(extent)]);
+    }
 }
 
 /// Начинает проход сцены: цвет в `color_view` (очистка цветом `clear`). Если задан `resolve_view`,

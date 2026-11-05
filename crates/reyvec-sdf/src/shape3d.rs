@@ -404,6 +404,9 @@ pub struct Program {
     pub words: Vec<u32>,
     /// Шар, в котором форма целиком (середина, радиус); `None` — форма бесконечна.
     pub bounds: Option<(Vec3, f32)>,
+    /// Невидимый заменитель полигональной модели (7.6ж): только тени и затенение в
+    /// углах, лучи глаза его не видят.
+    pub shadow_only: bool,
 }
 
 /// Почему форму нельзя превратить в программу.
@@ -451,6 +454,7 @@ pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
     Ok(Program {
         words,
         bounds: shape.bounds(),
+        shadow_only: false,
     })
 }
 
@@ -647,6 +651,9 @@ const MATERIAL_WORDS: usize = 8;
 const LAMP_WORDS: usize = 8;
 /// Слов в записи объекта.
 pub const OBJECT_WORDS: usize = 8;
+/// Флаг объекта: заменитель полигональной модели, только для теней (как в
+/// `include/space.slang`).
+pub const OBJECT_SHADOW_ONLY: u32 = 1;
 /// Слов в заголовке сцены.
 const HEADER_WORDS: usize = 8;
 
@@ -655,8 +662,8 @@ const HEADER_WORDS: usize = 8;
 ///
 /// - заголовок, 8 слов: число объектов, где начинаются объекты, где материалы, сколько
 ///   их, где лампы, сколько их, где сетка отсева (0 — сетки нет), 1 запасное;
-/// - объекты по 8 слов ([`OBJECT_WORDS`]): начало программы, её длина в словах,
-///   2 запасных, шар-граница (середина и радиус; радиус -1 — граница не нужна, форма
+/// - объекты по 8 слов ([`OBJECT_WORDS`]): начало программы, её длина в словах, флаги
+///   ([`OBJECT_SHADOW_ONLY`]), 1 запасное, шар-граница (середина и радиус; радиус -1 — граница не нужна, форма
 ///   бесконечна);
 /// - материалы по 8 слов: цвет (3 числа), флаги ([`MATERIAL_GRID`]), свечение, 3 запасных;
 /// - лампы по 8 слов: место (3 числа), дальность, цвет (3 числа), яркость;
@@ -679,7 +686,8 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
     ];
     let mut start = code_at;
     for p in objects {
-        out.extend([start as u32, p.words.len() as u32, 0, 0]);
+        let flags = if p.shadow_only { OBJECT_SHADOW_ONLY } else { 0 };
+        out.extend([start as u32, p.words.len() as u32, flags, 0]);
         let (c, r) = p.bounds.unwrap_or((Vec3::ZERO, -1.0));
         out.extend([c.x, c.y, c.z, r].map(f32::to_bits));
         start += p.words.len();

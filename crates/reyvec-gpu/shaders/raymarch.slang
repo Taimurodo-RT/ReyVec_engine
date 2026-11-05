@@ -11,7 +11,8 @@
 #include "include/space.slang"
 
 // Длины, с которых начинать лучи (7.8, raymarch_cone.slang): точка на квадрат 8×8.
-// Номер картинки приходит в поле `gbuffer` констант.
+// Номер картинки приходит в поле `gbuffer` констант. Буфер геометрии полигональных
+// моделей (7.6ж, mesh3d.slang) — в поле `shadows`, если стоит флаг SPACE_FLAG_MESHES.
 [[vk::binding(0, 0)]] Texture2D textures[];
 
 float3 normal_at(float3 p)
@@ -24,7 +25,7 @@ float3 normal_at(float3 p)
     for (uint k = 0; k < 4; k++)
     {
         float3 dir = float3(float(((k + 3) >> 1) & 1), float((k >> 1) & 1), float(k & 1)) * 2.0 - 1.0;
-        n += dir * scene_near(p + dir * e, 1e9).x;
+        n += dir * scene_near(p + dir * e, 1e9, false).x;
     }
     return normalize(n);
 }
@@ -37,7 +38,13 @@ float4 fs_main(VertexOut input) : SV_Target
     // Шагаем по лучу: каждый шаг — на расстояние до ближайшей формы, ближе неё ничего нет.
     // Начало — там, куда дошёл конус квадрата 8×8 (до этого места пусто для всех его
     // лучей).
-    float t = min(textures[pc.gbuffer].Load(int3(int2(input.position.xy) / 8, 0)).x, ray.limit);
+    // Полигоны (7.6ж) нарисованы раньше: дальше их точки луч не идёт, а если ни во что
+    // не попал раньше — пиксель их.
+    float4 mesh = float4(-1.0, 0.0, 0.0, 0.0);
+    if ((pc.flags & SPACE_FLAG_MESHES) != 0)
+        mesh = textures[pc.shadows].Load(int3(int2(input.position.xy), 0));
+    float limit = mesh.x >= 0.0 ? min(mesh.x, ray.limit) : ray.limit;
+    float t = min(textures[pc.gbuffer].Load(int3(int2(input.position.xy) / 8, 0)).x, limit);
     float2 hit = float2(-1.0, 0.0);
     // Шаг с «перелётом» (over-relaxation, Keinert и др., «Enhanced Sphere Tracing»,
     // 2014): шагаем в 1.6 раза дальше безопасного. Пока шары пустоты соседних точек
@@ -52,7 +59,7 @@ float4 fs_main(VertexOut input) : SV_Target
     {
         // Дальше 25 см (и ещё миллиметр на метр пути) от границы объекта его форма не
         // считается: это всегда больше точности попадания ниже.
-        float2 s = scene_near(ray.origin + ray.dir * t, 0.25 + 0.001 * t);
+        float2 s = scene_near(ray.origin + ray.dir * t, 0.25 + 0.001 * t, false);
         float radius = abs(s.x);
         if (omega > 1.0 && radius + previous < step)
         {
@@ -72,11 +79,11 @@ float4 fs_main(VertexOut input) : SV_Target
         step = s.x * omega;
         previous = radius;
         t += step;
-        if (t > ray.limit)
+        if (t > limit)
             break;
     }
     if (hit.x < 0.0)
-        return float4(-1.0, 0.0, 0.0, 0.0);
+        return mesh;
     float3 n = normal_at(ray.origin + ray.dir * hit.x);
     return float4(hit.x, hit.y, oct_encode(n));
 }

@@ -34,7 +34,7 @@ float fs_main(VertexOut input) : SV_Target
     for (int i = 0; i < 96; i++)
     {
         float cone = length(offset + drift * t);
-        float d = scene_near(axis.origin + axis.dir * t, max(0.25, 2.0 * cone)).x;
+        float d = scene_near(axis.origin + axis.dir * t, max(0.25, 2.0 * cone), false).x;
         // Пустота должна быть шире конуса с запасом: иначе дальше идут тонкие лучи.
         float free = d - cone;
         if (free < 0.01 + 0.002 * t)

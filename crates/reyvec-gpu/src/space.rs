@@ -3,41 +3,85 @@
 //! и едут в буфер кадра одним списком слов (`reyvec_sdf::shape3d::pack_scene`) вместе с
 //! материалами и лампами (7.4).
 
-use reyvec_sdf::shape3d::{Lamp3, Material3, Program, Shape3, compile, pack_scene};
+use reyvec_sdf::SpaceFrame;
+use reyvec_sdf::shape3d::{Material3, Program, Shape3, compile, pack_scene};
 
-/// Сколько слов помещается в буфер сцены кадра (256 КБ).
-pub(crate) const MAX_WORDS: usize = 64 * 1024;
+/// Сколько слов помещается в буфер сцены кадра (1 МБ).
+pub(crate) const MAX_WORDS: usize = 256 * 1024;
 
-/// Список слов сцены для видеокарты: программы объектов, материалы, лампы и сетка
-/// отсева (`culling: false` — шейдер её не читает и перебирает все объекты).
-pub(crate) fn pack(
-    shapes: &[Shape3],
-    materials: &[Material3],
-    lamps: &[Lamp3],
-    culling: bool,
-) -> Vec<u32> {
-    let programs: Vec<Program> = shapes
-        .iter()
-        .filter_map(|s| match compile(s) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                tracing::warn!("форма 3D пропущена: {e}");
-                None
-            }
-        })
-        .collect();
-    let mut words = pack_scene(&programs, materials, lamps);
-    if words.len() > MAX_WORDS {
+/// Слов в заголовке раздела моделей: число вершин, 3 запасных, матрица «мир → экран»
+/// (16 чисел, столбцами; пишет [`set_view_proj`]).
+const MESH_HEADER_WORDS: usize = 20;
+/// Слов на вершину: место (3 числа) и номер материала.
+const VERTEX_WORDS: usize = 4;
+
+/// Сцена кадра для видеокарты.
+pub(crate) struct Packed {
+    pub words: Vec<u32>,
+    /// Вершин полигональных моделей (по 3 на треугольник; 0 — моделей нет).
+    pub vertices: u32,
+}
+
+/// Список слов сцены для видеокарты: программы объектов (и невидимых заменителей
+/// моделей, 7.6ж), материалы, лампы, сетка отсева (`culling: false` — шейдер её не
+/// читает и перебирает все объекты) и треугольники моделей (слово 7 заголовка — где они).
+pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -> Packed {
+    let build = |shapes: &[Shape3], shadow_only: bool| -> Vec<Program> {
+        shapes
+            .iter()
+            .filter_map(|s| match compile(s) {
+                Ok(mut p) => {
+                    p.shadow_only = shadow_only;
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::warn!("форма 3D пропущена: {e}");
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut programs = build(&frame.shapes, false);
+    programs.extend(build(&frame.proxies, true));
+    let mut words = pack_scene(&programs, materials, &frame.lamps);
+    let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
+    let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;
+    if words.len() + mesh_words > MAX_WORDS {
         tracing::warn!(
             "сцена 3D не помещается в буфер ({} слов из {MAX_WORDS}), рисую пустую",
-            words.len()
+            words.len() + mesh_words
         );
-        words = pack_scene(&[], materials, lamps);
+        let words = pack_scene(&[], materials, &frame.lamps);
+        return Packed { words, vertices: 0 };
     }
     if !culling {
         words[6] = 0;
     }
-    words
+    words[7] = words.len() as u32;
+    words.extend([(triangles * 3) as u32, 0, 0, 0]);
+    words.extend([0u32; 16]);
+    for m in &frame.meshes {
+        for t in &m.triangles {
+            for v in t {
+                words.extend(v.to_array().map(f32::to_bits));
+                words.push(m.material);
+            }
+        }
+    }
+    Packed {
+        words,
+        vertices: (triangles * 3) as u32,
+    }
+}
+
+/// Матрица камеры «мир → экран» в раздел моделей (вершинный шейдер «полигонов 3D»).
+pub(crate) fn set_view_proj(words: &mut [u32], view_proj: glam::Mat4) {
+    let at = words[7] as usize + 4;
+    if let Some(slot) = words.get_mut(at..at + 16) {
+        for (w, v) in slot.iter_mut().zip(view_proj.to_cols_array()) {
+            *w = v.to_bits();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -48,7 +92,7 @@ mod tests {
     fn example_scene_compiles_and_fits() {
         let scene = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE).unwrap();
         let frame = scene.frame(1.0);
-        let words = pack(&frame.shapes, &scene.materials, &frame.lamps, true);
+        let words = pack(&frame, &scene.materials, true).words;
         assert_eq!(words[0] as usize, frame.shapes.len(), "все формы собрались");
         assert!(words.len() < MAX_WORDS);
         // Материалы всех форм есть в списке.
@@ -66,8 +110,42 @@ mod tests {
         let scene = reyvec_sdf::SpaceScene::parse(text).unwrap();
         assert_eq!(scene.object_count(), 200);
         let frame = scene.frame(1.0);
-        let words = pack(&frame.shapes, &scene.materials, &frame.lamps, true);
+        let words = pack(&frame, &scene.materials, true).words;
         assert_eq!(words[0] as usize, frame.shapes.len());
         assert!(words.len() < MAX_WORDS);
+    }
+
+    #[test]
+    fn mixed_scene_packs_meshes_and_proxies() {
+        // Опыт совмещения 7.6ж: модели и их невидимые заменители для теней.
+        let text = include_str!("../../../scenes/3d/mixed.ron");
+        let scene = reyvec_sdf::SpaceScene::parse(text).unwrap();
+        assert_eq!(scene.mesh_count(), 7);
+        let frame = scene.frame(1.0);
+        assert_eq!(frame.proxies.len(), 7);
+        let packed = pack(&frame, &scene.materials, true);
+        let w = &packed.words;
+        let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
+        assert_eq!(packed.vertices as usize, triangles * 3);
+        let at = w[7] as usize;
+        assert_eq!(w[at] as usize, triangles * 3);
+        assert_eq!(
+            w.len(),
+            at + MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS
+        );
+        // Заменители — последние объекты и помечены флагом.
+        let (count, objects) = (w[0] as usize, w[1] as usize);
+        let flag = |i: usize| w[objects + i * 8 + 2];
+        assert_eq!(flag(0), 0);
+        assert_eq!(
+            flag(count - 1),
+            reyvec_sdf::shape3d::OBJECT_SHADOW_ONLY,
+            "заменитель"
+        );
+        // Матрица камеры встаёт в заголовок раздела моделей.
+        let mut words = packed.words.clone();
+        set_view_proj(&mut words, glam::Mat4::IDENTITY);
+        assert_eq!(f32::from_bits(words[at + 4]), 1.0);
+        assert_eq!(f32::from_bits(words[at + 9]), 1.0);
     }
 }

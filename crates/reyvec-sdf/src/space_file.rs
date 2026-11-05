@@ -10,7 +10,8 @@
 use glam::Vec3;
 use serde::Deserialize;
 
-use crate::shape3d::{Bob, Circle, Lamp3, Material3, Shape3, compile, motion_offset};
+use crate::mesh3d::{MAX_TRIANGLES, Mesh3};
+use crate::shape3d::{Bob, Circle, Lamp3, Material3, Shape3, compile, motion_offset, rotation};
 
 /// Встроенный пример: тот же текст, что `scenes/3d/space.ron` в папке проекта.
 pub const EXAMPLE: &str = include_str!("../../../scenes/3d/space.ron");
@@ -109,6 +110,12 @@ pub struct SpaceFile {
     pub lamps: Vec<LampEntry>,
     #[serde(default)]
     pub objects: Vec<ObjectEntry>,
+    /// Полигональные модели (7.6ж).
+    #[serde(default)]
+    pub meshes: Vec<MeshEntry>,
+    /// Откуда камера смотрит при открытии файла и по R (без него — вид по умолчанию).
+    #[serde(default)]
+    pub camera: Option<CameraEntry>,
     /// Сетка отсева (7.6е): `false` выключает её для сравнения замеров.
     #[serde(default = "yes")]
     pub culling: bool,
@@ -116,6 +123,42 @@ pub struct SpaceFile {
 
 fn yes() -> bool {
     true
+}
+
+/// Камера сцены в файле: где глаз и куда смотрит.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+pub struct CameraEntry {
+    pub eye: [f32; 3],
+    pub look_at: [f32; 3],
+}
+
+/// Полигональная модель (7.6ж): многогранник, материал, место, поворот, движение.
+/// `shadow: false` — без тени (заменителя SDF нет).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct MeshEntry {
+    #[serde(default)]
+    pub name: String,
+    pub material: String,
+    #[serde(default)]
+    pub at: [f32; 3],
+    #[serde(default)]
+    pub turn: [f32; 3],
+    pub mesh: Mesh3,
+    #[serde(default)]
+    pub bob: Bob,
+    #[serde(default)]
+    pub circle: Circle,
+    #[serde(default)]
+    pub spin: [f32; 3],
+    #[serde(default = "yes")]
+    pub shadow: bool,
+}
+
+/// Модель в один момент: треугольники в мире и номер материала.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeshFrame {
+    pub triangles: Vec<[Vec3; 3]>,
+    pub material: u32,
 }
 
 /// Сцена, готовая к кадрам: материалы по номерам, лампы и предметы с номерами материалов.
@@ -129,6 +172,9 @@ pub struct SpaceScene {
     bulbs: Vec<Option<u32>>,
     objects: Vec<ObjectEntry>,
     object_materials: Vec<u32>,
+    meshes: Vec<(MeshEntry, u32, Vec<[Vec3; 3]>, Shape3)>,
+    /// Камера из файла (если записана).
+    pub camera: Option<CameraEntry>,
     /// Сетка отсева выключена в файле (`culling: false`).
     pub culling_off: bool,
 }
@@ -138,6 +184,9 @@ pub struct SpaceScene {
 pub struct SpaceFrame {
     pub shapes: Vec<Shape3>,
     pub lamps: Vec<Lamp3>,
+    /// Полигональные модели и их заменители для теней (7.6ж).
+    pub meshes: Vec<MeshFrame>,
+    pub proxies: Vec<Shape3>,
 }
 
 /// Свечение шарика лампы: ярче 1, чтобы вокруг был ореол.
@@ -186,6 +235,30 @@ impl SpaceScene {
             object_materials.push(index as u32);
             compile(&o.shape).map_err(|e| format!("{label}: {e}"))?;
         }
+        let mut meshes = Vec::new();
+        for (i, m) in file.meshes.iter().enumerate() {
+            let label = if m.name.is_empty() {
+                format!("модель {}", i + 1)
+            } else {
+                format!("модель «{}»", m.name)
+            };
+            let Some(index) = file.materials.iter().position(|e| e.name == m.material) else {
+                return Err(format!(
+                    "{label}: нет материала «{}» (есть: {})",
+                    m.material,
+                    names(&file.materials)
+                ));
+            };
+            let triangles = m.mesh.triangles();
+            if triangles.len() > MAX_TRIANGLES {
+                return Err(format!(
+                    "{label}: {} граней, больше {MAX_TRIANGLES} не бывает",
+                    triangles.len()
+                ));
+            }
+            let proxy = m.mesh.shadow_proxy();
+            meshes.push((m.clone(), index as u32, triangles, proxy));
+        }
         let mut lamp_colors = Vec::new();
         let mut bulbs = Vec::new();
         for (i, l) in file.lamps.iter().enumerate() {
@@ -210,6 +283,8 @@ impl SpaceScene {
             bulbs,
             objects: file.objects,
             object_materials,
+            meshes,
+            camera: file.camera,
             culling_off: !file.culling,
         })
     }
@@ -217,6 +292,18 @@ impl SpaceScene {
     /// Сколько предметов в сцене (без шариков ламп).
     pub fn object_count(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Камера при открытии сцены и по R: из файла или вид по умолчанию.
+    pub fn home_camera(&self) -> crate::Camera3D {
+        self.camera.map_or_else(crate::Camera3D::default, |c| {
+            crate::Camera3D::looking_at(Vec3::from(c.eye), Vec3::from(c.look_at))
+        })
+    }
+
+    /// Сколько полигональных моделей в сцене.
+    pub fn mesh_count(&self) -> usize {
+        self.meshes.len()
     }
 
     /// Предметы и лампы в момент `time` (секунды).
@@ -247,7 +334,26 @@ impl SpaceScene {
                 shapes.push(Shape3::Sphere { radius: l.bulb }.at(at).paint(*material));
             }
         }
-        SpaceFrame { shapes, lamps }
+        let mut meshes = Vec::new();
+        let mut proxies = Vec::new();
+        for (m, material, triangles, proxy) in &self.meshes {
+            let at = Vec3::from(m.at) + motion_offset(&m.bob, &m.circle, time);
+            let turn = [0, 1, 2].map(|i| m.turn[i] + m.spin[i] * time);
+            let r = rotation(turn);
+            meshes.push(MeshFrame {
+                triangles: triangles.iter().map(|t| t.map(|v| at + r * v)).collect(),
+                material: *material,
+            });
+            if m.shadow {
+                proxies.push(proxy.clone().placed(at.to_array(), turn));
+            }
+        }
+        SpaceFrame {
+            shapes,
+            lamps,
+            meshes,
+            proxies,
+        }
     }
 }
 
