@@ -21,6 +21,7 @@ mod geom;
 mod layout;
 mod outline;
 mod overlay;
+mod parts;
 mod ron_edit;
 mod theme;
 mod ui;
@@ -470,7 +471,10 @@ impl Editor {
             | Action::Paste { .. }
             | Action::Duplicate(_)
             | Action::Delete(_)
-            | Action::Move { .. } => self.apply_doc(action),
+            | Action::Move { .. }
+            | Action::DropAsset { .. }
+            | Action::AddPart { .. }
+            | Action::RemovePart { .. } => self.apply_doc(action),
             Action::Eject => {
                 if self.play != PlayState::Edit {
                     self.ejected = !self.ejected;
@@ -566,6 +570,15 @@ impl Editor {
                 }
                 true
             }
+            Action::DropAsset { file, at, after } => {
+                let dir = doc.dir().unwrap_or(std::path::Path::new(".")).to_owned();
+                let item = parts::picture_item(&dir, &file, at);
+                let (parent, index) = (Vec::new(), after.map_or(usize::MAX, |p| p[0] + 1));
+                if !structural(doc.paste(&item, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
             Action::Duplicate(path) => {
                 if !structural(doc.duplicate(&path), &mut select) {
                     return;
@@ -585,6 +598,21 @@ impl Editor {
                 index,
             } => {
                 if !structural(doc.move_node(&from, &parent, index), &mut select) {
+                    return;
+                }
+                true
+            }
+            Action::AddPart { path, field, item } => {
+                let r = doc.change(|t| ron_edit::insert_item(t, &path, field, usize::MAX, &item));
+                if let Err(e) = r {
+                    tracing::warn!("Часть не добавилась: {e}");
+                    return;
+                }
+                true
+            }
+            Action::RemovePart { path, field, index } => {
+                if let Err(e) = doc.change(|t| ron_edit::remove_item(t, &path, field, index)) {
+                    tracing::warn!("Часть не убралась: {e}");
                     return;
                 }
                 true

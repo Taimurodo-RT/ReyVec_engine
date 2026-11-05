@@ -1,8 +1,8 @@
 //! Вкладка «Ассеты»: дерево папок проекта слева, строка «крошек» (путь до открытой папки)
-//! и плитки файлов справа. Только просмотр; импорт и предпросмотр придут следующими шагами.
+//! и плитки файлов справа. Рисунок SVG можно перетащить в сцену — появится предмет с ним.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use egui::{Align2, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
@@ -20,12 +20,15 @@ pub(crate) struct Dir {
     pub name: String,
     pub dirs: Vec<Dir>,
     pub files: Vec<String>,
+    /// Где папка на диске.
+    pub path: PathBuf,
 }
 
 impl Dir {
     fn read(path: &Path, name: String, depth: usize) -> Self {
         let mut dir = Dir {
             name,
+            path: path.to_owned(),
             ..Default::default()
         };
         let Ok(rd) = std::fs::read_dir(path) else {
@@ -86,6 +89,7 @@ impl Assets {
                 .map(|r| Dir::read(&p.join(r), (*r).into(), 1))
                 .collect(),
             files: Vec::new(),
+            path: p.to_owned(),
         });
         // Сразу открыты сцены: с них начинается работа.
         Self {
@@ -149,7 +153,10 @@ impl Assets {
                                 }
                             }
                             for f in &dir.files {
-                                tile(ui, f, false);
+                                let r = tile(ui, f, false);
+                                if droppable(f) {
+                                    r.dnd_set_drag_payload(AssetFile(dir.path.join(f)));
+                                }
                             }
                         });
                     });
@@ -255,9 +262,23 @@ fn crumbs(ui: &mut Ui, root: &Dir, current: &[usize], go: &mut Option<Vec<usize>
     });
 }
 
+/// Файл, который тащат из Ассетов в сцену.
+#[derive(Clone, Debug)]
+pub(crate) struct AssetFile(pub PathBuf);
+
+/// Такой файл можно бросить в сцену: рисунок SVG станет предметом.
+fn droppable(name: &str) -> bool {
+    name.to_lowercase().ends_with(".svg")
+}
+
 /// Плитка файла или папки.
 fn tile(ui: &mut Ui, name: &str, folder: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(96.0, 92.0), Sense::click());
+    let sense = if !folder && droppable(name) {
+        Sense::click_and_drag()
+    } else {
+        Sense::click()
+    };
+    let (rect, response) = ui.allocate_exact_size(vec2(96.0, 92.0), sense);
     let thumb = Rect::from_min_size(rect.min, vec2(rect.width(), 64.0));
     let fill = if response.hovered() { HOVER } else { CARD };
     ui.painter().rect(
@@ -294,6 +315,8 @@ fn tile(ui: &mut Ui, name: &str, folder: bool) -> egui::Response {
     );
     let hint = if folder {
         format!("{name}\nДвойной щелчок — открыть папку")
+    } else if droppable(name) {
+        format!("{name}\nПеретащите в сцену — появится предмет с этим рисунком")
     } else {
         name.to_owned()
     };
@@ -329,8 +352,10 @@ mod tests {
                     ..Default::default()
                 }],
                 files: vec![],
+                ..Default::default()
             }],
             files: vec![],
+            ..Default::default()
         };
         assert_eq!(root.crumbs(&[]), ["Проект"]);
         assert_eq!(root.crumbs(&[0, 0]), ["Проект", "assets", "svg"]);

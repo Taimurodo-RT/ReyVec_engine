@@ -12,15 +12,16 @@ use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Layout, Margin, Pos2,
     Rect, Response, RichText, Sense, Stroke, Ui, Vec2, pos2, vec2,
 };
-use reyvec_scene::{Background, NodeDesc, SceneFile};
+use reyvec_scene::{NodeDesc, SceneFile};
 use winit::window::ResizeDirection;
 
-use super::assets::Assets;
+use super::assets::{AssetFile, Assets};
 use super::doc::{Change, Edit};
 use super::geom;
 use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
 use super::outline::{self, Kind};
 use super::overlay::{self, Overlay, ViewMode};
+use super::parts;
 use super::theme::*;
 use super::viewport::{self, TOOLBAR_HEIGHT, Tool, View, Viewport};
 
@@ -112,6 +113,24 @@ pub(crate) enum Action {
     Step,
     /// Скорость игры (замедление).
     SetTimeScale(f64),
+    /// Файл из Ассетов бросили в сцену в точку `at`: новый предмет за `after`.
+    DropAsset {
+        file: std::path::PathBuf,
+        at: [f64; 2],
+        after: Option<Vec<usize>>,
+    },
+    /// Добавить часть `item` (текст для файла) в конец списка `field` предмета.
+    AddPart {
+        path: Vec<usize>,
+        field: &'static str,
+        item: String,
+    },
+    /// Убрать часть номер `index` из списка `field`.
+    RemovePart {
+        path: Vec<usize>,
+        field: &'static str,
+        index: usize,
+    },
 }
 
 /// Что интерфейсу показать в этом кадре.
@@ -856,6 +875,9 @@ impl EditorUi {
                     .color(MUTED),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if editing {
+                    self.catalog_menu(ui, info);
+                }
                 ui.label(
                     RichText::new(format!("предметов: {}", outline::count(file)))
                         .small()
@@ -1081,6 +1103,31 @@ impl EditorUi {
         }
     }
 
+    /// Кнопка «+»: новый предмет из каталога там, куда смотрит камера, за выбранным.
+    fn catalog_menu(&mut self, ui: &mut Ui, info: &Info) {
+        let at = match (info.view, self.viewport) {
+            (Some(v), Some(r)) => v.to_scene(r.center()),
+            (Some(v), None) => v.center,
+            _ => [0.0, 0.0],
+        };
+        let at = at.map(|c| (c * 1000.0).round() / 1000.0);
+        ui.menu_button(RichText::new("+").strong().color(ACCENT), |ui| {
+            ui.set_min_width(260.0);
+            ui.label(RichText::new("Новый предмет").small().color(MUTED));
+            for (name, hint, template) in parts::CATALOG {
+                if ui.button(*name).on_hover_text(*hint).clicked() {
+                    self.actions.push(Action::Paste {
+                        after: top_of(self.selected.as_deref()),
+                        text: Some(parts::catalog_item(template, at)),
+                    });
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Добавить предмет");
+    }
+
     /// Пункты меню предмета (правая кнопка в иерархии или в сцене).
     fn node_menu(&mut self, ui: &mut Ui, path: &[usize], file: &SceneFile, info: &Info) {
         ui.set_min_width(230.0);
@@ -1182,7 +1229,7 @@ impl EditorUi {
                 &mut self.name_edit,
                 &mut self.actions,
             ),
-            None => scene_inspector(ui, file, info.scene_name),
+            None => parts::scene_settings(ui, file, info.scene_name, editing, &mut self.actions),
         }
         if !editing {
             ui.add_space(GAP_L);
@@ -1288,6 +1335,26 @@ impl EditorUi {
         );
         self.viewport_hovered = response.hovered() || response.dragged();
         let painter = ui.painter_at(rect);
+        // Рисунок тащат из Ассетов: рамка вокруг сцены, отпустили — новый предмет.
+        if editing && response.dnd_hover_payload::<AssetFile>().is_some() {
+            painter.rect_stroke(
+                rect.shrink(1.0),
+                0,
+                Stroke::new(LINE_FOCUS, ACCENT),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if editing
+            && let Some(f) = response.dnd_release_payload::<AssetFile>()
+            && let (Some(view), Some(m)) = (info.view, response.hover_pos())
+        {
+            let at = view.to_scene(m).map(|c| (c * 1000.0).round() / 1000.0);
+            self.actions.push(Action::DropAsset {
+                file: f.0.clone(),
+                at,
+                after: top_of(self.selected.as_deref()),
+            });
+        }
         let mut busy = false;
         if let (Some(file), Some(view)) = (info.scene, info.view) {
             let all = geom::place_all(file);
@@ -1528,6 +1595,12 @@ fn covered(path: &[usize], set: &HashSet<Vec<usize>>) -> bool {
     (1..=path.len()).any(|k| set.contains(&path[..k]))
 }
 
+/// Верхний предмет над `path`: новые предметы встают за ним, на верхний уровень, где
+/// место `at` — это место в сцене (у вложенного оно было бы от родителя).
+fn top_of(path: Option<&[usize]>) -> Option<Vec<usize>> {
+    path.and_then(|p| p.first()).map(|&i| vec![i])
+}
+
 /// Куда бросить предмет относительно строки иерархии.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Drop {
@@ -1748,6 +1821,7 @@ fn node_inspector(
                 }
             });
     });
+    parts::parts_card(ui, path, node, editing, actions);
     let mut motion = Vec::new();
     if node.spin != 0.0 {
         motion.push(format!("вращение {:.0}°/с", node.spin));
@@ -1770,63 +1844,8 @@ fn node_inspector(
     }
 }
 
-fn scene_inspector(ui: &mut Ui, file: &SceneFile, name: &str) {
-    ui.label(
-        RichText::new("Свойства сцены")
-            .heading()
-            .color(Color32::WHITE),
-    );
-    ui.label(RichText::new(name).small().color(MUTED));
-    ui.add_space(4.0);
-    card(ui, "Сцена", |ui| {
-        egui::Grid::new("scene-props")
-            .num_columns(2)
-            .spacing(vec2(10.0, 6.0))
-            .show(ui, |ui| {
-                prop(ui, "Фон");
-                ui.label(match file.background {
-                    Background::Plain => "светлый пол",
-                    Background::Lab => "лаборатория",
-                });
-                ui.end_row();
-                prop(ui, "Общий свет");
-                ui.horizontal(|ui| {
-                    let [r, g, b, _] = file.ambient.0.to_srgb_array();
-                    let c = Color32::from_rgb(
-                        (r * 255.0).round() as u8,
-                        (g * 255.0).round() as u8,
-                        (b * 255.0).round() as u8,
-                    );
-                    let (sw, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
-                    ui.painter().rect(
-                        sw,
-                        4,
-                        c,
-                        Stroke::new(1.0, BORDER_STRONG),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.label(
-                        RichText::new(format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()))
-                            .monospace(),
-                    );
-                });
-                ui.end_row();
-                prop(ui, "Предметов");
-                ui.label(outline::count(file).to_string());
-                ui.end_row();
-                prop(ui, "Слоёв");
-                ui.label(file.layers.len().to_string());
-                ui.end_row();
-            });
-    });
-    ui.label(
-        RichText::new("Выберите предмет в иерархии слева, чтобы увидеть его свойства.")
-            .color(TEXT_DIM),
-    );
-}
-
 /// Карточка с заголовком; щелчок по заголовку сворачивает её (запоминается по названию).
-fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
+pub(crate) fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     Frame::NONE
         .fill(CARD)
         .stroke(Stroke::new(LINE, BORDER_STRONG))
@@ -1883,7 +1902,7 @@ fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
     ui.add_space(GAP_M);
 }
 
-fn prop(ui: &mut Ui, name: &str) {
+pub(crate) fn prop(ui: &mut Ui, name: &str) {
     ui.label(RichText::new(name).color(TEXT_DIM));
 }
 
@@ -1891,7 +1910,7 @@ fn prop(ui: &mut Ui, name: &str) {
 type Row = (&'static str, f64, f64, &'static str, fn(f64) -> Change);
 
 /// Что сделали с числовым полем в этом кадре.
-enum FieldEdit {
+pub(crate) enum FieldEdit {
     /// Новое значение; `commit: false` — его ещё тянут мышью.
     Value(f64, bool),
     /// Перетаскивание кончилось на прошлом значении.
@@ -1900,7 +1919,7 @@ enum FieldEdit {
 
 impl FieldEdit {
     /// Действие для цикла окна; `make` строит правку с готовым значением.
-    fn action(self, make: impl FnOnce(f64) -> Action) -> Action {
+    pub(crate) fn action(self, make: impl FnOnce(f64) -> Action) -> Action {
         match self {
             FieldEdit::Value(v, commit) => match make(v) {
                 Action::Edit { edit, .. } => Action::Edit { edit, commit },
@@ -1912,7 +1931,7 @@ impl FieldEdit {
 }
 
 /// Число, которое тянут мышью или вводят с клавиатуры; `mark` — цветная полоска слева.
-fn num_field(
+pub(crate) fn num_field(
     ui: &mut Ui,
     v: f64,
     speed: f64,
@@ -2646,6 +2665,24 @@ mod tests {
     }
 
     #[test]
+    fn parts_card_for_every_node() {
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let file = SceneFile::parse(reyvec_scene::EXAMPLE).unwrap();
+        let info = info(Some(&file), PlayState::Edit);
+        // Каждый предмет примера: карточка «Части» рисуется, сама ничего не правит.
+        for i in 0..file.nodes.len() {
+            ui.selected = Some(vec![i]);
+            frame(&ctx, &mut ui, &info, Vec::new());
+        }
+        ui.selected = None;
+        frame(&ctx, &mut ui, &info, Vec::new());
+        assert!(ui.take_actions().is_empty());
+        assert_eq!(top_of(Some(&[2, 0, 1])), Some(vec![2]));
+        assert_eq!(top_of(None), None);
+    }
+
+    #[test]
     fn clipboard_keys_and_hierarchy() {
         use egui::{Key, Modifiers};
         let ctx = new_ctx();
@@ -2774,6 +2811,16 @@ mod tests {
             ui.ov.show.lights = play == PlayState::Playing;
             ui.ov.show.bones = play == PlayState::Playing;
             ui.workspace = ws;
+            // С меню — другой выбранный: ящик, у него в инспекторе видны части.
+            let pick = if menu {
+                file.nodes
+                    .iter()
+                    .position(|n| n.body.is_some())
+                    .unwrap_or(hero)
+            } else {
+                hero
+            };
+            ui.selected = Some(vec![pick]);
             if ws == 5 {
                 // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.
                 ui.frames = (0..FRAME_HISTORY)
