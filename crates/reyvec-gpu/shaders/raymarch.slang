@@ -10,6 +10,10 @@
 
 #include "include/space.slang"
 
+// Длины, с которых начинать лучи (7.8, raymarch_cone.slang): точка на квадрат 8×8.
+// Номер картинки приходит в поле `gbuffer` констант.
+[[vk::binding(0, 0)]] Texture2D textures[];
+
 float3 normal_at(float3 p)
 {
     // Наклон поля по четырём точкам тетраэдра: дешевле шести и без перекоса. Точки
@@ -31,7 +35,9 @@ float4 fs_main(VertexOut input) : SV_Target
     Ray ray = screen_ray(input.screen);
 
     // Шагаем по лучу: каждый шаг — на расстояние до ближайшей формы, ближе неё ничего нет.
-    float t = 0.0;
+    // Начало — там, куда дошёл конус квадрата 8×8 (до этого места пусто для всех его
+    // лучей).
+    float t = min(textures[pc.gbuffer].Load(int3(int2(input.position.xy) / 8, 0)).x, ray.limit);
     float2 hit = float2(-1.0, 0.0);
     for (int i = 0; i < 160; i++)
     {
