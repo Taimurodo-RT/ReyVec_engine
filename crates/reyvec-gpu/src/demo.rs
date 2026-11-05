@@ -883,6 +883,11 @@ impl Demo {
         self.space.object_count()
     }
 
+    /// Включена ли сетка отсева сцены «3D» (в файле `culling: false` выключает).
+    pub fn space_culling(&self) -> bool {
+        !self.space.culling_off
+    }
+
     /// Другой файл сцены (N в песочнице, 6.13): как [`Self::set_scene_file`], но персонаж
     /// встаёт на место из нового файла, а не остаётся там, где был.
     pub fn switch_scene_file(&mut self, text: &str, dir: Option<&std::path::Path>) {
@@ -1925,7 +1930,12 @@ impl Demo {
         let space_buffer = self.space_buffers[slot];
         if scene == DemoScene::Space {
             let frame = self.space.frame(time);
-            let words = crate::space::pack(&frame.shapes, &self.space.materials, &frame.lamps);
+            let words = crate::space::pack(
+                &frame.shapes,
+                &self.space.materials,
+                &frame.lamps,
+                !self.space.culling_off,
+            );
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
         }

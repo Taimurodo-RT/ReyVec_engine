@@ -639,6 +639,11 @@ impl WindowRenderer {
         self.demo.as_ref().map_or(0, Demo::space_objects)
     }
 
+    /// Включена ли сетка отсева сцены «3D».
+    pub fn space_culling(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::space_culling)
+    }
+
     /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
     pub fn shader_error(&self) -> Option<String> {
         self.shaders.error()

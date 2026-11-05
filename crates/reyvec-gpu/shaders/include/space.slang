@@ -84,15 +84,56 @@ static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
 // настоящего, но шагать по лучу на него безопасно). Программа формы выполняется только
 // вблизи объекта. `near` выбирает вызывающий: шагание берёт больше своей точности
 // попадания, чтобы попадание всегда считалось по настоящей форме; нормаль и углы —
-// бесконечность (только точный пропуск). Ответ по шару помечен материалом -1.
+// бесконечность (только точный пропуск). Ответ-оценка помечен материалом -1.
+//
+// Сетка отсева (7.6е, crates/reyvec-sdf/src/grid3d.rs): точка берёт свою клетку и
+// перебирает только её список (объекты ближе размера клетки) и бесконечные формы.
+// Объекты не из списка дальше размера клетки — это начальная оценка. Снаружи сетки
+// оценка — расстояние до коробки, где лежат все шары-границы. Без сетки (слово 6
+// заголовка 0) перебираются все объекты. Список один проход: тело цикла встраивается
+// в шейдер один раз.
 float2 scene_near(float3 p, float near)
 {
     // Числа из буфера ограничены сверху: испорченный буфер не должен вешать видеокарту.
     uint count = min(pc.scene[0], MAX_OBJECTS);
     uint objects = pc.scene[1];
+    uint g = pc.scene[6];
     float2 best = float2(1e9, 0.0);
-    for (uint o = 0; o < count; o++)
+    // Список — два куска подряд: бесконечные формы, потом объекты клетки. Без сетки —
+    // все объекты по порядку (номер — сам индекс).
+    uint first = 0;
+    uint first_count = count;
+    uint second = 0;
+    uint second_count = 0;
+    bool direct = g == 0;
+    if (!direct)
     {
+        first = pc.scene[g + 16];
+        first_count = min(pc.scene[g + 17], MAX_OBJECTS);
+        float3 origin = float3(asfloat(pc.scene[g]), asfloat(pc.scene[g + 1]), asfloat(pc.scene[g + 2]));
+        float cell = asfloat(pc.scene[g + 3]);
+        int3 dims = int3(pc.scene[g + 4], pc.scene[g + 5], pc.scene[g + 6]);
+        int3 q = int3(floor((p - origin) / cell));
+        if (all(q >= 0) && all(q < dims))
+        {
+            uint c = pc.scene[g + 14] + uint((q.z * dims.y + q.y) * dims.x + q.x) * 2;
+            second = pc.scene[c];
+            second_count = min(pc.scene[c + 1], MAX_OBJECTS);
+            best = float2(asfloat(pc.scene[g + 7]), -1.0);
+        }
+        else
+        {
+            float3 lo = float3(asfloat(pc.scene[g + 8]), asfloat(pc.scene[g + 9]), asfloat(pc.scene[g + 10]));
+            float3 hi = float3(asfloat(pc.scene[g + 11]), asfloat(pc.scene[g + 12]), asfloat(pc.scene[g + 13]));
+            best = float2(length(p - clamp(p, lo, hi)), -1.0);
+        }
+    }
+    uint total = first_count + second_count;
+    for (uint k = 0; k < total; k++)
+    {
+        uint o = direct ? k : (k < first_count ? pc.scene[first + k] : pc.scene[second + k - first_count]);
+        if (o >= count)
+            continue;
         uint w = objects + o * OBJECT_WORDS;
         float radius = asfloat(pc.scene[w + 7]);
         if (radius >= 0.0)

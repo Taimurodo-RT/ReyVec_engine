@@ -654,13 +654,14 @@ const HEADER_WORDS: usize = 8;
 /// списком слов. Раскладка (читает `include/space.slang`):
 ///
 /// - заголовок, 8 слов: число объектов, где начинаются объекты, где материалы, сколько
-///   их, где лампы, сколько их, 2 запасных;
+///   их, где лампы, сколько их, где сетка отсева (0 — сетки нет), 1 запасное;
 /// - объекты по 8 слов ([`OBJECT_WORDS`]): начало программы, её длина в словах,
 ///   2 запасных, шар-граница (середина и радиус; радиус -1 — граница не нужна, форма
 ///   бесконечна);
 /// - материалы по 8 слов: цвет (3 числа), флаги ([`MATERIAL_GRID`]), свечение, 3 запасных;
 /// - лампы по 8 слов: место (3 числа), дальность, цвет (3 числа), яркость;
-/// - программы подряд.
+/// - программы подряд;
+/// - сетка отсева ([`crate::grid3d::Grid::write`]).
 pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
     let objects_at = HEADER_WORDS;
     let materials_at = objects_at + objects.len() * OBJECT_WORDS;
@@ -696,6 +697,12 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
     }
     for p in objects {
         out.extend(&p.words);
+    }
+    let grid = crate::grid3d::Grid::build(objects);
+    if !grid.cells.is_empty() {
+        out[6] = out.len() as u32;
+        let at = out.len();
+        grid.write(at, &mut out);
     }
     out
 }
@@ -917,6 +924,7 @@ mod tests {
         assert_eq!(f32::from_bits(w[32 + 3]), 6.0, "дальность лампы");
         assert_eq!(f32::from_bits(w[32 + 7]), 4.0, "яркость лампы");
         assert_eq!(w[w[8] as usize..][..a.words.len()], a.words[..]);
+        assert_eq!(w[6] as usize, start_b + len_b, "сетка сразу за программами");
     }
 
     /// Граница честная: снаружи шара расстояние до формы не меньше расстояния до шара.

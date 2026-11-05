@@ -8,8 +8,14 @@ use reyvec_sdf::shape3d::{Lamp3, Material3, Program, Shape3, compile, pack_scene
 /// Сколько слов помещается в буфер сцены кадра (256 КБ).
 pub(crate) const MAX_WORDS: usize = 64 * 1024;
 
-/// Список слов сцены для видеокарты: программы объектов, материалы и лампы.
-pub(crate) fn pack(shapes: &[Shape3], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
+/// Список слов сцены для видеокарты: программы объектов, материалы, лампы и сетка
+/// отсева (`culling: false` — шейдер её не читает и перебирает все объекты).
+pub(crate) fn pack(
+    shapes: &[Shape3],
+    materials: &[Material3],
+    lamps: &[Lamp3],
+    culling: bool,
+) -> Vec<u32> {
     let programs: Vec<Program> = shapes
         .iter()
         .filter_map(|s| match compile(s) {
@@ -28,6 +34,9 @@ pub(crate) fn pack(shapes: &[Shape3], materials: &[Material3], lamps: &[Lamp3]) 
         );
         words = pack_scene(&[], materials, lamps);
     }
+    if !culling {
+        words[6] = 0;
+    }
     words
 }
 
@@ -39,7 +48,7 @@ mod tests {
     fn example_scene_compiles_and_fits() {
         let scene = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE).unwrap();
         let frame = scene.frame(1.0);
-        let words = pack(&frame.shapes, &scene.materials, &frame.lamps);
+        let words = pack(&frame.shapes, &scene.materials, &frame.lamps, true);
         assert_eq!(words[0] as usize, frame.shapes.len(), "все формы собрались");
         assert!(words.len() < MAX_WORDS);
         // Материалы всех форм есть в списке.
@@ -48,5 +57,17 @@ mod tests {
             let (_, m) = program.distance(glam::Vec3::ZERO);
             assert!((m as usize) < scene.materials.len());
         }
+    }
+
+    #[test]
+    fn stress_scene_compiles_and_fits() {
+        // Сцена-нагрузка 7.6: 200 предметов, помещается в буфер.
+        let text = include_str!("../../../scenes/3d/stress.ron");
+        let scene = reyvec_sdf::SpaceScene::parse(text).unwrap();
+        assert_eq!(scene.object_count(), 200);
+        let frame = scene.frame(1.0);
+        let words = pack(&frame.shapes, &scene.materials, &frame.lamps, true);
+        assert_eq!(words[0] as usize, frame.shapes.len());
+        assert!(words.len() < MAX_WORDS);
     }
 }
