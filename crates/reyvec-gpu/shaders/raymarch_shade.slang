@@ -24,6 +24,42 @@ float grid(float2 p, float step, float width, float2 fw)
 
 static const uint MATERIAL_GRID = 1;
 
+// Тени для пикселя `px` из половинного разрешения (7.6б). Точка теней h посчитана для
+// пикселя кадра 2h, поэтому пиксель кадра лежит между четырьмя ближайшими точками.
+// Каждая берётся с весом по расстоянию (как при обычном растяжении) и по сходству с
+// пикселем: та же глубина и та же сторона. Так тень не перетекает с переднего
+// предмета на пол за ним.
+float4 upsampled_shadows(int2 px, float t, float3 n)
+{
+    uint gw, gh, sw, sh;
+    textures[pc.gbuffer].GetDimensions(gw, gh);
+    textures[pc.shadows].GetDimensions(sw, sh);
+    int2 base = px >> 1;
+    float2 f = float2(px & 1) * 0.5;
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    float total = 0.0;
+    float4 nearest = textures[pc.shadows].Load(int3(min(base, int2(sw, sh) - 1), 0));
+    for (uint k = 0; k < 4; k++)
+    {
+        int2 o = int2(k & 1, k >> 1);
+        int2 hp = min(base + o, int2(sw, sh) - 1);
+        float bilinear = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+        if (bilinear <= 0.0)
+            continue;
+        float4 g = textures[pc.gbuffer].Load(int3(min(hp * 2, int2(gw, gh) - 1), 0));
+        if (g.x < 0.0)
+            continue;
+        float depth = saturate(1.0 - abs(g.x - t) / (0.02 * t + 0.05));
+        float facing = saturate(dot(oct_decode(g.zw), n));
+        facing *= facing;
+        facing *= facing;
+        float weight = bilinear * depth * facing;
+        sum += textures[pc.shadows].Load(int3(hp, 0)) * weight;
+        total += weight;
+    }
+    return total > 1e-4 ? sum / total : nearest;
+}
+
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
@@ -45,7 +81,7 @@ float4 fs_main(VertexOut input) : SV_Target
     bool grid_on = (pc.scene[m + 3] & MATERIAL_GRID) != 0;
     float glow = asfloat(pc.scene[m + 4]);
     float3 n = oct_decode(g.zw);
-    float4 shadows = textures[pc.shadows].Load(int3(int2(input.position.xy), 0));
+    float4 shadows = upsampled_shadows(int2(input.position.xy), t, n);
     if (grid_on)
     {
         // Сколько метров пола в пикселе: соседний луч пересекается с той же плоскостью.
