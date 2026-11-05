@@ -61,24 +61,32 @@ float4 fs_main(VertexOut input) : SV_Target
     // Чуть над поверхностью: иначе луч тени сразу «упирается» в саму точку.
     float3 p = ray.origin + ray.dir * s.t + s.normal * 0.004;
 
-    float4 result = float4(1.0, ambient_occlusion(p, s.normal), 1.0, 1.0);
-    if (dot(s.normal, SUN) > 0.0)
-        result.x = soft_shadow(p, SUN, 30.0, 12.0);
+    // Солнце и две первые лампы перебираются одним циклом: луч тени (с полем сцены
+    // внутри) встраивается в шейдер один раз. Иначе шейдер раздувается втрое, а
+    // программный lavapipe на таком падал при сборке.
+    float shadow[3] = { 1.0, 1.0, 1.0 };
     uint lamps = min(lamp_count(), SHADOW_LAMPS);
-    for (uint i = 0; i < lamps; i++)
+    for (uint k = 0; k <= lamps; k++)
     {
-        Lamp l = read_lamp(i);
-        float3 to = l.at - p;
-        float distance = length(to);
-        float shadow = 1.0;
-        // Только там, куда лампа светит. Луч останавливается, не дойдя до лампы на
-        // 15 см: лампочка-шарик вокруг лампы не должна закрывать свою же лампу.
-        if (distance < l.range && dot(s.normal, to) > 0.0)
-            shadow = soft_shadow(p, to / distance, distance - 0.15, 10.0);
-        if (i == 0)
-            result.z = shadow;
-        else
-            result.w = shadow;
+        float3 dir = SUN;
+        float far = 30.0;
+        float k_hard = 12.0;
+        bool lit = true;
+        if (k > 0)
+        {
+            Lamp l = read_lamp(k - 1);
+            float3 to = l.at - p;
+            float distance = length(to);
+            dir = to / max(distance, 1e-4);
+            // Луч останавливается, не дойдя до лампы на 15 см: лампочка-шарик вокруг
+            // лампы не должна закрывать свою же лампу.
+            far = distance - 0.15;
+            k_hard = 10.0;
+            lit = distance < l.range;
+        }
+        // Только там, куда свет падает: обратная сторона и так тёмная.
+        if (lit && dot(s.normal, dir) > 0.0 && far > 0.0)
+            shadow[k] = soft_shadow(p, dir, far, k_hard);
     }
-    return result;
+    return float4(shadow[0], ambient_occlusion(p, s.normal), shadow[1], shadow[2]);
 }
