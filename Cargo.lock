@@ -3290,6 +3290,7 @@ dependencies = [
  "ash",
  "ash-window",
  "egui",
+ "glam 0.30.10",
  "gpu-allocator",
  "notify",
  "raw-window-handle",
@@ -3354,6 +3355,9 @@ name = "reyvec-sdf"
 version = "0.1.0"
 dependencies = [
  "glam 0.30.10",
+ "ron",
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -10,6 +10,11 @@ publish.workspace = true
 
 [dependencies]
 glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ron.workspace = true
 
 [lints]
 workspace = true

@@ -339,6 +339,8 @@ pub(crate) struct FrameData {
     vector: Option<VectorData>,
     sprites_address: vk::DeviceAddress,
     sprite_count: u32,
+    /// Сцена «3D» (7.2): объекты, материалы и программы форм в буфере кадра.
+    space_address: vk::DeviceAddress,
     /// Источники света сцены «лампы и тени» в буфере кадра (адрес и сколько их).
     lights_address: vk::DeviceAddress,
     light_count: u32,
@@ -375,6 +377,8 @@ pub(crate) struct Demo {
     object: vk::Pipeline,
     object_mask: vk::Pipeline,
     object_buffers: Vec<BufferId>,
+    /// Сцена «3D» (7.2): список слов сцены на каждый кадр в работе.
+    space_buffers: Vec<BufferId>,
     blob_buffers: Vec<BufferId>,
     /// Свечение ярких мест (4.4): шаги вниз и вверх по цепочке уменьшенных картинок.
     bloom_down: vk::Pipeline,
@@ -544,6 +548,16 @@ impl Demo {
                 &format!("свет кадра {i}"),
             )?);
         }
+        let mut space_buffers = Vec::new();
+        for i in 0..frames_in_flight {
+            space_buffers.push(res.create_buffer(
+                ctx,
+                (crate::space::MAX_WORDS * 4) as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferMemory::CpuToGpu,
+                &format!("сцена 3D кадра {i}"),
+            )?);
+        }
         let mut object_buffers = Vec::new();
         let mut blob_buffers = Vec::new();
         for i in 0..frames_in_flight {
@@ -623,6 +637,7 @@ impl Demo {
             object: vk::Pipeline::null(),
             object_mask: vk::Pipeline::null(),
             object_buffers,
+            space_buffers,
             blob_buffers,
             bloom_down: vk::Pipeline::null(),
             bloom_up: vk::Pipeline::null(),
@@ -1829,6 +1844,13 @@ impl Demo {
         let (object_buffer, blob_buffer) = (self.object_buffers[slot], self.blob_buffers[slot]);
         res.write_buffer(object_buffer, 0, &object_bytes);
         res.write_buffer(blob_buffer, 0, &blob_bytes);
+        let space_buffer = self.space_buffers[slot];
+        if scene == DemoScene::Space {
+            let words =
+                crate::space::pack(&crate::space::demo_shapes(time), &crate::space::MATERIALS);
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+            res.write_buffer(space_buffer, 0, &bytes);
+        }
         FrameData {
             scene,
             msaa: self.msaa,
@@ -1836,6 +1858,7 @@ impl Demo {
             vector,
             sprites_address: res.buffer_address(buffer),
             sprite_count: count as u32,
+            space_address: res.buffer_address(space_buffer),
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
             objects_address: res.buffer_address(object_buffer),
@@ -2076,7 +2099,12 @@ impl Demo {
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
                 if frame.scene == DemoScene::Space {
-                    let push = space_push(&self.space_camera, frame.extent, frame.time);
+                    let push = space_push(
+                        &self.space_camera,
+                        frame.extent,
+                        frame.time,
+                        frame.space_address,
+                    );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.raymarch);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
@@ -2699,21 +2727,27 @@ fn sdf_push(
 }
 
 /// Константы для `raymarch.slang` (7.1) в раскладке его `Push`: столбцы обратной матрицы
-/// камеры, глаз, время, соотношение сторон, высота кадра и флаги.
-fn space_push(camera: &reyvec_sdf::Camera3D, extent: vk::Extent2D, time: f32) -> [u8; 96] {
+/// камеры, глаз, время, адрес сцены (7.2), соотношение сторон, высота кадра и флаги.
+fn space_push(
+    camera: &reyvec_sdf::Camera3D,
+    extent: vk::Extent2D,
+    time: f32,
+    scene: vk::DeviceAddress,
+) -> [u8; 104] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let inv = camera.inverse_view_proj(aspect).to_cols_array();
-    let mut values = [0f32; 24];
+    let mut values = [0f32; 20];
     values[..16].copy_from_slice(&inv);
     values[16..19].copy_from_slice(&camera.eye.to_array());
     values[19] = time;
-    values[20] = aspect;
-    values[21] = extent.height.max(1) as f32;
-    let mut push = [0u8; 96];
+    let mut push = [0u8; 104];
     for (i, v) in values.into_iter().enumerate() {
         push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
     }
-    // Флаги (values[22] как u32) пока 0.
+    push[80..88].copy_from_slice(&scene.to_ne_bytes());
+    push[88..92].copy_from_slice(&aspect.to_ne_bytes());
+    push[92..96].copy_from_slice(&(extent.height.max(1) as f32).to_ne_bytes());
+    // Флаги (96..100) пока 0.
     push
 }
 
