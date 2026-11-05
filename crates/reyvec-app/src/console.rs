@@ -22,8 +22,8 @@ const LINES: usize = 300;
 /// Сколько команд помнит история (стрелки вверх и вниз).
 const HISTORY: usize = 50;
 
-const GOLD: Color32 = Color32::from_rgb(255, 205, 70);
-const RED: Color32 = Color32::from_rgb(240, 90, 80);
+pub(crate) const GOLD: Color32 = Color32::from_rgb(255, 205, 70);
+pub(crate) const RED: Color32 = Color32::from_rgb(240, 90, 80);
 const GREY: Color32 = Color32::from_rgb(170, 170, 170);
 const GREEN: Color32 = Color32::from_rgb(110, 220, 120);
 const BLUE: Color32 = Color32::from_rgb(120, 180, 255);

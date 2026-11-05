@@ -15,6 +15,7 @@ use egui::{
 use reyvec_scene::{NodeDesc, SceneFile};
 use winit::window::ResizeDirection;
 
+use super::arrange;
 use super::assets::{AssetFile, Assets};
 use super::doc::{Change, Edit};
 use super::geom;
@@ -119,6 +120,12 @@ pub(crate) enum Action {
         at: [f64; 2],
         after: Option<Vec<usize>>,
     },
+    /// Новые места нескольких предметов (выравнивание) — один шаг истории.
+    MoveMany(Vec<(Vec<usize>, [f64; 2])>),
+    /// Вложить предметы одного уровня в новый предмет «группа» (Ctrl+G).
+    Group(Vec<Vec<usize>>),
+    /// Достать вложенные и убрать сам предмет (Ctrl+Shift+G).
+    Ungroup(Vec<usize>),
     /// Добавить часть `item` (текст для файла) в конец списка `field` предмета.
     AddPart {
         path: Vec<usize>,
@@ -206,6 +213,22 @@ pub(crate) struct EditorUi {
     ov: Overlay,
     /// Спросить, сохранить ли правки перед закрытием.
     asking_close: bool,
+    /// Ещё выбранные, кроме главного (Ctrl+щелчок в иерархии, Shift+щелчок в сцене).
+    more: Vec<Vec<usize>>,
+    /// Инспектор закреплён на этом предмете: выбор других его не меняет.
+    pinned: Option<Vec<usize>>,
+    /// Линейка: откуда и докуда (точки сцены).
+    ruler: Option<([f64; 2], [f64; 2])>,
+    /// Какие сообщения показывает консоль.
+    log_filter: LogFilter,
+}
+
+/// Фильтр консоли.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogFilter {
+    All,
+    Warnings,
+    Errors,
 }
 
 /// Элементы нижней строки, их можно выключить в меню «Вид». Порядок — как на экране.
@@ -251,6 +274,10 @@ impl EditorUi {
             drop_target: None,
             ov: Overlay::default(),
             asking_close: false,
+            more: Vec::new(),
+            pinned: None,
+            ruler: None,
+            log_filter: LogFilter::All,
         }
     }
 
@@ -287,10 +314,32 @@ impl EditorUi {
             }
         }
         self.selected = path;
+        self.more.clear();
+    }
+
+    /// Все выбранные: главный первым.
+    fn selection(&self) -> Vec<Vec<usize>> {
+        self.selected.iter().chain(&self.more).cloned().collect()
+    }
+
+    /// Добавить к выбору или убрать из него (Ctrl/Shift+щелчок).
+    fn toggle_select(&mut self, p: Vec<usize>) {
+        if self.selected.as_ref() == Some(&p) {
+            self.selected = self.more.pop();
+        } else if let Some(i) = self.more.iter().position(|x| *x == p) {
+            self.more.remove(i);
+        } else {
+            if let Some(s) = self.selected.take() {
+                self.more.push(s);
+            }
+            self.selected = Some(p);
+        }
     }
 
     /// Предметы добавили, убрали или переставили: старые номера больше не те.
     pub(crate) fn structure_changed(&mut self) {
+        self.more.clear();
+        self.pinned = None;
         self.locked.clear();
         self.open.clear();
         self.renaming = None;
@@ -487,15 +536,35 @@ impl EditorUi {
                 self.renaming = Some((path, n.name.clone()));
             }
         }
-        let (q, w, e, r, f) = ctx.input(|i| {
+        // Ctrl+Shift+G раньше Ctrl+G: иначе её съест более короткое сочетание.
+        let (ungroup, group) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::G),
+                i.consume_key(Modifiers::COMMAND, Key::G),
+            )
+        });
+        if ungroup && let Some(p) = self.selected.clone() {
+            self.actions.push(Action::Ungroup(p));
+        } else if group && !self.more.is_empty() {
+            self.actions.push(Action::Group(self.selection()));
+        }
+        let (q, w, e, r, t, f) = ctx.input(|i| {
             let k = |key| i.modifiers.is_none() && i.key_pressed(key);
-            (k(Key::Q), k(Key::W), k(Key::E), k(Key::R), k(Key::F))
+            (
+                k(Key::Q),
+                k(Key::W),
+                k(Key::E),
+                k(Key::R),
+                k(Key::T),
+                k(Key::F),
+            )
         });
         for (on, tool) in [
             (q, Tool::Select),
             (w, Tool::Move),
             (e, Tool::Rotate),
             (r, Tool::Scale),
+            (t, Tool::Measure),
         ] {
             if on {
                 self.vp.tool = tool;
@@ -816,6 +885,8 @@ impl EditorUi {
             match tab {
                 Tab::Assets => return self.assets.draw(ui),
                 Tab::Profiler => return profiler(ui, info, &self.frames),
+                // Фильтр и «Очистить» над прокруткой: всегда на виду.
+                Tab::Console => console_bar(ui, &mut self.log_filter, &mut self.log),
                 _ => {}
             }
             egui::ScrollArea::vertical()
@@ -825,7 +896,7 @@ impl EditorUi {
                 .show(ui, |ui| match tab {
                     Tab::Hierarchy => self.hierarchy(ui, info),
                     Tab::Inspector => self.inspector(ui, info),
-                    Tab::Console => console(ui, &self.log),
+                    Tab::Console => console(ui, &self.log, self.log_filter),
                     Tab::Assets | Tab::Profiler => {}
                     Tab::Soon { title, text } => soon(ui, title, text),
                 });
@@ -898,7 +969,8 @@ impl EditorUi {
         let pointer = ui.ctx().pointer_interact_pos();
         let mut drop: Option<(Rect, Drop)> = None;
         for row in &rows {
-            let selected = self.selected.as_ref() == Some(&row.path);
+            let selected =
+                self.selected.as_ref() == Some(&row.path) || self.more.contains(&row.path);
             let hidden = covered(&row.path, info.hidden);
             let sense = if editing {
                 Sense::click_and_drag()
@@ -1034,8 +1106,10 @@ impl EditorUi {
                     if !self.open.remove(&row.path) {
                         self.open.insert(row.path.clone());
                     }
+                } else if ui.input(|i| i.modifiers.command) {
+                    self.toggle_select(row.path.clone());
                 } else {
-                    self.selected = Some(row.path.clone());
+                    self.select(Some(row.path.clone()));
                 }
             }
             if response.double_clicked() && row.has_children && !self.open.remove(&row.path) {
@@ -1201,6 +1275,33 @@ impl EditorUi {
             ui.close();
         }
         ui.separator();
+        let many = !self.more.is_empty();
+        if ui
+            .add_enabled(
+                many,
+                egui::Button::new("Сгруппировать выбранные").shortcut_text("Ctrl+G"),
+            )
+            .on_disabled_hover_text(
+                "Выберите несколько: Ctrl+щелчок в иерархии или Shift+щелчок в сцене",
+            )
+            .clicked()
+        {
+            self.actions
+                .push(Action::Group(arrange::roots(&self.selection())));
+            ui.close();
+        }
+        let has_children = outline::node_at(file, path).is_some_and(|n| !n.children.is_empty());
+        if ui
+            .add_enabled(
+                has_children,
+                egui::Button::new("Разгруппировать").shortcut_text("Ctrl+Shift+G"),
+            )
+            .clicked()
+        {
+            self.actions.push(Action::Ungroup(p.clone()));
+            ui.close();
+        }
+        ui.separator();
         if item(ui, "Удалить", "Delete") {
             self.actions.push(Action::Delete(p));
             ui.close();
@@ -1216,10 +1317,50 @@ impl EditorUi {
             return;
         };
         let editing = info.play == PlayState::Edit;
-        let node = self
-            .selected
+        if self
+            .pinned
+            .as_ref()
+            .is_some_and(|p| outline::node_at(file, p).is_none())
+        {
+            self.pinned = None;
+        }
+        let shown = self.pinned.clone().or_else(|| self.selected.clone());
+        let node = shown
             .as_ref()
             .and_then(|p| outline::node_at(file, p).map(|n| (p, n)));
+        if let Some((path, _)) = node {
+            // Замок: инспектор остаётся на этом предмете, даже если выбрать другой.
+            ui.horizontal(|ui| {
+                let pinned = self.pinned.is_some();
+                let note = if pinned {
+                    "Инспектор закреплён"
+                } else if !self.more.is_empty() {
+                    "Выбрано несколько: здесь главный"
+                } else {
+                    ""
+                };
+                ui.label(RichText::new(note).small().color(MUTED));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (r, resp) = ui.allocate_exact_size(vec2(22.0, 20.0), Sense::click());
+                    let color = if resp.hovered() {
+                        Color32::WHITE
+                    } else if pinned {
+                        ACCENT
+                    } else {
+                        MUTED
+                    };
+                    paint_lock(ui.painter(), r.center(), pinned, color);
+                    let hint = if pinned {
+                        "Открепить инспектор: снова показывать выбранный"
+                    } else {
+                        "Закрепить инспектор на этом предмете"
+                    };
+                    if resp.on_hover_text(hint).clicked() {
+                        self.pinned = if pinned { None } else { Some(path.clone()) };
+                    }
+                });
+            });
+        }
         match node {
             Some((path, node)) => node_inspector(
                 ui,
@@ -1440,17 +1581,74 @@ impl EditorUi {
                 // Предмет пропал, пока его тянули.
                 self.actions.push(Action::CancelEdit);
             }
+            // Остальные выбранные — рамкой; над сценой полоса выравнивания.
+            for p in self.more.iter().filter_map(|path| geom::find(&all, path)) {
+                self.vp.selection(&painter, &view, p);
+            }
+            if !self.more.is_empty() {
+                let pick = egui::Area::new(ui.scope_id().with("align-bar"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos2(rect.center().x, rect.top() + GAP_M))
+                    .pivot(Align2::CENTER_TOP)
+                    .show(ui.ctx(), |ui| arrange::bar(ui, self.more.len() + 1))
+                    .inner;
+                let chosen = arrange::roots(&self.selection());
+                match pick {
+                    Some(arrange::BarPick::Align(how)) => {
+                        let items: Vec<arrange::Item> = chosen
+                            .iter()
+                            .filter_map(|path| {
+                                let p = geom::find(&all, path)?;
+                                let n = outline::node_at(file, path)?;
+                                Some(arrange::Item {
+                                    path: path.clone(),
+                                    bounds: p.all,
+                                    parent: p.parent,
+                                    at: [n.at.0, n.at.1],
+                                })
+                            })
+                            .collect();
+                        let moves = arrange::arrange(&items, how);
+                        if !moves.is_empty() {
+                            self.actions.push(Action::MoveMany(moves));
+                        }
+                    }
+                    Some(arrange::BarPick::Group) => self.actions.push(Action::Group(chosen)),
+                    None => {}
+                }
+            }
+            // Линейка: тянут мышью — длина и угол; остаётся, пока выбрана линейка.
+            if self.vp.tool == viewport::Tool::Measure {
+                busy = true;
+                if let Some(m) = response.interact_pointer_pos() {
+                    let at = view.to_scene(m);
+                    if response.drag_started_by(egui::PointerButton::Primary) {
+                        let from = ui.input(|i| i.pointer.press_origin()).unwrap_or(m);
+                        self.ruler = Some((view.to_scene(from), at));
+                    } else if response.dragged_by(egui::PointerButton::Primary)
+                        && let Some((_, end)) = self.ruler.as_mut()
+                    {
+                        *end = at;
+                    }
+                }
+                if let Some((a, b)) = self.ruler {
+                    arrange::draw_ruler(&painter, &view, a, b);
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+            }
             if !busy
                 && let Some(m) = response.interact_pointer_pos()
                 && (response.clicked() || response.double_clicked())
             {
                 let deep = response.double_clicked();
-                self.selected = geom::pick(&placed, view.to_scene(m), deep);
-                if let Some(path) = &self.selected {
-                    // Родители выбранного раскрываются в иерархии.
-                    for k in 1..path.len() {
-                        self.open.insert(path[..k].to_vec());
+                let picked = geom::pick(&placed, view.to_scene(m), deep);
+                if ui.input(|i| i.modifiers.shift) {
+                    if let Some(p) = picked {
+                        self.toggle_select(p);
                     }
+                } else {
+                    // Родители выбранного раскрываются в иерархии.
+                    self.select(picked);
                 }
             }
             // Правая кнопка без перетаскивания: выбрать предмет под мышью и показать меню.
@@ -1972,13 +2170,67 @@ pub(crate) fn num_field(
     }
 }
 
-fn console(ui: &mut Ui, log: &VecDeque<(Color32, String)>) {
-    if log.is_empty() {
-        ui.label(RichText::new("Сообщений пока нет").color(MUTED));
+/// Полоса над журналом: что показывать и «Очистить».
+fn console_bar(ui: &mut Ui, filter: &mut LogFilter, log: &mut VecDeque<(Color32, String)>) {
+    let lines = log.len();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP_XS;
+        for (f, name) in [
+            (LogFilter::All, "Все"),
+            (LogFilter::Warnings, "Предупреждения"),
+            (LogFilter::Errors, "Ошибки"),
+        ] {
+            if ui
+                .selectable_label(*filter == f, RichText::new(name).size(FONT_SMALL))
+                .clicked()
+            {
+                *filter = f;
+            }
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            let clear = ui
+                .add_enabled(
+                    lines > 0,
+                    egui::Button::new(RichText::new("Очистить").size(FONT_SMALL)),
+                )
+                .clicked();
+            if clear {
+                log.clear();
+            }
+            ui.label(
+                RichText::new(format!("строк: {lines}"))
+                    .size(FONT_SMALL)
+                    .color(MUTED),
+            );
+        });
+    });
+    ui.add_space(GAP_S);
+}
+
+/// Подходит ли строка журнала под фильтр (важность видна по цвету строки).
+fn log_shown(filter: LogFilter, color: Color32) -> bool {
+    use crate::console::{GOLD, RED};
+    match filter {
+        LogFilter::All => true,
+        LogFilter::Warnings => color == GOLD || color == RED,
+        LogFilter::Errors => color == RED,
     }
+}
+
+fn console(ui: &mut Ui, log: &VecDeque<(Color32, String)>, filter: LogFilter) {
+    let mut any = false;
     ui.spacing_mut().item_spacing.y = 2.0;
-    for (color, line) in log {
+    for (color, line) in log.iter().filter(|(c, _)| log_shown(filter, *c)) {
+        any = true;
         ui.label(RichText::new(line).monospace().color(*color));
+    }
+    if !any {
+        let text = match filter {
+            LogFilter::All => "Сообщений пока нет",
+            LogFilter::Warnings => "Предупреждений нет",
+            LogFilter::Errors => "Ошибок нет",
+        };
+        ui.label(RichText::new(text).color(MUTED));
     }
 }
 
@@ -2683,6 +2935,49 @@ mod tests {
     }
 
     #[test]
+    fn several_selected_group_and_tools() {
+        use egui::{Key, Modifiers};
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let file = SceneFile::parse(reyvec_scene::EXAMPLE).unwrap();
+        let info = info(Some(&file), PlayState::Edit);
+        ui.select(Some(vec![1]));
+        ui.toggle_select(vec![3]);
+        ui.toggle_select(vec![2]);
+        assert_eq!(ui.selection(), [vec![2], vec![1], vec![3]]);
+        ui.toggle_select(vec![1]);
+        assert_eq!(ui.selection(), [vec![2], vec![3]]);
+        // С несколькими выбранными над сценой полоса выравнивания; Ctrl+G — группа.
+        frame(&ctx, &mut ui, &info, Vec::new());
+        frame(&ctx, &mut ui, &info, vec![key(Key::G, Modifiers::COMMAND)]);
+        frame(
+            &ctx,
+            &mut ui,
+            &info,
+            vec![key(Key::G, Modifiers::COMMAND | Modifiers::SHIFT)],
+        );
+        assert_eq!(
+            ui.take_actions(),
+            [
+                Action::Group(vec![vec![2], vec![3]]),
+                Action::Ungroup(vec![2])
+            ]
+        );
+        // T — линейка; закреплённый инспектор не меняется вместе с выбором.
+        frame(&ctx, &mut ui, &info, vec![key(Key::T, Modifiers::NONE)]);
+        assert_eq!(ui.vp.tool, Tool::Measure);
+        ui.ruler = Some(([0.0, 0.0], [0.3, 0.4]));
+        ui.pinned = Some(vec![0]);
+        ui.select(Some(vec![1]));
+        frame(&ctx, &mut ui, &info, Vec::new());
+        assert_eq!(ui.pinned, Some(vec![0]));
+        ui.structure_changed();
+        assert!(ui.pinned.is_none() && ui.more.is_empty());
+        assert!(log_shown(LogFilter::Errors, crate::console::RED));
+        assert!(!log_shown(LogFilter::Warnings, TEXT_DIM));
+    }
+
+    #[test]
     fn clipboard_keys_and_hierarchy() {
         use egui::{Key, Modifiers};
         let ctx = new_ctx();
@@ -2821,6 +3116,18 @@ mod tests {
                 hero
             };
             ui.selected = Some(vec![pick]);
+            // В первой картинке выбраны ещё две монеты: видна полоса выравнивания.
+            ui.more = if ws == START_WORKSPACE && play == PlayState::Edit && !menu {
+                file.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| n.name.starts_with("монета"))
+                    .take(2)
+                    .map(|(i, _)| vec![i])
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if ws == 5 {
                 // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.
                 ui.frames = (0..FRAME_HISTORY)
