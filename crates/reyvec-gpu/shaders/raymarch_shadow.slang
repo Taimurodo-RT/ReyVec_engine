@@ -24,12 +24,16 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
             break;
         // Граница объекта вместо формы, только если она так далеко, что полутени не даёт:
         // k · h / t заметно больше 1 (см. scene_near).
-        float h = scene_near(from + dir * t, max(0.15, 2.0 * t / k)).x;
+        float2 s = scene_near(from + dir * t, max(0.15, 2.0 * t / k));
+        float h = s.x;
         // Уточнение по двум последним шагам: меньше полос в полутени.
         float y = h * h / (2.0 * last);
         float d = sqrt(max(h * h - y * y, 0.0));
         light = min(light, k * d / max(t - y, 1e-4));
-        last = h;
+        // Уточнение верит, что прошлый шаг — настоящее расстояние. Расстояние до шара
+        // меньше настоящего, и с ним следующая точка выходит темнее, чем есть: после
+        // такого шага уточнение пропускаем.
+        last = s.y < 0.0 ? 1e9 : h;
         if (light < 0.002)
             break;
         t += clamp(h, 0.02, 0.6);
