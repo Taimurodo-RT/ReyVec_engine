@@ -878,6 +878,11 @@ impl Demo {
         match reyvec_sdf::SpaceScene::parse(text) {
             Ok(space) => {
                 tracing::info!("Сцена 3D из файла: предметов {}", space.object_count());
+                // Камера из файла ставится, когда её запись поменялась (или появилась):
+                // правка остального файла не сбивает полёт.
+                if space.camera != self.space.camera {
+                    self.space_camera = space.home_camera();
+                }
                 self.space = space;
                 self.space_error = None;
             }
@@ -1386,6 +1391,11 @@ impl Demo {
     /// Камера сцены «3D».
     pub fn space_camera(&self) -> reyvec_sdf::Camera3D {
         self.space_camera
+    }
+
+    /// Камера сцены «3D» по R: из файла сцены или вид по умолчанию.
+    pub fn space_home_camera(&self) -> reyvec_sdf::Camera3D {
+        self.space.home_camera()
     }
 
     /// Ставит камеру сцены «3D» со следующего кадра.

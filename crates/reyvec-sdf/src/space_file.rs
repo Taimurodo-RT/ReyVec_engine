@@ -113,6 +113,9 @@ pub struct SpaceFile {
     /// Полигональные модели (7.6ж).
     #[serde(default)]
     pub meshes: Vec<MeshEntry>,
+    /// Откуда камера смотрит при открытии файла и по R (без него — вид по умолчанию).
+    #[serde(default)]
+    pub camera: Option<CameraEntry>,
     /// Сетка отсева (7.6е): `false` выключает её для сравнения замеров.
     #[serde(default = "yes")]
     pub culling: bool,
@@ -120,6 +123,13 @@ pub struct SpaceFile {
 
 fn yes() -> bool {
     true
+}
+
+/// Камера сцены в файле: где глаз и куда смотрит.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+pub struct CameraEntry {
+    pub eye: [f32; 3],
+    pub look_at: [f32; 3],
 }
 
 /// Полигональная модель (7.6ж): многогранник, материал, место, поворот, движение.
@@ -163,6 +173,8 @@ pub struct SpaceScene {
     objects: Vec<ObjectEntry>,
     object_materials: Vec<u32>,
     meshes: Vec<(MeshEntry, u32, Vec<[Vec3; 3]>, Shape3)>,
+    /// Камера из файла (если записана).
+    pub camera: Option<CameraEntry>,
     /// Сетка отсева выключена в файле (`culling: false`).
     pub culling_off: bool,
 }
@@ -272,6 +284,7 @@ impl SpaceScene {
             objects: file.objects,
             object_materials,
             meshes,
+            camera: file.camera,
             culling_off: !file.culling,
         })
     }
@@ -279,6 +292,13 @@ impl SpaceScene {
     /// Сколько предметов в сцене (без шариков ламп).
     pub fn object_count(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Камера при открытии сцены и по R: из файла или вид по умолчанию.
+    pub fn home_camera(&self) -> crate::Camera3D {
+        self.camera.map_or_else(crate::Camera3D::default, |c| {
+            crate::Camera3D::looking_at(Vec3::from(c.eye), Vec3::from(c.look_at))
+        })
     }
 
     /// Сколько полигональных моделей в сцене.

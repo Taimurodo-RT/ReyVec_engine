@@ -16,6 +16,8 @@
 (
     format: "reyvec-space",
     version: 1,
+    // Откуда камера смотрит при открытии и по R.
+    camera: Some((eye: (3.2, 2.6, 5.2), look_at: (-0.2, 0.7, 0.0))),
 
     materials: [
         (name: "пол", color: (0.18, 0.19, 0.21), grid: true),

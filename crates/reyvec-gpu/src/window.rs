@@ -359,6 +359,13 @@ impl WindowRenderer {
             .unwrap_or_default()
     }
 
+    /// Камера сцены «3D» по R: из файла сцены или вид по умолчанию.
+    pub fn space_home_camera(&self) -> reyvec_sdf::Camera3D {
+        self.demo
+            .as_ref()
+            .map_or_else(reyvec_sdf::Camera3D::default, Demo::space_home_camera)
+    }
+
     /// Ставит камеру сцены «3D» со следующего кадра.
     pub fn set_space_camera(&mut self, camera: reyvec_sdf::Camera3D) {
         if let Some(demo) = self.demo.as_mut() {

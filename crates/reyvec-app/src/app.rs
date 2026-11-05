@@ -385,7 +385,7 @@ impl App {
             }
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
-                r.set_space_camera(reyvec_sdf::Camera3D::default());
+                r.set_space_camera(r.space_home_camera());
                 r.set_follow(true);
                 tracing::info!("Камера в начале");
             }
