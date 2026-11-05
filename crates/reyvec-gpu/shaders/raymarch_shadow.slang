@@ -39,7 +39,10 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
         last = s.y < 0.0 ? 1e9 : h;
         if (light < 0.002)
             break;
-        t += clamp(h, 0.02, 0.6);
+        // Короткие шаги нужны только у полутени, где k · h / t близко к 1. Где пусто
+        // (k · h больше 2t), шаг на всю пустоту: луч к солнцу над полем уходит за
+        // несколько шагов, а не за 50 (7.6г).
+        t += (k * h > 2.0 * t) ? h : clamp(h, 0.02, 0.6);
     }
     light = saturate(light);
     return light * light * (3.0 - 2.0 * light);
@@ -99,7 +102,9 @@ float4 fs_main(VertexOut input) : SV_Target
             // полутень кольцами).
             far = distance - 0.35;
             k_hard = 10.0;
-            lit = distance < l.range;
+            // Лампа, чей свет здесь всё равно не виден (меньше 0,3 % яркости), луча
+            // тени не стоит.
+            lit = lamp_falloff(l, distance) * dot(s.normal, dir) > 0.003;
         }
         // Только там, куда свет падает: обратная сторона и так тёмная.
         if (lit && dot(s.normal, dir) > 0.0 && far > 0.0)
