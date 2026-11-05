@@ -51,6 +51,8 @@ pub struct AppConfig {
     pub files: reyvec_gpu::UserFiles,
     /// Файл сцены, за которым следить: после сохранения сцена «из файла» обновляется.
     pub scene_file: Option<std::path::PathBuf>,
+    /// Файл сцены «3D», за которым следить (7.5): после сохранения сцена обновляется.
+    pub space_file: Option<std::path::PathBuf>,
     /// Закрыть окно после стольких нарисованных кадров (для автопроверок).
     pub max_frames: Option<u64>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -113,6 +115,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         grabbing: false,
         scene_watcher: None,
         scene_file_label: None,
+        space_watcher: None,
+        space_file_label: None,
         modifiers: ModifiersState::empty(),
         gamepads: crate::gamepad::Gamepads::new(),
         game_ui: crate::game_ui::GameUi::new(),
@@ -174,6 +178,9 @@ struct App {
     /// Слежка за файлом сцены (5.1) и его путь для панели.
     scene_watcher: Option<reyvec_scene::SceneWatcher>,
     scene_file_label: Option<String>,
+    /// Слежка за файлом сцены «3D» (7.5) и его путь для панели.
+    space_watcher: Option<reyvec_scene::SceneWatcher>,
+    space_file_label: Option<String>,
     /// Зажатые Shift, Ctrl и другие (для Shift+U).
     modifiers: ModifiersState,
     /// Геймпады (6.3).
@@ -244,6 +251,20 @@ impl App {
                 }
                 Err(e) => {
                     tracing::warn!("Не удалось следить за файлом сцены {}: {e}", path.display())
+                }
+            }
+        }
+        if let Some(path) = &self.config.space_file {
+            match reyvec_scene::SceneWatcher::new(path) {
+                Ok(w) => {
+                    self.space_file_label = Some(w.path().display().to_string());
+                    self.space_watcher = Some(w);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Не удалось следить за файлом сцены 3D {}: {e}",
+                        path.display()
+                    )
                 }
             }
         }
@@ -439,6 +460,16 @@ impl App {
                 None => {}
             }
         }
+        if let Some(watcher) = self.space_watcher.as_mut() {
+            match watcher.poll() {
+                Some(Ok(text)) => {
+                    tracing::info!("Файл сцены 3D сохранён, читаю заново");
+                    renderer.set_space_file(&text);
+                }
+                Some(Err(e)) => tracing::warn!("Файл сцены 3D: {e}"),
+                None => {}
+            }
+        }
         let size = window.inner_size();
         let time = self.start.elapsed().as_secs_f32();
         let msaa_options: Vec<Msaa> = [Msaa::Off, Msaa::X2, Msaa::X4, Msaa::X8]
@@ -501,6 +532,9 @@ impl App {
                 physics: renderer.physics_stats(),
                 space: (renderer.scene() == DemoScene::Space)
                     .then(|| space_text(&renderer.space_camera(), self.fly.speed)),
+                space_file: self.space_file_label.as_deref(),
+                space_error: renderer.space_error(),
+                space_objects: renderer.space_objects(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),
@@ -552,9 +586,11 @@ impl App {
                     }
                 }
                 let now = Instant::now();
-                let scene_error = renderer
-                    .scene_error()
-                    .filter(|_| renderer.scene() == DemoScene::File);
+                let scene_error = match renderer.scene() {
+                    DemoScene::File => renderer.scene_error(),
+                    DemoScene::Space => renderer.space_error(),
+                    _ => None,
+                };
                 let base = match (renderer.shader_error(), scene_error) {
                     (Some(err), _) => format!("ОШИБКА ШЕЙДЕРА: {err} | {}", self.config.title),
                     (None, Some(err)) => {

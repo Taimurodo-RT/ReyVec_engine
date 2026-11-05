@@ -78,10 +78,57 @@ pub enum Shape3 {
     },
     /// Материал `material` (номер в списке материалов) для всех примитивов внутри.
     Paint { material: u32, shape: Box<Shape3> },
+    /// Форма в движении (7.5): покачивание `bob`, движение по кругу `circle` и вращение
+    /// `spin` (градусов в секунду вокруг X, Y, Z). Положение в момент времени даёт
+    /// [`Shape3::at_time`]; без времени (расчёт по дереву, сборка программы) — момент 0.
+    Animate {
+        #[serde(default)]
+        bob: Bob,
+        #[serde(default)]
+        circle: Circle,
+        #[serde(default)]
+        spin: [f32; 3],
+        shape: Box<Shape3>,
+    },
 }
 
 fn one() -> f32 {
     1.0
+}
+
+/// Покачивание туда-обратно: сдвиг `by · sin(2π·t / period)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Bob {
+    #[serde(default)]
+    pub by: [f32; 3],
+    /// Секунд на полный взмах туда и обратно (0 — стоит на месте).
+    #[serde(default)]
+    pub period: f32,
+}
+
+/// Движение по кругу (или овалу) в плоскости XZ: сдвиг
+/// `(rx · cos(2π·t / period), 0, rz · sin(2π·t / period))`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Circle {
+    /// Радиусы по X и по Z.
+    #[serde(default)]
+    pub radius: [f32; 2],
+    /// Секунд на круг (0 — стоит на месте; меньше нуля — по часовой).
+    #[serde(default)]
+    pub period: f32,
+}
+
+/// Сдвиг от покачивания и движения по кругу в момент `time`.
+pub fn motion_offset(bob: &Bob, circle: &Circle, time: f32) -> Vec3 {
+    let mut out = Vec3::ZERO;
+    if bob.period != 0.0 {
+        out += Vec3::from(bob.by) * (std::f32::consts::TAU * time / bob.period).sin();
+    }
+    if circle.period != 0.0 {
+        let a = std::f32::consts::TAU * time / circle.period;
+        out += Vec3::new(circle.radius[0] * a.cos(), 0.0, circle.radius[1] * a.sin());
+    }
+    out
 }
 
 impl Shape3 {
@@ -150,6 +197,55 @@ impl Shape3 {
                 shape.distance(local) * *scale
             }
             Self::Paint { shape, .. } => shape.distance(p),
+            Self::Animate { .. } => self.at_time(0.0).distance(p),
+        }
+    }
+
+    /// Форма в момент `time` (секунды): движения [`Shape3::Animate`] заменены сдвигами
+    /// и поворотами на этот момент.
+    pub fn at_time(&self, time: f32) -> Self {
+        let all = |shapes: &[Shape3]| shapes.iter().map(|s| s.at_time(time)).collect();
+        match self {
+            Self::Union { shapes, smooth } => Self::Union {
+                shapes: all(shapes),
+                smooth: *smooth,
+            },
+            Self::Intersect { shapes, smooth } => Self::Intersect {
+                shapes: all(shapes),
+                smooth: *smooth,
+            },
+            Self::Subtract { base, cut, smooth } => Self::Subtract {
+                base: Box::new(base.at_time(time)),
+                cut: all(cut),
+                smooth: *smooth,
+            },
+            Self::Move {
+                at,
+                turn,
+                scale,
+                shape,
+            } => Self::Move {
+                at: *at,
+                turn: *turn,
+                scale: *scale,
+                shape: Box::new(shape.at_time(time)),
+            },
+            Self::Paint { material, shape } => Self::Paint {
+                material: *material,
+                shape: Box::new(shape.at_time(time)),
+            },
+            Self::Animate {
+                bob,
+                circle,
+                spin,
+                shape,
+            } => Self::Move {
+                at: motion_offset(bob, circle, time).to_array(),
+                turn: spin.map(|s| s * time),
+                scale: 1.0,
+                shape: Box::new(shape.at_time(time)),
+            },
+            plain => plain.clone(),
         }
     }
 }
@@ -367,6 +463,7 @@ fn emit(
             out,
         ),
         Shape3::Paint { material, shape } => emit(shape, at, *material, base, out),
+        Shape3::Animate { .. } => emit(&shape.at_time(0.0), at, material, base, out),
     }
 }
 

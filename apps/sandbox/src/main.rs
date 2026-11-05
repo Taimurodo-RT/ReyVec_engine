@@ -17,6 +17,8 @@
 //!   берётся `scenes/first-room.ron` из папки проекта. После сохранения файла сцена обновляется;
 //!   в этой сцене N ещё раз — следующий файл из той же папки (например, полигон физики
 //!   `scenes/physics-polygon.ron`), Q (держать) тащит тела к курсору, Y — взрыв у курсора;
+//! - `--space-file <файл.ron>`: свой файл объёмной сцены «3D» (клавиша I); без него берётся
+//!   `scenes/3d/space.ron` из папки проекта. После сохранения файла сцена обновляется;
 //! - `--msaa off|2|4|8`: сглаживание сцены (по умолчанию 2 на встроенной видеокарте, 4 на остальных);
 //! - `--editor-edges`: сводить края MSAA «как в редакторах» (своим проходом, дороже);
 //! - `--fill shape|triangles|stencil`: как рисовать заливки векторных фигур (по умолчанию
@@ -60,6 +62,9 @@ const HELP: &str = "\
                          видна в окне сразу после сохранения. В этой сцене N ещё раз —
                          следующий файл из той же папки (scenes\\physics-polygon.ron —
                          полигон физики): Q (держать) тащит тела к курсору, Y — взрыв
+  --space-file <файл.ron>  свой файл объёмной сцены «3D» (с неё и начнёт); без него
+                         берётся scenes\\3d\\space.ron из папки проекта. Правка файла
+                         видна в окне сразу после сохранения
   --svg <файл.svg>       показать свой рисунок SVG в сцене «SVG» (клавиша 6, с неё и начнёт)
   --motif <файл.reyvec.json>  показать свои перетекающие фигуры от Motif в сцене «Motif»
                          (клавиша 7, с неё и начнёт)
@@ -103,6 +108,7 @@ struct Args {
     svg: Option<String>,
     motif: Option<String>,
     scene_file: Option<String>,
+    space_file: Option<String>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -175,6 +181,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                         .ok_or("после --scene-file нужен путь к файлу сцены .ron")?,
                 );
             }
+            "--space-file" => {
+                out.space_file = Some(
+                    it.next()
+                        .ok_or("после --space-file нужен путь к файлу сцены 3D .ron")?,
+                );
+            }
             "--snapshot" => {
                 out.snapshot = Some(it.next().ok_or("после --snapshot нужно имя файла")?);
             }
@@ -209,36 +221,34 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
     Some((ok(w.trim().parse().ok()?)?, ok(h.trim().parse().ok()?)?))
 }
 
-/// Пример сцены в папке проекта: рядом с `dist` (где лежит собранная песочница) или там,
-/// где проект собирали.
-fn default_scene_file() -> Option<std::path::PathBuf> {
-    const NAME: &str = "scenes/first-room.ron";
+/// Пример в папке проекта (`name` вроде `scenes/first-room.ron`): рядом с `dist` (где
+/// лежит собранная песочница) или там, где проект собирали.
+fn project_file(name: &str) -> Option<std::path::PathBuf> {
     let near_exe = std::env::current_exe()
         .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join(NAME)));
+        .and_then(|exe| Some(exe.parent()?.parent()?.join(name)));
     let built_here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
-        .join(NAME);
+        .join(name);
     near_exe
         .into_iter()
         .chain([built_here])
         .find(|p| p.is_file())
 }
 
-/// Файл сцены для сцены «из файла» и его текст: свой (`--scene-file`) или пример из папки
-/// проекта. Если примера нет рядом, сцена берёт встроенную копию и за файлом не следит.
+/// Файл сцены и его текст: свой (`own`, из флага) или пример `example` из папки проекта.
+/// Если примера нет рядом, сцена берёт встроенную копию и за файлом не следит.
 #[allow(clippy::type_complexity)]
-fn scene_file(
+fn user_file(
     own: &Option<String>,
+    example: &str,
 ) -> Result<(Option<std::path::PathBuf>, Option<std::sync::Arc<str>>), ExitCode> {
     let path = match own {
         Some(p) => std::path::PathBuf::from(p),
-        None => match default_scene_file() {
+        None => match project_file(example) {
             Some(p) => p,
             None => {
-                tracing::info!(
-                    "Файл сцены scenes/first-room.ron не найден, беру встроенный пример"
-                );
+                tracing::info!("Файл сцены {example} не найден, беру встроенный пример");
                 return Ok((None, None));
             }
         },
@@ -374,7 +384,11 @@ fn main() -> ExitCode {
             }
         },
     };
-    let (scene_file, scene_text) = match scene_file(&args.scene_file) {
+    let (scene_file, scene_text) = match user_file(&args.scene_file, "scenes/first-room.ron") {
+        Ok(found) => found,
+        Err(code) => return code,
+    };
+    let (space_file, space_text) = match user_file(&args.space_file, "scenes/3d/space.ron") {
         Ok(found) => found,
         Err(code) => return code,
     };
@@ -387,12 +401,15 @@ fn main() -> ExitCode {
                 .as_deref()
                 .and_then(std::path::Path::parent)
                 .map(std::path::Path::to_path_buf),
+            space: space_text,
         },
         (Err(code), _) | (_, Err(code)) => return code,
     };
     // Со своим файлом песочница начинает с его сцены.
     if args.scene.is_none() {
-        if args.scene_file.is_some() {
+        if args.space_file.is_some() {
+            args.scene = Some(reyvec_app::DemoScene::Space);
+        } else if args.scene_file.is_some() {
             args.scene = Some(reyvec_app::DemoScene::File);
         } else if files.motif.is_some() {
             args.scene = Some(reyvec_app::DemoScene::Motif);
@@ -419,6 +436,7 @@ fn main() -> ExitCode {
         zoom: args.zoom,
         files,
         scene_file,
+        space_file,
         max_frames: args.frames,
         max_seconds: args.seconds,
     };
@@ -543,6 +561,14 @@ mod tests {
             Some("my.ron")
         );
         assert!(parse("--scene-file").is_err());
+        assert_eq!(
+            parse("--space-file my3d.ron")
+                .unwrap()
+                .space_file
+                .as_deref(),
+            Some("my3d.ron")
+        );
+        assert!(parse("--space-file").is_err());
         assert!(parse("--svg").is_err());
         assert_eq!(
             parse("--scene motif").unwrap().scene,

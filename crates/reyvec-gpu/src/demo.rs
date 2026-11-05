@@ -108,6 +108,8 @@ pub struct UserFiles {
     /// Папка файла сцены: от неё считаются пути к рисункам SVG и файлам Motif в сцене.
     /// Для встроенного примера не нужна (берётся `reyvec_scene::EXAMPLE_DIR`).
     pub scene_dir: Option<std::path::PathBuf>,
+    /// Текст файла объёмной сцены «3D» (RON, этап 7.5). Без него — пример `scenes/3d/space.ron`.
+    pub space: Option<std::sync::Arc<str>>,
 }
 
 impl UserFiles {
@@ -459,6 +461,10 @@ pub(crate) struct Demo {
     cull: crate::CullStats,
     file_shapes: reyvec_scene::ShapeCache,
     scene_error: Option<String>,
+    /// Сцена «3D» из файла (7.5): последняя, что прочиталась без ошибок, и ошибка
+    /// последнего сохранения файла (если была).
+    space: reyvec_sdf::SpaceScene,
+    space_error: Option<String>,
     /// Мир сцены из файла (5.3): в окне он шагает в своём потоке логики, без окна
     /// (снимки, тесты) — прямо в кадре в заданный момент, чтобы кадр был повторяемым.
     file_world: Option<reyvec_scene::SceneWorld>,
@@ -626,6 +632,8 @@ impl Demo {
             cull: crate::CullStats::default(),
             file_shapes: reyvec_scene::ShapeCache::new(),
             scene_error: None,
+            space: reyvec_sdf::SpaceScene::default(),
+            space_error: None,
             file_world: None,
             file_logic: None,
             fresh_scene: false,
@@ -687,6 +695,12 @@ impl Demo {
         };
         let (text, dir) = files.scene_text();
         demo.set_scene_file(text, dir);
+        demo.set_space_file(
+            files
+                .space
+                .as_deref()
+                .unwrap_or(reyvec_sdf::space_file::EXAMPLE),
+        );
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
             demo.triangle = build(
@@ -830,6 +844,32 @@ impl Demo {
             }
             Err(e) => self.reject_scene(e.to_string()),
         }
+    }
+
+    /// Читает текст файла сцены «3D» (7.5). Если в нём ошибка, остаётся прошлая сцена,
+    /// а ошибка видна через [`Demo::space_error`].
+    pub fn set_space_file(&mut self, text: &str) {
+        match reyvec_sdf::SpaceScene::parse(text) {
+            Ok(space) => {
+                tracing::info!("Сцена 3D из файла: предметов {}", space.object_count());
+                self.space = space;
+                self.space_error = None;
+            }
+            Err(e) => {
+                tracing::warn!("Файл сцены 3D не принят: {e}");
+                self.space_error = Some(e);
+            }
+        }
+    }
+
+    /// Ошибка в последнем сохранении файла сцены «3D» (рисуется прошлая сцена).
+    pub fn space_error(&self) -> Option<&str> {
+        self.space_error.as_deref()
+    }
+
+    /// Сколько предметов в сцене «3D».
+    pub fn space_objects(&self) -> usize {
+        self.space.object_count()
     }
 
     /// Другой файл сцены (N в песочнице, 6.13): как [`Self::set_scene_file`], но персонаж
@@ -1872,11 +1912,8 @@ impl Demo {
         res.write_buffer(blob_buffer, 0, &blob_bytes);
         let space_buffer = self.space_buffers[slot];
         if scene == DemoScene::Space {
-            let words = crate::space::pack(
-                &crate::space::demo_shapes(time),
-                &crate::space::MATERIALS,
-                &crate::space::demo_lamps(time),
-            );
+            let frame = self.space.frame(time);
+            let words = crate::space::pack(&frame.shapes, &self.space.materials, &frame.lamps);
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
         }
