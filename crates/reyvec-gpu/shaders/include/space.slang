@@ -24,7 +24,12 @@ struct Push
     uint flags;
     uint gbuffer; // буфер геометрии в общем списке текстур (читают тени и освещение)
     uint shadows; // тени и затенение в углах (7.4, читает освещение)
-    uint target; // куда вычислительный «реймарчинг» пишет буфер геометрии: номер в images[] (7.6м)
+    // Куда вычислительный проход пишет: номер в images[] (реймарчинг 7.6м — буфер
+    // геометрии, края 7.6о — цвет краёв). Освещение читает по нему цвет краёв из textures[].
+    uint target;
+    uint cone; // длины начала лучей (7.8, raymarch_cone.slang)
+    uint meshes; // буфер геометрии полигонов (7.6ж), если стоит SPACE_FLAG_MESHES
+    uint* edges; // список пикселей на краях форм (7.6о, raymarch_edge_find.slang)
 };
 [[vk::push_constant]] ConstantBuffer<Push> pc;
 
@@ -84,6 +89,7 @@ static const uint OBJECT_PLANE = 2; // как shape3d::OBJECT_PLANE
 static const uint MAX_PLANES = 8; // как shape3d::MAX_PLANES
 // Флаги констант (pc.flags) сцены «3D», как SPACE_FLAG_* в demo.rs.
 static const uint SPACE_FLAG_MESHES = 1; // у «реймарчинга» есть буфер геометрии полигонов
+static const uint SPACE_FLAG_EDGES = 2; // края форм сглажены (7.6о): освещение берёт их цвет
 
 // Расстояние до ближайшего объекта (x) и его материал (y).
 //

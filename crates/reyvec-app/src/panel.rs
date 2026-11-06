@@ -29,6 +29,8 @@ pub(crate) enum PanelAction {
     Glow(bool),
     Cascades(bool),
     Dither(bool),
+    /// Сглаживание краёв форм сцены «3D» (7.6о).
+    SpaceSmooth(bool),
     /// Фонтан частиц для замера (6.6).
     Fountain(bool),
     /// Музыка (6.7).
@@ -108,6 +110,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_in_view: Option<(usize, usize)>,
     /// Лучи «3D» вычислительным шейдером (опыт 7.6м): попросил ли файл и шли ли так.
     pub space_compute: (bool, bool),
+    /// Сглаживание краёв форм «3D» (7.6о): включено ли и умеет ли видеокарта.
+    pub space_smooth: (bool, bool),
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -621,6 +625,22 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::Fountain(fountain));
         }
     }
+    if info.scene_id == DemoScene::Space {
+        let (mut smooth, can) = info.space_smooth;
+        if ui
+            .add_enabled(can, egui::Checkbox::new(&mut smooth, "Сглаживание 3D (X)"))
+            .on_hover_text(
+                "На краях форм в пиксель идут четыре луча вместо одного: меньше лесенок. \
+                 Время — строки «края 3D» в счётчиках",
+            )
+            .on_disabled_hover_text(
+                "Видеокарта не умеет писать в картинки через общий список (см. журнал)",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::SpaceSmooth(smooth));
+        }
+    }
     let mut dither = info.dither;
     if ui
         .checkbox(&mut dither, "Шум против полос (D)")
@@ -826,7 +846,13 @@ fn zoom_text(zoom: f64) -> String {
 
 /// Проходы, которые шагают лучами по сцене «3D»: вместе у них свой бюджет
 /// (`docs/decisions/0003-performance-targets.md`).
-const RAYMARCH_PASSES: [&str; 3] = ["лучи 3D грубо", "реймарчинг", "тени 3D"];
+const RAYMARCH_PASSES: [&str; 5] = [
+    "лучи 3D грубо",
+    "реймарчинг",
+    "тени 3D",
+    "края 3D: поиск",
+    "края 3D",
+];
 const RAYMARCH_BUDGET_MS: f64 = 2.0;
 
 /// Зелёный, пока время укладывается в бюджет с запасом, жёлтый у края, красный сверх.
@@ -964,6 +990,7 @@ mod tests {
             space_culling: true,
             space_in_view: Some((150, 202)),
             space_compute: (false, false),
+            space_smooth: (true, true),
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {
