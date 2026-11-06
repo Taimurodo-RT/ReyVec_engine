@@ -190,3 +190,49 @@ float2 sdf_program(uint* code, uint start, uint len, float3 p)
     }
     return top > 0 ? stack[0] : float2(1e9, 0.0);
 }
+
+// То же для программы, где ждёт операции не больше одной формы (7.6т): цепочка «форма,
+// форма, операция, форма, операция…» — объединение и пересечение списком, вырезание.
+// Таких почти все. Стек машины видеокарта держит в медленной памяти, а здесь он не нужен:
+// хватает итога `acc` и следующей формы `next` в регистрах. Признак — флаг объекта
+// OBJECT_CHAIN, его ставит упаковка сцены на процессоре (shape3d::Program::chain).
+float2 sdf_chain(uint* code, uint start, uint len, float3 p)
+{
+    float2 acc = float2(1e9, 0.0);
+    float2 next = float2(1e9, 0.0);
+    bool first = true;
+    uint i = start;
+    uint end = start + len;
+    while (i < end)
+    {
+        uint word = code[i];
+        uint op = word & 0xff;
+        if (op == OP_PRIM)
+        {
+            float2 s = sdf_primitive(code, i, p);
+            if (first)
+                acc = s;
+            else
+                next = s;
+            first = false;
+            i += PRIM_WORDS + (word >> 16);
+        }
+        else
+        {
+            if (op < OP_UNION || op > OP_INTERSECT)
+                break;
+            float k = asfloat(code[i + 1]);
+            float d;
+            if (op == OP_UNION)
+                d = op3_union(acc.x, next.x, k);
+            else if (op == OP_SUBTRACT)
+                d = op3_subtract(acc.x, next.x, k);
+            else
+                d = op3_intersect(acc.x, next.x, k);
+            float material = (op == OP_UNION && next.x < acc.x) ? next.y : acc.y;
+            acc = float2(d, material);
+            i += OP_WORDS;
+        }
+    }
+    return acc;
+}

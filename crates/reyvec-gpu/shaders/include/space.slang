@@ -86,6 +86,7 @@ static const uint MAX_PROGRAM_WORDS = 16384;
 static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
 static const uint OBJECT_SHADOW_ONLY = 1; // как shape3d::OBJECT_SHADOW_ONLY
 static const uint OBJECT_PLANE = 2; // как shape3d::OBJECT_PLANE
+static const uint OBJECT_CHAIN = 4; // как shape3d::OBJECT_CHAIN
 static const uint MAX_PLANES = 8; // как shape3d::MAX_PLANES
 // Флаги констант (pc.flags) сцены «3D», как SPACE_FLAG_* в demo.rs.
 static const uint SPACE_FLAG_MESHES = 1; // у «реймарчинга» есть буфер геометрии полигонов
@@ -184,6 +185,8 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
         uint head = pc.scene[start];
         if (len == PRIM_WORDS + (head >> 16) && (head & 0xff) == OP_PRIM)
             s = sdf_primitive(pc.scene, start, p);
+        else if ((flags & OBJECT_CHAIN) != 0)
+            s = sdf_chain(pc.scene, start, len, p);
         else
             s = sdf_program(pc.scene, start, len, p);
         if (s.x < best.x)

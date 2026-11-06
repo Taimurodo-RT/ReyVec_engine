@@ -162,9 +162,10 @@ mod tests {
         let flag = |i: usize| w[objects + i * 8 + 2];
         // Пол — плоскость, луч глаза находит её формулой (7.6и).
         assert_eq!(flag(0), reyvec_sdf::shape3d::OBJECT_PLANE);
-        assert_eq!(flag(1), 0);
+        // Капля — объединение списком: шейдер считает её без стека (7.6т).
+        assert_eq!(flag(1), reyvec_sdf::shape3d::OBJECT_CHAIN);
         assert_eq!(
-            flag(count - 1),
+            flag(count - 1) & !reyvec_sdf::shape3d::OBJECT_CHAIN,
             reyvec_sdf::shape3d::OBJECT_SHADOW_ONLY,
             "заменитель"
         );
