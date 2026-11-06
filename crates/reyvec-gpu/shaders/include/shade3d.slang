@@ -26,7 +26,9 @@ static const uint MATERIAL_GRID = 1;
 // Каждая берётся с весом по расстоянию (как при обычном растяжении) и по сходству с
 // пикселем: та же глубина и та же сторона. Так тень не перетекает с переднего
 // предмета на пол за ним. Если похожих нет среди четырёх, ищем в квадрате 4×4.
-float4 upsampled_shadows(int2 px, float t, float3 n)
+// `similar` — сколько веса набрали четыре ближайшие точки (0..1): меньше половины —
+// тени пикселя растянуты из чужой или далёкой поверхности, ненадёжны (7.6с).
+float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
 {
     uint gw, gh, sw, sh;
     textures[pc.gbuffer].GetDimensions(gw, gh);
@@ -54,6 +56,7 @@ float4 upsampled_shadows(int2 px, float t, float3 n)
         sum += textures[pc.shadows].Load(int3(hp, 0)) * weight;
         total += weight;
     }
+    similar = total;
     if (total > 1e-4)
         return sum / total;
     // Ни одна из четырёх точек не похожа на пиксель: тонкая перемычка или край формы,
@@ -74,6 +77,13 @@ float4 upsampled_shadows(int2 px, float t, float3 n)
         total += weight;
     }
     return total > 1e-4 ? sum / total : nearest;
+}
+
+// Тени пикселя без проверки (см. upsampled_shadows_checked).
+float4 upsampled_shadows(int2 px, float t, float3 n)
+{
+    float similar;
+    return upsampled_shadows_checked(px, t, n, similar);
 }
 
 // То же с готовыми долями света `shadows` (солнце, углы, две лампы).
