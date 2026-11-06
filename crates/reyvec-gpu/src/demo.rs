@@ -352,6 +352,9 @@ pub(crate) struct FrameData {
     /// Сглаживание краёв форм (7.6о): список пикселей краёв (адрес и сам буфер).
     /// `None` — выключено.
     space_edges: Option<(vk::DeviceAddress, vk::Buffer)>,
+    /// Запечённое поле расстояний (7.10б): что пересчитать в проходе «поле». `None` —
+    /// поле выключено.
+    space_field: Option<crate::field::FieldFrame>,
     /// Источники света сцены «лампы и тени» в буфере кадра (адрес и сколько их).
     lights_address: vk::DeviceAddress,
     light_count: u32,
@@ -393,6 +396,9 @@ pub(crate) struct Demo {
     space_edge_lists: Vec<Option<(BufferId, u64)>>,
     /// Включено ли сглаживание краёв (настройка, X).
     space_smooth: bool,
+    /// Запечённое поле расстояний (7.10б) и его проход «поле» (`field_bake.slang`).
+    space_field: crate::field::SpaceField,
+    space_field_bake: vk::Pipeline,
     /// …и его освещение в проходе «сцена» (`raymarch_shade.slang`).
     space_shade: vk::Pipeline,
     /// Камера сцены «3D».
@@ -661,6 +667,11 @@ impl Demo {
             space_edges: vk::Pipeline::null(),
             space_edge_lists: vec![None; frames_in_flight],
             space_smooth: true,
+            space_field: crate::field::SpaceField::new(
+                frames_in_flight,
+                reyvec_sdf::field3d::FIELD_SIZE,
+            ),
+            space_field_bake: vk::Pipeline::null(),
             space_shade: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
             space_view: Default::default(),
@@ -843,6 +854,11 @@ impl Demo {
                 res.bindless.pipeline_layout,
                 shaders.compute("particles"),
             )?;
+            demo.space_field_bake = crate::pipeline::compute_pipeline(
+                &ctx.device,
+                res.bindless.pipeline_layout,
+                shaders.compute("field_bake"),
+            )?;
             if res.bindless.storage_images {
                 let layout = res.bindless.pipeline_layout;
                 demo.space_march_compute = crate::pipeline::compute_pipeline(
@@ -992,6 +1008,29 @@ impl Demo {
         }
         let (id, _) = (*entry)?;
         Some((res.buffer_address(id), res.buffer_raw(id)?))
+    }
+
+    /// Запечённое поле расстояний сцены «3D» (7.10б): включено ли и умеет ли видеокарта.
+    pub fn space_field(&self) -> (bool, bool) {
+        (
+            self.space_field.enabled,
+            self.space_field_bake != vk::Pipeline::null(),
+        )
+    }
+
+    /// Включает или выключает запечённое поле со следующего кадра (включённое
+    /// считается заново целиком).
+    pub fn set_space_field(&mut self, on: bool) {
+        self.space_field.enabled = on;
+        self.space_field.window.reset();
+        self.space_field.skip();
+    }
+
+    /// Буфер запечённого поля (для проверки в тестах: читается после кадра).
+    pub(crate) fn space_field_buffer(
+        &self,
+    ) -> Option<(BufferId, reyvec_sdf::field3d::FieldWindow)> {
+        Some((self.space_field.buffer()?, self.space_field.window.clone()))
     }
 
     /// Сглаживание краёв форм сцены «3D» (7.6о): включено ли и умеет ли видеокарта.
@@ -2080,8 +2119,16 @@ impl Demo {
         } else {
             None
         };
+        let mut space_field = None;
         if scene == DemoScene::Space {
             let mut frame = self.space.frame(time);
+            if self.space_field_bake != vk::Pipeline::null() {
+                // Поле — по всем предметам, до отсева по взгляду.
+                let programs = crate::space::field_programs(&frame);
+                space_field =
+                    self.space_field
+                        .prepare(ctx, res, slot, self.space_camera.eye, programs);
+            }
             let view_proj = self.space_camera.view_proj(aspect);
             if !self.space.view_culling_off {
                 self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj);
@@ -2092,6 +2139,8 @@ impl Demo {
             space_vertices = packed.vertices;
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
+        } else {
+            self.space_field.skip();
         }
         FrameData {
             scene,
@@ -2104,6 +2153,7 @@ impl Demo {
             space_vertices,
             space_compute,
             space_edges,
+            space_field,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
             objects_address: res.buffer_address(object_buffer),
@@ -2291,6 +2341,18 @@ impl Demo {
         // пиксель и без MSAA: шагание — самое дорогое), а «сцена» его освещает.
         let gbuffer = (frame.scene == DemoScene::Space).then(|| {
             let camera = self.space_camera;
+            // Запечённое поле расстояний (7.10б): кубики у сдвинутых предметов и вошедшие
+            // в слои при полёте камеры — до всех лучей кадра.
+            if let Some(field) = frame.space_field {
+                let bake = self.space_field_bake;
+                graph.add_pass("поле", &[], move |p| {
+                    // SAFETY: проход вне рисования; конвейер жив, пока жива сцена; буферы
+                    // поля и задания кадра живы, пока кадр выполняется.
+                    unsafe {
+                        crate::field::SpaceField::record(p.device, p.cmd, layout, bake, field);
+                    }
+                });
+            }
             // Предварительное шагание конусами (7.8): точка на квадрат 8×8 пикселей.
             let tiles = vk::Extent2D {
                 width: frame.extent.width.div_ceil(CONE_TILE),
@@ -3207,6 +3269,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_march_compute, None);
             ctx.device.destroy_pipeline(self.space_edge_find, None);
             ctx.device.destroy_pipeline(self.space_edges, None);
+            ctx.device.destroy_pipeline(self.space_field_bake, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.light, None);
             ctx.device.destroy_pipeline(self.object, None);
@@ -3231,6 +3294,7 @@ impl Demo {
         self.space_march_compute = vk::Pipeline::null();
         self.space_edge_find = vk::Pipeline::null();
         self.space_edges = vk::Pipeline::null();
+        self.space_field_bake = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
         self.object = vk::Pipeline::null();

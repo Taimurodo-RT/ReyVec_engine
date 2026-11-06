@@ -31,6 +31,8 @@ pub(crate) enum PanelAction {
     Dither(bool),
     /// Сглаживание краёв форм сцены «3D» (7.6о).
     SpaceSmooth(bool),
+    /// Запечённое поле расстояний сцены «3D» (7.10б).
+    SpaceField(bool),
     /// Фонтан частиц для замера (6.6).
     Fountain(bool),
     /// Музыка (6.7).
@@ -112,6 +114,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_compute: (bool, bool),
     /// Сглаживание краёв форм «3D» (7.6о): включено ли и умеет ли видеокарта.
     pub space_smooth: (bool, bool),
+    /// Запечённое поле расстояний (7.10б): включено ли и умеет ли видеокарта.
+    pub space_field: (bool, bool),
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -640,6 +644,18 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         {
             actions.push(PanelAction::SpaceSmooth(smooth));
         }
+        let (mut field, can) = info.space_field;
+        if ui
+            .add_enabled(can, egui::Checkbox::new(&mut field, "Поле расстояний"))
+            .on_hover_text(
+                "Запечённое поле расстояний вокруг камеры (7.10). Пока только считается: \
+                 его время — строка «поле» в счётчиках. Тени и затенение в углах начнут \
+                 брать из него расстояния в следующих шагах",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::SpaceField(field));
+        }
     }
     let mut dither = info.dither;
     if ui
@@ -991,6 +1007,7 @@ mod tests {
             space_in_view: Some((150, 202)),
             space_compute: (false, false),
             space_smooth: (true, true),
+            space_field: (true, true),
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {

@@ -26,23 +26,7 @@ pub(crate) struct Packed {
 /// моделей, 7.6ж), материалы, лампы, сетка отсева (`culling: false` — шейдер её не
 /// читает и перебирает все объекты) и треугольники моделей (слово 7 заголовка — где они).
 pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -> Packed {
-    let build = |shapes: &[Shape3], shadow_only: bool| -> Vec<Program> {
-        shapes
-            .iter()
-            .filter_map(|s| match compile(s) {
-                Ok(mut p) => {
-                    p.shadow_only = shadow_only;
-                    Some(p)
-                }
-                Err(e) => {
-                    tracing::warn!("форма 3D пропущена: {e}");
-                    None
-                }
-            })
-            .collect()
-    };
-    let mut programs = build(&frame.shapes, false);
-    programs.extend(build(&frame.proxies, true));
+    let programs = programs(frame);
     let mut words = pack_scene(&programs, materials, &frame.lamps);
     let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
     let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;
@@ -72,6 +56,35 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
         words,
         vertices: (triangles * 3) as u32,
     }
+}
+
+/// Программы форм кадра: предметы, потом невидимые заменители моделей (7.6ж). Форма,
+/// которую не вышло превратить в программу, пропускается с записью в журнал.
+fn programs(frame: &SpaceFrame) -> Vec<Program> {
+    let build = |shapes: &[Shape3], shadow_only: bool| -> Vec<Program> {
+        shapes
+            .iter()
+            .filter_map(|s| match compile(s) {
+                Ok(mut p) => {
+                    p.shadow_only = shadow_only;
+                    Some(p)
+                }
+                Err(e) => {
+                    tracing::warn!("форма 3D пропущена: {e}");
+                    None
+                }
+            })
+            .collect()
+    };
+    let mut programs = build(&frame.shapes, false);
+    programs.extend(build(&frame.proxies, true));
+    programs
+}
+
+/// Формы для запечённого поля (7.10б): все предметы и заменители кадра, до отсева по
+/// взгляду.
+pub(crate) fn field_programs(frame: &SpaceFrame) -> Vec<Program> {
+    programs(frame)
 }
 
 /// Матрица камеры «мир → экран» в раздел моделей (вершинный шейдер «полигонов 3D»).
