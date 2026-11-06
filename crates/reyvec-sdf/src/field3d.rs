@@ -27,6 +27,8 @@
 
 use glam::{IVec3, Vec3};
 
+use crate::shape3d::plane_objects;
+
 /// Точек по стороне слоя.
 pub const FIELD_SIZE: i32 = 128;
 /// Слоёв.
@@ -172,13 +174,11 @@ impl FieldWindow {
 /// точки кубика и на записанное число не влияют.
 pub fn brick_objects(objects: &[crate::Program], job: &BrickJob) -> Vec<u32> {
     let (middle, reach) = job.reach();
+    let planes = plane_objects(objects);
     (0..objects.len() as u32)
-        .filter(|&i| {
-            let o = &objects[i as usize];
-            match o.bounds {
-                Some((c, r)) => (c - middle).length() - r < reach,
-                None => o.plane().is_none(),
-            }
+        .filter(|&i| match objects[i as usize].bounds {
+            Some((c, r)) => (c - middle).length() - r < reach,
+            None => !planes.contains(&i),
         })
         .collect()
 }
@@ -276,10 +276,15 @@ impl Field {
 /// шар-граница; дальше `near` от шара ответ — расстояние до шара (оценка снизу). Сетка
 /// отсева (7.6е) здесь не годится: её оценка «не ближе клетки» зависит от размера
 /// клетки, а он меняется, когда предметы двигаются, — и поле вдали от них менялось бы.
+///
+/// Плоскости — ровно те, что шейдер находит формулой ([`plane_objects`]): остальные
+/// формы-плоскости (их больше [`crate::shape3d::MAX_PLANES`] или это заменитель модели)
+/// шейдер считает как обычные предметы, и поле тоже.
 pub fn solid_distance(objects: &[crate::Program], p: Vec3, near: f32) -> f32 {
+    let planes = plane_objects(objects);
     let mut best = f32::INFINITY;
-    for o in objects {
-        if o.plane().is_some() {
+    for (i, o) in objects.iter().enumerate() {
+        if planes.contains(&(i as u32)) {
             continue;
         }
         if let Some((c, r)) = o.bounds {
@@ -307,12 +312,14 @@ pub fn changed_bounds(
     if before.len() != after.len() {
         return None;
     }
+    let (planes_a, planes_b) = (plane_objects(before), plane_objects(after));
     let mut out = Vec::new();
-    for (a, b) in before.iter().zip(after) {
+    for (i, (a, b)) in before.iter().zip(after).enumerate() {
         if a.words == b.words && a.bounds == b.bounds {
             continue;
         }
-        if a.plane().is_some() && b.plane().is_some() {
+        let i = i as u32;
+        if planes_a.contains(&i) && planes_b.contains(&i) {
             continue; // плоскостей в поле нет
         }
         out.push(a.bounds?);
