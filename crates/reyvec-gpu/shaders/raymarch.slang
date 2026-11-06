@@ -25,7 +25,7 @@ float3 normal_at(float3 p)
     for (uint k = 0; k < 4; k++)
     {
         float3 dir = float3(float(((k + 3) >> 1) & 1), float((k >> 1) & 1), float(k & 1)) * 2.0 - 1.0;
-        n += dir * scene_near(p + dir * e, 1e9, false).x;
+        n += dir * scene_near(p + dir * e, 1e9, false, true).x;
     }
     return normalize(n);
 }
@@ -44,6 +44,12 @@ float4 fs_main(VertexOut input) : SV_Target
     if ((pc.flags & SPACE_FLAG_MESHES) != 0)
         mesh = textures[pc.shadows].Load(int3(int2(input.position.xy), 0));
     float limit = mesh.x >= 0.0 ? min(mesh.x, ray.limit) : ray.limit;
+    // Плоскости (пол, стены) — формулой (7.6и): луч шагает только среди остальных форм
+    // и не дальше точки плоскости; не встретив ничего раньше, пиксель берёт её.
+    float3 plane_normal;
+    float2 plane = plane_hit(ray.origin, ray.dir, plane_normal);
+    bool plane_first = plane.x <= limit;
+    limit = min(limit, plane.x);
     float t = min(textures[pc.gbuffer].Load(int3(int2(input.position.xy) / 8, 0)).x, limit);
     float2 hit = float2(-1.0, 0.0);
     // Шаг с «перелётом» (over-relaxation, Keinert и др., «Enhanced Sphere Tracing»,
@@ -59,7 +65,7 @@ float4 fs_main(VertexOut input) : SV_Target
     {
         // Дальше 25 см (и ещё миллиметр на метр пути) от границы объекта его форма не
         // считается: это всегда больше точности попадания ниже.
-        float2 s = scene_near(ray.origin + ray.dir * t, 0.25 + 0.001 * t, false);
+        float2 s = scene_near(ray.origin + ray.dir * t, 0.25 + 0.001 * t, false, false);
         float radius = abs(s.x);
         if (omega > 1.0 && radius + previous < step)
         {
@@ -83,7 +89,11 @@ float4 fs_main(VertexOut input) : SV_Target
             break;
     }
     if (hit.x < 0.0)
+    {
+        if (plane_first)
+            return float4(plane.x, plane.y, oct_encode(plane_normal));
         return mesh;
+    }
     float3 n = normal_at(ray.origin + ray.dir * hit.x);
     return float4(hit.x, hit.y, oct_encode(n));
 }

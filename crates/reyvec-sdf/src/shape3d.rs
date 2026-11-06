@@ -644,6 +644,29 @@ fn chain(
 }
 
 impl Program {
+    /// Если вся форма — одна плоскость: плоскость в мире `(n, c)`, расстояние до неё
+    /// `dot(n, p) + c` (`n` единичная). Такую форму луч глаза находит формулой (7.6и).
+    pub fn plane(&self) -> Option<(Vec3, f32)> {
+        let w = &self.words;
+        if w.len() != PRIM_WORDS || w[0] != op::PRIM | (prim::PLANE << 8) {
+            return None;
+        }
+        let f = |i: usize| f32::from_bits(w[i]);
+        let row = |r: usize| Vec3::new(f(2 + 4 * r), f(3 + 4 * r), f(4 + 4 * r));
+        let (rot, shift) = (
+            Mat3::from_cols(row(0), row(1), row(2)).transpose(),
+            Vec3::new(f(5), f(9), f(13)),
+        );
+        let (scale, n, offset) = (f(14), Vec3::new(f(15), f(16), f(17)), f(18));
+        // d = scale · (n · (rot p + shift) − offset).
+        let world = rot.transpose() * n * scale;
+        let len = world.length();
+        if len.is_nan() || len <= 1e-6 {
+            return None;
+        }
+        Some((world / len, scale * (n.dot(shift) - offset) / len))
+    }
+
     /// Расстояние до формы в точке `p` и материал ближайшей части: то же, что считает
     /// шейдер по этой программе.
     pub fn distance(&self, p: Vec3) -> (f32, u32) {
@@ -752,20 +775,40 @@ pub const OBJECT_WORDS: usize = 8;
 /// Флаг объекта: заменитель полигональной модели, только для теней (как в
 /// `include/space.slang`).
 pub const OBJECT_SHADOW_ONLY: u32 = 1;
+/// Флаг объекта: объект — одна плоскость (пол, стена). Луч глаза находит её точку
+/// формулой и не опрашивает её на каждом шаге (7.6и); в слове 3 и словах 4–6 записи
+/// объекта вместо шара-границы — плоскость в мире: `dot(n, p) + c` (c, потом n).
+pub const OBJECT_PLANE: u32 = 2;
+/// Больше плоскостей, считаемых формулой, не бывает (шейдер дальше не читает).
+pub const MAX_PLANES: usize = 8;
 /// Слов в заголовке сцены.
-const HEADER_WORDS: usize = 8;
+const HEADER_WORDS: usize = 10;
+
+/// Объекты-плоскости, которые луч глаза находит формулой ([`OBJECT_PLANE`]): первые
+/// [`MAX_PLANES`] видимых объектов из одной плоскости.
+pub fn plane_objects(objects: &[Program]) -> Vec<u32> {
+    (0..objects.len() as u32)
+        .filter(|&i| {
+            let p = &objects[i as usize];
+            !p.shadow_only && p.plane().is_some()
+        })
+        .take(MAX_PLANES)
+        .collect()
+}
 
 /// Сцена для видеокарты: объекты (у каждого своя программа), материалы и лампы одним
 /// списком слов. Раскладка (читает `include/space.slang`):
 ///
-/// - заголовок, 8 слов: число объектов, где начинаются объекты, где материалы, сколько
-///   их, где лампы, сколько их, где сетка отсева (0 — сетки нет), 1 запасное;
+/// - заголовок, 10 слов: число объектов, где начинаются объекты, где материалы, сколько
+///   их, где лампы, сколько их, где сетка отсева (0 — сетки нет), где полигоны (пишет
+///   `reyvec-gpu`), где список плоскостей и сколько их ([`OBJECT_PLANE`]);
 /// - объекты по 8 слов ([`OBJECT_WORDS`]): начало программы, её длина в словах, флаги
-///   ([`OBJECT_SHADOW_ONLY`]), 1 запасное, шар-граница (середина и радиус; радиус -1 — граница не нужна, форма
-///   бесконечна);
+///   ([`OBJECT_SHADOW_ONLY`], [`OBJECT_PLANE`]), 1 запасное, шар-граница (середина и
+///   радиус; радиус -1 — граница не нужна, форма бесконечна);
 /// - материалы по 8 слов: цвет (3 числа), флаги ([`MATERIAL_GRID`]), свечение, 3 запасных;
 /// - лампы по 8 слов: место (3 числа), дальность, цвет (3 числа), яркость;
 /// - программы подряд;
+/// - список плоскостей: номера объектов (не больше [`MAX_PLANES`]);
 /// - сетка отсева ([`crate::grid3d::Grid::write`]).
 pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
     let objects_at = HEADER_WORDS;
@@ -781,13 +824,21 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
         lamps.len() as u32,
         0,
         0,
+        0,
+        0,
     ];
     let mut start = code_at;
-    for p in objects {
-        let flags = if p.shadow_only { OBJECT_SHADOW_ONLY } else { 0 };
-        out.extend([start as u32, p.words.len() as u32, flags, 0]);
-        let (c, r) = p.bounds.unwrap_or((Vec3::ZERO, -1.0));
-        out.extend([c.x, c.y, c.z, r].map(f32::to_bits));
+    let planes = plane_objects(objects);
+    for (i, p) in objects.iter().enumerate() {
+        let mut flags = if p.shadow_only { OBJECT_SHADOW_ONLY } else { 0 };
+        let plane = p.plane().filter(|_| planes.contains(&(i as u32)));
+        if plane.is_some() {
+            flags |= OBJECT_PLANE;
+        }
+        let (n, c) = plane.unwrap_or((Vec3::ZERO, 0.0));
+        out.extend([start as u32, p.words.len() as u32, flags, c.to_bits()]);
+        let (center, r) = p.bounds.unwrap_or((n, -1.0));
+        out.extend([center.x, center.y, center.z, r].map(f32::to_bits));
         start += p.words.len();
     }
     for m in materials {
@@ -804,6 +855,9 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
     for p in objects {
         out.extend(&p.words);
     }
+    out[8] = out.len() as u32;
+    out[9] = planes.len() as u32;
+    out.extend(&planes);
     let grid = crate::grid3d::Grid::build(objects);
     if !grid.cells.is_empty() {
         out[6] = out.len() as u32;
@@ -1033,22 +1087,48 @@ mod tests {
             power: 4.0,
             range: 6.0,
         }];
-        let w = pack_scene(&[a.clone(), b.clone()], &materials, &lamps);
-        assert_eq!(&w[..6], &[2, 8, 24, 1, 32, 1]);
-        let (start_b, len_b) = (w[16] as usize, w[17] as usize);
+        let floor = compile(
+            &Shape3::Plane {
+                normal: [0.0, 1.0, 0.0],
+                offset: 0.5,
+            }
+            .placed([0.0, 1.0, 0.0], [0.0, 0.0, 30.0]),
+        )
+        .unwrap();
+        let w = pack_scene(&[a.clone(), b.clone(), floor.clone()], &materials, &lamps);
+        let o = |i: usize| 10 + 8 * i;
+        assert_eq!(&w[..6], &[3, 10, 34, 1, 42, 1]);
+        let (start_b, len_b) = (w[o(1)] as usize, w[o(1) + 1] as usize);
         assert_eq!(len_b, b.words.len());
         assert_eq!(&w[start_b..start_b + len_b], &b.words[..]);
-        assert_eq!(f32::from_bits(w[8 + 7]), 1.0, "граница шара");
+        assert_eq!(f32::from_bits(w[o(0) + 7]), 1.0, "граница шара");
         assert_eq!(
-            f32::from_bits(w[16 + 7]),
+            f32::from_bits(w[o(1) + 7]),
             -1.0,
             "у формы с полом границы нет"
         );
-        assert_eq!(w[27], MATERIAL_GRID);
-        assert_eq!(f32::from_bits(w[32 + 3]), 6.0, "дальность лампы");
-        assert_eq!(f32::from_bits(w[32 + 7]), 4.0, "яркость лампы");
-        assert_eq!(w[w[8] as usize..][..a.words.len()], a.words[..]);
-        assert_eq!(w[6] as usize, start_b + len_b, "сетка сразу за программами");
+        assert_eq!(w[37], MATERIAL_GRID);
+        assert_eq!(f32::from_bits(w[42 + 3]), 6.0, "дальность лампы");
+        assert_eq!(f32::from_bits(w[42 + 7]), 4.0, "яркость лампы");
+        assert_eq!(w[w[o(0)] as usize..][..a.words.len()], a.words[..]);
+        // Плоскость (7.6и): только третий объект — у второго пол внутри объединения.
+        assert_eq!(w[o(1) + 2] & OBJECT_PLANE, 0);
+        assert_eq!(w[o(2) + 2] & OBJECT_PLANE, OBJECT_PLANE);
+        let planes_at = w[8] as usize;
+        assert_eq!(planes_at, w[o(2)] as usize + floor.words.len());
+        assert_eq!(&w[planes_at..planes_at + w[9] as usize], &[2]);
+        assert_eq!(w[6] as usize, planes_at + 1, "сетка сразу за плоскостями");
+        // Плоскость в мире совпадает с расстоянием по программе.
+        let f = |i: usize| f32::from_bits(w[o(2) + i]);
+        let (n, c) = (Vec3::new(f(4), f(5), f(6)), f(3));
+        for p in points() {
+            let want = floor.distance(p).0;
+            assert!(
+                (n.dot(p) + c - want).abs() < 1e-4,
+                "{p}: {} вместо {want}",
+                n.dot(p) + c
+            );
+        }
     }
 
     /// Граница честная: снаружи шара расстояние до формы не меньше расстояния до шара.

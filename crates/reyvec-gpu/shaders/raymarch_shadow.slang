@@ -21,13 +21,18 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
     float light = 1.0;
     float t = 0.02;
     float last = 1e9;
+    // Луч, уходящий от всех плоскостей (от пола к солнцу или к лампе над полом), они не
+    // заслонят (7.6и): шагаем без них, иначе у пола шаг не длиннее высоты над полом.
+    // Их полутень теряется, только когда свет почти вдоль плоскости (под углом меньше
+    // 1/k, около 5°).
+    bool planes = !away_from_planes(from, dir);
     for (int i = 0; i < 64; i++)
     {
         if (t >= far)
             break;
         // Граница объекта вместо формы, только если она так далеко, что полутени не даёт:
         // k · h / t заметно больше 1 (см. scene_near).
-        float2 s = scene_near(from + dir * t, max(0.15, 2.0 * t / k), true);
+        float2 s = scene_near(from + dir * t, max(0.15, 2.0 * t / k), true, planes);
         float h = s.x;
         // Уточнение по двум последним шагам: меньше полос в полутени.
         float y = h * h / (2.0 * last);
@@ -60,7 +65,7 @@ float ambient_occlusion(float3 p, float3 n)
     for (uint i = 0; i < 5; i++)
     {
         float h = 0.02 + 0.12 * float(i);
-        float d = scene_near(p + n * h, 1e9, true).x;
+        float d = scene_near(p + n * h, 1e9, true, true).x;
         occlusion += (h - d) * weight;
         weight *= 0.85;
     }

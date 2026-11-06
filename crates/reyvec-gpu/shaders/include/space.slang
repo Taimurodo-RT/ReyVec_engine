@@ -80,6 +80,8 @@ static const uint MAX_PROGRAM_WORDS = 16384;
 
 static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
 static const uint OBJECT_SHADOW_ONLY = 1; // как shape3d::OBJECT_SHADOW_ONLY
+static const uint OBJECT_PLANE = 2; // как shape3d::OBJECT_PLANE
+static const uint MAX_PLANES = 8; // как shape3d::MAX_PLANES
 // Флаги констант (pc.flags) сцены «3D», как SPACE_FLAG_* в demo.rs.
 static const uint SPACE_FLAG_MESHES = 1; // у «реймарчинга» есть буфер геометрии полигонов
 
@@ -102,7 +104,11 @@ static const uint SPACE_FLAG_MESHES = 1; // у «реймарчинга» ест
 //
 // Заменители полигональных моделей (7.6ж, флаг OBJECT_SHADOW_ONLY) видны только при
 // `proxies`: тени и углы их считают, лучи глаза и нормали — нет.
-float2 scene_near(float3 p, float near, bool proxies)
+//
+// Плоскости (7.6и, флаг OBJECT_PLANE: пол, стены) видны только при `planes`. Луч глаза
+// находит их точку формулой (plane_hit) и шагает без них: иначе у пола каждый шаг
+// короче высоты над полом, и луч, скользящий вдоль пола, тратит на это десятки шагов.
+float2 scene_near(float3 p, float near, bool proxies, bool planes)
 {
     // Числа из буфера ограничены сверху: испорченный буфер не должен вешать видеокарту.
     uint count = min(pc.scene[0], MAX_OBJECTS);
@@ -119,7 +125,8 @@ float2 scene_near(float3 p, float near, bool proxies)
     if (!direct)
     {
         first = pc.scene[g + 16];
-        first_count = min(pc.scene[g + 17], MAX_OBJECTS);
+        // Плоскости — в конце списка бесконечных форм: без них список короче.
+        first_count = min(pc.scene[g + (planes ? 17 : 18)], MAX_OBJECTS);
         float3 origin = float3(asfloat(pc.scene[g]), asfloat(pc.scene[g + 1]), asfloat(pc.scene[g + 2]));
         float cell = asfloat(pc.scene[g + 3]);
         int3 dims = int3(pc.scene[g + 4], pc.scene[g + 5], pc.scene[g + 6]);
@@ -145,7 +152,10 @@ float2 scene_near(float3 p, float near, bool proxies)
         if (o >= count)
             continue;
         uint w = objects + o * OBJECT_WORDS;
-        if (!proxies && (pc.scene[w + 2] & OBJECT_SHADOW_ONLY) != 0)
+        uint flags = pc.scene[w + 2];
+        if (!proxies && (flags & OBJECT_SHADOW_ONLY) != 0)
+            continue;
+        if (!planes && (flags & OBJECT_PLANE) != 0)
             continue;
         float radius = asfloat(pc.scene[w + 7]);
         if (radius >= 0.0)
@@ -174,6 +184,49 @@ float2 scene_near(float3 p, float near, bool proxies)
             best = s;
     }
     return best;
+}
+
+// Ближайшая точка плоскостей сцены на луче (7.6и): x — длина вдоль луча (1e30 — ни
+// одной плоскости впереди), y — материал; `normal` — нормаль этой плоскости. Луч,
+// начатый за плоскостью (внутри), упирается в неё сразу.
+float2 plane_hit(float3 origin, float3 dir, out float3 normal)
+{
+    uint list = pc.scene[8];
+    uint count = min(pc.scene[9], MAX_PLANES);
+    uint objects = pc.scene[1];
+    float2 best = float2(1e30, 0.0);
+    normal = float3(0.0, 1.0, 0.0);
+    for (uint k = 0; k < count; k++)
+    {
+        uint w = objects + min(pc.scene[list + k], MAX_OBJECTS - 1) * OBJECT_WORDS;
+        float3 n = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
+        float above = dot(n, origin) + asfloat(pc.scene[w + 3]);
+        float toward = dot(n, dir);
+        float t = above <= 0.0 ? 0.0 : (toward < 0.0 ? -above / toward : 1e30);
+        if (t < best.x)
+        {
+            best = float2(t, float(pc.scene[pc.scene[w] + 1]));
+            normal = n;
+        }
+    }
+    return best;
+}
+
+// Уходит ли луч от всех плоскостей сцены (7.6и): тогда плоскости его не заслонят, и
+// шагать по лучу тени можно без них (у пола шаг иначе не длиннее высоты над полом).
+bool away_from_planes(float3 origin, float3 dir)
+{
+    uint list = pc.scene[8];
+    uint count = min(pc.scene[9], MAX_PLANES);
+    uint objects = pc.scene[1];
+    for (uint k = 0; k < count; k++)
+    {
+        uint w = objects + min(pc.scene[list + k], MAX_OBJECTS - 1) * OBJECT_WORDS;
+        float3 n = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
+        if (dot(n, dir) < 0.0 || dot(n, origin) + asfloat(pc.scene[w + 3]) <= 0.0)
+            return false;
+    }
+    return true;
 }
 
 // Нормаль в буфере геометрии: два числа вместо трёх (октаэдрическая раскладка: сфера
