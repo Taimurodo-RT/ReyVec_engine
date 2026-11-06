@@ -106,6 +106,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_culling: bool,
     /// Отсев по взгляду: объектов в кадре и всего (`None` — выключен).
     pub space_in_view: Option<(usize, usize)>,
+    /// Лучи «3D» вычислительным шейдером (опыт 7.6м): попросил ли файл и шли ли так.
+    pub space_compute: (bool, bool),
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -358,6 +360,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             Some((kept, total)) => format!("{grid}, в кадре {kept} из {total}"),
             None => format!("{grid}, отсев по взгляду выключен (view_culling: false)"),
         };
+        let rays = match info.space_compute {
+            (_, true) => "лучи вычислительным шейдером (compute: true)",
+            (true, false) => {
+                "лучи пиксельным шейдером: видеокарта не умеет вычислительный вариант, см. журнал"
+            }
+            (false, false) => "лучи пиксельным шейдером",
+        };
+        let culling = format!("{culling}, {rays}");
         match (&info.space_error, info.space_file) {
             (Some(err), _) => {
                 ui.label(
@@ -815,14 +825,8 @@ fn zoom_text(zoom: f64) -> String {
 }
 
 /// Проходы, которые шагают лучами по сцене «3D»: вместе у них свой бюджет
-/// (`docs/decisions/0003-performance-targets.md`). Копия буфера геометрии бывает только
-/// у лучей вычислительным шейдером (опыт 7.6м) и входит в их цену.
-const RAYMARCH_PASSES: [&str; 4] = [
-    "лучи 3D грубо",
-    "реймарчинг",
-    "копия буфера геометрии",
-    "тени 3D",
-];
+/// (`docs/decisions/0003-performance-targets.md`).
+const RAYMARCH_PASSES: [&str; 3] = ["лучи 3D грубо", "реймарчинг", "тени 3D"];
 const RAYMARCH_BUDGET_MS: f64 = 2.0;
 
 /// Зелёный, пока время укладывается в бюджет с запасом, жёлтый у края, красный сверх.
@@ -959,6 +963,7 @@ mod tests {
             space_objects: 0,
             space_culling: true,
             space_in_view: Some((150, 202)),
+            space_compute: (false, false),
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {

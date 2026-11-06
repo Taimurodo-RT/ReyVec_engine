@@ -6,13 +6,17 @@
 //!
 //! Раскладка (set 0), общая для всех конвейеров движка:
 //! - binding 0: `texture2D textures[MAX_TEXTURES]`;
-//! - binding 1: `sampler samplers[2]`: 0 = сглаживающий, 1 = без сглаживания (для пикселей).
+//! - binding 1: `sampler samplers[2]`: 0 = сглаживающий, 1 = без сглаживания (для пикселей);
+//! - binding 2: `RWTexture2D images[TRANSIENT_TEXTURES]` — запись в картинки из шейдеров
+//!   (временные картинки графа: ячейка `i` здесь = ячейка `FIRST_TRANSIENT_SLOT + i` в
+//!   binding 0). Есть, только если видеокарта умеет (`GpuContext::storage_images`).
 //!
 //! Буферы шейдеры читают по адресу (buffer device address), его передают в push constants.
 
 use ash::vk;
 
 use crate::context::GpuContext;
+use crate::graph::TRANSIENT_TEXTURES;
 use crate::{GpuError, VkResultExt};
 
 /// Сколько текстур помещается в общий список.
@@ -37,6 +41,8 @@ pub(crate) struct Bindless {
     pool: vk::DescriptorPool,
     pub set: vk::DescriptorSet,
     samplers: [vk::Sampler; 2],
+    /// Есть ли binding 2 (запись в картинки).
+    pub storage_images: bool,
 }
 
 impl Bindless {
@@ -48,6 +54,7 @@ impl Bindless {
             pool: vk::DescriptorPool::null(),
             set: vk::DescriptorSet::null(),
             samplers: [vk::Sampler::null(); 2],
+            storage_images: ctx.storage_images,
         };
         // При ошибке на любом шаге убираем то, что успели создать (null-дескрипторы допустимы).
         match this.init(d) {
@@ -79,7 +86,7 @@ impl Bindless {
                 .create_sampler(&make_sampler(vk::Filter::NEAREST), None)
                 .ctx("сэмплер")?;
 
-            let bindings = [
+            let bindings_all = [
                 vk::DescriptorSetLayoutBinding::default()
                     .binding(0)
                     .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
@@ -91,26 +98,31 @@ impl Bindless {
                     .descriptor_count(self.samplers.len() as u32)
                     .stage_flags(vk::ShaderStageFlags::ALL)
                     .immutable_samplers(&self.samplers),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(2)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(TRANSIENT_TEXTURES)
+                    .stage_flags(vk::ShaderStageFlags::ALL),
             ];
-            let flags = [
-                vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
-                    | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING,
-                vk::DescriptorBindingFlags::empty(),
-            ];
+            let updatable = vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND
+                | vk::DescriptorBindingFlags::UPDATE_UNUSED_WHILE_PENDING;
+            let flags_all = [updatable, vk::DescriptorBindingFlags::empty(), updatable];
+            let count = if self.storage_images { 3 } else { 2 };
+            let (bindings, flags) = (&bindings_all[..count], &flags_all[..count]);
             let mut flags_info =
-                vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&flags);
+                vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(flags);
             self.set_layout = d
                 .create_descriptor_set_layout(
                     &vk::DescriptorSetLayoutCreateInfo::default()
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL)
-                        .bindings(&bindings)
+                        .bindings(bindings)
                         .push_next(&mut flags_info),
                     None,
                 )
                 .ctx("раскладка bindless")?;
 
-            let sizes = [
+            let sizes_all = [
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::SAMPLED_IMAGE,
                     descriptor_count: MAX_TEXTURES,
@@ -119,13 +131,18 @@ impl Bindless {
                     ty: vk::DescriptorType::SAMPLER,
                     descriptor_count: self.samplers.len() as u32,
                 },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: TRANSIENT_TEXTURES,
+                },
             ];
+            let sizes = &sizes_all[..count];
             self.pool = d
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
                         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND)
                         .max_sets(1)
-                        .pool_sizes(&sizes),
+                        .pool_sizes(sizes),
                     None,
                 )
                 .ctx("пул дескрипторов")?;
@@ -167,6 +184,25 @@ impl Bindless {
             .image_info(&image);
         // SAFETY: набор создан с UPDATE_AFTER_BIND, ячейка в пределах MAX_TEXTURES
         // (проверяет вызывающий), вид текстуры жив.
+        unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
+    }
+
+    /// Кладёт картинку для записи в ячейку `index` списка binding 2 (раскладка GENERAL).
+    pub fn write_storage_image(&self, ctx: &GpuContext, index: u32, view: vk::ImageView) {
+        if !self.storage_images {
+            return;
+        }
+        let image = [vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::GENERAL)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.set)
+            .dst_binding(2)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(&image);
+        // SAFETY: binding 2 создан с UPDATE_AFTER_BIND, ячейка в пределах
+        // TRANSIENT_TEXTURES (проверяет вызывающий), вид картинки жив.
         unsafe { ctx.device.update_descriptor_sets(&[write], &[]) };
     }
 

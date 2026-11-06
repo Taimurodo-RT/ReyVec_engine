@@ -56,6 +56,7 @@ fn srgb_to_linear(v: u8) -> f32 {
 
 /// Материал в файле.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterialEntry {
     pub name: String,
     pub color: Color3,
@@ -67,6 +68,7 @@ pub struct MaterialEntry {
 
 /// Лампа в файле. `bulb` — радиус светящегося шарика на месте лампы (0 — без шарика).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LampEntry {
     pub at: [f32; 3],
     pub color: Color3,
@@ -82,6 +84,7 @@ pub struct LampEntry {
 
 /// Предмет: форма, её материал, место, поворот (градусы вокруг X, Y, Z) и движение.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectEntry {
     #[serde(default)]
     pub name: String,
@@ -101,6 +104,7 @@ pub struct ObjectEntry {
 
 /// Файл объёмной сцены как он записан.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SpaceFile {
     pub format: String,
     pub version: u32,
@@ -134,6 +138,7 @@ fn yes() -> bool {
 
 /// Камера сцены в файле: где глаз и куда смотрит.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CameraEntry {
     pub eye: [f32; 3],
     pub look_at: [f32; 3],
@@ -142,6 +147,7 @@ pub struct CameraEntry {
 /// Полигональная модель (7.6ж): многогранник, материал, место, поворот, движение.
 /// `shadow: false` — без тени (заменителя SDF нет).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeshEntry {
     #[serde(default)]
     pub name: String,
@@ -404,6 +410,17 @@ mod tests {
         for s in &b.shapes {
             assert!(compile(s).is_ok());
         }
+    }
+
+    /// Опечатка в имени настройки — ошибка с её именем, а не тихий пропуск (так
+    /// `compute: true` в старой сборке не выглядит включённым).
+    #[test]
+    fn unknown_keys_are_errors() {
+        let text = EXAMPLE.replacen("version: 1,", "version: 1,\n    computе: true,", 1);
+        let err = SpaceScene::parse(&text).unwrap_err();
+        assert!(err.contains("computе"), "{err}");
+        let text = EXAMPLE.replacen("version: 1,", "version: 1,\n    compute: true,", 1);
+        assert!(SpaceScene::parse(&text).unwrap().compute);
     }
 
     #[test]
