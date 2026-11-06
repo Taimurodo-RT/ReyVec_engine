@@ -14,68 +14,7 @@
 
 [[vk::binding(0, 0)]] Texture2D textures[];
 
-// Доля света от источника по направлению `dir` с расстояния `far`: 1 — свет виден
-// целиком, 0 — закрыт. `k` — жёсткость края (больше — резче).
-float soft_shadow(float3 from, float3 dir, float far, float k)
-{
-    float light = 1.0;
-    float t = 0.02;
-    float last = 1e9;
-    // Луч, уходящий от всех плоскостей (от пола к солнцу или к лампе над полом), они не
-    // заслонят (7.6и): шагаем без них, иначе у пола шаг не длиннее высоты над полом.
-    // Их полутень теряется, только когда свет почти вдоль плоскости (под углом меньше
-    // 1/k, около 5°).
-    bool planes = !away_from_planes(from, dir);
-    for (int i = 0; i < 64; i++)
-    {
-        if (t >= far)
-            break;
-        // Граница объекта вместо формы, только если она так далеко, что полутени не даёт:
-        // k · h / t заметно больше 1 (см. scene_near).
-        float2 s = scene_near(from + dir * t, max(0.15, 2.0 * t / k), true, planes);
-        float h = s.x;
-        // Уточнение по двум последним шагам: меньше полос в полутени.
-        float y = h * h / (2.0 * last);
-        float d = sqrt(max(h * h - y * y, 0.0));
-        // Полутень — только от настоящих форм. Оценка по шару-границе и так не даёт
-        // полутени (порог выше), а оценка по клетке сетки (7.6е) меньше настоящего
-        // расстояния и дала бы ложную полутень вдали.
-        if (s.y >= 0.0)
-            light = min(light, k * d / max(t - y, 1e-4));
-        // Уточнение верит, что прошлый шаг — настоящее расстояние. Расстояние до шара
-        // меньше настоящего, и с ним следующая точка выходит темнее, чем есть: после
-        // такого шага уточнение пропускаем.
-        last = s.y < 0.0 ? 1e9 : h;
-        if (light < 0.002)
-            break;
-        // Короткие шаги нужны только у полутени, где k · h / t близко к 1. Где пусто
-        // (k · h больше 2t), шаг на всю пустоту: луч к солнцу над полем уходит за
-        // несколько шагов, а не за 50 (7.6г).
-        t += (k * h > 2.0 * t) ? h : clamp(h, 0.02, 0.6);
-    }
-    light = saturate(light);
-    return light * light * (3.0 - 2.0 * light);
-}
-
-// Как view3d::AO_REACH в crates/reyvec-sdf.
-static const float AO_REACH = 1.0;
-
-// Затенение в углах: 1 — вокруг пусто, меньше — рядом другие формы.
-float ambient_occlusion(float3 p, float3 n)
-{
-    float occlusion = 0.0;
-    float weight = 1.0;
-    for (uint i = 0; i < 5; i++)
-    {
-        float h = 0.02 + 0.12 * float(i);
-        // Дальше AO_REACH расстояние не различаем: так объекты, отсеянные по взгляду
-        // (7.6к, они дальше этого от любой пробы), на углы не влияют.
-        float d = min(scene_near(p + n * h, 1e9, true, true).x, AO_REACH);
-        occlusion += (h - d) * weight;
-        weight *= 0.85;
-    }
-    return saturate(1.0 - 2.5 * occlusion);
-}
+#include "include/shadow3d.slang"
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
@@ -89,40 +28,12 @@ float4 fs_main(VertexOut input) : SV_Target
     // Луч того же пикселя кадра, что и точка буфера геометрии.
     float2 screen = float2((float(px.x) + 0.5) / float(w) * 2.0 - 1.0, 1.0 - (float(px.y) + 0.5) / float(h) * 2.0);
     Ray ray = screen_ray(screen);
-    // Над поверхностью: иначе луч тени сразу «упирается» в саму точку, и по формам идёт
-    // рябь. Шагание останавливается с точностью 0,5 мм на метр пути, поэтому дальние
-    // точки поднимаются выше.
-    float3 p = ray.origin + ray.dir * s.t + s.normal * (0.01 + 0.002 * s.t);
-
-    // Солнце и две первые лампы перебираются одним циклом: луч тени (с полем сцены
+    float3 surface = ray.origin + ray.dir * s.t;
+    // Солнце, углы и две первые лампы перебираются одним циклом: луч тени (с полем сцены
     // внутри) встраивается в шейдер один раз. Иначе шейдер раздувается втрое, а
     // программный lavapipe на таком падал при сборке.
-    float shadow[3] = { 1.0, 1.0, 1.0 };
-    uint lamps = min(lamp_count(), SHADOW_LAMPS);
-    for (uint k = 0; k <= lamps; k++)
-    {
-        float3 dir = SUN;
-        float far = 30.0;
-        float k_hard = 12.0;
-        bool lit = true;
-        if (k > 0)
-        {
-            Lamp l = read_lamp(k - 1);
-            float3 to = l.at - p;
-            float distance = length(to);
-            dir = to / max(distance, 1e-4);
-            // Луч останавливается, не дойдя до лампы 35 см: лампочка-шарик вокруг лампы
-            // не должна закрывать свою же лампу (а луч, прошедший рядом с ней, — давать
-            // полутень кольцами).
-            far = distance - 0.35;
-            k_hard = 10.0;
-            // Лампа, чей свет здесь всё равно не виден (меньше 0,3 % яркости), луча
-            // тени не стоит.
-            lit = lamp_falloff(l, distance) * dot(s.normal, dir) > 0.003;
-        }
-        // Только там, куда свет падает: обратная сторона и так тёмная.
-        if (lit && dot(s.normal, dir) > 0.0 && far > 0.0)
-            shadow[k] = soft_shadow(p, dir, far, k_hard);
-    }
-    return float4(shadow[0], ambient_occlusion(p, s.normal), shadow[1], shadow[2]);
+    float shadow[4] = { 1.0, 1.0, 1.0, 1.0 };
+    for (uint k = 0; k < 4; k++)
+        shadow[k] = shadow_part(surface, s.normal, s.t, k);
+    return float4(shadow[0], shadow[1], shadow[2], shadow[3]);
 }
