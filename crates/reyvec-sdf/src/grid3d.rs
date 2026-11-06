@@ -21,7 +21,7 @@ use glam::Vec3;
 /// К этому числу клеток подбирается размер клетки.
 const TARGET_CELLS: f32 = 2048.0;
 /// Больше клеток не бывает (буфер кадра не резиновый).
-pub const MAX_CELLS: usize = 4096;
+pub const MAX_CELLS: usize = 32768;
 /// Клетка не мельче 25 см: мельче — длинные списки соседей и лишняя память.
 const MIN_CELL: f32 = 0.25;
 
@@ -77,8 +77,15 @@ impl Grid {
             hi = hi.max(c + r);
         }
         let extent = (hi - lo).max(Vec3::splat(MIN_CELL));
+        // Клетка — по объёму сцены, но не крупнее радиуса обычного предмета: в большой и
+        // густой сцене крупная клетка собирает длинные списки соседей, и каждый шаг
+        // луча перебирает их все (на 200 предметах это и было узким местом).
+        let mut sizes: Vec<f32> = finite.iter().map(|f| f.2).collect();
+        let mid = sizes.len() / 2;
+        let typical = *sizes.select_nth_unstable_by(mid, f32::total_cmp).1;
         let mut cell = ((extent.x * extent.y * extent.z) / TARGET_CELLS)
             .cbrt()
+            .min(typical)
             .max(MIN_CELL);
         let dims = loop {
             // Сетка шире коробки на margin = cell с каждой стороны: у её края до любого
