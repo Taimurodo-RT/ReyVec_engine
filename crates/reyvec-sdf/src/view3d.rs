@@ -32,9 +32,9 @@ const LAMP_HARDNESS: f32 = 10.0;
 /// Дальше этого затенение в углах расстояние не различает (`AO_REACH` в
 /// `raymarch_shadow.slang`).
 pub const AO_REACH: f32 = 1.0;
-/// Запас вокруг пирамиды: пробы затенения в углах уходят от видимой точки до 0,5 м
-/// вдоль нормали (плюс подъём точки над поверхностью), и объект дальше [`AO_REACH`] от
-/// любой пробы на них не влияет.
+/// Запас вокруг пирамиды: пробы затенения в углах уходят от видимой точки до 0,4 м
+/// (вдоль нормали и наклонно от неё, плюс подъём точки над поверхностью), и объект
+/// дальше [`AO_REACH`] от любой пробы на них не влияет.
 pub const AO_MARGIN: f32 = 2.0;
 
 /// Пирамида камеры: шесть плоскостей, внутри — `dot(n, p) + d >= 0`.
@@ -254,8 +254,7 @@ mod tests {
                         );
                     }
                     // Затенение в углах.
-                    for h in [0.02, 0.26, 0.5] {
-                        let q = from + n * h;
+                    for q in ao_probes(from, n) {
                         let (na, nb) = (near(&a, q).min(AO_REACH), near(&b, q).min(AO_REACH));
                         assert!(
                             (na - nb).abs() < 1e-4,
@@ -266,6 +265,21 @@ mod tests {
             }
         }
         assert!(culled_any, "хоть с одной камеры что-то должно отсеяться");
+    }
+
+    /// Точки проб затенения в углах, как в `ambient_occlusion` (shadow3d.slang).
+    fn ao_probes(p: Vec3, n: Vec3) -> Vec<Vec3> {
+        let s = if n.z >= 0.0 { 1.0 } else { -1.0 };
+        let a = -1.0 / (s + n.z);
+        let b = n.x * n.y * a;
+        let t1 = Vec3::new(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+        let t2 = Vec3::new(b, s + n.y * n.y * a, -n.y);
+        let mut probes: Vec<Vec3> = [0.04, 0.16, 0.4].iter().map(|h| p + n * *h).collect();
+        for side in [t1, t2, -t1, -t2] {
+            let dir = (n + 0.9 * side).normalize();
+            probes.extend([0.16, 0.4].iter().map(|h| p + dir * *h));
+        }
+        probes
     }
 
     fn near(objs: &[Program], p: Vec3) -> f32 {

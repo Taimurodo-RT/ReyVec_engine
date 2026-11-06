@@ -282,6 +282,21 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
+        // Коробка с вырезанным шаром вблизи и сбоку (7.6п): у края дыры не должно быть
+        // тёмной полосы от затенения в углах.
+        Case {
+            name: "space-hollow-side-2s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(with_camera(
+                        include_str!("../../../scenes/3d/space.ron"),
+                        "(eye: (4.9, 0.9, 3.3), look_at: (3.4, 0.6, 2.6))",
+                    )),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 2.0, false)
+            },
+        },
         // Лучи глаза пиксельным шейдером (`compute: false`) дают тот же кадр, что
         // вычислительным (7.6м; эталоны — копии space-1s и space-mixed-1s).
         Case {
@@ -312,6 +327,17 @@ fn fragment(text: &str) -> std::sync::Arc<str> {
     assert!(text.contains("version: 1,"));
     text.replacen("version: 1,", "version: 1,\n    compute: false,", 1)
         .into()
+}
+
+/// Файл сцены «3D» с другой камерой.
+fn with_camera(text: &str, camera: &str) -> std::sync::Arc<str> {
+    assert!(text.contains("version: 1,"));
+    text.replacen(
+        "version: 1,",
+        &format!("version: 1,\n    camera: Some({camera}),"),
+        1,
+    )
+    .into()
 }
 
 /// Печатает PNG в лог строками base64 между метками `--- PNG <имя> ---` и
