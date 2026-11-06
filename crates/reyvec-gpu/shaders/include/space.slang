@@ -238,6 +238,25 @@ bool away_from_planes(float3 origin, float3 dir)
     return true;
 }
 
+// Расстояние до плоскостей сцены (пол, стены), найденных формулой (7.6и): запечённое
+// поле (7.10) их не хранит.
+float planes_distance(float3 p)
+{
+    uint list = pc.scene[8];
+    uint count = min(pc.scene[9], MAX_PLANES);
+    uint objects = pc.scene[1];
+    float best = 1e9;
+    for (uint k = 0; k < count; k++)
+    {
+        uint w = objects + min(pc.scene[list + k], MAX_OBJECTS - 1) * OBJECT_WORDS;
+        float3 n = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
+        best = min(best, dot(n, p) + asfloat(pc.scene[w + 3]));
+    }
+    return best;
+}
+
+#include "field3d.slang"
+
 // Нормаль в буфере геометрии: два числа вместо трёх (октаэдрическая раскладка: сфера
 // направлений разворачивается в квадрат).
 float2 oct_encode(float3 n)

@@ -2136,6 +2136,10 @@ impl Demo {
             let mut packed =
                 crate::space::pack(&frame, &self.space.materials, !self.space.culling_off);
             crate::space::set_view_proj(&mut packed.words, view_proj);
+            crate::space::set_field(
+                &mut packed.words,
+                space_field.map(|f| (f.field, &self.space_field.window)),
+            );
             space_vertices = packed.vertices;
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
