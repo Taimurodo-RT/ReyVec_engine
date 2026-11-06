@@ -118,6 +118,35 @@ pub struct HeadlessImage {
     pub player: Option<reyvec_scene::PlayerView>,
     /// Частицы в этом кадре (6.6).
     pub particles: crate::ParticleStats,
+    /// Запечённое поле расстояний сцены «3D» после кадра (7.10б), если оно считалось.
+    pub field: Option<FieldSnapshot>,
+}
+
+/// Запечённое поле расстояний, прочитанное с видеокарты: где стоят слои и числа.
+pub struct FieldSnapshot {
+    pub window: reyvec_sdf::field3d::FieldWindow,
+    /// Слои подряд, по `size³` half float.
+    pub halves: Vec<u16>,
+}
+
+impl FieldSnapshot {
+    /// Число в точке с мировым номером `w` слоя `level`.
+    pub fn value(&self, level: usize, w: glam::IVec3) -> f32 {
+        let size = self.window.size as usize;
+        half_to_f32(self.halves[level * size * size * size + self.window.slot(w)])
+    }
+}
+
+/// half float (IEEE 754, 16 бит) в f32.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1f);
+    let frac = f32::from(h & 0x3ff);
+    sign * match exp {
+        0 => frac * 2f32.powi(-24),
+        31 => f32::INFINITY,
+        _ => (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
+    }
 }
 
 impl HeadlessImage {
@@ -238,6 +267,7 @@ pub fn render_headless_play(
         camera: frame.camera,
         player: frame.player,
         particles: frame.particles,
+        field: frame.field,
     })
 }
 
@@ -247,6 +277,37 @@ struct Rendered {
     camera: ([f64; 2], f64),
     player: Option<reyvec_scene::PlayerView>,
     particles: crate::ParticleStats,
+    field: Option<FieldSnapshot>,
+}
+
+/// Читает буфер запечённого поля после законченного кадра.
+fn read_field(
+    ctx: &GpuContext,
+    gpu: &mut GpuResources,
+    demo: &Demo,
+) -> Result<Option<FieldSnapshot>, GpuError> {
+    let Some((id, window)) = demo.space_field_buffer() else {
+        return Ok(None);
+    };
+    let size = window.size as u64;
+    let bytes = size * size * size * reyvec_sdf::field3d::FIELD_LEVELS as u64 * 2;
+    let read = gpu.create_buffer(
+        ctx,
+        bytes,
+        vk::BufferUsageFlags::TRANSFER_DST,
+        crate::BufferMemory::GpuToCpu,
+        "чтение поля",
+    )?;
+    gpu.copy_buffer(ctx, id, read, bytes)?;
+    let data = gpu.read_buffer(read, bytes as usize);
+    gpu.destroy_buffer(read);
+    Ok(data.map(|data| FieldSnapshot {
+        window,
+        halves: data
+            .chunks_exact(2)
+            .map(|c| u16::from_ne_bytes([c[0], c[1]]))
+            .collect(),
+    }))
 }
 
 fn render(
@@ -499,12 +560,19 @@ fn render(
             }
             None => None,
         };
+        let field = match (r.gpu.as_mut(), r.demo.as_ref()) {
+            (Some(gpu), Some(demo)) if scene.scene == DemoScene::Space => {
+                read_field(ctx, gpu, demo)?
+            }
+            _ => None,
+        };
         Ok(Rendered {
             rgba: pixels,
             timings,
             camera,
             player,
             particles,
+            field,
         })
     }
 }
@@ -513,6 +581,68 @@ fn render(
 mod tests {
     use super::*;
     use crate::validation_error_count;
+
+    /// Поле, посчитанное видеокартой (7.10б), совпадает с моделью на процессоре
+    /// (`reyvec_sdf::field3d`) в случайных точках всех слоёв.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn baked_field_matches_cpu_model() {
+        use reyvec_sdf::field3d::{
+            BRICK, FIELD_LEVELS, band, level_step, round_half, solid_distance,
+        };
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let time = 2.0;
+        let scene = HeadlessScene {
+            width: 160,
+            height: 90,
+            time,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::Off,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        let errors = validation_error_count();
+        let img = render_headless(&options, &scene).expect("кадр без окна");
+        assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+        let field = img.field.expect("поле считалось");
+        let frame = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE)
+            .unwrap()
+            .frame(time);
+        let programs = crate::space::field_programs(&frame);
+        let size = field.window.size;
+        let mut seed = 99u32;
+        let mut rnd = |n: i32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed % n as u32) as i32
+        };
+        let mut near_surface = 0;
+        for _ in 0..40000 {
+            let level = rnd(FIELD_LEVELS as i32) as usize;
+            let w = field.window.corners[level] + glam::IVec3::new(rnd(size), rnd(size), rnd(size));
+            let step = level_step(level);
+            let b = band(level);
+            let cpu = round_half(solid_distance(&programs, w.as_vec3() * step, b).clamp(-b, b));
+            let gpu = field.value(level, w);
+            assert!(
+                (cpu - gpu).abs() <= 1e-3 + cpu.abs() / 1024.0,
+                "слой {level}, точка {w}: процессор {cpu}, видеокарта {gpu}"
+            );
+            if cpu.abs() < b {
+                near_surface += 1;
+            }
+        }
+        assert!(near_surface > 200, "точек у поверхностей: {near_surface}");
+        assert_eq!(size % BRICK, 0);
+    }
 
     /// Нужен драйвер Vulkan. В CI запускается на программном lavapipe:
     /// `cargo test -p reyvec-gpu -- --include-ignored`.

@@ -66,48 +66,55 @@ pub fn round_half(x: f32) -> f32 {
     f32::from_bits(rounded)
 }
 
-/// Один слой: кольцо `size³` значений вокруг камеры.
-#[derive(Clone, Debug)]
-pub struct FieldLevel {
-    /// Мировой номер первой точки слоя (кратен [`BRICK`]); точка `w` стоит в `w · шаг`.
-    pub corner: IVec3,
-    pub values: Vec<f32>,
+/// Кубик, который надо посчитать: слой и мировой номер его первой точки.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrickJob {
+    pub level: usize,
+    pub first: IVec3,
 }
 
-/// Все слои поля.
+impl BrickJob {
+    /// Середина кубика и радиус шара вокруг него, в котором поле может зависеть от
+    /// предмета: полоса слоя плюс половина диагонали кубика.
+    pub fn reach(&self) -> (Vec3, f32) {
+        let step = level_step(self.level);
+        let middle = (self.first.as_vec3() + BRICK as f32 * 0.5) * step;
+        (
+            middle,
+            band(self.level) + INTERP_MARGIN * step * BRICK as f32,
+        )
+    }
+}
+
+/// Где стоят слои и посчитано ли поле: всё, что нужно, чтобы решить, какие кубики
+/// пересчитать. Сами числа держит [`Field`] (процессор) или буфер видеокарты.
 #[derive(Clone, Debug)]
-pub struct Field {
+pub struct FieldWindow {
     pub size: i32,
-    pub levels: Vec<FieldLevel>,
-    /// Посчитано ли поле хоть раз (до этого [`Field::update`] собирает его целиком).
+    /// Мировой номер первой точки каждого слоя (кратен [`BRICK`]); точка `w` слоя
+    /// стоит в `w · шаг`.
+    pub corners: [IVec3; FIELD_LEVELS],
     built: bool,
 }
 
-/// Сколько кубиков пересчитал [`Field::update`] (для полосы времени и тестов).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FieldUpdate {
-    pub bricks: usize,
-}
-
-impl Field {
-    /// Пустое поле `size³` на слой (`size` кратен [`BRICK`]). В игре — [`FIELD_SIZE`],
-    /// тесты берут меньше.
+impl FieldWindow {
+    /// Слои по `size³` точек (`size` кратен [`BRICK`]). В игре — [`FIELD_SIZE`], тесты
+    /// берут меньше.
     pub fn new(size: i32) -> Self {
         assert!(
             size > 0 && size % BRICK == 0,
             "size {size} не кратен {BRICK}"
         );
-        let n = (size * size * size) as usize;
-        Field {
+        FieldWindow {
             size,
-            levels: (0..FIELD_LEVELS)
-                .map(|_| FieldLevel {
-                    corner: IVec3::ZERO,
-                    values: vec![0.0; n],
-                })
-                .collect(),
+            corners: [IVec3::ZERO; FIELD_LEVELS],
             built: false,
         }
+    }
+
+    /// Забыть посчитанное: следующий [`FieldWindow::plan`] пересчитает всё.
+    pub fn reset(&mut self) {
+        self.built = false;
     }
 
     /// Угол слоя `level` для камеры в `camera`: камера посередине, с точностью до кубика.
@@ -117,17 +124,93 @@ impl Field {
         (middle - IVec3::splat(self.size / BRICK / 2)) * BRICK
     }
 
-    fn slot(&self, w: IVec3) -> usize {
+    /// Номер ячейки точки `w` в кольце слоя.
+    pub fn slot(&self, w: IVec3) -> usize {
         let s = self.size;
         let q = IVec3::new(w.x.rem_euclid(s), w.y.rem_euclid(s), w.z.rem_euclid(s));
         ((q.z * s + q.y) * s + q.x) as usize
     }
 
-    /// Привести поле к кадру: слои встают вокруг `camera`; кубики, вошедшие в слой,
-    /// и кубики в полосе вокруг шаров `changed` (старое и новое место сдвинутых
-    /// предметов) пересчитываются. `distance(p, near)` — расстояние до форм без
-    /// плоскостей; дальше `near` от формы можно отвечать оценкой снизу (по шару-границе).
-    /// `full` — пересчитать всё (сцена сменилась целиком).
+    /// Поставить слои вокруг `camera` и вернуть кубики, которые надо пересчитать:
+    /// вошедшие в слой и лежащие в полосе вокруг шаров `changed` (старое и новое место
+    /// сдвинутых предметов). `full` — все (сцена сменилась целиком).
+    pub fn plan(&mut self, camera: Vec3, changed: &[(Vec3, f32)], full: bool) -> Vec<BrickJob> {
+        let full = full || !self.built;
+        self.built = true;
+        let mut jobs = Vec::new();
+        let bricks = self.size / BRICK;
+        for level in 0..FIELD_LEVELS {
+            let old = self.corners[level];
+            let new = self.corner_for(camera, level);
+            self.corners[level] = new;
+            for bz in 0..bricks {
+                for by in 0..bricks {
+                    for bx in 0..bricks {
+                        let job = BrickJob {
+                            level,
+                            first: new + IVec3::new(bx, by, bz) * BRICK,
+                        };
+                        let entered = (job.first - old).min_element() < 0
+                            || (job.first - old).max_element() >= self.size;
+                        let (middle, reach) = job.reach();
+                        let near_change = changed
+                            .iter()
+                            .any(|&(c, r)| (middle - c).length() - r < reach);
+                        if full || entered || near_change {
+                            jobs.push(job);
+                        }
+                    }
+                }
+            }
+        }
+        jobs
+    }
+}
+
+/// Предметы, от которых зависит поле в кубике `job`: бесконечные (кроме плоскостей)
+/// и те, чей шар-граница ближе [`BrickJob::reach`]. Остальные дальше полосы от каждой
+/// точки кубика и на записанное число не влияют.
+pub fn brick_objects(objects: &[crate::Program], job: &BrickJob) -> Vec<u32> {
+    let (middle, reach) = job.reach();
+    (0..objects.len() as u32)
+        .filter(|&i| {
+            let o = &objects[i as usize];
+            match o.bounds {
+                Some((c, r)) => (c - middle).length() - r < reach,
+                None => o.plane().is_none(),
+            }
+        })
+        .collect()
+}
+
+/// Поле на процессоре: окно слоёв и сами числа.
+#[derive(Clone, Debug)]
+pub struct Field {
+    pub window: FieldWindow,
+    /// Числа слоёв: `size³` на слой, ячейка точки — [`FieldWindow::slot`].
+    pub values: Vec<Vec<f32>>,
+}
+
+/// Сколько кубиков пересчитал [`Field::update`] (для тестов).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FieldUpdate {
+    pub bricks: usize,
+}
+
+impl Field {
+    /// Пустое поле `size³` на слой (`size` кратен [`BRICK`]).
+    pub fn new(size: i32) -> Self {
+        let window = FieldWindow::new(size);
+        let n = (size * size * size) as usize;
+        Field {
+            window,
+            values: vec![vec![0.0; n]; FIELD_LEVELS],
+        }
+    }
+
+    /// Привести поле к кадру ([`FieldWindow::plan`]) и посчитать кубики.
+    /// `distance(p, near)` — расстояние до форм без плоскостей; дальше `near` от формы
+    /// можно отвечать оценкой снизу (по шару-границе).
     pub fn update(
         &mut self,
         camera: Vec3,
@@ -135,47 +218,23 @@ impl Field {
         full: bool,
         distance: &impl Fn(Vec3, f32) -> f32,
     ) -> FieldUpdate {
-        let full = full || !self.built;
-        self.built = true;
-        let mut done = FieldUpdate::default();
-        let bricks = self.size / BRICK;
-        for level in 0..FIELD_LEVELS {
-            let old = self.levels[level].corner;
-            let new = self.corner_for(camera, level);
-            self.levels[level].corner = new;
-            let step = level_step(level);
-            let reach = band(level) + INTERP_MARGIN * step * BRICK as f32;
-            for bz in 0..bricks {
-                for by in 0..bricks {
-                    for bx in 0..bricks {
-                        let first = new + IVec3::new(bx, by, bz) * BRICK;
-                        let entered = (first - old).min_element() < 0
-                            || (first - old).max_element() >= self.size;
-                        let middle = (first.as_vec3() + BRICK as f32 * 0.5) * step;
-                        let near_change = changed
-                            .iter()
-                            .any(|&(c, r)| (middle - c).length() - r < reach);
-                        if full || entered || near_change {
-                            self.bake_brick(level, first, distance);
-                            done.bricks += 1;
-                        }
-                    }
-                }
-            }
+        let jobs = self.window.plan(camera, changed, full);
+        for job in &jobs {
+            self.bake_brick(job, distance);
         }
-        done
+        FieldUpdate { bricks: jobs.len() }
     }
 
-    fn bake_brick(&mut self, level: usize, first: IVec3, distance: &impl Fn(Vec3, f32) -> f32) {
-        let step = level_step(level);
-        let band = band(level);
+    fn bake_brick(&mut self, job: &BrickJob, distance: &impl Fn(Vec3, f32) -> f32) {
+        let step = level_step(job.level);
+        let band = band(job.level);
         for z in 0..BRICK {
             for y in 0..BRICK {
                 for x in 0..BRICK {
-                    let w = first + IVec3::new(x, y, z);
+                    let w = job.first + IVec3::new(x, y, z);
                     let d = distance(w.as_vec3() * step, band).clamp(-band, band);
-                    let slot = self.slot(w);
-                    self.levels[level].values[slot] = round_half(d);
+                    let slot = self.window.slot(w);
+                    self.values[job.level][slot] = round_half(d);
                 }
             }
         }
@@ -184,11 +243,13 @@ impl Field {
     /// Трилинейная выборка самого мелкого слоя, где лежит весь кубик решётки вокруг `p`:
     /// значение и номер слоя. `None` — точка вне всех слоёв.
     pub fn sample(&self, p: Vec3) -> Option<(f32, usize)> {
-        for (level, l) in self.levels.iter().enumerate() {
+        let size = self.window.size;
+        for (level, values) in self.values.iter().enumerate() {
+            let corner = self.window.corners[level];
             let g = p / level_step(level);
             let base = g.floor();
             let b = base.as_ivec3();
-            if (b - l.corner).min_element() < 0 || (b - l.corner).max_element() >= self.size - 1 {
+            if (b - corner).min_element() < 0 || (b - corner).max_element() >= size - 1 {
                 continue;
             }
             let f = g - base;
@@ -196,7 +257,7 @@ impl Field {
             for k in 0..8 {
                 let o = IVec3::new(k & 1, (k >> 1) & 1, (k >> 2) & 1);
                 let w = Vec3::select(o.cmpeq(IVec3::ONE), f, Vec3::ONE - f);
-                v += w.x * w.y * w.z * l.values[self.slot(b + o)];
+                v += w.x * w.y * w.z * values[self.window.slot(b + o)];
             }
             return Some((v, level));
         }
@@ -369,9 +430,7 @@ mod tests {
         );
         // Ровно как собранное заново.
         let fresh = build(&after, camera, 32);
-        for (a, b) in field.levels.iter().zip(&fresh.levels) {
-            assert_eq!(a.values, b.values);
-        }
+        assert_eq!(field.values, fresh.values);
     }
 
     #[test]
@@ -389,19 +448,48 @@ mod tests {
             "{done:?}"
         );
         let fresh = build(&objects, camera, 32);
-        for (level, (a, b)) in field.levels.iter().zip(&fresh.levels).enumerate() {
-            assert_eq!(a.corner, b.corner);
+        assert_eq!(field.window.corners, fresh.window.corners);
+        for (level, (a, b)) in field.values.iter().zip(&fresh.values).enumerate() {
             // Ячейки кольца у тех же мировых точек — те же числа.
             for z in 0..32 {
                 for y in 0..32 {
                     for x in 0..32 {
-                        let w = a.corner + IVec3::new(x, y, z);
-                        let s = field.slot(w);
-                        assert_eq!(a.values[s], b.values[s], "слой {level}, точка {w}");
+                        let w = field.window.corners[level] + IVec3::new(x, y, z);
+                        let s = field.window.slot(w);
+                        assert_eq!(a[s], b[s], "слой {level}, точка {w}");
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn brick_lists_hold_every_object_that_matters() {
+        let objects = programs(crate::space_file::EXAMPLE, 2.0);
+        let mut window = FieldWindow::new(32);
+        let jobs = window.plan(Vec3::new(3.0, 1.2, 2.0), &[], true);
+        let mut short = 0;
+        for job in &jobs {
+            let list = brick_objects(&objects, job);
+            let listed: Vec<Program> = list.iter().map(|&i| objects[i as usize].clone()).collect();
+            if list.len() < objects.len() {
+                short += 1;
+            }
+            // Углы кубика: по списку — то же число, что по всем предметам.
+            let step = level_step(job.level);
+            let band = band(job.level);
+            for k in [0, 7, 63, 511] {
+                let o = IVec3::new(k & 7, (k >> 3) & 7, k >> 6);
+                let p = (job.first + o).as_vec3() * step;
+                let all = solid_distance(&objects, p, band).clamp(-band, band);
+                let some = solid_distance(&listed, p, band).clamp(-band, band);
+                assert_eq!(all, some, "{job:?} точка {p}");
+            }
+        }
+        assert!(
+            short > jobs.len() / 2,
+            "списки почти всегда короче всех предметов"
+        );
     }
 
     #[test]

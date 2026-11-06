@@ -36,6 +36,7 @@ mod cull;
 mod demo;
 mod demo_load;
 mod demo_vector;
+mod field;
 mod graph;
 mod headless;
 mod lab;
@@ -60,8 +61,8 @@ pub use demo_load::{LastLoad, LoadStats, ShapeMemory};
 pub use demo_vector::LIGHT_VECTOR_TOP;
 pub use graph::GraphReport;
 pub use headless::{
-    FrameImage, HeadlessImage, HeadlessPlay, HeadlessScene, PlayInput, render_headless,
-    render_headless_play, render_triangle_headless,
+    FieldSnapshot, FrameImage, HeadlessImage, HeadlessPlay, HeadlessScene, PlayInput,
+    render_headless, render_headless_play, render_triangle_headless,
 };
 pub use particles::ParticleStats;
 pub use pipeline::CLEAR_COLOR;

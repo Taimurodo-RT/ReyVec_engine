@@ -658,6 +658,18 @@ impl WindowRenderer {
             .map_or((false, false), Demo::space_smooth)
     }
 
+    /// Запечённое поле расстояний сцены «3D» (7.10б): включено ли и умеет ли видеокарта.
+    pub fn space_field(&self) -> (bool, bool) {
+        self.demo.as_ref().map_or((false, false), Demo::space_field)
+    }
+
+    /// Включает или выключает запечённое поле сцены «3D» со следующего кадра.
+    pub fn set_space_field(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_field(on);
+        }
+    }
+
     /// Включает или выключает сглаживание краёв форм сцены «3D» со следующего кадра.
     pub fn set_space_smooth(&mut self, on: bool) {
         if let Some(demo) = self.demo.as_mut() {
