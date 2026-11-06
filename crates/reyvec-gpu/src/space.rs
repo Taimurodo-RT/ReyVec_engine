@@ -160,7 +160,9 @@ mod tests {
         // Заменители — последние объекты и помечены флагом.
         let (count, objects) = (w[0] as usize, w[1] as usize);
         let flag = |i: usize| w[objects + i * 8 + 2];
-        assert_eq!(flag(0), 0);
+        // Пол — плоскость, луч глаза находит её формулой (7.6и).
+        assert_eq!(flag(0), reyvec_sdf::shape3d::OBJECT_PLANE);
+        assert_eq!(flag(1), 0);
         assert_eq!(
             flag(count - 1),
             reyvec_sdf::shape3d::OBJECT_SHADOW_ONLY,

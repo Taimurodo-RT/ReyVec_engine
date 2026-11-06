@@ -30,19 +30,23 @@ float fs_main(VertexOut input) : SV_Target
     // камеры лучи параллельны и расстояние постоянно).
     float3 offset = edge.origin - axis.origin;
     float3 drift = edge.dir - axis.dir;
+    // Плоскости (7.6и) конус не опрашивает: каждый луч квадрата сам упрётся в свою
+    // точку плоскости. Дальше точки плоскости на оси идти незачем — там пол.
+    float3 plane_normal;
+    float limit = min(axis.limit, plane_hit(axis.origin, axis.dir, plane_normal).x);
     float t = 0.0;
     for (int i = 0; i < 96; i++)
     {
         float cone = length(offset + drift * t);
-        float d = scene_near(axis.origin + axis.dir * t, max(0.25, 2.0 * cone), false).x;
+        float d = scene_near(axis.origin + axis.dir * t, max(0.25, 2.0 * cone), false, false).x;
         // Пустота должна быть шире конуса с запасом: иначе дальше идут тонкие лучи.
         float free = d - cone;
         if (free < 0.01 + 0.002 * t)
             break;
         // Шаг меньше пустоты: за шаг конус чуть расширяется.
         t += free * 0.9;
-        if (t > axis.limit)
+        if (t > limit)
             break;
     }
-    return t;
+    return min(t, limit);
 }

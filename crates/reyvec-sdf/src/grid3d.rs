@@ -49,17 +49,25 @@ pub struct Grid {
     pub inner_hi: Vec3,
     pub cells: Vec<Cell>,
     pub items: Vec<u32>,
-    /// Объекты без границы: считаются в каждой точке.
+    /// Объекты без границы: считаются в каждой точке. Сначала обычные, в конце —
+    /// плоскости, которые луч глаза находит формулой ([`crate::shape3d::OBJECT_PLANE`]).
     pub unbounded: Vec<u32>,
+    /// Сколько первых из `unbounded` — не плоскости.
+    pub unbounded_solid: usize,
 }
 
 impl Grid {
     /// Сетка для объектов `objects` (номера в списках — их индексы).
     pub fn build(objects: &[Program]) -> Self {
+        let planes = crate::shape3d::plane_objects(objects);
+        let (mut unbounded, flat): (Vec<u32>, Vec<u32>) = (0..objects.len() as u32)
+            .filter(|&i| objects[i as usize].bounds.is_none())
+            .partition(|i| !planes.contains(i));
+        let unbounded_solid = unbounded.len();
+        unbounded.extend(flat);
         let mut grid = Grid {
-            unbounded: (0..objects.len() as u32)
-                .filter(|&i| objects[i as usize].bounds.is_none())
-                .collect(),
+            unbounded,
+            unbounded_solid,
             ..Grid::default()
         };
         let finite: Vec<(u32, Vec3, f32)> = objects
@@ -162,7 +170,7 @@ impl Grid {
     ///
     /// - заголовок, 20 слов: угол сетки (3 числа), размер клетки, клеток по осям
     ///   (3 целых), margin, коробка шаров (6 чисел), где клетки, где списки, где и
-    ///   сколько бесконечных объектов, 2 запасных;
+    ///   сколько бесконечных объектов, сколько из них не плоскости, 1 запасное;
     /// - клетки по 2 слова: начало списка (номер слова в буфере) и длина; клетка
     ///   (x, y, z) — номер (z · ny + y) · nx + x;
     /// - списки клеток подряд, потом список бесконечных объектов.
@@ -181,7 +189,7 @@ impl Grid {
             items_at as u32,
             unbounded_at as u32,
             self.unbounded.len() as u32,
-            0,
+            self.unbounded_solid as u32,
             0,
         ]);
         for c in &self.cells {
