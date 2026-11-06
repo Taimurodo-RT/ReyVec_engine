@@ -294,7 +294,24 @@ fn cases() -> Vec<Case> {
                     )),
                     ..Default::default()
                 },
+                width: 1920,
+                height: 1080,
                 ..at(DemoScene::Space, 1.0, false)
+            },
+        },
+        Case {
+            name: "space-hollow-side-2s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(with_camera(
+                        include_str!("../../../scenes/3d/space.ron"),
+                        "(eye: (4.9, 0.9, 3.3), look_at: (3.4, 0.6, 2.6))",
+                    )),
+                    ..Default::default()
+                },
+                width: 1920,
+                height: 1080,
+                ..at(DemoScene::Space, 2.0, false)
             },
         },
         Case {
@@ -307,6 +324,8 @@ fn cases() -> Vec<Case> {
                     )),
                     ..Default::default()
                 },
+                width: 1920,
+                height: 1080,
                 ..at(DemoScene::Space, 0.0, false)
             },
         },
