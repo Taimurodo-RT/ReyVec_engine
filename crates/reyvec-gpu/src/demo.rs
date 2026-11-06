@@ -346,6 +346,9 @@ pub(crate) struct FrameData {
     /// Вершин полигональных моделей сцены «3D» (7.6ж; 0 — моделей нет, проход
     /// «полигоны 3D» не нужен).
     space_vertices: u32,
+    /// Опыт 7.6м: буфер, куда вычислительный «реймарчинг» пишет буфер геометрии
+    /// (адрес и сам буфер для копии в картинку). `None` — лучи пиксельным шейдером.
+    space_march_out: Option<(vk::DeviceAddress, vk::Buffer)>,
     /// Источники света сцены «лампы и тени» в буфере кадра (адрес и сколько их).
     lights_address: vk::DeviceAddress,
     light_count: u32,
@@ -372,6 +375,10 @@ pub(crate) struct Demo {
     space_cone: vk::Pipeline,
     /// …тени и затенение в углах по нему (7.4, `raymarch_shadow.slang`)…
     space_shadow: vk::Pipeline,
+    /// Опыт 7.6м: те же лучи вычислительным шейдером (`cs_main` в `raymarch.slang`),
+    /// если в файле сцены `compute: true`. Пишет в буфер `space_march_out` кадра.
+    space_march_compute: vk::Pipeline,
+    space_march_out: Vec<Option<(BufferId, u64)>>,
     /// …и его освещение в проходе «сцена» (`raymarch_shade.slang`).
     space_shade: vk::Pipeline,
     /// Камера сцены «3D».
@@ -634,6 +641,8 @@ impl Demo {
             space_mesh: vk::Pipeline::null(),
             space_cone: vk::Pipeline::null(),
             space_shadow: vk::Pipeline::null(),
+            space_march_compute: vk::Pipeline::null(),
+            space_march_out: vec![None; frames_in_flight],
             space_shade: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
             space_view: Default::default(),
@@ -816,6 +825,11 @@ impl Demo {
                 res.bindless.pipeline_layout,
                 shaders.compute("particles"),
             )?;
+            demo.space_march_compute = crate::pipeline::compute_pipeline(
+                &ctx.device,
+                res.bindless.pipeline_layout,
+                shaders.compute("raymarch"),
+            )?;
             demo.bloom_down = build(
                 ctx,
                 res,
@@ -909,6 +923,42 @@ impl Demo {
     /// Включена ли сетка отсева сцены «3D» (в файле `culling: false` выключает).
     pub fn space_culling(&self) -> bool {
         !self.space.culling_off
+    }
+
+    /// Буфер кадра `slot` под буфер геометрии размера `extent` для вычислительного
+    /// «реймарчинга» (опыт 7.6м): создаётся при первой надобности и пересоздаётся, когда
+    /// кадр стал больше. `None` — не вышло (тогда лучи идут пиксельным шейдером).
+    fn march_out_buffer(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        slot: usize,
+        extent: vk::Extent2D,
+    ) -> Option<(vk::DeviceAddress, vk::Buffer)> {
+        let size = u64::from(extent.width) * u64::from(extent.height) * 16;
+        let entry = self.space_march_out.get_mut(slot)?;
+        if entry.is_some_and(|(_, have)| have < size)
+            && let Some((id, _)) = entry.take()
+        {
+            res.destroy_buffer(id);
+        }
+        if entry.is_none() {
+            match res.create_buffer(
+                ctx,
+                size.max(16),
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+                BufferMemory::GpuOnly,
+                &format!("лучи 3D вычислительным шейдером, кадр {slot}"),
+            ) {
+                Ok(id) => *entry = Some((id, size.max(16))),
+                Err(e) => {
+                    tracing::warn!("буфер для лучей вычислительным шейдером: {e}");
+                    return None;
+                }
+            }
+        }
+        let (id, _) = (*entry)?;
+        Some((res.buffer_address(id), res.buffer_raw(id)?))
     }
 
     /// Отсев по взгляду в последнем кадре сцены «3D»: сколько объектов осталось из
@@ -1969,6 +2019,10 @@ impl Demo {
         res.write_buffer(blob_buffer, 0, &blob_bytes);
         let space_buffer = self.space_buffers[slot];
         let mut space_vertices = 0;
+        let mut space_march_out = None;
+        if scene == DemoScene::Space && self.space.compute {
+            space_march_out = self.march_out_buffer(ctx, res, slot, extent);
+        }
         if scene == DemoScene::Space {
             let mut frame = self.space.frame(time);
             let view_proj = self.space_camera.view_proj(aspect);
@@ -1991,6 +2045,7 @@ impl Demo {
             sprite_count: count as u32,
             space_address: res.buffer_address(space_buffer),
             space_vertices,
+            space_march_out,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
             objects_address: res.buffer_address(object_buffer),
@@ -2257,31 +2312,120 @@ impl Demo {
                 meshes
             });
             let gbuffer = graph.create("буфер геометрии 3D", frame.extent, GBUFFER_FORMAT);
-            let mut march_uses = vec![(cone, Access::Sampled), (gbuffer, Access::ColorAttachment)];
-            if let Some(m) = meshes {
-                march_uses.push((m, Access::Sampled));
-            }
-            graph.add_pass("реймарчинг", &march_uses, move |p| {
-                let push = space_push(
-                    &camera,
-                    frame.extent,
-                    frame.time,
-                    frame.space_address,
-                    [p.texture(cone), meshes.map_or(0, |m| p.texture(m))],
-                    u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
-                );
-                let (d, cmd) = (p.device, p.cmd);
-                // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
-                // этого кадра жив, пока кадр рисуется.
-                unsafe {
-                    begin_color_pass(d, cmd, p.view(gbuffer), frame.extent);
-                    bindless.bind(d, cmd);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_march);
-                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                    d.cmd_draw(cmd, 3, 1, 0, 0);
-                    d.cmd_end_rendering(cmd);
+            if let Some((out, out_buffer)) = frame.space_march_out {
+                // Опыт 7.6м: те же лучи вычислительным шейдером в буфер, потом копия в
+                // картинку буфера геометрии (её читают тени и освещение как обычно).
+                let mut uses = vec![(cone, Access::ComputeSampled)];
+                if let Some(m) = meshes {
+                    uses.push((m, Access::ComputeSampled));
                 }
-            });
+                graph.add_pass("реймарчинг", &uses, move |p| {
+                    let push = space_push_out(
+                        space_push(
+                            &camera,
+                            frame.extent,
+                            frame.time,
+                            frame.space_address,
+                            [p.texture(cone), meshes.map_or(0, |m| p.texture(m))],
+                            u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
+                        ),
+                        out,
+                    );
+                    // Буфер этого кадра в прошлый раз читала копия: запись после неё.
+                    let before = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)];
+                    let after = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)];
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл конусы (и полигоны) в чтение; буфер лучей и
+                    // буфер сцены этого кадра живы, пока кадр рисуется; барьеры выше
+                    // упорядочивают запись буфера с копией прошлого и этого кадра.
+                    unsafe {
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&before),
+                        );
+                        bindless.bind_compute(d, cmd);
+                        d.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.space_march_compute,
+                        );
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_dispatch(
+                            cmd,
+                            frame.extent.width.div_ceil(8),
+                            frame.extent.height.div_ceil(8),
+                            1,
+                        );
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&after),
+                        );
+                    }
+                });
+                graph.add_pass(
+                    "копия буфера геометрии",
+                    &[(gbuffer, Access::TransferDst)],
+                    move |p| {
+                        let region = vk::BufferImageCopy::default()
+                            .image_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .layer_count(1),
+                            )
+                            .image_extent(vk::Extent3D {
+                                width: frame.extent.width,
+                                height: frame.extent.height,
+                                depth: 1,
+                            });
+                        // SAFETY: граф перевёл буфер геометрии в раскладку копирования;
+                        // буфер лучей записан (барьер в прошлом проходе) и жив весь кадр.
+                        unsafe {
+                            p.device.cmd_copy_buffer_to_image(
+                                p.cmd,
+                                out_buffer,
+                                p.image(gbuffer),
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                &[region],
+                            );
+                        }
+                    },
+                );
+            } else {
+                let mut march_uses =
+                    vec![(cone, Access::Sampled), (gbuffer, Access::ColorAttachment)];
+                if let Some(m) = meshes {
+                    march_uses.push((m, Access::Sampled));
+                }
+                graph.add_pass("реймарчинг", &march_uses, move |p| {
+                    let push = space_push(
+                        &camera,
+                        frame.extent,
+                        frame.time,
+                        frame.space_address,
+                        [p.texture(cone), meshes.map_or(0, |m| p.texture(m))],
+                        u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
+                    // этого кадра жив, пока кадр рисуется.
+                    unsafe {
+                        begin_color_pass(d, cmd, p.view(gbuffer), frame.extent);
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_march);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                });
+            }
             // Тени и затенение в углах (7.4): мягкие, поэтому в половинном разрешении —
             // точка на квадрат 2×2 пикселя, вчетверо меньше лучей (7.6б). «Сцена»
             // растягивает их обратно с оглядкой на глубину и нормаль.
@@ -2898,6 +3042,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_mesh, None);
             ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
+            ctx.device.destroy_pipeline(self.space_march_compute, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.light, None);
             ctx.device.destroy_pipeline(self.object, None);
@@ -2919,6 +3064,7 @@ impl Demo {
         self.space_mesh = vk::Pipeline::null();
         self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
+        self.space_march_compute = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
         self.object = vk::Pipeline::null();
@@ -3051,6 +3197,15 @@ fn space_push(
     push[100..104].copy_from_slice(&textures[0].to_ne_bytes());
     push[104..108].copy_from_slice(&textures[1].to_ne_bytes());
     push
+}
+
+/// Константы сцены «3D» и адрес, куда вычислительный «реймарчинг» пишет буфер
+/// геометрии (поле `out` в `include/space.slang`, опыт 7.6м).
+fn space_push_out(push: [u8; 112], out: vk::DeviceAddress) -> [u8; 120] {
+    let mut full = [0u8; 120];
+    full[..112].copy_from_slice(&push);
+    full[112..].copy_from_slice(&out.to_ne_bytes());
+    full
 }
 
 /// Константы для `sdf_object.slang` (4.5): записи объектов, камера и режим (0 — цвет

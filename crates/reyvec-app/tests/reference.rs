@@ -282,7 +282,36 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
+        // Опыт 7.6м: лучи глаза вычислительным шейдером дают тот же кадр, что пиксельным
+        // (эталоны — копии space-1s и space-mixed-1s).
+        Case {
+            name: "space-1s-compute",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(with_compute(include_str!("../../../scenes/3d/space.ron"))),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
+        Case {
+            name: "space-mixed-1s-compute",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(with_compute(include_str!("../../../scenes/3d/mixed.ron"))),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
     ]
+}
+
+/// Файл сцены «3D» с лучами вычислительным шейдером (`compute: true`).
+fn with_compute(text: &str) -> std::sync::Arc<str> {
+    assert!(text.contains("version: 1,"));
+    text.replacen("version: 1,", "version: 1,\n    compute: true,", 1)
+        .into()
 }
 
 /// Печатает PNG в лог строками base64 между метками `--- PNG <имя> ---` и
