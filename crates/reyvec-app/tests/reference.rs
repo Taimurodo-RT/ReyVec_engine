@@ -384,6 +384,8 @@ fn frames_match_references() {
             save_png(&actual, &frame.image).expect("запись кадра");
             save_png(&marked, &diff_image(&frame.image, &expected, TOLERANCE))
                 .expect("запись отличий");
+            // Кадр и в лог: новый эталон можно взять из лога, не скачивая артефакт.
+            print_png_text(case.name, &actual);
             problems.push(format!(
                 "{}: кадр не совпал с эталоном ({:.3}% пикселей). Смотрите {} и {}",
                 case.name,
