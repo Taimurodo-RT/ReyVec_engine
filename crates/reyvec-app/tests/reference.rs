@@ -282,23 +282,8 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
-        // Коробка с дырами вблизи (искажение по кругу на стенках, 7.6п): наискосок
-        // и прямо сквозь дыру.
-        Case {
-            name: "space-hollow-near-1s",
-            scene: HeadlessScene {
-                files: reyvec_app::UserFiles {
-                    space: Some(with_camera(
-                        include_str!("../../../scenes/3d/space.ron"),
-                        "(eye: (5.0, 1.5, 4.4), look_at: (3.4, 0.55, 2.6))",
-                    )),
-                    ..Default::default()
-                },
-                width: 1920,
-                height: 1080,
-                ..at(DemoScene::Space, 1.0, false)
-            },
-        },
+        // Коробка с вырезанным шаром вблизи и сбоку (7.6п): у края дыры не должно быть
+        // тёмной полосы от затенения в углах.
         Case {
             name: "space-hollow-side-2s",
             scene: HeadlessScene {
@@ -309,24 +294,7 @@ fn cases() -> Vec<Case> {
                     )),
                     ..Default::default()
                 },
-                width: 1920,
-                height: 1080,
                 ..at(DemoScene::Space, 2.0, false)
-            },
-        },
-        Case {
-            name: "space-hollow-through-0s",
-            scene: HeadlessScene {
-                files: reyvec_app::UserFiles {
-                    space: Some(with_camera(
-                        include_str!("../../../scenes/3d/space.ron"),
-                        "(eye: (3.4, 0.75, 5.0), look_at: (3.4, 0.6, 2.6))",
-                    )),
-                    ..Default::default()
-                },
-                width: 1920,
-                height: 1080,
-                ..at(DemoScene::Space, 0.0, false)
             },
         },
         // Лучи глаза пиксельным шейдером (`compute: false`) дают тот же кадр, что

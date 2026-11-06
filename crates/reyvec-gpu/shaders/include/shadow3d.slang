@@ -47,22 +47,56 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
 
 // Как view3d::AO_REACH в crates/reyvec-sdf.
 static const float AO_REACH = 1.0;
+// Насколько темнеют углы: доля закрытых проб, умноженная на это, вычитается из 1.
+static const float AO_STRENGTH = 2.2;
 
 // Затенение в углах: 1 — вокруг пусто, меньше — рядом другие формы.
+//
+// Пробы идут вдоль нормали и по четырём направлениям, наклонённым от неё на 42°. Каждая
+// проба сравнивает расстояние до ближайшей формы с тем, каким оно было бы над ровной
+// плоскостью (h · cos наклона), и даёт долю закрытости от 0 до 1. До 7.6п пробы шли только
+// вдоль нормали и складывались без предела: на узком скруглении (край дыры в коробке
+// с вырезанным шаром) нормаль смотрит прямо в полость, и там выходила чёрная полоса
+// толщиной в несколько пикселей, бегущая по кругу вдоль края дыры.
 float ambient_occlusion(float3 p, float3 n)
 {
+    // Два направления поперёк нормали (без ветвлений, Duff и др. 2017).
+    float s = n.z >= 0.0 ? 1.0 : -1.0;
+    float a = -1.0 / (s + n.z);
+    float b = n.x * n.y * a;
+    float3 t1 = float3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+    float3 t2 = float3(b, s + n.y * n.y * a, -n.y);
     float occlusion = 0.0;
-    float weight = 1.0;
-    for (uint i = 0; i < 5; i++)
+    float total = 0.0;
+    // Проба: 0..2 — вдоль нормали (близко, средне, далеко), 3..10 — по наклонным
+    // направлениям средне и далеко.
+    for (uint i = 0; i < 11; i++)
     {
-        float h = 0.02 + 0.12 * float(i);
+        float3 dir = n;
+        float h;
+        float weight;
+        if (i < 3)
+        {
+            h = i == 0 ? 0.04 : (i == 1 ? 0.16 : 0.4);
+            weight = i == 0 ? 1.0 : (i == 1 ? 0.8 : 0.6);
+        }
+        else
+        {
+            uint k = (i - 3) >> 1;
+            float3 side = (k & 1) == 0 ? t1 : t2;
+            dir = normalize(n + ((k & 2) == 0 ? 0.9 : -0.9) * side);
+            bool far_probe = ((i - 3) & 1) == 1;
+            h = far_probe ? 0.4 : 0.16;
+            weight = far_probe ? 0.45 : 0.6;
+        }
         // Дальше AO_REACH расстояние не различаем: так объекты, отсеянные по взгляду
         // (7.6к, они дальше этого от любой пробы), на углы не влияют.
-        float d = min(scene_near(p + n * h, 1e9, true, true).x, AO_REACH);
-        occlusion += (h - d) * weight;
-        weight *= 0.85;
+        float d = min(scene_near(p + dir * h, 1e9, true, true).x, AO_REACH);
+        float plane = h * dot(dir, n);
+        occlusion += weight * saturate((plane - d) / plane);
+        total += weight;
     }
-    return saturate(1.0 - 2.5 * occlusion);
+    return saturate(1.0 - AO_STRENGTH * occlusion / total);
 }
 
 // Одна из четырёх долей света точки `surface` (на поверхности, нормаль `n`, `t` —
