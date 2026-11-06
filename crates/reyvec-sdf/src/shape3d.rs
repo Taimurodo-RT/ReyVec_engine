@@ -667,6 +667,33 @@ impl Program {
         Some((world / len, scale * (n.dot(shift) - offset) / len))
     }
 
+    /// Программа — цепочка «форма, форма, операция, форма, операция…»: на стеке машины
+    /// никогда не больше двух значений. Шейдер считает такую без стека (`sdf_chain`).
+    /// Одна форма без операций — не цепочка: её шейдер и так считает напрямую.
+    pub fn chain(&self) -> bool {
+        let w = &self.words;
+        let mut depth = 0usize;
+        let mut ops = 0usize;
+        let mut i = 0;
+        while i < w.len() {
+            if w[i] & 0xff == op::PRIM {
+                depth += 1;
+                if depth > 2 {
+                    return false;
+                }
+                i += PRIM_WORDS + (w[i] >> 16) as usize;
+            } else {
+                if depth < 2 {
+                    return false;
+                }
+                depth -= 1;
+                ops += 1;
+                i += OP_WORDS;
+            }
+        }
+        depth == 1 && ops > 0
+    }
+
     /// Расстояние до формы в точке `p` и материал ближайшей части: то же, что считает
     /// шейдер по этой программе.
     pub fn distance(&self, p: Vec3) -> (f32, u32) {
@@ -779,6 +806,9 @@ pub const OBJECT_SHADOW_ONLY: u32 = 1;
 /// формулой и не опрашивает её на каждом шаге (7.6и); в слове 3 и словах 4–6 записи
 /// объекта вместо шара-границы — плоскость в мире: `dot(n, p) + c` (c, потом n).
 pub const OBJECT_PLANE: u32 = 2;
+/// Флаг объекта: программа — цепочка, где операции ждёт не больше одной формы
+/// ([`Program::chain`]); шейдер считает её без стека, в регистрах (7.6т).
+pub const OBJECT_CHAIN: u32 = 4;
 /// Больше плоскостей, считаемых формулой, не бывает (шейдер дальше не читает).
 pub const MAX_PLANES: usize = 8;
 /// Слов в заголовке сцены.
@@ -835,6 +865,9 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
         if plane.is_some() {
             flags |= OBJECT_PLANE;
         }
+        if p.chain() {
+            flags |= OBJECT_CHAIN;
+        }
         let (n, c) = plane.unwrap_or((Vec3::ZERO, 0.0));
         out.extend([start as u32, p.words.len() as u32, flags, c.to_bits()]);
         let (center, r) = p.bounds.unwrap_or((n, -1.0));
@@ -890,6 +923,40 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn chains_need_no_stack() {
+        let sphere = || Shape3::Sphere { radius: 0.5 };
+        let hollow = Shape3::Subtract {
+            base: Box::new(Shape3::Box {
+                size: [1.2, 1.2, 1.2],
+                round: 0.04,
+            }),
+            cut: vec![sphere(), sphere()],
+            smooth: 0.05,
+        };
+        let list = Shape3::Union {
+            smooth: 0.4,
+            shapes: vec![sphere(), sphere(), sphere(), sphere()],
+        };
+        assert!(compile(&hollow).unwrap().chain(), "вырезание — цепочка");
+        assert!(
+            compile(&list).unwrap().chain(),
+            "объединение списком — цепочка"
+        );
+        assert!(
+            !compile(&sphere()).unwrap().chain(),
+            "одна форма считается напрямую"
+        );
+        // Вырезать объединение: пока считается вырезаемое, основа ждёт на стеке.
+        let nested = Shape3::Subtract {
+            base: Box::new(sphere()),
+            cut: vec![list.clone()],
+            smooth: 0.0,
+        };
+        assert!(!compile(&nested).unwrap().chain());
+        assert!(!compile(&sample()).unwrap().chain());
     }
 
     fn sample() -> Shape3 {
