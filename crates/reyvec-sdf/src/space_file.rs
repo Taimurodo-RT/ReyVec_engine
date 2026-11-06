@@ -123,6 +123,9 @@ pub struct SpaceFile {
     /// бросающие тень в кадр. `false` выключает его для сравнения замеров.
     #[serde(default = "yes")]
     pub view_culling: bool,
+    /// Опыт 7.6м: лучи глаза вычислительным шейдером вместо пиксельного (для замеров).
+    #[serde(default)]
+    pub compute: bool,
 }
 
 fn yes() -> bool {
@@ -183,6 +186,8 @@ pub struct SpaceScene {
     pub culling_off: bool,
     /// Отсев по взгляду выключен в файле (`view_culling: false`).
     pub view_culling_off: bool,
+    /// Лучи глаза вычислительным шейдером (`compute: true`, опыт 7.6м).
+    pub compute: bool,
 }
 
 /// Что сцена «3D» рисует в один момент.
@@ -293,6 +298,7 @@ impl SpaceScene {
             camera: file.camera,
             culling_off: !file.culling,
             view_culling_off: !file.view_culling,
+            compute: file.compute,
         })
     }
 

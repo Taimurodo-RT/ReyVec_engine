@@ -38,10 +38,11 @@ pub(crate) enum Access {
     StencilAttachment,
     /// Читает её в пиксельном шейдере (через общий список текстур).
     Sampled,
+    /// Читает её в вычислительном шейдере (через общий список текстур).
+    ComputeSampled,
     /// Копирует из неё.
     TransferSrc,
-    /// Копирует в неё (понадобится загрузке данных через граф).
-    #[allow(dead_code)]
+    /// Копирует в неё.
     TransferDst,
     /// Отдаёт на экран (только как конечное состояние картинки окна).
     Present,
@@ -91,6 +92,11 @@ impl Access {
                 vk::PipelineStageFlags2::FRAGMENT_SHADER,
                 vk::AccessFlags2::SHADER_SAMPLED_READ,
             ),
+            Access::ComputeSampled => (
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            ),
             Access::TransferSrc => (
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags2::COPY,
@@ -118,7 +124,7 @@ impl Access {
         match self {
             Access::ColorAttachment => vk::ImageUsageFlags::COLOR_ATTACHMENT,
             Access::StencilAttachment => vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-            Access::Sampled => vk::ImageUsageFlags::SAMPLED,
+            Access::Sampled | Access::ComputeSampled => vk::ImageUsageFlags::SAMPLED,
             Access::TransferSrc => vk::ImageUsageFlags::TRANSFER_SRC,
             Access::TransferDst => vk::ImageUsageFlags::TRANSFER_DST,
             Access::Present => vk::ImageUsageFlags::empty(),
@@ -149,9 +155,20 @@ fn transition(
         && !next_writes
         && cur.layout != vk::ImageLayout::UNDEFINED
     {
+        // Чтение в новой стадии (вычислительный шейдер после пиксельного): прошлая
+        // запись видна только уже ждавшим её стадиям, новой нужен барьер — цепочкой от
+        // прежних чтений.
+        let barrier = (!cur.stage.contains(next.stage)).then_some(PlannedBarrier {
+            image,
+            old: ImageState {
+                access: vk::AccessFlags2::NONE,
+                ..*cur
+            },
+            new: next,
+        });
         cur.stage |= next.stage;
         cur.access |= next.access;
-        return None;
+        return barrier;
     }
     let old = *cur;
     *cur = next;
@@ -689,6 +706,28 @@ mod tests {
         assert_eq!(w.old.stage, vk::PipelineStageFlags2::FRAGMENT_SHADER);
         // Чтения не надо «делать видимыми»: в барьере только ожидание по стадии.
         assert_eq!(w.old.access, vk::AccessFlags2::NONE);
+    }
+
+    /// Чтение вычислительным шейдером после пиксельного: своей стадии запись ещё не
+    /// видна, нужен барьер без смены раскладки.
+    #[test]
+    fn read_in_new_stage_has_barrier() {
+        let initial = [ImageState::UNDEFINED];
+        let passes = vec![
+            vec![(A, Access::ColorAttachment)],
+            vec![(A, Access::Sampled)],
+            vec![(A, Access::ComputeSampled)],
+            vec![(A, Access::Sampled)],
+        ];
+        let (before, _, _) = plan(&initial, &passes, &[None]);
+        assert_eq!(
+            before.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 1, 1, 0]
+        );
+        let b = before[2][0];
+        assert_eq!(b.old.layout, b.new.layout);
+        assert_eq!(b.old.stage, vk::PipelineStageFlags2::FRAGMENT_SHADER);
+        assert_eq!(b.new.stage, vk::PipelineStageFlags2::COMPUTE_SHADER);
     }
 
     /// Две записи подряд в одну раскладку: барьер всё равно нужен (запись после записи).

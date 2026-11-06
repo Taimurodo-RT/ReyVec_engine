@@ -188,6 +188,24 @@ impl Bindless {
         }
     }
 
+    /// То же для вычислительных шейдеров.
+    ///
+    /// # Safety
+    /// Как у [`Bindless::bind`].
+    pub unsafe fn bind_compute(&self, d: &ash::Device, cmd: vk::CommandBuffer) {
+        // SAFETY: условие функции.
+        unsafe {
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[self.set],
+                &[],
+            );
+        }
+    }
+
     pub fn destroy(&self, ctx: &GpuContext) {
         let d = &ctx.device;
         // SAFETY: вызывается, когда видеокарта не использует эти объекты; null допустим.

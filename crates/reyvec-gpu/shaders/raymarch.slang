@@ -30,10 +30,11 @@ float3 normal_at(float3 p)
     return normalize(n);
 }
 
-[shader("fragment")]
-float4 fs_main(VertexOut input) : SV_Target
+// Точка буфера геометрии для пикселя `px` (точка экрана `screen`). Общая для
+// пиксельного шейдера и вычислительного (опыт 7.6м).
+float4 march_pixel(int2 px, float2 screen)
 {
-    Ray ray = screen_ray(input.screen);
+    Ray ray = screen_ray(screen);
 
     // Шагаем по лучу: каждый шаг — на расстояние до ближайшей формы, ближе неё ничего нет.
     // Начало — там, куда дошёл конус квадрата 8×8 (до этого места пусто для всех его
@@ -42,7 +43,7 @@ float4 fs_main(VertexOut input) : SV_Target
     // не попал раньше — пиксель их.
     float4 mesh = float4(-1.0, 0.0, 0.0, 0.0);
     if ((pc.flags & SPACE_FLAG_MESHES) != 0)
-        mesh = textures[pc.shadows].Load(int3(int2(input.position.xy), 0));
+        mesh = textures[pc.shadows].Load(int3(px, 0));
     float limit = mesh.x >= 0.0 ? min(mesh.x, ray.limit) : ray.limit;
     // Плоскости (пол, стены) — формулой (7.6и): луч шагает только среди остальных форм
     // и не дальше точки плоскости; не встретив ничего раньше, пиксель берёт её.
@@ -50,7 +51,7 @@ float4 fs_main(VertexOut input) : SV_Target
     float2 plane = plane_hit(ray.origin, ray.dir, plane_normal);
     bool plane_first = plane.x <= limit;
     limit = min(limit, plane.x);
-    float t = min(textures[pc.gbuffer].Load(int3(int2(input.position.xy) / 8, 0)).x, limit);
+    float t = min(textures[pc.gbuffer].Load(int3(px / 8, 0)).x, limit);
     float2 hit = float2(-1.0, 0.0);
     // Шаг с «перелётом» (over-relaxation, Keinert и др., «Enhanced Sphere Tracing»,
     // 2014): шагаем в 1.6 раза дальше безопасного. Пока шары пустоты соседних точек
@@ -96,4 +97,25 @@ float4 fs_main(VertexOut input) : SV_Target
     }
     float3 n = normal_at(ray.origin + ray.dir * hit.x);
     return float4(hit.x, hit.y, oct_encode(n));
+}
+
+[shader("fragment")]
+float4 fs_main(VertexOut input) : SV_Target
+{
+    return march_pixel(int2(input.position.xy), input.screen);
+}
+
+// Опыт 7.6м: те же лучи вычислительным шейдером. Группа 8×8 — ровно квадрат конуса
+// (все её лучи начинают с одной длины). Результат — в буфер `pc.out` строками, проход
+// «копия буфера геометрии» кладёт его в картинку буфера геометрии.
+[shader("compute")]
+[numthreads(8, 8, 1)]
+void cs_main(uint3 id : SV_DispatchThreadID)
+{
+    uint w = uint(pc.aspect * pc.height + 0.5);
+    uint h = uint(pc.height);
+    if (id.x >= w || id.y >= h)
+        return;
+    float2 screen = float2((float(id.x) + 0.5) / float(w) * 2.0 - 1.0, 1.0 - (float(id.y) + 0.5) / float(h) * 2.0);
+    pc.out[id.y * w + id.x] = march_pixel(int2(id.xy), screen);
 }
