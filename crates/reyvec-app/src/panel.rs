@@ -365,11 +365,11 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             None => format!("{grid}, отсев по взгляду выключен (view_culling: false)"),
         };
         let rays = match info.space_compute {
-            (_, true) => "лучи вычислительным шейдером (compute: true)",
+            (_, true) => "лучи вычислительным шейдером",
             (true, false) => {
                 "лучи пиксельным шейдером: видеокарта не умеет вычислительный вариант, см. журнал"
             }
-            (false, false) => "лучи пиксельным шейдером",
+            (false, false) => "лучи пиксельным шейдером (compute: false)",
         };
         let culling = format!("{culling}, {rays}");
         match (&info.space_error, info.space_file) {

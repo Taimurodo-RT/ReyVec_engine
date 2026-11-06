@@ -282,23 +282,23 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
-        // Опыт 7.6м: лучи глаза вычислительным шейдером дают тот же кадр, что пиксельным
-        // (эталоны — копии space-1s и space-mixed-1s).
+        // Лучи глаза пиксельным шейдером (`compute: false`) дают тот же кадр, что
+        // вычислительным (7.6м; эталоны — копии space-1s и space-mixed-1s).
         Case {
-            name: "space-1s-compute",
+            name: "space-1s-fragment",
             scene: HeadlessScene {
                 files: reyvec_app::UserFiles {
-                    space: Some(with_compute(include_str!("../../../scenes/3d/space.ron"))),
+                    space: Some(fragment(include_str!("../../../scenes/3d/space.ron"))),
                     ..Default::default()
                 },
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
         Case {
-            name: "space-mixed-1s-compute",
+            name: "space-mixed-1s-fragment",
             scene: HeadlessScene {
                 files: reyvec_app::UserFiles {
-                    space: Some(with_compute(include_str!("../../../scenes/3d/mixed.ron"))),
+                    space: Some(fragment(include_str!("../../../scenes/3d/mixed.ron"))),
                     ..Default::default()
                 },
                 ..at(DemoScene::Space, 1.0, false)
@@ -307,10 +307,10 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Файл сцены «3D» с лучами вычислительным шейдером (`compute: true`).
-fn with_compute(text: &str) -> std::sync::Arc<str> {
+/// Файл сцены «3D» с лучами пиксельным шейдером (`compute: false`).
+fn fragment(text: &str) -> std::sync::Arc<str> {
     assert!(text.contains("version: 1,"));
-    text.replacen("version: 1,", "version: 1,\n    compute: true,", 1)
+    text.replacen("version: 1,", "version: 1,\n    compute: false,", 1)
         .into()
 }
 
