@@ -87,6 +87,38 @@ pub(crate) fn field_programs(frame: &SpaceFrame) -> Vec<Program> {
     programs(frame)
 }
 
+/// Слов в разделе запечённого поля: адрес буфера поля (2 слова), точек по стороне слоя,
+/// 1 запасное, углы слоёв (по 3 целых).
+const FIELD_SECTION_WORDS: usize = 4 + 3 * reyvec_sdf::field3d::FIELD_LEVELS;
+
+/// Раздел запечённого поля (7.10) в конец сцены кадра; слово 10 заголовка — где он.
+/// Раздел начинается с чётного слова: адрес буфера шейдер читает 8-байтным указателем.
+/// `None` — поля в этом кадре нет (шейдер считает формы как раньше).
+pub(crate) fn set_field(
+    words: &mut Vec<u32>,
+    field: Option<(u64, &reyvec_sdf::field3d::FieldWindow)>,
+) {
+    let Some((address, window)) = field else {
+        return;
+    };
+    if words.len() % 2 == 1 {
+        words.push(0);
+    }
+    if words.len() + FIELD_SECTION_WORDS > MAX_WORDS {
+        return;
+    }
+    words[10] = words.len() as u32;
+    words.extend([
+        address as u32,
+        (address >> 32) as u32,
+        window.size as u32,
+        0,
+    ]);
+    for c in window.corners {
+        words.extend(c.to_array().map(|v| v as u32));
+    }
+}
+
 /// Матрица камеры «мир → экран» в раздел моделей (вершинный шейдер «полигонов 3D»).
 pub(crate) fn set_view_proj(words: &mut [u32], view_proj: glam::Mat4) {
     let at = words[7] as usize + 4;

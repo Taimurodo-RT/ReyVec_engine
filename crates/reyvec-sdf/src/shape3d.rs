@@ -812,7 +812,7 @@ pub const OBJECT_CHAIN: u32 = 4;
 /// Больше плоскостей, считаемых формулой, не бывает (шейдер дальше не читает).
 pub const MAX_PLANES: usize = 8;
 /// Слов в заголовке сцены.
-const HEADER_WORDS: usize = 10;
+const HEADER_WORDS: usize = 12;
 
 /// Объекты-плоскости, которые луч глаза находит формулой ([`OBJECT_PLANE`]): первые
 /// [`MAX_PLANES`] видимых объектов из одной плоскости.
@@ -829,9 +829,10 @@ pub fn plane_objects(objects: &[Program]) -> Vec<u32> {
 /// Сцена для видеокарты: объекты (у каждого своя программа), материалы и лампы одним
 /// списком слов. Раскладка (читает `include/space.slang`):
 ///
-/// - заголовок, 10 слов: число объектов, где начинаются объекты, где материалы, сколько
+/// - заголовок, 12 слов: число объектов, где начинаются объекты, где материалы, сколько
 ///   их, где лампы, сколько их, где сетка отсева (0 — сетки нет), где полигоны (пишет
-///   `reyvec-gpu`), где список плоскостей и сколько их ([`OBJECT_PLANE`]);
+///   `reyvec-gpu`), где список плоскостей и сколько их ([`OBJECT_PLANE`]), где раздел
+///   запечённого поля (7.10, пишет `reyvec-gpu`; 0 — поля нет), 1 запасное;
 /// - объекты по 8 слов ([`OBJECT_WORDS`]): начало программы, её длина в словах, флаги
 ///   ([`OBJECT_SHADOW_ONLY`], [`OBJECT_PLANE`]), 1 запасное, шар-граница (середина и
 ///   радиус; радиус -1 — граница не нужна, форма бесконечна);
@@ -852,6 +853,8 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
         materials.len() as u32,
         lamps_at as u32,
         lamps.len() as u32,
+        0,
+        0,
         0,
         0,
         0,
@@ -1163,8 +1166,8 @@ mod tests {
         )
         .unwrap();
         let w = pack_scene(&[a.clone(), b.clone(), floor.clone()], &materials, &lamps);
-        let o = |i: usize| 10 + 8 * i;
-        assert_eq!(&w[..6], &[3, 10, 34, 1, 42, 1]);
+        let o = |i: usize| HEADER_WORDS + 8 * i;
+        assert_eq!(&w[..6], &[3, 12, 36, 1, 44, 1]);
         let (start_b, len_b) = (w[o(1)] as usize, w[o(1) + 1] as usize);
         assert_eq!(len_b, b.words.len());
         assert_eq!(&w[start_b..start_b + len_b], &b.words[..]);
@@ -1174,9 +1177,9 @@ mod tests {
             -1.0,
             "у формы с полом границы нет"
         );
-        assert_eq!(w[37], MATERIAL_GRID);
-        assert_eq!(f32::from_bits(w[42 + 3]), 6.0, "дальность лампы");
-        assert_eq!(f32::from_bits(w[42 + 7]), 4.0, "яркость лампы");
+        assert_eq!(w[w[2] as usize + 3], MATERIAL_GRID);
+        assert_eq!(f32::from_bits(w[w[4] as usize + 3]), 6.0, "дальность лампы");
+        assert_eq!(f32::from_bits(w[w[4] as usize + 7]), 4.0, "яркость лампы");
         assert_eq!(w[w[o(0)] as usize..][..a.words.len()], a.words[..]);
         // Плоскость (7.6и): только третий объект — у второго пол внутри объединения.
         assert_eq!(w[o(1) + 2] & OBJECT_PLANE, 0);

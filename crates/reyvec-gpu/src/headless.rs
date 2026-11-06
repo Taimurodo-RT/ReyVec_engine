@@ -436,6 +436,10 @@ fn render(
             // него.
             demo.set_dither(false);
             demo.set_cascades(scene.cascades);
+            #[cfg(test)]
+            if tests::FIELD_OFF.get() {
+                demo.set_space_field(false);
+            }
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -642,6 +646,74 @@ mod tests {
         }
         assert!(near_surface > 200, "точек у поверхностей: {near_surface}");
         assert_eq!(size % BRICK, 0);
+    }
+
+    thread_local! {
+        /// Кадр без запечённого поля (для сравнения с кадром с полем).
+        pub(super) static FIELD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Тени по полю (7.10в) рисуют то же, что точные: поле лишь пропускает точки луча, где
+    /// полутени заведомо нет. Полая коробка сбоку — самый трудный вид: луч к солнцу идёт
+    /// вдоль стенок, и там, где он перестаёт шагать по полю, сдвиг полос полутени виден
+    /// первым.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn field_shadows_match_exact_ones() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let space = include_str!("../../../scenes/3d/space.ron").replacen(
+            "version: 1,",
+            "version: 1,\n    camera: Some((eye: (4.9, 0.9, 3.3), look_at: (3.4, 0.6, 2.6))),",
+            1,
+        );
+        let files = crate::UserFiles {
+            space: Some(space.into()),
+            ..Default::default()
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 2.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::Off,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files,
+            cascades: false,
+        };
+        let with = render_headless(&options, &scene).expect("кадр с полем");
+        assert!(with.field.is_some(), "поле считалось");
+        FIELD_OFF.set(true);
+        let without = render_headless(&options, &scene);
+        FIELD_OFF.set(false);
+        let without = without.expect("кадр без поля");
+        assert!(without.field.is_none(), "поле выключено");
+        let (mut changed, mut worst) = (0, 0);
+        for (a, b) in with.image.rgba.chunks(4).zip(without.image.rgba.chunks(4)) {
+            let d = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap_or(0);
+            worst = worst.max(d);
+            if d > 2 {
+                changed += 1;
+            }
+        }
+        // Полосы полутени сдвигаются чуть-чуть (до 21 из 255 у стыка стенок на lavapipe),
+        // пятен с резкими краями нет.
+        let total = with.image.rgba.len() / 4;
+        assert!(
+            changed * 200 < total,
+            "отличаются {changed} пикселей из {total}"
+        );
+        assert!(worst < 48, "наибольшая разница канала {worst}");
     }
 
     /// Нужен драйвер Vulkan. В CI запускается на программном lavapipe:
