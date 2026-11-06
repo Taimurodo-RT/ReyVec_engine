@@ -127,8 +127,9 @@ pub struct SpaceFile {
     /// бросающие тень в кадр. `false` выключает его для сравнения замеров.
     #[serde(default = "yes")]
     pub view_culling: bool,
-    /// Опыт 7.6м: лучи глаза вычислительным шейдером вместо пиксельного (для замеров).
-    #[serde(default)]
+    /// Лучи глаза вычислительным шейдером (7.6м, быстрее пиксельного на RTX 5080:
+    /// реймарчинг 0.26 мс вместо 0.45). `false` — пиксельным, для сравнения.
+    #[serde(default = "yes")]
     pub compute: bool,
 }
 
@@ -192,7 +193,7 @@ pub struct SpaceScene {
     pub culling_off: bool,
     /// Отсев по взгляду выключен в файле (`view_culling: false`).
     pub view_culling_off: bool,
-    /// Лучи глаза вычислительным шейдером (`compute: true`, опыт 7.6м).
+    /// Лучи глаза вычислительным шейдером (7.6м; `compute: false` — пиксельным).
     pub compute: bool,
 }
 
@@ -419,8 +420,11 @@ mod tests {
         let text = EXAMPLE.replacen("version: 1,", "version: 1,\n    computе: true,", 1);
         let err = SpaceScene::parse(&text).unwrap_err();
         assert!(err.contains("computе"), "{err}");
-        let text = EXAMPLE.replacen("version: 1,", "version: 1,\n    compute: true,", 1);
-        assert!(SpaceScene::parse(&text).unwrap().compute);
+        let text = EXAMPLE.replacen("version: 1,", "version: 1,\n    compute: false,", 1);
+        assert!(!SpaceScene::parse(&text).unwrap().compute);
+        // По умолчанию лучи вычислительным шейдером: обновление (update.bat) затирает
+        // правки в файлах сцен, и строка `compute: true` пропадала.
+        assert!(SpaceScene::parse(EXAMPLE).unwrap().compute);
     }
 
     #[test]

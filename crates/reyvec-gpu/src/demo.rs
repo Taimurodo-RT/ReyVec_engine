@@ -379,7 +379,7 @@ pub(crate) struct Demo {
     /// …тени и затенение в углах по нему (7.4, `raymarch_shadow.slang`)…
     space_shadow: vk::Pipeline,
     /// Опыт 7.6м: те же лучи вычислительным шейдером (`cs_main` в `raymarch.slang`),
-    /// если в файле сцены `compute: true` и видеокарта умеет писать в картинки через
+    /// если в файле сцены нет `compute: false` и видеокарта умеет писать в картинки через
     /// общий список (иначе конвейера нет, null).
     space_march_compute: vk::Pipeline,
     /// Шли ли лучи последнего кадра «3D» вычислительным шейдером.
@@ -1011,7 +1011,7 @@ impl Demo {
     }
 
     /// Лучи сцены «3D» вычислительным шейдером (опыт 7.6м): попросил ли файл
-    /// (`compute: true`) и шли ли так лучи последнего кадра.
+    /// (нет `compute: false`) и шли ли так лучи последнего кадра.
     pub fn space_compute(&self) -> (bool, bool) {
         (self.space.compute, self.space_compute_running)
     }
