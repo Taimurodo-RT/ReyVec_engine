@@ -11,7 +11,8 @@
 // кадра, и на перемычке тоньше двух пикселей или на полоске пола у края формы пиксель
 // получал бы тень соседней поверхности. Четыре доли света (солнце, углы, две лампы)
 // считают те же четыре потока пикселя, по одной. Луч, попавший на ту же поверхность,
-// берёт эти точные доли, попавший на другую — растянутые из картинки теней.
+// берёт эти точные доли, попавший на другую — растянутые из картинки теней. Точные
+// доли считаются, только если растянутые для точки пикселя ненадёжны (7.6с).
 
 [[vk::binding(0, 0)]] Texture2D textures[];
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
@@ -57,10 +58,17 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         g0 = textures[pc.gbuffer].Load(int3(px, 0));
     }
 
-    // Точные доли света точки самого пикселя: каждый поток свою.
+    // Точные доли света точки самого пикселя: каждый поток свою. Только там, где тени из
+    // половинного размера для неё ненадёжны (7.6с): у силуэта большой формы её сторона
+    // края и так покрыта похожими точками, и четыре луча тени на пиксель не нужны.
     float part = 1.0;
     float3 n0 = oct_decode(g0.zw);
+    float similar = 0.0;
+    float4 upsampled = float4(1.0, 1.0, 1.0, 1.0);
     if (g0.x >= 0.0)
+        upsampled = upsampled_shadows_checked(px, g0.x, n0, similar);
+    bool reliable = similar >= 0.5;
+    if (g0.x >= 0.0 && !reliable)
     {
         float2 c = float2(px) + 0.5;
         Ray r0 = screen_ray(float2(c.x / float(w) * 2.0 - 1.0, 1.0 - c.y / float(h) * 2.0));
@@ -69,7 +77,8 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     parts[lane] = part;
     GroupMemoryBarrierWithGroupSync();
     uint first = lane & ~3u;
-    float4 exact = float4(parts[first], parts[first + 1], parts[first + 2], parts[first + 3]);
+    float4 exact = reliable ? upsampled
+        : float4(parts[first], parts[first + 1], parts[first + 2], parts[first + 3]);
 
     float3 color = float3(0.0, 0.0, 0.0);
     if (i < count)
