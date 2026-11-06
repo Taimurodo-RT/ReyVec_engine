@@ -104,6 +104,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_objects: usize,
     /// Сетка отсева сцены «3D» включена (в файле `culling: false` выключает).
     pub space_culling: bool,
+    /// Отсев по взгляду: объектов в кадре и всего (`None` — выключен).
+    pub space_in_view: Option<(usize, usize)>,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -347,10 +349,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — смотреть \
              вокруг, колесо — скорость, Tab — перспектива или плоская, R — в начало",
         );
-        let culling = if info.space_culling {
+        let grid = if info.space_culling {
             "сетка отсева включена"
         } else {
             "сетка отсева выключена (culling: false)"
+        };
+        let culling = match info.space_in_view {
+            Some((kept, total)) => format!("{grid}, в кадре {kept} из {total}"),
+            None => format!("{grid}, отсев по взгляду выключен (view_culling: false)"),
         };
         match (&info.space_error, info.space_file) {
             (Some(err), _) => {
@@ -946,6 +952,7 @@ mod tests {
             space_error: None,
             space_objects: 0,
             space_culling: true,
+            space_in_view: Some((150, 202)),
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {

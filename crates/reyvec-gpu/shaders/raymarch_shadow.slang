@@ -57,6 +57,9 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
     return light * light * (3.0 - 2.0 * light);
 }
 
+// Как view3d::AO_REACH в crates/reyvec-sdf.
+static const float AO_REACH = 1.0;
+
 // Затенение в углах: 1 — вокруг пусто, меньше — рядом другие формы.
 float ambient_occlusion(float3 p, float3 n)
 {
@@ -65,7 +68,9 @@ float ambient_occlusion(float3 p, float3 n)
     for (uint i = 0; i < 5; i++)
     {
         float h = 0.02 + 0.12 * float(i);
-        float d = scene_near(p + n * h, 1e9, true, true).x;
+        // Дальше AO_REACH расстояние не различаем: так объекты, отсеянные по взгляду
+        // (7.6к, они дальше этого от любой пробы), на углы не влияют.
+        float d = min(scene_near(p + n * h, 1e9, true, true).x, AO_REACH);
         occlusion += (h - d) * weight;
         weight *= 0.85;
     }

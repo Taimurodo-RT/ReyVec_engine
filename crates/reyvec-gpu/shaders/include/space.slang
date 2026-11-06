@@ -303,4 +303,4 @@ float lamp_falloff(Lamp l, float distance)
 }
 
 // Солнце: сбоку сверху.
-static const float3 SUN = float3(0.4969, 0.7950, 0.3478); // normalize(0.5, 0.8, 0.35)
+static const float3 SUN = float3(0.4969, 0.7950, 0.3478); // normalize(0.5, 0.8, 0.35); как view3d::SUN

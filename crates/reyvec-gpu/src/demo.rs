@@ -376,6 +376,8 @@ pub(crate) struct Demo {
     space_shade: vk::Pipeline,
     /// Камера сцены «3D».
     space_camera: reyvec_sdf::Camera3D,
+    /// Отсев по взгляду в последнем кадре сцены «3D» (7.6к).
+    space_view: reyvec_sdf::view3d::ViewCullStats,
     /// Поле расстояний сцены «свет» (4.2): маска теней и проходы jump flooding.
     field: FieldPipelines,
     /// Линии фона сцены «свет» по полю из картинки (jump flooding), а не точному.
@@ -634,6 +636,7 @@ impl Demo {
             space_shadow: vk::Pipeline::null(),
             space_shade: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
+            space_view: Default::default(),
             field: FieldPipelines::default(),
             light_field: false,
             file_scene: reyvec_scene::Scene::default(),
@@ -906,6 +909,12 @@ impl Demo {
     /// Включена ли сетка отсева сцены «3D» (в файле `culling: false` выключает).
     pub fn space_culling(&self) -> bool {
         !self.space.culling_off
+    }
+
+    /// Отсев по взгляду в последнем кадре сцены «3D»: сколько объектов осталось из
+    /// скольких (`None` — выключен, `view_culling: false`).
+    pub fn space_in_view(&self) -> Option<reyvec_sdf::view3d::ViewCullStats> {
+        (!self.space.view_culling_off).then_some(self.space_view)
     }
 
     /// Другой файл сцены (N в песочнице, 6.13): как [`Self::set_scene_file`], но персонаж
@@ -1961,10 +1970,14 @@ impl Demo {
         let space_buffer = self.space_buffers[slot];
         let mut space_vertices = 0;
         if scene == DemoScene::Space {
-            let frame = self.space.frame(time);
+            let mut frame = self.space.frame(time);
+            let view_proj = self.space_camera.view_proj(aspect);
+            if !self.space.view_culling_off {
+                self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj);
+            }
             let mut packed =
                 crate::space::pack(&frame, &self.space.materials, !self.space.culling_off);
-            crate::space::set_view_proj(&mut packed.words, self.space_camera.view_proj(aspect));
+            crate::space::set_view_proj(&mut packed.words, view_proj);
             space_vertices = packed.vertices;
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
