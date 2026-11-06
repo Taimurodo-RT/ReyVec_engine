@@ -651,6 +651,20 @@ impl WindowRenderer {
         self.demo.as_ref().is_some_and(Demo::space_culling)
     }
 
+    /// Сглаживание краёв форм сцены «3D» (7.6о): включено ли и умеет ли видеокарта.
+    pub fn space_smooth(&self) -> (bool, bool) {
+        self.demo
+            .as_ref()
+            .map_or((false, false), Demo::space_smooth)
+    }
+
+    /// Включает или выключает сглаживание краёв форм сцены «3D» со следующего кадра.
+    pub fn set_space_smooth(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_smooth(on);
+        }
+    }
+
     /// Лучи сцены «3D» вычислительным шейдером: попросил ли файл и шли ли так лучи.
     pub fn space_compute(&self) -> (bool, bool) {
         self.demo

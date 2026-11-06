@@ -371,6 +371,10 @@ impl App {
                     }
                 );
             }
+            PanelAction::SpaceSmooth(on) => {
+                r.set_space_smooth(on);
+                tracing::info!("Сглаживание 3D: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::Dither(on) => {
                 r.set_dither(on);
                 tracing::info!("Шум против полос: {}", if on { "вкл" } else { "выкл" });
@@ -538,6 +542,7 @@ impl App {
                 space_culling: renderer.space_culling(),
                 space_in_view: renderer.space_in_view(),
                 space_compute: renderer.space_compute(),
+                space_smooth: renderer.space_smooth(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),
@@ -1076,6 +1081,24 @@ impl ApplicationHandler for App {
                 if let Some(r) = self.renderer.as_ref() {
                     let on = !r.glow();
                     self.apply(PanelAction::Glow(on));
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(KeyCode::KeyX),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                // X только в сцене «3D»: в сцене из файла это рывок персонажа.
+                if let Some(r) = self.renderer.as_ref()
+                    && r.scene() == DemoScene::Space
+                {
+                    let on = !r.space_smooth().0;
+                    self.apply(PanelAction::SpaceSmooth(on));
                 }
             }
             WindowEvent::KeyboardInput {

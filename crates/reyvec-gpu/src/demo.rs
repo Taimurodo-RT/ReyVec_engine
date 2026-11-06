@@ -349,6 +349,9 @@ pub(crate) struct FrameData {
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
+    /// Сглаживание краёв форм (7.6о): список пикселей краёв (адрес и сам буфер).
+    /// `None` — выключено.
+    space_edges: Option<(vk::DeviceAddress, vk::Buffer)>,
     /// Источники света сцены «лампы и тени» в буфере кадра (адрес и сколько их).
     lights_address: vk::DeviceAddress,
     light_count: u32,
@@ -381,6 +384,15 @@ pub(crate) struct Demo {
     space_march_compute: vk::Pipeline,
     /// Шли ли лучи последнего кадра «3D» вычислительным шейдером.
     space_compute_running: bool,
+    /// Сглаживание краёв форм сцены «3D» (7.6о): поиск краёв и лучи внутри их пикселей
+    /// (`raymarch_edge_find.slang`, `raymarch_edges.slang`). Null — видеокарта не умеет
+    /// писать в картинки через общий список.
+    space_edge_find: vk::Pipeline,
+    space_edges: vk::Pipeline,
+    /// Список пикселей краёв, свой у каждого кадра в полёте (буфер и его размер).
+    space_edge_lists: Vec<Option<(BufferId, u64)>>,
+    /// Включено ли сглаживание краёв (настройка, X).
+    space_smooth: bool,
     /// …и его освещение в проходе «сцена» (`raymarch_shade.slang`).
     space_shade: vk::Pipeline,
     /// Камера сцены «3D».
@@ -645,6 +657,10 @@ impl Demo {
             space_shadow: vk::Pipeline::null(),
             space_march_compute: vk::Pipeline::null(),
             space_compute_running: false,
+            space_edge_find: vk::Pipeline::null(),
+            space_edges: vk::Pipeline::null(),
+            space_edge_lists: vec![None; frames_in_flight],
+            space_smooth: true,
             space_shade: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
             space_view: Default::default(),
@@ -828,10 +844,21 @@ impl Demo {
                 shaders.compute("particles"),
             )?;
             if res.bindless.storage_images {
+                let layout = res.bindless.pipeline_layout;
                 demo.space_march_compute = crate::pipeline::compute_pipeline(
                     &ctx.device,
-                    res.bindless.pipeline_layout,
+                    layout,
                     shaders.compute("raymarch"),
+                )?;
+                demo.space_edge_find = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_edge_find"),
+                )?;
+                demo.space_edges = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_edges"),
                 )?;
             }
             demo.bloom_down = build(
@@ -927,6 +954,54 @@ impl Demo {
     /// Включена ли сетка отсева сцены «3D» (в файле `culling: false` выключает).
     pub fn space_culling(&self) -> bool {
         !self.space.culling_off
+    }
+
+    /// Список пикселей краёв (7.6о) кадра `slot` для кадра размера `extent`: создаётся
+    /// при первой надобности и пересоздаётся, когда кадр стал больше. `None` — не вышло
+    /// (тогда края не сглаживаются).
+    fn edge_list(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        slot: usize,
+        extent: vk::Extent2D,
+    ) -> Option<(vk::DeviceAddress, vk::Buffer)> {
+        let size = 16 + u64::from(extent.width) * u64::from(extent.height) * 4;
+        let entry = self.space_edge_lists.get_mut(slot)?;
+        if entry.is_some_and(|(_, have)| have < size)
+            && let Some((id, _)) = entry.take()
+        {
+            res.destroy_buffer(id);
+        }
+        if entry.is_none() {
+            match res.create_buffer(
+                ctx,
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                BufferMemory::GpuOnly,
+                &format!("края 3D, кадр {slot}"),
+            ) {
+                Ok(id) => *entry = Some((id, size)),
+                Err(e) => {
+                    tracing::warn!("буфер краёв 3D: {e}");
+                    return None;
+                }
+            }
+        }
+        let (id, _) = (*entry)?;
+        Some((res.buffer_address(id), res.buffer_raw(id)?))
+    }
+
+    /// Сглаживание краёв форм сцены «3D» (7.6о): включено ли и умеет ли видеокарта.
+    pub fn space_smooth(&self) -> (bool, bool) {
+        (self.space_smooth, self.space_edges != vk::Pipeline::null())
+    }
+
+    /// Включает или выключает сглаживание краёв форм сцены «3D».
+    pub fn set_space_smooth(&mut self, on: bool) {
+        self.space_smooth = on;
     }
 
     /// Отсев по взгляду в последнем кадре сцены «3D»: сколько объектов осталось из
@@ -1997,6 +2072,14 @@ impl Demo {
         if scene == DemoScene::Space {
             self.space_compute_running = space_compute;
         }
+        let space_edges = if scene == DemoScene::Space
+            && self.space_smooth
+            && self.space_edges != vk::Pipeline::null()
+        {
+            self.edge_list(ctx, res, slot, extent)
+        } else {
+            None
+        };
         if scene == DemoScene::Space {
             let mut frame = self.space.frame(time);
             let view_proj = self.space_camera.view_proj(aspect);
@@ -2020,6 +2103,7 @@ impl Demo {
             space_address: res.buffer_address(space_buffer),
             space_vertices,
             space_compute,
+            space_edges,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
             objects_address: res.buffer_address(object_buffer),
@@ -2222,7 +2306,7 @@ impl Demo {
                         frame.extent,
                         frame.time,
                         frame.space_address,
-                        [0, 0],
+                        SpaceSlots::default(),
                         0,
                     );
                     let (d, cmd) = (p.device, p.cmd);
@@ -2256,7 +2340,7 @@ impl Demo {
                             frame.extent,
                             frame.time,
                             frame.space_address,
-                            [0, 0],
+                            SpaceSlots::default(),
                             0,
                         );
                         let (d, cmd) = (p.device, p.cmd);
@@ -2297,15 +2381,19 @@ impl Demo {
                     uses.push((m, Access::ComputeSampled));
                 }
                 graph.add_pass("реймарчинг", &uses, move |p| {
-                    let mut push = space_push(
+                    let push = space_push(
                         &camera,
                         frame.extent,
                         frame.time,
                         frame.space_address,
-                        [p.texture(cone), meshes.map_or(0, |m| p.texture(m))],
+                        SpaceSlots {
+                            target: p.storage(gbuffer),
+                            cone: p.texture(cone),
+                            meshes: meshes.map_or(0, |m| p.texture(m)),
+                            ..SpaceSlots::default()
+                        },
                         u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
                     );
-                    push[108..112].copy_from_slice(&p.storage(gbuffer).to_ne_bytes());
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл конусы (и полигоны) в чтение, буфер геометрии в
                     // запись; буфер сцены этого кадра жив, пока кадр рисуется.
@@ -2337,7 +2425,11 @@ impl Demo {
                         frame.extent,
                         frame.time,
                         frame.space_address,
-                        [p.texture(cone), meshes.map_or(0, |m| p.texture(m))],
+                        SpaceSlots {
+                            cone: p.texture(cone),
+                            meshes: meshes.map_or(0, |m| p.texture(m)),
+                            ..SpaceSlots::default()
+                        },
                         u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
                     );
                     let (d, cmd) = (p.device, p.cmd);
@@ -2373,7 +2465,10 @@ impl Demo {
                         frame.extent,
                         frame.time,
                         frame.space_address,
-                        [p.texture(gbuffer), 0],
+                        SpaceSlots {
+                            gbuffer: p.texture(gbuffer),
+                            ..SpaceSlots::default()
+                        },
                         0,
                     );
                     let (d, cmd) = (p.device, p.cmd);
@@ -2393,16 +2488,151 @@ impl Demo {
                     }
                 },
             );
-            (gbuffer, shadows)
+            // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
+            // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
+            let edges = frame.space_edges.map(|(list, list_buffer)| {
+                let edges = graph.create("края 3D", frame.extent, EDGE_FORMAT);
+                graph.add_pass(
+                    "края 3D: поиск",
+                    &[
+                        (gbuffer, Access::ComputeSampled),
+                        (edges, Access::ComputeWrite),
+                    ],
+                    move |p| {
+                        let push = space_push(
+                            &camera,
+                            frame.extent,
+                            frame.time,
+                            frame.space_address,
+                            SpaceSlots {
+                                gbuffer: p.texture(gbuffer),
+                                target: p.storage(edges),
+                                edges: list,
+                                ..SpaceSlots::default()
+                            },
+                            0,
+                        );
+                        // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей.
+                        let start: Vec<u8> = [0u32, 1, 1, 0]
+                            .iter()
+                            .flat_map(|w| w.to_ne_bytes())
+                            .collect();
+                        // Список этого кадра в прошлый раз читал проход «края 3D».
+                        let before_reset = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(
+                                vk::PipelineStageFlags2::COMPUTE_SHADER
+                                    | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                            )
+                            .src_access_mask(
+                                vk::AccessFlags2::SHADER_STORAGE_READ
+                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                            )
+                            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+                        let after_reset = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_STORAGE_READ
+                                    | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                            )];
+                        let after = [vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                            .dst_stage_mask(
+                                vk::PipelineStageFlags2::COMPUTE_SHADER
+                                    | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                            )
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_STORAGE_READ
+                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                            )];
+                        let (d, cmd) = (p.device, p.cmd);
+                        // SAFETY: граф перевёл буфер геометрии в чтение, а картинку краёв в
+                        // запись; список краёв и буфер сцены этого кадра живы, пока кадр
+                        // рисуется; барьеры выше упорядочивают список с прошлым кадром и
+                        // со следующим проходом.
+                        unsafe {
+                            d.cmd_pipeline_barrier2(
+                                cmd,
+                                &vk::DependencyInfo::default().memory_barriers(&before_reset),
+                            );
+                            d.cmd_update_buffer(cmd, list_buffer, 0, &start);
+                            d.cmd_pipeline_barrier2(
+                                cmd,
+                                &vk::DependencyInfo::default().memory_barriers(&after_reset),
+                            );
+                            bindless.bind_compute(d, cmd);
+                            d.cmd_bind_pipeline(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                self.space_edge_find,
+                            );
+                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                            d.cmd_dispatch(
+                                cmd,
+                                frame.extent.width.div_ceil(8),
+                                frame.extent.height.div_ceil(8),
+                                1,
+                            );
+                            d.cmd_pipeline_barrier2(
+                                cmd,
+                                &vk::DependencyInfo::default().memory_barriers(&after),
+                            );
+                        }
+                    },
+                );
+                let mut uses = vec![
+                    (cone, Access::ComputeSampled),
+                    (gbuffer, Access::ComputeSampled),
+                    (shadows, Access::ComputeSampled),
+                    (edges, Access::ComputeWrite),
+                ];
+                if let Some(m) = meshes {
+                    uses.push((m, Access::ComputeSampled));
+                }
+                graph.add_pass("края 3D", &uses, move |p| {
+                    let push = space_push(
+                        &camera,
+                        frame.extent,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            gbuffer: p.texture(gbuffer),
+                            shadows: p.texture(shadows),
+                            target: p.storage(edges),
+                            cone: p.texture(cone),
+                            meshes: meshes.map_or(0, |m| p.texture(m)),
+                            edges: list,
+                        },
+                        u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
+                    // список краёв записан (барьер в прошлом проходе) и жив весь кадр.
+                    unsafe {
+                        bindless.bind_compute(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.space_edges);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_dispatch_indirect(cmd, list_buffer, 0);
+                    }
+                });
+                edges
+            });
+            (gbuffer, shadows, edges)
         });
 
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
             (stencil, Access::StencilAttachment),
         ];
-        if let Some((g, s)) = gbuffer {
+        if let Some((g, s, e)) = gbuffer {
             uses.push((g, Access::Sampled));
             uses.push((s, Access::Sampled));
+            if let Some(e) = e {
+                uses.push((e, Access::Sampled));
+            }
         }
         if let Some(f) = field {
             uses.push((f, Access::Sampled));
@@ -2456,14 +2686,19 @@ impl Demo {
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
-                if let Some((g, s)) = gbuffer {
+                if let Some((g, s, e)) = gbuffer {
                     let push = space_push(
                         &self.space_camera,
                         frame.extent,
                         frame.time,
                         frame.space_address,
-                        [p.texture(g), p.texture(s)],
-                        0,
+                        SpaceSlots {
+                            gbuffer: p.texture(g),
+                            shadows: p.texture(s),
+                            target: e.map_or(0, |e| p.texture(e)),
+                            ..SpaceSlots::default()
+                        },
+                        u32::from(e.is_some()) * SPACE_FLAG_EDGES,
                     );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_shade);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
@@ -2970,6 +3205,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
             ctx.device.destroy_pipeline(self.space_march_compute, None);
+            ctx.device.destroy_pipeline(self.space_edge_find, None);
+            ctx.device.destroy_pipeline(self.space_edges, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.light, None);
             ctx.device.destroy_pipeline(self.object, None);
@@ -2992,6 +3229,8 @@ impl Demo {
         self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
         self.space_march_compute = vk::Pipeline::null();
+        self.space_edge_find = vk::Pipeline::null();
+        self.space_edges = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
         self.object = vk::Pipeline::null();
@@ -3099,30 +3338,51 @@ fn sdf_push(
 /// Константы сцены «3D» в раскладке `Push` из `include/space.slang`: столбцы обратной
 /// матрицы камеры, глаз, время, адрес сцены (7.2), соотношение сторон, высота кадра, флаги
 /// и номера картинок в общем списке текстур: буфера геометрии (7.3) и теней (7.4).
+/// Картинки и буферы, которые читают и пишут проходы сцены «3D» (поля `Push` в
+/// `include/space.slang`).
+#[derive(Clone, Copy, Default)]
+struct SpaceSlots {
+    gbuffer: u32,
+    shadows: u32,
+    target: u32,
+    cone: u32,
+    meshes: u32,
+    edges: vk::DeviceAddress,
+}
+
 fn space_push(
     camera: &reyvec_sdf::Camera3D,
     extent: vk::Extent2D,
     time: f32,
     scene: vk::DeviceAddress,
-    textures: [u32; 2],
+    slots: SpaceSlots,
     flags: u32,
-) -> [u8; 112] {
+) -> [u8; 128] {
     let aspect = extent.width as f32 / extent.height.max(1) as f32;
     let inv = camera.inverse_view_proj(aspect).to_cols_array();
     let mut values = [0f32; 20];
     values[..16].copy_from_slice(&inv);
     values[16..19].copy_from_slice(&camera.eye.to_array());
     values[19] = time;
-    let mut push = [0u8; 112];
+    let mut push = [0u8; 128];
     for (i, v) in values.into_iter().enumerate() {
         push[4 * i..4 * i + 4].copy_from_slice(&v.to_ne_bytes());
     }
     push[80..88].copy_from_slice(&scene.to_ne_bytes());
     push[88..92].copy_from_slice(&aspect.to_ne_bytes());
     push[92..96].copy_from_slice(&(extent.height.max(1) as f32).to_ne_bytes());
-    push[96..100].copy_from_slice(&flags.to_ne_bytes());
-    push[100..104].copy_from_slice(&textures[0].to_ne_bytes());
-    push[104..108].copy_from_slice(&textures[1].to_ne_bytes());
+    let words = [
+        flags,
+        slots.gbuffer,
+        slots.shadows,
+        slots.target,
+        slots.cone,
+        slots.meshes,
+    ];
+    for (i, w) in words.into_iter().enumerate() {
+        push[96 + 4 * i..100 + 4 * i].copy_from_slice(&w.to_ne_bytes());
+    }
+    push[120..128].copy_from_slice(&slots.edges.to_ne_bytes());
     push
 }
 
@@ -3177,6 +3437,10 @@ const CONE_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 const MESH_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 /// Флаг сцены «3D»: у «реймарчинга» есть буфер геометрии полигонов (как в raymarch.slang).
 const SPACE_FLAG_MESHES: u32 = 1;
+/// Флаг сцены «3D»: края форм сглажены (7.6о), «сцена» берёт их цвет из картинки краёв.
+const SPACE_FLAG_EDGES: u32 = 2;
+/// Цвет краёв форм сцены «3D» (7.6о); прозрачность 0 — пиксель не на краю.
+const EDGE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
 const CONE_TILE: u32 = 8;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
