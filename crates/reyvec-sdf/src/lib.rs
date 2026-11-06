@@ -12,6 +12,7 @@
 //! (реймарчинг теней не проскочит край), но точным оно бывает не везде.
 
 pub mod camera3d;
+pub mod field3d;
 pub mod grid3d;
 pub mod mesh3d;
 pub mod profile2d;
