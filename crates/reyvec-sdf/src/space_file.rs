@@ -119,6 +119,10 @@ pub struct SpaceFile {
     /// Сетка отсева (7.6е): `false` выключает её для сравнения замеров.
     #[serde(default = "yes")]
     pub culling: bool,
+    /// Отсев по взгляду (7.6к): в кадр идут только объекты, видимые камерой или
+    /// бросающие тень в кадр. `false` выключает его для сравнения замеров.
+    #[serde(default = "yes")]
+    pub view_culling: bool,
 }
 
 fn yes() -> bool {
@@ -177,6 +181,8 @@ pub struct SpaceScene {
     pub camera: Option<CameraEntry>,
     /// Сетка отсева выключена в файле (`culling: false`).
     pub culling_off: bool,
+    /// Отсев по взгляду выключен в файле (`view_culling: false`).
+    pub view_culling_off: bool,
 }
 
 /// Что сцена «3D» рисует в один момент.
@@ -286,6 +292,7 @@ impl SpaceScene {
             meshes,
             camera: file.camera,
             culling_off: !file.culling,
+            view_culling_off: !file.view_culling,
         })
     }
 

@@ -536,6 +536,7 @@ impl App {
                 space_error: renderer.space_error(),
                 space_objects: renderer.space_objects(),
                 space_culling: renderer.space_culling(),
+                space_in_view: renderer.space_in_view(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),

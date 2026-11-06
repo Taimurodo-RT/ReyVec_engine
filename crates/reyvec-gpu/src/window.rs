@@ -651,6 +651,14 @@ impl WindowRenderer {
         self.demo.as_ref().is_some_and(Demo::space_culling)
     }
 
+    /// Отсев по взгляду сцены «3D»: объектов в кадре и всего (`None` — выключен).
+    pub fn space_in_view(&self) -> Option<(usize, usize)> {
+        self.demo
+            .as_ref()
+            .and_then(Demo::space_in_view)
+            .map(|s| (s.kept, s.total))
+    }
+
     /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
     pub fn shader_error(&self) -> Option<String> {
         self.shaders.error()
