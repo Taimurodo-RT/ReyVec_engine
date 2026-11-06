@@ -76,9 +76,8 @@ float4 upsampled_shadows(int2 px, float t, float3 n)
     return total > 1e-4 ? sum / total : nearest;
 }
 
-// Цвет точки буфера геометрии `g`, полученной лучом через точку экрана `screen`
-// пикселя `px` (тени берутся вокруг этого пикселя).
-float3 shade_point(float2 screen, float4 g, int2 px)
+// То же с готовыми долями света `shadows` (солнце, углы, две лампы).
+float3 shade_lit(float2 screen, float4 g, float4 shadows)
 {
     Ray ray = screen_ray(screen);
     float t = g.x;
@@ -99,7 +98,6 @@ float3 shade_point(float2 screen, float4 g, int2 px)
     bool grid_on = (pc.scene[m + 3] & MATERIAL_GRID) != 0;
     float glow = asfloat(pc.scene[m + 4]);
     float3 n = oct_decode(g.zw);
-    float4 shadows = upsampled_shadows(px, t, n);
     if (grid_on)
     {
         // Сколько метров пола в пикселе: соседний луч пересекается с той же плоскостью.
@@ -148,3 +146,13 @@ float3 shade_point(float2 screen, float4 g, int2 px)
     float fog = 1.0 - exp(-0.0025 * t * t * 0.1);
     return lerp(color, sky(ray.dir), saturate(fog));
 }
+
+// Цвет точки буфера геометрии `g`, полученной лучом через точку экрана `screen`
+// пикселя `px` (тени берутся вокруг этого пикселя).
+float3 shade_point(float2 screen, float4 g, int2 px)
+{
+    if (g.x < 0.0)
+        return sky(screen_ray(screen).dir);
+    return shade_lit(screen, g, upsampled_shadows(px, g.x, oct_decode(g.zw)));
+}
+
