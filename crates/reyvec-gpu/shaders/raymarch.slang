@@ -14,6 +14,9 @@
 // Номер картинки приходит в поле `gbuffer` констант. Буфер геометрии полигональных
 // моделей (7.6ж, mesh3d.slang) — в поле `shadows`, если стоит флаг SPACE_FLAG_MESHES.
 [[vk::binding(0, 0)]] Texture2D textures[];
+// Запись в картинки (binding 2 общего списка): сюда вычислительный вариант кладёт буфер
+// геометрии, номер — в поле `target` констант.
+[[vk::binding(2, 0)]] [format("rgba32f")] RWTexture2D<float4> images[];
 
 float3 normal_at(float3 p)
 {
@@ -106,16 +109,16 @@ float4 fs_main(VertexOut input) : SV_Target
 }
 
 // Опыт 7.6м: те же лучи вычислительным шейдером. Группа 8×8 — ровно квадрат конуса
-// (все её лучи начинают с одной длины). Результат — в буфер `pc.out` строками, проход
-// «копия буфера геометрии» кладёт его в картинку буфера геометрии.
+// (все её лучи начинают с одной длины). Результат пишется прямо в картинку буфера
+// геометрии, без копии.
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void cs_main(uint3 id : SV_DispatchThreadID)
 {
-    uint w = uint(pc.aspect * pc.height + 0.5);
-    uint h = uint(pc.height);
+    uint w, h;
+    images[pc.target].GetDimensions(w, h);
     if (id.x >= w || id.y >= h)
         return;
     float2 screen = float2((float(id.x) + 0.5) / float(w) * 2.0 - 1.0, 1.0 - (float(id.y) + 0.5) / float(h) * 2.0);
-    pc.out[id.y * w + id.x] = march_pixel(int2(id.xy), screen);
+    images[pc.target][id.xy] = march_pixel(int2(id.xy), screen);
 }

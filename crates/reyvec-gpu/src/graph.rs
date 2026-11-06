@@ -40,9 +40,12 @@ pub(crate) enum Access {
     Sampled,
     /// Читает её в вычислительном шейдере (через общий список текстур).
     ComputeSampled,
+    /// Пишет в неё вычислительным шейдером (`images[]` в binding 2 общего списка).
+    ComputeWrite,
     /// Копирует из неё.
     TransferSrc,
-    /// Копирует в неё.
+    /// Копирует в неё (понадобится загрузке данных через граф).
+    #[allow(dead_code)]
     TransferDst,
     /// Отдаёт на экран (только как конечное состояние картинки окна).
     Present,
@@ -97,6 +100,11 @@ impl Access {
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_SAMPLED_READ,
             ),
+            Access::ComputeWrite => (
+                vk::ImageLayout::GENERAL,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+            ),
             Access::TransferSrc => (
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 vk::PipelineStageFlags2::COPY,
@@ -125,6 +133,7 @@ impl Access {
             Access::ColorAttachment => vk::ImageUsageFlags::COLOR_ATTACHMENT,
             Access::StencilAttachment => vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             Access::Sampled | Access::ComputeSampled => vk::ImageUsageFlags::SAMPLED,
+            Access::ComputeWrite => vk::ImageUsageFlags::STORAGE,
             Access::TransferSrc => vk::ImageUsageFlags::TRANSFER_SRC,
             Access::TransferDst => vk::ImageUsageFlags::TRANSFER_DST,
             Access::Present => vk::ImageUsageFlags::empty(),
@@ -278,6 +287,14 @@ impl PassContext<'_> {
         self.images[h.0]
             .slot
             .expect("картинку читают в шейдере, но она не объявлена как Access::Sampled")
+    }
+
+    /// Номер картинки в списке для записи (`images[]`, binding 2 общего списка).
+    pub fn storage(&self, h: ImageHandle) -> u32 {
+        self.images[h.0]
+            .slot
+            .expect("в картинку пишут из шейдера, но она не объявлена как Access::ComputeWrite")
+            - FIRST_TRANSIENT_SLOT
     }
 }
 
@@ -609,10 +626,16 @@ impl TransientPool {
             return Ok(i);
         }
         let texture = create_texture(ctx, key.extent, key.format, key.usage, key.samples, name)?;
-        let slot = if key.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        let shader_visible = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE;
+        let slot = if key.usage.intersects(shader_visible) {
             match self.free_slots.pop() {
                 Some(s) => {
-                    bindless.write_texture(ctx, s, texture.view);
+                    if key.usage.contains(vk::ImageUsageFlags::SAMPLED) {
+                        bindless.write_texture(ctx, s, texture.view);
+                    }
+                    if key.usage.contains(vk::ImageUsageFlags::STORAGE) {
+                        bindless.write_storage_image(ctx, s - FIRST_TRANSIENT_SLOT, texture.view);
+                    }
                     Some(s)
                 }
                 None => {
@@ -728,6 +751,22 @@ mod tests {
         assert_eq!(b.old.layout, b.new.layout);
         assert_eq!(b.old.stage, vk::PipelineStageFlags2::FRAGMENT_SHADER);
         assert_eq!(b.new.stage, vk::PipelineStageFlags2::COMPUTE_SHADER);
+    }
+
+    /// Вычислительный шейдер пишет картинку, пиксельный читает: переход из GENERAL в
+    /// чтение, запись видна чтению.
+    #[test]
+    fn compute_write_then_sampled() {
+        let initial = [ImageState::UNDEFINED];
+        let passes = vec![vec![(A, Access::ComputeWrite)], vec![(A, Access::Sampled)]];
+        let (before, _, _) = plan(&initial, &passes, &[None]);
+        assert_eq!(before[0][0].new.layout, vk::ImageLayout::GENERAL);
+        let b = before[1][0];
+        assert_eq!(b.old.layout, vk::ImageLayout::GENERAL);
+        assert_eq!(b.old.stage, vk::PipelineStageFlags2::COMPUTE_SHADER);
+        assert_eq!(b.old.access, vk::AccessFlags2::SHADER_STORAGE_WRITE);
+        assert_eq!(b.new.layout, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        assert_eq!(Access::ComputeWrite.usage(), vk::ImageUsageFlags::STORAGE);
     }
 
     /// Две записи подряд в одну раскладку: барьер всё равно нужен (запись после записи).

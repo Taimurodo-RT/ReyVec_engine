@@ -651,6 +651,13 @@ impl WindowRenderer {
         self.demo.as_ref().is_some_and(Demo::space_culling)
     }
 
+    /// Лучи сцены «3D» вычислительным шейдером: попросил ли файл и шли ли так лучи.
+    pub fn space_compute(&self) -> (bool, bool) {
+        self.demo
+            .as_ref()
+            .map_or((false, false), Demo::space_compute)
+    }
+
     /// Отсев по взгляду сцены «3D»: объектов в кадре и всего (`None` — выключен).
     pub fn space_in_view(&self) -> Option<(usize, usize)> {
         self.demo

@@ -346,6 +346,9 @@ pub(crate) struct GpuContext {
     pub adapter: AdapterInfo,
     /// Видеокарта умеет сообщать забором, что кадр показан (VK_EXT_swapchain_maintenance1).
     pub present_fences: bool,
+    /// Можно писать в картинки из шейдеров через общий список (binding 2 в bindless):
+    /// так «реймарчинг» вычислительным шейдером пишет буфер геометрии (7.6м).
+    pub storage_images: bool,
     // Последним: уничтожается после устройства.
     pub core: Core,
 }
@@ -361,7 +364,15 @@ impl GpuContext {
         surface: Option<(&khr::surface::Instance, vk::SurfaceKHR)>,
     ) -> Result<Self, Box<(GpuError, Core)>> {
         match Self::create_device(&core, options, surface) {
-            Ok((device, queue, queue_family, physical, adapter, present_fences)) => {
+            Ok((
+                device,
+                queue,
+                queue_family,
+                physical,
+                adapter,
+                present_fences,
+                storage_images,
+            )) => {
                 let allocator = gpu_allocator::vulkan::Allocator::new(
                     &gpu_allocator::vulkan::AllocatorCreateDesc {
                         instance: core.instance.clone(),
@@ -388,6 +399,7 @@ impl GpuContext {
                     physical,
                     adapter,
                     present_fences,
+                    storage_images,
                     core,
                 })
             }
@@ -408,6 +420,7 @@ impl GpuContext {
             vk::PhysicalDevice,
             AdapterInfo,
             bool,
+            bool,
         ),
         GpuError,
     > {
@@ -425,7 +438,9 @@ impl GpuContext {
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities)];
+        let storage_images = Self::storage_images(&core.instance, physical);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
+            .descriptor_binding_storage_image_update_after_bind(storage_images)
             .descriptor_indexing(true)
             .runtime_descriptor_array(true)
             .descriptor_binding_partially_bound(true)
@@ -472,7 +487,8 @@ impl GpuContext {
         // Векторный слой рисует много фигур одной командой (vkCmdDrawIndirect).
         let base_features = vk::PhysicalDeviceFeatures::default()
             .multi_draw_indirect(true)
-            .draw_indirect_first_instance(true);
+            .draw_indirect_first_instance(true)
+            .shader_storage_image_array_dynamic_indexing(storage_images);
         let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_features(&base_features)
@@ -495,7 +511,36 @@ impl GpuContext {
             physical,
             adapter,
             present_fences,
+            storage_images,
         ))
+    }
+
+    /// Умеет ли видеокарта то, что нужно для записи в картинки через общий список:
+    /// менять ячейки списка, пока кадр рисуется, выбирать ячейку номером из констант
+    /// и держать столько ячеек. Без этого лучи «3D» идут пиксельным шейдером.
+    fn storage_images(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12);
+        let mut p12 = vk::PhysicalDeviceVulkan12Properties::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p12);
+        // SAFETY: physical получен из этого экземпляра, структуры живут до конца вызовов.
+        unsafe {
+            instance.get_physical_device_features2(physical, &mut f2);
+            instance.get_physical_device_properties2(physical, &mut p2);
+        }
+        let dynamic_indexing = f2.features.shader_storage_image_array_dynamic_indexing;
+        let need = crate::graph::TRANSIENT_TEXTURES;
+        let ok = f12.descriptor_binding_storage_image_update_after_bind == vk::TRUE
+            && dynamic_indexing == vk::TRUE
+            && p12.max_descriptor_set_update_after_bind_storage_images >= need
+            && p12.max_per_stage_descriptor_update_after_bind_storage_images >= need;
+        if !ok {
+            tracing::warn!(
+                "видеокарта не даёт писать в картинки через общий список: \
+                 лучи «3D» пойдут пиксельным шейдером"
+            );
+        }
+        ok
     }
 
     pub fn instance(&self) -> &ash::Instance {
