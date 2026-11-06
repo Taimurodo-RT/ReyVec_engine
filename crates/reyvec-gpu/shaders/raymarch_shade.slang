@@ -28,7 +28,7 @@ static const uint MATERIAL_GRID = 1;
 // пикселя кадра 2h, поэтому пиксель кадра лежит между четырьмя ближайшими точками.
 // Каждая берётся с весом по расстоянию (как при обычном растяжении) и по сходству с
 // пикселем: та же глубина и та же сторона. Так тень не перетекает с переднего
-// предмета на пол за ним.
+// предмета на пол за ним. Если похожих нет среди четырёх, ищем в квадрате 4×4.
 float4 upsampled_shadows(int2 px, float t, float3 n)
 {
     uint gw, gh, sw, sh;
@@ -54,6 +54,25 @@ float4 upsampled_shadows(int2 px, float t, float3 n)
         facing *= facing;
         facing *= facing;
         float weight = bilinear * depth * facing;
+        sum += textures[pc.shadows].Load(int3(hp, 0)) * weight;
+        total += weight;
+    }
+    if (total > 1e-4)
+        return sum / total;
+    // Ни одна из четырёх точек не похожа на пиксель: тонкая перемычка или край формы,
+    // где вокруг другая поверхность. Раньше бралась ближняя точка как есть — и пиксель
+    // получал чужую тень (тёмные точки на краях). Теперь ищем похожие точки шире,
+    // квадратом 4×4 вокруг, уже без веса по расстоянию.
+    for (uint k = 0; k < 16; k++)
+    {
+        int2 hp = clamp(base + int2(int(k & 3) - 1, int(k >> 2) - 1), int2(0, 0), int2(sw, sh) - 1);
+        float4 g = textures[pc.gbuffer].Load(int3(min(hp * 2, int2(gw, gh) - 1), 0));
+        if (g.x < 0.0)
+            continue;
+        float depth = saturate(1.0 - abs(g.x - t) / (0.02 * t + 0.05));
+        float facing = saturate(dot(oct_decode(g.zw), n));
+        facing *= facing;
+        float weight = depth * facing * facing;
         sum += textures[pc.shadows].Load(int3(hp, 0)) * weight;
         total += weight;
     }
