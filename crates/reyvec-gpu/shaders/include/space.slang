@@ -91,6 +91,9 @@ static const uint MAX_PLANES = 8; // как shape3d::MAX_PLANES
 // Флаги констант (pc.flags) сцены «3D», как SPACE_FLAG_* в demo.rs.
 static const uint SPACE_FLAG_MESHES = 1; // у «реймарчинга» есть буфер геометрии полигонов
 static const uint SPACE_FLAG_EDGES = 2; // края форм сглажены (7.6о): освещение берёт их цвет
+// Края — по два луча на пиксель вместо четырёх (7.15, уменьшенное разрешение 3D):
+// поиск краёв считает группы по 32 пикселя, проход «края 3D» — по два потока на пиксель.
+static const uint SPACE_FLAG_EDGE_PAIRS = 4;
 
 // Расстояние до ближайшего объекта (x) и его материал (y).
 //
