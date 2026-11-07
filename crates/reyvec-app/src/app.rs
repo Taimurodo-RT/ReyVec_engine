@@ -389,6 +389,10 @@ impl App {
                 r.set_space_scale(scale);
                 tracing::info!("Разрешение 3D: {}", scale.title());
             }
+            PanelAction::LevelView(on) => {
+                r.set_level_view(on);
+                tracing::info!("2.5D-вид уровня: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::SpaceField(on) => {
                 r.set_space_field(on);
                 tracing::info!("Поле расстояний 3D: {}", if on { "вкл" } else { "выкл" });
@@ -426,6 +430,7 @@ impl App {
             PanelAction::ResetCamera => {
                 r.set_camera(Camera2D::default());
                 r.set_space_camera(r.space_home_camera());
+                r.reset_level_orbit();
                 r.set_follow(true);
                 tracing::info!("Камера в начале");
             }
@@ -589,6 +594,7 @@ impl App {
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
                 space_scale: renderer.space_scale(),
+                level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
                 space_field: renderer.space_field(),
                 space_ao_field: renderer.space_ao_field(),
                 field_bench: field_bench_text.as_deref(),
@@ -1155,6 +1161,24 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
+                        logical_key: Key::Named(NamedKey::F2),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                // F2 только в сцене из файла: тот же уровень плоским или объёмом.
+                if let Some(r) = self.renderer.as_ref()
+                    && r.scene() == DemoScene::File
+                {
+                    let on = !r.level_view();
+                    self.apply(PanelAction::LevelView(on));
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
                         physical_key: PhysicalKey::Code(KeyCode::KeyX),
                         state: ElementState::Pressed,
                         repeat: false,
@@ -1297,6 +1321,17 @@ impl ApplicationHandler for App {
                     &self.window,
                 ) {
                     let size = w.inner_size();
+                    // 2.5D-вид (7.9): мышь облетает уровень вокруг середины вида, герой
+                    // и игра те же. Пол-окна по ширине — 90°.
+                    if r.scene() == DemoScene::File && r.level_view() {
+                        let k = 180.0 / f64::from(size.width.max(1));
+                        r.orbit_level(
+                            ((prev.x - position.x) * k) as f32,
+                            ((position.y - prev.y) * k) as f32,
+                        );
+                        self.cursor = Some(position);
+                        return;
+                    }
                     let delta = to_screen(position, size) - to_screen(prev, size);
                     let mut camera = r.camera();
                     camera.pan_screen(delta);

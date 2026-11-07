@@ -422,6 +422,8 @@ pub(crate) struct FrameData {
     extent: vk::Extent2D,
     /// Размер картинок сцены «3D» (7.14): `extent` или меньше (см. [`SpaceScale`]).
     space_extent: vk::Extent2D,
+    /// Камера объёма этого кадра: сцены «3D» или 2.5D-вида уровня (7.9).
+    space_camera: reyvec_sdf::Camera3D,
 }
 
 pub(crate) struct Demo {
@@ -459,6 +461,11 @@ pub(crate) struct Demo {
     /// в картинку [`SPACE_COLOR_FORMAT`] (`space_shade_small`), а «сцена» растягивает её
     /// на весь кадр (`raymarch_upscale.slang`).
     space_scale: SpaceScale,
+    /// 2.5D-вид уровня из файла (7.9): та же игра, нарисованная объёмом.
+    level_view: bool,
+    /// Облёт 2.5D-вида: влево-вправо и вверх-вниз от обычного вида, градусы.
+    level_orbit: [f32; 2],
+    level: crate::level3d::Level3d,
     space_shade_small: vk::Pipeline,
     space_upscale: vk::Pipeline,
     /// Камера сцены «3D».
@@ -598,6 +605,11 @@ pub struct PlayerStats {
 /// Рамка камеры за персонажем (в высотах экрана от середины, экран от -1 до 1): по
 /// бокам, снизу и сверху. Персонаж обычно ниже середины: впереди видно больше.
 const FOLLOW_X: f64 = 0.3;
+/// Облёт 2.5D-вида (7.9): влево-вправо до этого угла, вниз до вида прямо сбоку, вверх
+/// почти до вида сверху (к обычным 12° сверху).
+const LEVEL_ORBIT_YAW: f32 = 75.0;
+const LEVEL_ORBIT_DOWN: f32 = 12.0;
+const LEVEL_ORBIT_UP: f32 = 63.0;
 const FOLLOW_BELOW: f64 = 0.75;
 const FOLLOW_ABOVE: f64 = 0.3;
 /// Как быстро камера догоняет (за 0,1 с проходит 63% пути).
@@ -734,6 +746,9 @@ impl Demo {
             space_field_bake: vk::Pipeline::null(),
             space_shade: vk::Pipeline::null(),
             space_scale: SpaceScale::for_adapter(ctx.adapter.kind),
+            level_view: false,
+            level_orbit: [0.0, 0.0],
+            level: Default::default(),
             space_shade_small: vk::Pipeline::null(),
             space_upscale: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
@@ -1133,6 +1148,34 @@ impl Demo {
     /// Включает или выключает сглаживание краёв форм сцены «3D».
     pub fn set_space_smooth(&mut self, on: bool) {
         self.space_smooth = on;
+    }
+
+    /// 2.5D-вид уровня из файла (7.9): включён ли.
+    pub fn level_view(&self) -> bool {
+        self.level_view
+    }
+
+    /// Облёт 2.5D-вида для осмотра: повернуть ещё на `yaw` градусов влево-вправо и
+    /// `pitch` вверх-вниз. Наклон держится между видом прямо сбоку снизу и почти сверху.
+    pub fn orbit_level(&mut self, yaw: f32, pitch: f32) {
+        let [y, p] = self.level_orbit;
+        self.level_orbit = [
+            (y + yaw).clamp(-LEVEL_ORBIT_YAW, LEVEL_ORBIT_YAW),
+            (p + pitch).clamp(-LEVEL_ORBIT_DOWN, LEVEL_ORBIT_UP),
+        ];
+    }
+
+    /// Возвращает 2.5D-вид из облёта к обычному.
+    pub fn reset_level_orbit(&mut self) {
+        self.level_orbit = [0.0, 0.0];
+    }
+
+    /// Включает или выключает 2.5D-вид уровня со следующего кадра. Игра не меняется.
+    pub fn set_level_view(&mut self, on: bool) {
+        if on && !self.level_view {
+            self.level.clear();
+        }
+        self.level_view = on;
     }
 
     /// Разрешение сцены «3D» (7.14).
@@ -2135,6 +2178,10 @@ impl Demo {
             }
             self.follow_player(time);
         }
+        // 2.5D-вид (7.9): мир уровня обновлён как обычно, а рисуется он объёмом — дальше
+        // кадр готовится как кадр сцены «3D».
+        let level = scene == DemoScene::File && self.level_view;
+        let scene = if level { DemoScene::Space } else { scene };
         self.prepare_particles(res, slot, time, scene, aspect);
         let vector = match scene {
             DemoScene::Gpu | DemoScene::Space => {
@@ -2228,7 +2275,8 @@ impl Demo {
         res.write_buffer(blob_buffer, 0, &blob_bytes);
         let space_buffer = self.space_buffers[slot];
         let mut space_vertices = 0;
-        let space_compute = self.space.compute && self.space_march_compute != vk::Pipeline::null();
+        let space_compute =
+            (level || self.space.compute) && self.space_march_compute != vk::Pipeline::null();
         if scene == DemoScene::Space {
             self.space_compute_running = space_compute;
         }
@@ -2241,21 +2289,40 @@ impl Demo {
             None
         };
         let mut space_field = None;
+        let mut space_camera = self.space_camera;
         if scene == DemoScene::Space {
-            let mut frame = self.space.frame(time);
-            if self.space_field_bake != vk::Pipeline::null() {
+            let (mut frame, level_materials) = if level {
+                let _zone = crate::cpu_zone!("уровень в объёме");
+                let center = [self.camera.center.x, self.camera.center.y];
+                space_camera = crate::level3d::camera(center, self.camera.zoom, self.level_orbit);
+                let made = self
+                    .level
+                    .frame(&self.file_scene, &self.vector_demo.library);
+                let mut frame = made.frame;
+                frame.lamps =
+                    crate::level3d::lamps(&self.file_scene, [center[0] as f32, center[1] as f32]);
+                (frame, Some(made.materials))
+            } else {
+                (self.space.frame(time), None)
+            };
+            // Поле расстояний — только у сцены «3D»: у уровня почти всё движется вместе
+            // с камерой и героем, пересчёт стоил бы дороже, чем экономит (7.12).
+            if level {
+                self.space_field.skip();
+            } else if self.space_field_bake != vk::Pipeline::null() {
                 // Поле — по всем предметам, до отсева по взгляду.
                 let programs = crate::space::field_programs(&frame);
-                space_field =
-                    self.space_field
-                        .prepare(ctx, res, slot, self.space_camera.eye, programs);
+                space_field = self
+                    .space_field
+                    .prepare(ctx, res, slot, space_camera.eye, programs);
             }
-            let view_proj = self.space_camera.view_proj(aspect);
-            if !self.space.view_culling_off {
+            let view_proj = space_camera.view_proj(aspect);
+            if level || !self.space.view_culling_off {
                 self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj);
             }
-            let mut packed =
-                crate::space::pack(&frame, &self.space.materials, !self.space.culling_off);
+            let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
+            let culling = level || !self.space.culling_off;
+            let mut packed = crate::space::pack(&frame, materials, culling);
             crate::space::set_view_proj(&mut packed.words, view_proj);
             crate::space::set_field(
                 &mut packed.words,
@@ -2301,6 +2368,7 @@ impl Demo {
             } else {
                 extent
             },
+            space_camera,
         }
     }
 
@@ -2471,7 +2539,7 @@ impl Demo {
         // Сцена «3D» (7.3): лучи шагают своим проходом в буфер геометрии (по точке на
         // пиксель и без MSAA: шагание — самое дорогое), а «сцена» его освещает.
         let gbuffer = (frame.scene == DemoScene::Space).then(|| {
-            let camera = self.space_camera;
+            let camera = frame.space_camera;
             let ext = frame.space_extent;
             // Запечённое поле расстояний (7.10б): кубики у сдвинутых предметов и вошедшие
             // в слои при полёте камеры — до всех лучей кадра.
@@ -2929,7 +2997,7 @@ impl Demo {
                 if let Some((_, _, _, Some(c))) = gbuffer {
                     // Растяжение уменьшенной сцены «3D» на весь кадр (7.14).
                     let push = space_push(
-                        &self.space_camera,
+                        &frame.space_camera,
                         frame.extent,
                         frame.time,
                         frame.space_address,
@@ -2944,7 +3012,7 @@ impl Demo {
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 } else if let Some((g, s, e, None)) = gbuffer {
                     let push = space_push(
-                        &self.space_camera,
+                        &frame.space_camera,
                         frame.extent,
                         frame.time,
                         frame.space_address,

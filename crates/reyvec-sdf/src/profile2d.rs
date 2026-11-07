@@ -69,7 +69,26 @@ impl Profile {
         }
         Ok(Self {
             path: path.to_owned(),
-            field: Arc::new(bake(&contours, lo, hi)),
+            field: Arc::new(bake(&contours, lo, hi, 0.0)),
+        })
+    }
+
+    /// Контур из готовой кривой (2.5D-вид уровня, 7.9: фигуры векторного слоя). Клетка
+    /// сетки — не мельче `cell`: у маленькой фигуры сетка меньше 64×64, и её поле
+    /// занимает меньше слов в буфере сцены.
+    pub fn from_bez(bez: &BezPath, cell: f32) -> Result<Self, ProfileError> {
+        let contours = flatten(bez);
+        let (lo, hi) = contours.iter().flatten().fold(
+            (Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)),
+            |(lo, hi), &p| (lo.min(p), hi.max(p)),
+        );
+        let size = hi - lo;
+        if contours.is_empty() || size.min_element() <= 0.0 {
+            return Err(ProfileError::Empty);
+        }
+        Ok(Self {
+            path: bez.to_svg(),
+            field: Arc::new(bake(&contours, lo, hi, cell)),
         })
     }
 
@@ -160,9 +179,10 @@ fn flatten(bez: &BezPath) -> Vec<Vec<Vec2>> {
 
 /// Точное поле по ломаным: расстояние до ближайшего отрезка, знак — по числу обходов
 /// (правило «ненулевое», как у заливки SVG).
-fn bake(contours: &[Vec<Vec2>], lo: Vec2, hi: Vec2) -> Field2 {
+/// Клетка — не мельче `min_cell` (0 — сетка 64 по длинной стороне).
+fn bake(contours: &[Vec<Vec2>], lo: Vec2, hi: Vec2, min_cell: f32) -> Field2 {
     let size = hi - lo;
-    let cell = size.max_element() / (FIELD_SIDE as f32 - 2.0 * MARGIN_CELLS);
+    let cell = (size.max_element() / (FIELD_SIDE as f32 - 2.0 * MARGIN_CELLS)).max(min_cell);
     let count = |s: f32| ((s / cell).ceil() as u32 + 2 * MARGIN_CELLS as u32).min(FIELD_SIDE);
     let (nx, ny) = (count(size.x), count(size.y));
     // Сетка по середине фигуры.
@@ -250,6 +270,18 @@ mod tests {
 
     const STAR: &str = "M 0 1 L 0.22 0.3 L 0.95 0.31 L 0.36 -0.12 L 0.59 -0.81 \
                         L 0 -0.38 L -0.59 -0.81 L -0.36 -0.12 L -0.95 0.31 L -0.22 0.3 Z";
+
+    #[test]
+    fn coarse_profile_is_smaller_and_still_close() {
+        let bez = BezPath::from_svg("M -1 -1 L 1 -1 L 1 1 L -1 1 Z").unwrap();
+        let fine = Profile::from_bez(&bez, 0.0).unwrap();
+        let coarse = Profile::from_bez(&bez, 0.2).unwrap();
+        assert!(coarse.words().len() < fine.words().len() / 10);
+        for q in [Vec2::ZERO, Vec2::new(0.5, 0.2), Vec2::new(1.5, 0.0)] {
+            // Внутри, у «хребта» поля, смешивание соседей ошибается до половины клетки.
+            assert!((coarse.distance(q) - fine.distance(q)).abs() < 0.11, "{q}");
+        }
+    }
 
     #[test]
     fn square_field_matches_exact_distance() {

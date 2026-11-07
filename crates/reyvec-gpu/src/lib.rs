@@ -40,6 +40,7 @@ mod field;
 mod graph;
 mod headless;
 mod lab;
+mod level3d;
 mod lights;
 mod particles;
 mod pipeline;

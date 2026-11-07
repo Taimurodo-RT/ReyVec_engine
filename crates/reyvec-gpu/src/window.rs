@@ -691,6 +691,32 @@ impl WindowRenderer {
         }
     }
 
+    /// 2.5D-вид уровня из файла (7.9): включён ли.
+    pub fn level_view(&self) -> bool {
+        self.demo.as_ref().is_some_and(Demo::level_view)
+    }
+
+    /// Включает или выключает 2.5D-вид уровня со следующего кадра. Игра не меняется.
+    pub fn set_level_view(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_level_view(on);
+        }
+    }
+
+    /// Облёт 2.5D-вида мышью: ещё `yaw` градусов влево-вправо и `pitch` вверх-вниз.
+    pub fn orbit_level(&mut self, yaw: f32, pitch: f32) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.orbit_level(yaw, pitch);
+        }
+    }
+
+    /// Возвращает 2.5D-вид из облёта к обычному.
+    pub fn reset_level_orbit(&mut self) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.reset_level_orbit();
+        }
+    }
+
     /// Разрешение сцены «3D» (7.14).
     pub fn space_scale(&self) -> crate::SpaceScale {
         self.demo
