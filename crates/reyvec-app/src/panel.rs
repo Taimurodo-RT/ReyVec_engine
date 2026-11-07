@@ -33,6 +33,8 @@ pub(crate) enum PanelAction {
     SpaceSmooth(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
+    /// 2.5D-вид уровня из файла (7.9).
+    LevelView(bool),
     /// Запечённое поле расстояний сцены «3D» (7.10б).
     SpaceField(bool),
     /// Затенение в углах из поля (7.10г).
@@ -122,6 +124,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_smooth: (bool, bool),
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
+    /// 2.5D-вид уровня из файла (7.9).
+    pub level_view: bool,
     /// Запечённое поле расстояний (7.10б): включено ли и умеет ли видеокарта.
     pub space_field: (bool, bool),
     /// Затенение в углах из поля: включено ли и можно ли (поле включено).
@@ -643,10 +647,36 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::Fountain(fountain));
         }
     }
-    if info.scene_id == DemoScene::Space {
+    if info.scene_id == DemoScene::File {
+        let mut level = info.level_view;
+        if ui
+            .checkbox(&mut level, "2.5D-вид уровня (F2)")
+            .on_hover_text(
+                "Тот же уровень объёмом: стены и полы — блоки, фигуры — плитки с \
+                 толщиной, свет и тени как в сцене «3D». Камера сбоку с небольшим \
+                 наклоном сверху идёт за героем. Игра та же, переключать можно на ходу",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::LevelView(level));
+        }
+    }
+    let volume = info.scene_id == DemoScene::Space || info.level_view;
+    if volume {
         let (mut smooth, can) = info.space_smooth;
         if ui
-            .add_enabled(can, egui::Checkbox::new(&mut smooth, "Сглаживание 3D (X)"))
+            .add_enabled(
+                can,
+                egui::Checkbox::new(
+                    &mut smooth,
+                    // В сцене из файла X — рывок героя.
+                    if info.level_view {
+                        "Сглаживание 3D"
+                    } else {
+                        "Сглаживание 3D (X)"
+                    },
+                ),
+            )
             .on_hover_text(
                 "На краях форм в пиксель идут четыре луча вместо одного: меньше лесенок. \
                  Время — строки «края 3D» в счётчиках",
@@ -674,6 +704,8 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 }
             }
         });
+    }
+    if info.scene_id == DemoScene::Space {
         let (mut field, can) = info.space_field;
         if ui
             .add_enabled(can, egui::Checkbox::new(&mut field, "Поле расстояний"))
@@ -1071,6 +1103,7 @@ mod tests {
             space_compute: (false, false),
             space_smooth: (true, true),
             space_scale: SpaceScale::Full,
+            level_view: false,
             space_field: (true, true),
             space_ao_field: (true, true),
             field_bench: Some("Сравнение поля (среднее за 240 кадров):\nбез поля: тени 0.722"),

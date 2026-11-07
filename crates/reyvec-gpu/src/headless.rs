@@ -445,6 +445,8 @@ fn render(
             demo.set_space_scale(crate::SpaceScale::Full);
             #[cfg(test)]
             demo.set_space_scale(tests::SPACE_SCALE.get());
+            #[cfg(test)]
+            demo.set_level_view(tests::LEVEL_VIEW.get());
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -661,6 +663,8 @@ mod tests {
         /// Разрешение сцены «3D» (7.14).
         pub(super) static SPACE_SCALE: std::cell::Cell<crate::SpaceScale> =
             const { std::cell::Cell::new(crate::SpaceScale::Full) };
+        /// 2.5D-вид уровня из файла (7.9).
+        pub(super) static LEVEL_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Вид на полую коробку сбоку (как эталон space-hollow-side-2s).
@@ -801,6 +805,73 @@ mod tests {
             );
             assert!(mean < 3.0, "{}: средняя разница {mean:.2}", scale.title());
             assert!(share < 0.25, "{}: отличается {share:.3}", scale.title());
+        }
+    }
+
+    /// 2.5D-вид уровня (7.9): встроенный уровень из файла рисуется объёмом — кадр не
+    /// пустой и не плоский (много разных цветов), без ошибок валидации.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_view_draws_volume() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        // Комната, подъёмник в коридоре и склон в конце.
+        let plays = [
+            ("room", 1.0, [-0.6, -0.5]),
+            ("lift", 3.0, [9.6, 0.6]),
+            ("slope", 1.0, [14.2, 0.2]),
+        ];
+        for (name, time, start) in plays {
+            let scene = HeadlessScene {
+                time,
+                ..scene.clone()
+            };
+            let play = HeadlessPlay {
+                start: Some(start),
+                ..Default::default()
+            };
+            let flat = render_headless_play(&options, &scene, Some(&play)).expect("плоский кадр");
+            LEVEL_VIEW.set(true);
+            let volume = render_headless_play(&options, &scene, Some(&play));
+            LEVEL_VIEW.set(false);
+            let volume = volume.expect("объёмный кадр");
+            assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            if let Ok(dir) = std::env::var("PPM_DIR") {
+                for (kind, f) in [("flat", &flat), ("volume", &volume)] {
+                    let mut out =
+                        format!("P6 {} {} 255\n", f.image.width, f.image.height).into_bytes();
+                    for px in f.image.rgba.chunks(4) {
+                        out.extend_from_slice(&px[..3]);
+                    }
+                    std::fs::write(format!("{dir}/level-{name}-{kind}.ppm"), out).expect("ppm");
+                }
+            }
+            let (changed, _, mean) = image_diff(&flat.image, &volume.image);
+            let mut colors = std::collections::HashSet::new();
+            for px in volume.image.rgba.chunks(4) {
+                colors.insert([px[0] >> 3, px[1] >> 3, px[2] >> 3]);
+            }
+            eprintln!(
+                "{name}: отличается {changed} пикселей, средняя {mean:.1}, цветов {}",
+                colors.len()
+            );
+            assert!(mean > 5.0, "{name}: объёмный кадр такой же, как плоский");
+            assert!(colors.len() > 200, "{name}: мало цветов: {}", colors.len());
         }
     }
 
