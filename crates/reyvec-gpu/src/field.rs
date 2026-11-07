@@ -82,7 +82,7 @@ impl SpaceField {
             buffer: None,
             jobs: vec![None; frames_in_flight],
             previous: None,
-            enabled: true,
+            enabled: false,
             last_bricks: 0,
             ao_from_field: false,
         }

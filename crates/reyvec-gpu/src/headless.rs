@@ -436,10 +436,10 @@ fn render(
             // него.
             demo.set_dither(false);
             demo.set_cascades(scene.cascades);
+            // Поле по умолчанию выключено (пока медленнее точного расчёта на RTX 5080), а
+            // тесты поля включают его сами.
             #[cfg(test)]
-            if tests::FIELD_OFF.get() {
-                demo.set_space_field(false);
-            }
+            demo.set_space_field(!tests::FIELD_OFF.get());
             #[cfg(test)]
             demo.set_space_ao_field(tests::AO_FROM_FIELD.get());
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
