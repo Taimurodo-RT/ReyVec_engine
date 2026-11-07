@@ -7,8 +7,9 @@
 //!   [`SOLID_BACK`]…[`SOLID_FRONT`] по Z. По ним герой и ходит, поэтому в объёме видно,
 //!   на что он встаёт;
 //! - **фигуры** векторного слоя (герой, предметы, рисунок тайлов) — выдавленные пластины
-//!   толщиной [`PLATE`] у переднего края брусков. Порядок рисования сохраняется: каждая
-//!   следующая фигура на [`LAYER_STEP`] ближе к камере, как в 2D она рисуется поверх;
+//!   толщиной [`PLATE`] у переднего края брусков. Порядок рисования сохраняется: фигура,
+//!   накрывающая уже поставленные, на [`LAYER_STEP`] ближе к камере самой передней из них,
+//!   как в 2D она рисуется поверх; не перекрывающиеся делят одну лицевую грань (7.18а);
 //! - **лампы** — лампы объёмной сцены перед уровнем; первые две (ближние к камере)
 //!   отбрасывают тени;
 //! - **SDF-объекты** (капли слизи, лампочки) — капсулы, светящиеся остаются светящимися;
@@ -49,8 +50,14 @@ pub(crate) const SOLID_FRONT: f32 = 1.0;
 pub(crate) const SOLID_BACK: f32 = -0.6;
 /// Толщина пластины фигуры, метры.
 const PLATE: f32 = 0.3;
-/// Насколько каждая следующая по порядку рисования фигура ближе к камере, метры.
+/// Насколько фигура ближе к камере, чем самая передняя из накрытых ею, метры.
 const LAYER_STEP: f32 = 0.002;
+/// Ширина полосы, по которым разложены поставленные плиты (единицы 2D, 4 м в объёме).
+const LAYER_STRIP: f64 = 1.0;
+/// Плита шире стольких полос — «широкая»: её проверяют всегда, а не по полосам.
+const LAYER_WIDE: i64 = 64;
+/// Касание краями — не перекрытие: соседние плитки ряда делят лицевую грань (единицы 2D).
+const LAYER_TOUCH: f64 = 1e-4;
 /// Самая мелкая клетка поля фигуры в единицах плоской сцены (4 мм в объёме).
 const PROFILE_CELL: f32 = 0.001;
 /// Самая мелкая клетка поля, если фигура мелкая: поле не больше нужного.
@@ -125,6 +132,85 @@ struct FlatMesh {
 pub(crate) struct Level3d {
     flats: HashMap<ShapeId, Option<Flat>>,
     meshes: HashMap<ShapeId, Option<Arc<FlatMesh>>>,
+    /// Прямоугольник фигуры в её координатах (для слоёв плит); общий для обоих способов
+    /// рисовать, чтобы слои совпадали.
+    bounds: HashMap<ShapeId, Option<kurbo::Rect>>,
+}
+
+/// Слои плит по перекрытию (7.18а): плита встаёт на [`LAYER_STEP`] перед самой передней
+/// из уже поставленных, чьи прямоугольники в мире её пересекают; никого не накрывающая —
+/// у переднего края брусков. Так герой и предметы стоят вплотную к мебели, а не на
+/// полметра впереди всего, что нарисовано раньше. Поставленные плиты разложены по полосам
+/// вдоль X, чтобы не перебирать все на каждую.
+#[derive(Default)]
+struct Layers {
+    /// Прямоугольник в мире (единицы 2D) и слой каждой поставленной плиты.
+    placed: Vec<(kurbo::Rect, u32)>,
+    /// Номера плит по полосам.
+    strips: HashMap<i64, Vec<u32>>,
+    /// Номера широких плит (во многих полосах сразу).
+    wide: Vec<u32>,
+}
+
+impl Layers {
+    /// Ставит плиту с прямоугольником `rect` в мире и возвращает её слой.
+    fn place(&mut self, rect: kurbo::Rect) -> u32 {
+        let rect = rect.abs();
+        let strips = rect
+            .is_finite()
+            .then(|| {
+                let lo = (rect.x0 / LAYER_STRIP).floor() as i64;
+                let hi = (rect.x1 / LAYER_STRIP).floor() as i64;
+                lo..=hi
+            })
+            .filter(|strips| strips.end() - strips.start() < LAYER_WIDE);
+        let layer = match &strips {
+            // Узкая плита: соперники — плиты её полос и широкие.
+            Some(strips) => {
+                let in_strips = strips
+                    .clone()
+                    .filter_map(|strip| self.strips.get(&strip))
+                    .flatten();
+                self.top(rect, in_strips.chain(&self.wide).copied())
+            }
+            // Широкая: соперники — все поставленные.
+            None => self.top(rect, 0..self.placed.len() as u32),
+        };
+        let index = self.placed.len() as u32;
+        self.placed.push((rect, layer));
+        match strips {
+            Some(strips) => {
+                for strip in strips {
+                    self.strips.entry(strip).or_default().push(index);
+                }
+            }
+            None => self.wide.push(index),
+        }
+        layer
+    }
+
+    /// Слой перед самой передней из плит `indices`, пересекающих `rect` (0, если никто).
+    fn top(&self, rect: kurbo::Rect, indices: impl Iterator<Item = u32>) -> u32 {
+        indices
+            .map(|i| self.placed[i as usize])
+            .filter(|&(other, _)| overlaps(rect, other))
+            .map(|(_, below)| below + 1)
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Пересекаются ли прямоугольники (касание краями не в счёт).
+fn overlaps(a: kurbo::Rect, b: kurbo::Rect) -> bool {
+    a.x0 < b.x1 - LAYER_TOUCH
+        && b.x0 < a.x1 - LAYER_TOUCH
+        && a.y0 < b.y1 - LAYER_TOUCH
+        && b.y0 < a.y1 - LAYER_TOUCH
+}
+
+/// Передняя сторона плиты слоя `layer`, метры по Z.
+fn plate_front(layer: u32) -> f32 {
+    SOLID_FRONT + PLATE * 0.5 + layer as f32 * LAYER_STEP
 }
 
 /// Треугольники кадра по материалам (в мире).
@@ -216,6 +302,7 @@ impl Level3d {
     pub fn clear(&mut self) {
         self.flats.clear();
         self.meshes.clear();
+        self.bounds.clear();
     }
 
     /// Объёмная сцена из снимка мира `scene`; формы фигур берутся из `library`.
@@ -226,11 +313,11 @@ impl Level3d {
         library: &ShapeLibrary,
         render: LevelRender,
     ) -> LevelFrame {
-        if self.flats.len() > MAX_CACHED {
-            self.flats.clear();
-        }
-        if self.meshes.len() > MAX_CACHED {
-            self.meshes.clear();
+        if self.flats.len() > MAX_CACHED
+            || self.meshes.len() > MAX_CACHED
+            || self.bounds.len() > MAX_CACHED
+        {
+            self.clear();
         }
         let triangles = render == LevelRender::Triangles;
         let mut prisms = Prisms::default();
@@ -280,8 +367,8 @@ impl Level3d {
             }
         }
 
-        // Фигуры: пластины по порядку рисования.
-        let mut layer = 0u32;
+        // Фигуры: пластины по порядку рисования, слой — по перекрытию с поставленными.
+        let mut layers = Layers::default();
         let mut mask_depth = 0u32;
         for item in &scene.items {
             match item {
@@ -291,12 +378,15 @@ impl Level3d {
                     let Some(color) = shape_color(library, instance.shape, instance.tint) else {
                         continue;
                     };
-                    let front = SOLID_FRONT + PLATE * 0.5 + layer as f32 * LAYER_STEP;
+                    let Some(bounds) = self.bounds(library, instance.shape) else {
+                        continue;
+                    };
+                    let in_world = instance.transform.transform_rect_bbox(bounds);
                     if triangles {
                         let Some(mesh) = self.mesh(library, instance.shape) else {
                             continue;
                         };
-                        layer += 1;
+                        let front = plate_front(layers.place(in_world));
                         let world = Affine::scale(f64::from(s)) * instance.transform;
                         let put = |p: [f32; 2]| {
                             let q = world * kurbo::Point::new(f64::from(p[0]), f64::from(p[1]));
@@ -317,7 +407,7 @@ impl Level3d {
                     let Some(flat) = self.flat(library, instance.shape) else {
                         continue;
                     };
-                    layer += 1;
+                    let front = plate_front(layers.place(in_world));
                     if let Some(shape) = plate(&flat, instance.transform, front) {
                         shapes.push(shape.paint(materials.get(color, 0.0)));
                     }
@@ -386,6 +476,14 @@ impl Level3d {
             .entry(id)
             .or_insert_with(|| library.shape(id).and_then(flat_of))
             .clone()
+    }
+
+    /// Прямоугольник фигуры `id` в её координатах (готовится при первой встрече).
+    fn bounds(&mut self, library: &ShapeLibrary, id: ShapeId) -> Option<kurbo::Rect> {
+        *self
+            .bounds
+            .entry(id)
+            .or_insert_with(|| library.shape(id).and_then(bounds_of))
     }
 }
 
@@ -590,23 +688,34 @@ fn shape_color(library: &ShapeLibrary, id: ShapeId, tint: Color) -> Option<[f32;
     (alpha >= 0.05).then_some([base.r * tint.r, base.g * tint.g, base.b * tint.b])
 }
 
-/// Форма фигуры без толщины: прямоугольник по осям или поле контура (обводка — поле
-/// её полосы).
-fn flat_of(shape: &reyvec_vector::Shape) -> Option<Flat> {
-    let path = match shape.style {
-        reyvec_vector::Style::Fill(_) => {
-            if let Some(rect) = axis_rect(&shape.path) {
-                return Some(rect);
-            }
-            shape.path.clone()
-        }
-        reyvec_vector::Style::Stroke(stroke) => kurbo::stroke(
+/// Контур того, что фигура закрашивает: у заливки — её путь, у обводки — её полоса.
+fn drawn_path(shape: &reyvec_vector::Shape) -> std::borrow::Cow<'_, BezPath> {
+    match shape.style {
+        reyvec_vector::Style::Fill(_) => std::borrow::Cow::Borrowed(&shape.path),
+        reyvec_vector::Style::Stroke(stroke) => std::borrow::Cow::Owned(kurbo::stroke(
             shape.path.iter(),
             &kurbo::Stroke::new(stroke.width),
             &kurbo::StrokeOpts::default(),
             stroke.width * 0.05,
-        ),
-    };
+        )),
+    }
+}
+
+/// Прямоугольник фигуры в её координатах; `None` — закрашивать нечего.
+fn bounds_of(shape: &reyvec_vector::Shape) -> Option<kurbo::Rect> {
+    let rect = kurbo::Shape::bounding_box(&*drawn_path(shape));
+    (rect.is_finite() && rect.width() > 0.0 && rect.height() > 0.0).then_some(rect)
+}
+
+/// Форма фигуры без толщины: прямоугольник по осям или поле контура (обводка — поле
+/// её полосы).
+fn flat_of(shape: &reyvec_vector::Shape) -> Option<Flat> {
+    if let reyvec_vector::Style::Fill(_) = shape.style
+        && let Some(rect) = axis_rect(&shape.path)
+    {
+        return Some(rect);
+    }
+    let path = drawn_path(shape).into_owned();
     let size = kurbo::Shape::bounding_box(&path).size();
     let long = size.width.max(size.height) as f32;
     let cell = (long / MIN_PROFILE_CELLS).clamp(PROFILE_CELL, PROFILE_CELL * 10.0);
@@ -616,17 +725,10 @@ fn flat_of(shape: &reyvec_vector::Shape) -> Option<Flat> {
 /// Треугольники фигуры для призмы: заливка контура (у обводки — её полосы) и контуры
 /// ломаными. Точность — сотая доля размера фигуры.
 fn mesh_of(shape: &reyvec_vector::Shape) -> Option<FlatMesh> {
-    let (path, rule) = match shape.style {
-        reyvec_vector::Style::Fill(rule) => (shape.path.clone(), rule),
-        reyvec_vector::Style::Stroke(stroke) => (
-            kurbo::stroke(
-                shape.path.iter(),
-                &kurbo::Stroke::new(stroke.width),
-                &kurbo::StrokeOpts::default(),
-                stroke.width * 0.05,
-            ),
-            reyvec_vector::FillRule::NonZero,
-        ),
+    let path = drawn_path(shape).into_owned();
+    let rule = match shape.style {
+        reyvec_vector::Style::Fill(rule) => rule,
+        reyvec_vector::Style::Stroke(_) => reyvec_vector::FillRule::NonZero,
     };
     let size = kurbo::Shape::bounding_box(&path).size();
     let long = size.width.max(size.height);
@@ -831,6 +933,54 @@ mod tests {
             assert!(shape.distance(at(inside)) < 0.0, "{transform:?}");
             assert!(shape.distance(at(outside)) > 0.0, "{transform:?}");
         }
+    }
+
+    /// Плита встаёт перед самой передней из накрытых; не перекрывающиеся делят лицевую
+    /// грань; касание краями — не перекрытие.
+    #[test]
+    fn layers_follow_overlap_not_draw_order() {
+        let r = |x0: f64, y0: f64, x1: f64, y1: f64| kurbo::Rect::new(x0, y0, x1, y1);
+        let mut layers = Layers::default();
+        // Мебель: три плитки ряда вплотную друг к другу — один слой.
+        assert_eq!(layers.place(r(0.0, 0.0, 1.0, 1.0)), 0);
+        assert_eq!(layers.place(r(1.0, 0.0, 2.0, 1.0)), 0);
+        assert_eq!(layers.place(r(2.0, 0.0, 3.0, 1.0)), 0);
+        // Стопка: монета из двух кругов — второй над первым.
+        assert_eq!(layers.place(r(0.2, 0.2, 0.4, 0.4)), 1);
+        assert_eq!(layers.place(r(0.25, 0.25, 0.35, 0.35)), 2);
+        // Предмет далеко от всего (другая полоса) — снова у переднего края.
+        assert_eq!(layers.place(r(10.0, 0.0, 10.5, 0.5)), 0);
+        // Герой у третьей плитки: накрывает её, но не монету — сразу перед плиткой.
+        assert_eq!(layers.place(r(2.3, 0.5, 2.6, 1.3)), 1);
+        // Широкая плита (фон на весь уровень) накрывает всё: перед монетой.
+        assert_eq!(layers.place(r(-100.0, -1.0, 100.0, 2.0)), 3);
+        // И её видят из любой полосы.
+        assert_eq!(layers.place(r(50.0, 0.0, 51.0, 1.0)), 4);
+        // Перевёрнутый прямоугольник (отражение) — тот же, что прямой.
+        assert_eq!(layers.place(r(51.0, 1.0, 50.0, 0.0)), 5);
+    }
+
+    /// Прямоугольник обводки шире самой линии, а у заливки — её путь.
+    #[test]
+    fn bounds_include_stroke_width() {
+        let mut path = BezPath::new();
+        path.move_to((0.0, 0.0));
+        path.line_to((1.0, 0.0));
+        let stroke = reyvec_vector::Shape {
+            path: path.clone(),
+            style: reyvec_vector::Style::Stroke(reyvec_vector::Stroke::new(0.2)),
+            paint: Paint::Solid(Color::linear(1.0, 1.0, 1.0, 1.0)),
+        };
+        let rect = bounds_of(&stroke).unwrap();
+        assert!((rect.height() - 0.2).abs() < 1e-3, "{rect:?}");
+        assert!(rect.width() >= 1.0, "{rect:?}");
+        // Заливка линии без площади не рисуется.
+        let fill = reyvec_vector::Shape {
+            path,
+            style: reyvec_vector::Style::Fill(reyvec_vector::FillRule::NonZero),
+            ..stroke
+        };
+        assert!(bounds_of(&fill).is_none());
     }
 
     #[test]
