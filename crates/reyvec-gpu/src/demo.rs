@@ -2361,11 +2361,14 @@ impl Demo {
             // в слои при полёте камеры — до всех лучей кадра.
             if let Some(field) = frame.space_field {
                 let bake = self.space_field_bake;
+                let copies = self.space_field.copies.clone();
                 graph.add_pass("поле", &[], move |p| {
                     // SAFETY: проход вне рисования; конвейер жив, пока жива сцена; буферы
                     // поля и задания кадра живы, пока кадр выполняется.
                     unsafe {
-                        crate::field::SpaceField::record(p.device, p.cmd, layout, bake, field);
+                        crate::field::SpaceField::record(
+                            p.device, p.cmd, layout, bake, &field, &copies,
+                        );
                     }
                 });
             }
