@@ -121,6 +121,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_culling: bool,
     /// Отсев по взгляду: объектов в кадре и всего (`None` — выключен).
     pub space_in_view: Option<(usize, usize)>,
+    /// Сетка отсева последнего кадра: клетка, размеры, длины списков (`None` — её нет).
+    pub space_grid: Option<reyvec_gpu::GridStats>,
     /// Лучи «3D» вычислительным шейдером (опыт 7.6м): попросил ли файл и шли ли так.
     pub space_compute: (bool, bool),
     /// Сглаживание краёв форм «3D» (7.6о): включено ли и умеет ли видеокарта.
@@ -382,10 +384,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — смотреть \
              вокруг, колесо — скорость, Tab — перспектива или плоская, R — в начало",
         );
-        let grid = if info.space_culling {
-            "сетка отсева включена"
-        } else {
-            "сетка отсева выключена (culling: false)"
+        let grid = match (info.space_culling, info.space_grid) {
+            (false, _) => "сетка отсева выключена (culling: false)".to_string(),
+            (true, None) => "сетка отсева включена".to_string(),
+            (true, Some(g)) => format!(
+                "сетка отсева: клетка {:.2} м, {}×{}×{}, в списке клетки в среднем {:.1}, \
+                 не больше {}",
+                g.cell, g.dims[0], g.dims[1], g.dims[2], g.mean_list, g.max_list
+            ),
         };
         let culling = match info.space_in_view {
             Some((kept, total)) => format!("{grid}, в кадре {kept} из {total}"),
@@ -1124,6 +1130,7 @@ mod tests {
             space_objects: 0,
             space_culling: true,
             space_in_view: Some((150, 202)),
+            space_grid: None,
             space_compute: (false, false),
             space_smooth: (true, true),
             space_scale: SpaceScale::Full,

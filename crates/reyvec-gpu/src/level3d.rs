@@ -273,8 +273,10 @@ impl Level3d {
                     let front = fan(&outline);
                     prisms.add(solid, front, [outline], SOLID_FRONT, SOLID_BACK);
                 }
-            } else if let Some(shape) = solid_shape(c) {
-                shapes.push(shape.paint(solid));
+            } else {
+                for shape in solid_shapes(c) {
+                    shapes.push(shape.paint(solid));
+                }
             }
         }
 
@@ -483,28 +485,58 @@ fn fan(points: &[[f32; 2]]) -> Vec<[[f32; 2]; 3]> {
         .collect()
 }
 
-/// Брусок твёрдого (склон — выдавленный многоугольник).
-fn solid_shape(c: &reyvec_scene::game::Collider) -> Option<Shape3> {
+/// Длиннее этого (в метрах) брусок твёрдого режется на куски встык. У длинного бруска
+/// шар-граница накрывает всю комнату: сетка отсева считала его в каждой клетке, а её
+/// границы растягивались по нему (пол в 53,6 м давал клетку 2 м вместо полуметра, и
+/// каждый шаг луча перебирал 30–50 объектов). Снаружи расстояние до кусков то же, что
+/// до целого бруска: картинка не меняется.
+const SOLID_PIECE: f32 = 2.0;
+
+/// Бруски твёрдого: коробка (длинная — кусками) или у склона выдавленный многоугольник.
+fn solid_shapes(c: &reyvec_scene::game::Collider) -> Vec<Shape3> {
     let s = LEVEL_SCALE;
     let (lo, hi) = (c.aabb.min, c.aabb.max);
     let (w, h) = ((hi[0] - lo[0]) as f32, (hi[1] - lo[1]) as f32);
     if w <= 0.0 || h <= 0.0 {
-        return None;
+        return Vec::new();
     }
     let depth = SOLID_FRONT - SOLID_BACK;
     let z = (SOLID_FRONT + SOLID_BACK) * 0.5;
     if c.slope == 0.0 {
-        return Some(
-            Shape3::Box {
-                size: [w * s, h * s, depth],
-                round: 0.0,
+        let pieces = |len: f32| ((len * s / SOLID_PIECE).ceil() as u32).max(1);
+        let (nx, ny) = (pieces(w), pieces(h));
+        if nx == 1 && ny == 1 {
+            return vec![
+                Shape3::Box {
+                    size: [w * s, h * s, depth],
+                    round: 0.0,
+                }
+                .at([
+                    (lo[0] + hi[0]) as f32 * 0.5 * s,
+                    (lo[1] + hi[1]) as f32 * 0.5 * s,
+                    z,
+                ]),
+            ];
+        }
+        let (pw, ph) = (w * s / nx as f32, h * s / ny as f32);
+        let (x0, y0) = (lo[0] as f32 * s, lo[1] as f32 * s);
+        let mut out = Vec::with_capacity((nx * ny) as usize);
+        for j in 0..ny {
+            for i in 0..nx {
+                out.push(
+                    Shape3::Box {
+                        size: [pw, ph, depth],
+                        round: 0.0,
+                    }
+                    .at([
+                        x0 + (i as f32 + 0.5) * pw,
+                        y0 + (j as f32 + 0.5) * ph,
+                        z,
+                    ]),
+                );
             }
-            .at([
-                (lo[0] + hi[0]) as f32 * 0.5 * s,
-                (lo[1] + hi[1]) as f32 * 0.5 * s,
-                z,
-            ]),
-        );
+        }
+        return out;
     }
     // Склон: верх идёт от одного верхнего угла вниз на |slope| у другого края.
     let drop = c.slope.abs().min(f64::from(h));
@@ -519,8 +551,10 @@ fn solid_shape(c: &reyvec_scene::game::Collider) -> Option<Shape3> {
     path.line_to((hi[0], right_top));
     path.line_to((lo[0], left_top));
     path.close_path();
-    let profile = Profile::from_bez(&path, PROFILE_CELL * 10.0).ok()?;
-    Some(Shape3::Move {
+    let Ok(profile) = Profile::from_bez(&path, PROFILE_CELL * 10.0) else {
+        return Vec::new();
+    };
+    vec![Shape3::Move {
         at: [0.0, 0.0, z],
         turn: [0.0, 0.0, 0.0],
         scale: s,
@@ -529,7 +563,7 @@ fn solid_shape(c: &reyvec_scene::game::Collider) -> Option<Shape3> {
             depth: depth / s,
             round: 0.0,
         }),
-    })
+    }]
 }
 
 /// Цвет фигуры (линейный) с оттенком; `None` — почти прозрачная, не рисуется.
@@ -810,6 +844,67 @@ mod tests {
         assert!((size[0] - 0.4).abs() < 1e-6 && (size[1] - 0.6).abs() < 1e-6);
         let circle = kurbo::Shape::to_path(&kurbo::Circle::new((0.0, 0.0), 1.0), 0.1);
         assert!(axis_rect(&circle).is_none());
+    }
+
+    /// Длинный брусок режется на куски, а расстояние снаружи до них то же, что до целого.
+    #[test]
+    fn long_solids_split_without_changing_distance() {
+        use reyvec_scene::game::{Aabb, Collider};
+        let floor = Collider {
+            aabb: Aabb {
+                min: [-2.1, -0.98],
+                max: [11.3, -0.78],
+            },
+            oneway: false,
+            id: 0,
+            moved: [0.0; 2],
+            slope: 0.0,
+        };
+        let pieces = solid_shapes(&floor);
+        assert_eq!(pieces.len(), 27, "53,6 м по 2 м");
+        for piece in &pieces {
+            let (_, r) = piece.bounds().unwrap();
+            assert!(r < 1.4, "шар куска {r}");
+        }
+        let whole = Shape3::Box {
+            size: [53.6, 0.8, SOLID_FRONT - SOLID_BACK],
+            round: 0.0,
+        }
+        .at([
+            4.6 * LEVEL_SCALE,
+            -0.88 * LEVEL_SCALE,
+            (SOLID_FRONT + SOLID_BACK) * 0.5,
+        ]);
+        for k in 0..300 {
+            let t = k as f32 * 0.37;
+            let p = Vec3::new(
+                -10.0 + (t * 1.7) % 70.0,
+                -6.0 + (t * 2.3) % 10.0,
+                -2.0 + (t * 1.1) % 5.0,
+            );
+            let near = pieces
+                .iter()
+                .map(|s| s.distance(p))
+                .fold(f32::INFINITY, f32::min);
+            let d = whole.distance(p);
+            if d > 0.0 {
+                assert!((near - d).abs() < 1e-4, "{p}: {near} и {d}");
+            } else {
+                assert!(
+                    near <= 1e-4,
+                    "{p}: внутри целого, но снаружи кусков ({near})"
+                );
+            }
+        }
+        // Короткий брусок остаётся одним.
+        let short = Collider {
+            aabb: Aabb {
+                min: [0.0, 0.0],
+                max: [0.4, 0.3],
+            },
+            ..floor
+        };
+        assert_eq!(solid_shapes(&short).len(), 1);
     }
 
     #[test]

@@ -139,7 +139,10 @@ float ambient_occlusion(float3 p, float3 n)
             if (i > 0 && (pc.scene[11] & 1) != 0 && estimate > -1e29)
                 d = estimate;
             else
-                d = scene_near(q, 1e9, true, false).x;
+                // Порог `plane`: форма дальше него пробу не закрывает (by_shapes = 0),
+                // и её точное расстояние не нужно — scene_near такие пропускает по
+                // шару-границе, не считая программу. Картинка та же.
+                d = scene_near(q, plane, true, false).x;
             // Дальше AO_REACH расстояние не различаем: так объекты, отсеянные по взгляду
             // (7.6к, они дальше этого от любой пробы), на углы не влияют.
             d = min(d, AO_REACH);
