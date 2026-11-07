@@ -141,7 +141,9 @@ impl SpaceField {
             previous: None,
             volumes: None,
             copies: FieldCopies::default(),
-            enabled: true,
+            // Выключено (7.12): вблизи движущихся предметов пересчёт поля дороже, чем
+            // экономия на тенях (13 мс на RTX 5080 у вращающейся коробки).
+            enabled: false,
             last_bricks: 0,
             ao_from_field: true,
         }
