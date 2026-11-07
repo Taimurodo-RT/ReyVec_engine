@@ -6,7 +6,8 @@
 // луча внутри пикселя. Остальным пикселям картинки краёв ставится прозрачность 0:
 // «сцена» по ней узнаёт, где брать готовый цвет края.
 //
-// Список (`uint`): [0] — сколько групп по 64 потока запустить (16 пикселей на группу),
+// Список (`uint`): [0] — сколько групп по 64 потока запустить (16 пикселей на группу,
+// 32 при SPACE_FLAG_EDGE_PAIRS),
 // [1], [2] — 1 (размеры запуска), [3] — сколько пикселей, дальше пиксели (x | y << 16).
 // Начало [0, 1, 1, 0] пишет процессор перед проходом.
 
@@ -65,33 +66,55 @@ float4 fs_main(VertexOut input) : SV_Target
     return float4(0.0, 0.0, 0.0, 0.0);
 }
 
+// Края группы 8×8: сначала собираются здесь, потом группа одним сложением берёт место в
+// общем списке (7.15). Сложение в общий счётчик от каждого пикселя края по отдельности
+// на встроенной видеокарте стоило почти миллисекунду.
+groupshared uint group_count;
+groupshared uint group_base;
+groupshared uint group_pixels[64];
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void cs_main(uint3 id : SV_DispatchThreadID)
+void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
 {
+    if (lane == 0)
+        group_count = 0;
+    GroupMemoryBarrierWithGroupSync();
     uint w, h;
     textures[pc.gbuffer].GetDimensions(w, h);
-    if (id.x >= w || id.y >= h)
-        return;
     int2 px = int2(id.xy);
-    if (!is_edge(px, int2(w, h)))
+    bool inside = id.x < w && id.y < h;
+    bool edge = inside && is_edge(px, int2(w, h));
+    if (edge)
     {
+        uint slot;
+        InterlockedAdd(group_count, 1u, slot);
+        group_pixels[slot] = id.x | (id.y << 16);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint count = group_count;
+    if (lane == 0 && count > 0)
+    {
+        uint base;
+        InterlockedAdd(pc.edges[3], count, base);
+        group_base = base;
+        // Группы прохода «края 3D» по 16 пикселей (по 32 при двух лучах): сколько новых
+        // границ групп перешёл список (номера 0, 16, 32… — как раньше по одной на пиксель).
+        uint per = (pc.flags & SPACE_FLAG_EDGE_PAIRS) != 0 ? 32 : 16;
+        uint end = min(base + count, MAX_EDGES);
+        uint groups = base < MAX_EDGES ? (end + per - 1) / per - (base + per - 1) / per : 0;
+        if (groups > 0)
+            InterlockedAdd(pc.edges[0], groups);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // Края группы — в список по местам от начала группы (пишет поток с тем же номером,
+    // какой бы пиксель он ни смотрел). Не влезшие остаются с одним лучом.
+    if (lane < count)
+    {
+        uint index = group_base + lane;
+        if (index < MAX_EDGES)
+            pc.edges[4 + index] = group_pixels[lane];
+    }
+    if (inside)
         images[pc.target][px] = float4(0.0, 0.0, 0.0, 0.0);
-        return;
-    }
-    uint index;
-    InterlockedAdd(pc.edges[3], 1u, index);
-    if (index >= MAX_EDGES)
-    {
-        // Краёв больше, чем можно запустить одной командой: этот остаётся с одним лучом.
-        images[pc.target][px] = float4(0.0, 0.0, 0.0, 0.0);
-        return;
-    }
-    pc.edges[4 + index] = id.x | (id.y << 16);
-    // Каждые 16 пикселей — ещё одна группа прохода «края 3D».
-    if ((index & 15) == 0)
-    {
-        uint groups;
-        InterlockedAdd(pc.edges[0], 1u, groups);
-    }
 }

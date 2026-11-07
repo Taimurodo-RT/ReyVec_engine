@@ -2683,6 +2683,11 @@ impl Demo {
             // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
             // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
             let edges = frame.space_edges.map(|(list, list_buffer)| {
+                let pairs = if ext == frame.extent {
+                    0
+                } else {
+                    SPACE_FLAG_EDGE_PAIRS
+                };
                 let edges = graph.create("края 3D", ext, EDGE_FORMAT);
                 graph.add_pass(
                     "края 3D: поиск",
@@ -2702,7 +2707,7 @@ impl Demo {
                                 edges: list,
                                 ..SpaceSlots::default()
                             },
-                            0,
+                            pairs,
                         );
                         // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей.
                         let start: Vec<u8> = [0u32, 1, 1, 0]
@@ -2793,7 +2798,7 @@ impl Demo {
                             meshes: meshes.map_or(0, |m| p.texture(m)),
                             edges: list,
                         },
-                        u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
+                        (u32::from(meshes.is_some()) * SPACE_FLAG_MESHES) | pairs,
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
@@ -3696,6 +3701,9 @@ const MESH_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const SPACE_FLAG_MESHES: u32 = 1;
 /// Флаг сцены «3D»: края форм сглажены (7.6о), «сцена» берёт их цвет из картинки краёв.
 const SPACE_FLAG_EDGES: u32 = 2;
+/// Флаг сцены «3D»: края по два луча на пиксель вместо четырёх (7.15) — при уменьшенном
+/// разрешении 3D, где растяжение и так смягчает края (как в space.slang).
+const SPACE_FLAG_EDGE_PAIRS: u32 = 4;
 /// Цвет краёв форм сцены «3D» (7.6о); прозрачность 0 — пиксель не на краю.
 const EDGE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
