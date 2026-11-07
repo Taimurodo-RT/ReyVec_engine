@@ -55,6 +55,59 @@ pub(crate) struct FieldFrame {
     pub field: vk::DeviceAddress,
     /// Сколько кубиков посчитать (0 — поле уже верное, проход ничего не запускает).
     pub count: u32,
+    /// Буфер поля: из него посчитанные кубики копируются в слои-картинки.
+    pub buffer: vk::Buffer,
+    /// Слои-картинки (7.10е), из них шейдеры читают поле.
+    pub volumes: [vk::Image; FIELD_LEVELS],
+    /// Слои только что созданы: перевести в раскладку GENERAL.
+    pub fresh: bool,
+}
+
+/// Что скопировать из буфера поля в слои в этом кадре: по слою список кусков.
+pub(crate) type FieldCopies = std::sync::Arc<Vec<Vec<vk::BufferImageCopy>>>;
+
+/// Куски копирования буфера поля в слои-картинки: по куску на кубик, или весь слой, если
+/// кубик не помещается в слой целиком (на стыке кольца).
+fn brick_copies(jobs: &[BrickJob], size: i32) -> Vec<Vec<vk::BufferImageCopy>> {
+    let cells = (size as u64).pow(3);
+    let brick = reyvec_sdf::field3d::BRICK;
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    let region = |level: usize, q: glam::IVec3, extent: u32| {
+        let slot = ((q.z * size + q.y) * size + q.x) as u64;
+        vk::BufferImageCopy::default()
+            .buffer_offset((level as u64 * cells + slot) * 2)
+            .buffer_row_length(size as u32)
+            .buffer_image_height(size as u32)
+            .image_subresource(layers)
+            .image_offset(vk::Offset3D {
+                x: q.x,
+                y: q.y,
+                z: q.z,
+            })
+            .image_extent(vk::Extent3D {
+                width: extent,
+                height: extent,
+                depth: extent,
+            })
+    };
+    let mut out = vec![Vec::new(); FIELD_LEVELS];
+    let mut whole = [false; FIELD_LEVELS];
+    for job in jobs {
+        let q = job.first.rem_euclid(glam::IVec3::splat(size));
+        if (q + brick).cmpgt(glam::IVec3::splat(size)).any() {
+            whole[job.level] = true;
+        } else {
+            out[job.level].push(region(job.level, q, brick as u32));
+        }
+    }
+    for (level, regions) in out.iter_mut().enumerate() {
+        if whole[level] {
+            *regions = vec![region(level, glam::IVec3::ZERO, size as u32)];
+        }
+    }
+    out
 }
 
 /// Поле сцены «3D»: окно слоёв, буфер чисел и задания кадров в полёте.
@@ -67,6 +120,10 @@ pub(crate) struct SpaceField {
     /// Формы прошлого кадра с полем: по ним видно, какие предметы сдвинулись. `None` —
     /// прошлый кадр поля не считал (выключено, другая сцена): пересчитать всё.
     previous: Option<Vec<Program>>,
+    /// Слои-картинки (7.10е); `None` — ещё не созданы.
+    volumes: Option<[vk::Image; FIELD_LEVELS]>,
+    /// Куски копирования в слои последнего подготовленного кадра.
+    pub copies: FieldCopies,
     /// Включено ли поле (настройка в панели).
     pub enabled: bool,
     /// Кубиков в последнем кадре (для журнала и панели).
@@ -82,6 +139,8 @@ impl SpaceField {
             buffer: None,
             jobs: vec![None; frames_in_flight],
             previous: None,
+            volumes: None,
+            copies: FieldCopies::default(),
             enabled: false,
             last_bricks: 0,
             ao_from_field: false,
@@ -133,6 +192,29 @@ impl SpaceField {
                 }
             }
         }
+        let mut fresh = false;
+        if self.volumes.is_none() {
+            let size = self.window.size.unsigned_abs();
+            match res.field_volumes(ctx, size, FIELD_LEVELS as u32) {
+                Ok(v) if v.len() == FIELD_LEVELS => {
+                    self.volumes = Some(std::array::from_fn(|i| v[i]));
+                    fresh = true;
+                    // Слои пустые: всё поле считается заново.
+                    self.window.reset();
+                    self.previous = None;
+                }
+                Ok(_) => {
+                    tracing::warn!("слои поля расстояний: не все созданы");
+                    self.enabled = false;
+                    return None;
+                }
+                Err(e) => {
+                    tracing::warn!("слои поля расстояний: {e}");
+                    self.enabled = false;
+                    return None;
+                }
+            }
+        }
         let changed = self
             .previous
             .as_ref()
@@ -174,10 +256,15 @@ impl SpaceField {
         res.write_buffer(id, 0, &bytes);
         self.previous = Some(programs);
         self.last_bricks = jobs.len();
+        let field_buffer = self.buffer?;
+        self.copies = std::sync::Arc::new(brick_copies(&jobs, self.window.size));
         Some(FieldFrame {
             jobs: res.buffer_address(id),
-            field: res.buffer_address(self.buffer?),
+            field: res.buffer_address(field_buffer),
             count: jobs.len() as u32,
+            buffer: res.buffer_raw(field_buffer)?,
+            volumes: self.volumes?,
+            fresh,
         })
     }
 
@@ -192,35 +279,99 @@ impl SpaceField {
         cmd: vk::CommandBuffer,
         layout: vk::PipelineLayout,
         pipeline: vk::Pipeline,
-        frame: FieldFrame,
+        frame: &FieldFrame,
+        copies: &[Vec<vk::BufferImageCopy>],
     ) {
         if frame.count == 0 {
             return;
         }
         let shaders =
             vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER;
+        // До расчёта: прошлые кадры читали буфер поля (копирование в слои).
         let before = [vk::MemoryBarrier2::default()
-            .src_stage_mask(shaders)
-            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_READ)
+            .src_stage_mask(shaders | vk::PipelineStageFlags2::COPY)
+            .src_access_mask(
+                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::TRANSFER_READ,
+            )
             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)];
-        let after = [vk::MemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-            .dst_stage_mask(shaders | vk::PipelineStageFlags2::COPY)
-            .dst_access_mask(
-                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::TRANSFER_READ,
-            )];
+        // После расчёта: буфер поля читает копирование в слои (и чтение в тестах), а
+        // слои, которые прошлые кадры читали шейдерами, перезаписывает копирование.
+        let to_copy = [
+            vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ),
+            vk::MemoryBarrier2::default()
+                .src_stage_mask(shaders)
+                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE),
+        ];
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(1);
+        let fresh: Vec<vk::ImageMemoryBarrier2> = if frame.fresh {
+            frame
+                .volumes
+                .iter()
+                .map(|&image| {
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(image)
+                        .subresource_range(range)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let after = [
+            vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                .dst_stage_mask(shaders | vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::TRANSFER_READ,
+                ),
+            vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(shaders)
+                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ),
+        ];
         let mut push = [0u8; 16];
         push[..8].copy_from_slice(&frame.jobs.to_ne_bytes());
         push[8..].copy_from_slice(&frame.field.to_ne_bytes());
-        // SAFETY: условия функции; барьеры упорядочивают буфер поля с прошлым и этим
-        // кадром.
+        // SAFETY: условия функции; барьеры упорядочивают буфер и слои поля с прошлым и
+        // этим кадром; куски копирования лежат внутри буфера и слоёв (brick_copies).
         unsafe {
             d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&before));
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
             d.cmd_dispatch(cmd, frame.count, 1, 1);
+            d.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&to_copy)
+                    .image_memory_barriers(&fresh),
+            );
+            for (image, regions) in frame.volumes.iter().zip(copies) {
+                if !regions.is_empty() {
+                    d.cmd_copy_buffer_to_image(
+                        cmd,
+                        frame.buffer,
+                        *image,
+                        vk::ImageLayout::GENERAL,
+                        regions,
+                    );
+                }
+            }
             d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&after));
         }
     }

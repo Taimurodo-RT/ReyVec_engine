@@ -144,6 +144,8 @@ pub(crate) struct GpuResources {
     frame: u64,
     upload_pool: vk::CommandPool,
     upload_fence: vk::Fence,
+    /// Слои запечённого поля (7.10е): живут, пока живут ресурсы.
+    field_volumes: Vec<Texture>,
 }
 
 impl GpuResources {
@@ -187,6 +189,7 @@ impl GpuResources {
             frame: 0,
             upload_pool,
             upload_fence,
+            field_volumes: Vec::new(),
         })
     }
 
@@ -396,6 +399,42 @@ impl GpuResources {
         Ok(TextureId(slot))
     }
 
+    /// Слои запечённого поля: `levels` объёмных картинок R16F `size`³, положенных в
+    /// binding 3 общего списка. Создаются один раз; повторный вызов отдаёт те же. Новые
+    /// лежат в раскладке UNDEFINED (перевести в GENERAL до первого копирования).
+    pub fn field_volumes(
+        &mut self,
+        ctx: &GpuContext,
+        size: u32,
+        levels: u32,
+    ) -> Result<Vec<vk::Image>, GpuError> {
+        if self.field_volumes.is_empty() {
+            for level in 0..levels.min(crate::bindless::FIELD_VOLUMES) {
+                let t = create_volume(
+                    ctx,
+                    size,
+                    vk::Format::R16_SFLOAT,
+                    vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                    &format!("поле 3D: слой {level}"),
+                );
+                match t {
+                    Ok(t) => {
+                        self.bindless.write_field_volume(ctx, level, t.view);
+                        self.field_volumes.push(t);
+                    }
+                    Err(e) => {
+                        // Слои ещё ни разу не использовались: убираем сразу.
+                        for t in self.field_volumes.drain(..) {
+                            destroy_texture(ctx, t);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(self.field_volumes.iter().map(|t| t.image).collect())
+    }
+
     /// Картинка Vulkan текстуры `id` (для записи команд загрузки).
     pub fn texture_image(&self, id: TextureId) -> Option<vk::Image> {
         self.textures.get(id.0).map(|t| t.image)
@@ -512,6 +551,9 @@ impl GpuResources {
         for t in self.textures.drain() {
             destroy_texture(ctx, t);
         }
+        for t in self.field_volumes.drain(..) {
+            destroy_texture(ctx, t);
+        }
         // SAFETY: видеокарта простаивает (условие функции).
         unsafe {
             ctx.device.destroy_fence(self.upload_fence, None);
@@ -615,15 +657,61 @@ pub(crate) fn create_texture(
     samples: vk::SampleCountFlags,
     name: &str,
 ) -> Result<Texture, GpuError> {
-    let d = &ctx.device;
-    let info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(vk::Extent3D {
+    create_image(
+        ctx,
+        vk::Extent3D {
             width: extent.width,
             height: extent.height,
             depth: 1,
+        },
+        format,
+        usage,
+        samples,
+        name,
+    )
+}
+
+/// Объёмная картинка `size`³ (слой запечённого поля, 7.10е), раскладка UNDEFINED.
+pub(crate) fn create_volume(
+    ctx: &GpuContext,
+    size: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    name: &str,
+) -> Result<Texture, GpuError> {
+    create_image(
+        ctx,
+        vk::Extent3D {
+            width: size,
+            height: size,
+            depth: size,
+        },
+        format,
+        usage,
+        vk::SampleCountFlags::TYPE_1,
+        name,
+    )
+}
+
+/// Картинка с видом: плоская при `extent.depth == 1`, иначе объёмная.
+fn create_image(
+    ctx: &GpuContext,
+    extent: vk::Extent3D,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    samples: vk::SampleCountFlags,
+    name: &str,
+) -> Result<Texture, GpuError> {
+    let d = &ctx.device;
+    let volume = extent.depth > 1;
+    let info = vk::ImageCreateInfo::default()
+        .image_type(if volume {
+            vk::ImageType::TYPE_3D
+        } else {
+            vk::ImageType::TYPE_2D
         })
+        .format(format)
+        .extent(extent)
         .mip_levels(1)
         .array_layers(1)
         .samples(samples)
@@ -658,7 +746,11 @@ pub(crate) fn create_texture(
     }
     let view_info = vk::ImageViewCreateInfo::default()
         .image(image)
-        .view_type(vk::ImageViewType::TYPE_2D)
+        .view_type(if volume {
+            vk::ImageViewType::TYPE_3D
+        } else {
+            vk::ImageViewType::TYPE_2D
+        })
         .format(format)
         .subresource_range(full_range(format));
     // SAFETY: картинка с привязанной памятью.
