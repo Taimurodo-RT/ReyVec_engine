@@ -279,6 +279,58 @@ impl Msaa {
     }
 }
 
+/// Разрешение сцены «3D» (7.14): в какой доле кадра по каждой стороне шагают лучи,
+/// считаются тени, края и освещение. Меньше — вчетверо меньше лучей на половине, а
+/// картинка растягивается на весь кадр одним проходом без накопления по кадрам (без
+/// сглаживания по времени). Встроенной видеокарте иначе не хватает на 60 кадров.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpaceScale {
+    /// Каждый пиксель кадра — свой луч.
+    #[default]
+    Full,
+    /// Три четверти по каждой стороне: около 56 % лучей.
+    ThreeQuarters,
+    /// Половина по каждой стороне: четверть лучей. По умолчанию на встроенных.
+    Half,
+}
+
+impl SpaceScale {
+    /// Все варианты для панели.
+    pub const ALL: [Self; 3] = [Self::Full, Self::ThreeQuarters, Self::Half];
+
+    /// Название для панели и лога.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Full => "100 %",
+            Self::ThreeQuarters => "75 %",
+            Self::Half => "50 %",
+        }
+    }
+
+    /// Разрешение по умолчанию для видеокарты этого типа. Встроенная Radeon на полном
+    /// разрешении рисует сцену «3D» за 43 мс (23 кадра, замер 2026-11-07), а лучей и
+    /// теней на половине вчетверо меньше.
+    pub fn for_adapter(kind: AdapterKind) -> Self {
+        match kind {
+            AdapterKind::Integrated => Self::Half,
+            _ => Self::Full,
+        }
+    }
+
+    /// Размер картинок сцены «3D» для кадра размера `extent` (не меньше 1×1).
+    pub fn apply(self, extent: vk::Extent2D) -> vk::Extent2D {
+        let (num, den) = match self {
+            Self::Full => return extent,
+            Self::ThreeQuarters => (3, 4),
+            Self::Half => (1, 2),
+        };
+        vk::Extent2D {
+            width: (extent.width * num).div_ceil(den).max(1),
+            height: (extent.height * num).div_ceil(den).max(1),
+        }
+    }
+}
+
 /// Данные одного спрайта. Раскладка совпадает со структурой `Sprite` в `sprite.vert` (std430).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -368,6 +420,8 @@ pub(crate) struct FrameData {
     time: f32,
     aspect: f32,
     extent: vk::Extent2D,
+    /// Размер картинок сцены «3D» (7.14): `extent` или меньше (см. [`SpaceScale`]).
+    space_extent: vk::Extent2D,
 }
 
 pub(crate) struct Demo {
@@ -401,6 +455,12 @@ pub(crate) struct Demo {
     space_field_bake: vk::Pipeline,
     /// …и его освещение в проходе «сцена» (`raymarch_shade.slang`).
     space_shade: vk::Pipeline,
+    /// Разрешение сцены «3D» (7.14). Если меньше полного, освещение идёт своим проходом
+    /// в картинку [`SPACE_COLOR_FORMAT`] (`space_shade_small`), а «сцена» растягивает её
+    /// на весь кадр (`raymarch_upscale.slang`).
+    space_scale: SpaceScale,
+    space_shade_small: vk::Pipeline,
+    space_upscale: vk::Pipeline,
     /// Камера сцены «3D».
     space_camera: reyvec_sdf::Camera3D,
     /// Отсев по взгляду в последнем кадре сцены «3D» (7.6к).
@@ -673,6 +733,9 @@ impl Demo {
             ),
             space_field_bake: vk::Pipeline::null(),
             space_shade: vk::Pipeline::null(),
+            space_scale: SpaceScale::for_adapter(ctx.adapter.kind),
+            space_shade_small: vk::Pipeline::null(),
+            space_upscale: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
             space_view: Default::default(),
             field: FieldPipelines::default(),
@@ -784,6 +847,24 @@ impl Demo {
                 res,
                 shaders,
                 "raymarch_shade",
+                scene_format,
+                Msaa::Off,
+                Some(stencil_format),
+            )?;
+            demo.space_shade_small = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_shade",
+                SPACE_COLOR_FORMAT,
+                Msaa::Off,
+                None,
+            )?;
+            demo.space_upscale = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_upscale",
                 scene_format,
                 Msaa::Off,
                 Some(stencil_format),
@@ -1052,6 +1133,16 @@ impl Demo {
     /// Включает или выключает сглаживание краёв форм сцены «3D».
     pub fn set_space_smooth(&mut self, on: bool) {
         self.space_smooth = on;
+    }
+
+    /// Разрешение сцены «3D» (7.14).
+    pub fn space_scale(&self) -> SpaceScale {
+        self.space_scale
+    }
+
+    /// Меняет разрешение сцены «3D» со следующего кадра.
+    pub fn set_space_scale(&mut self, scale: SpaceScale) {
+        self.space_scale = scale;
     }
 
     /// Отсев по взгляду в последнем кадре сцены «3D»: сколько объектов осталось из
@@ -1666,6 +1757,7 @@ impl Demo {
                 ("sdf_object", msaa, stencil),
                 ("particles", msaa, stencil),
                 ("raymarch_shade", msaa, stencil),
+                ("raymarch_upscale", msaa, stencil),
             ] {
                 made.push(build(ctx, res, shaders, name, format, samples, stencil)?);
             }
@@ -1687,6 +1779,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.object, None);
             ctx.device.destroy_pipeline(self.particle_draw, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
+            ctx.device.destroy_pipeline(self.space_upscale, None);
         }
         self.triangle = made[0];
         self.sprites = made[1];
@@ -1695,6 +1788,7 @@ impl Demo {
         self.object = made[4];
         self.particle_draw = made[5];
         self.space_shade = made[6];
+        self.space_upscale = made[7];
         self.msaa = msaa;
         self.scene_format = format;
         Ok(())
@@ -1756,7 +1850,23 @@ impl Demo {
                 "present" => (&mut self.present, self.format, Msaa::Off, None),
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
-                "raymarch_shade" => (&mut self.space_shade, self.scene_format, self.msaa, stencil),
+                "raymarch_shade" => {
+                    match build(ctx, res, shaders, name, SPACE_COLOR_FORMAT, Msaa::Off, None) {
+                        Ok(new) => {
+                            let old = std::mem::replace(&mut self.space_shade_small, new);
+                            // SAFETY: видеокарта простаивает (условие функции).
+                            unsafe { ctx.device.destroy_pipeline(old, None) };
+                        }
+                        Err(e) => shaders.set_error(name, e.to_string()),
+                    }
+                    (&mut self.space_shade, self.scene_format, self.msaa, stencil)
+                }
+                "raymarch_upscale" => (
+                    &mut self.space_upscale,
+                    self.scene_format,
+                    self.msaa,
+                    stencil,
+                ),
                 "raymarch" => (&mut self.space_march, GBUFFER_FORMAT, Msaa::Off, None),
                 "raymarch_cone" => (&mut self.space_cone, CONE_FORMAT, Msaa::Off, None),
                 "mesh3d" => (
@@ -2126,7 +2236,7 @@ impl Demo {
             && self.space_smooth
             && self.space_edges != vk::Pipeline::null()
         {
-            self.edge_list(ctx, res, slot, extent)
+            self.edge_list(ctx, res, slot, self.space_scale.apply(extent))
         } else {
             None
         };
@@ -2186,6 +2296,11 @@ impl Demo {
             time,
             aspect,
             extent,
+            space_extent: if scene == DemoScene::Space {
+                self.space_scale.apply(extent)
+            } else {
+                extent
+            },
         }
     }
 
@@ -2357,6 +2472,7 @@ impl Demo {
         // пиксель и без MSAA: шагание — самое дорогое), а «сцена» его освещает.
         let gbuffer = (frame.scene == DemoScene::Space).then(|| {
             let camera = self.space_camera;
+            let ext = frame.space_extent;
             // Запечённое поле расстояний (7.10б): кубики у сдвинутых предметов и вошедшие
             // в слои при полёте камеры — до всех лучей кадра.
             if let Some(field) = frame.space_field {
@@ -2374,8 +2490,8 @@ impl Demo {
             }
             // Предварительное шагание конусами (7.8): точка на квадрат 8×8 пикселей.
             let tiles = vk::Extent2D {
-                width: frame.extent.width.div_ceil(CONE_TILE),
-                height: frame.extent.height.div_ceil(CONE_TILE),
+                width: ext.width.div_ceil(CONE_TILE),
+                height: ext.height.div_ceil(CONE_TILE),
             };
             let cone = graph.create("конусы 3D", tiles, CONE_FORMAT);
             graph.add_pass(
@@ -2384,7 +2500,7 @@ impl Demo {
                 move |p| {
                     let push = space_push(
                         &camera,
-                        frame.extent,
+                        ext,
                         frame.time,
                         frame.space_address,
                         SpaceSlots::default(),
@@ -2407,8 +2523,8 @@ impl Demo {
             // той же раскладки. «Реймарчинг» не шагает дальше них и берёт их точку, если
             // луч ни во что не попал раньше.
             let meshes = (frame.space_vertices > 0).then(|| {
-                let meshes = graph.create("полигоны 3D", frame.extent, GBUFFER_FORMAT);
-                let depth = graph.create("глубина полигонов 3D", frame.extent, MESH_DEPTH_FORMAT);
+                let meshes = graph.create("полигоны 3D", ext, GBUFFER_FORMAT);
+                let depth = graph.create("глубина полигонов 3D", ext, MESH_DEPTH_FORMAT);
                 graph.add_pass(
                     "полигоны 3D",
                     &[
@@ -2418,7 +2534,7 @@ impl Demo {
                     move |p| {
                         let push = space_push(
                             &camera,
-                            frame.extent,
+                            ext,
                             frame.time,
                             frame.space_address,
                             SpaceSlots::default(),
@@ -2433,7 +2549,7 @@ impl Demo {
                                 cmd,
                                 p.view(meshes),
                                 p.view(depth),
-                                frame.extent,
+                                ext,
                                 [-1.0, 0.0, 0.0, 0.0],
                             );
                             bindless.bind(d, cmd);
@@ -2450,7 +2566,7 @@ impl Demo {
                 );
                 meshes
             });
-            let gbuffer = graph.create("буфер геометрии 3D", frame.extent, GBUFFER_FORMAT);
+            let gbuffer = graph.create("буфер геометрии 3D", ext, GBUFFER_FORMAT);
             if frame.space_compute {
                 // Опыт 7.6м: те же лучи вычислительным шейдером, прямо в картинку буфера
                 // геометрии (её читают тени и освещение как обычно).
@@ -2464,7 +2580,7 @@ impl Demo {
                 graph.add_pass("реймарчинг", &uses, move |p| {
                     let push = space_push(
                         &camera,
-                        frame.extent,
+                        ext,
                         frame.time,
                         frame.space_address,
                         SpaceSlots {
@@ -2486,12 +2602,7 @@ impl Demo {
                             self.space_march_compute,
                         );
                         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_dispatch(
-                            cmd,
-                            frame.extent.width.div_ceil(8),
-                            frame.extent.height.div_ceil(8),
-                            1,
-                        );
+                        d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
                     }
                 });
             } else {
@@ -2503,7 +2614,7 @@ impl Demo {
                 graph.add_pass("реймарчинг", &march_uses, move |p| {
                     let push = space_push(
                         &camera,
-                        frame.extent,
+                        ext,
                         frame.time,
                         frame.space_address,
                         SpaceSlots {
@@ -2517,7 +2628,7 @@ impl Demo {
                     // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
                     // этого кадра жив, пока кадр рисуется.
                     unsafe {
-                        begin_color_pass(d, cmd, p.view(gbuffer), frame.extent);
+                        begin_color_pass(d, cmd, p.view(gbuffer), ext);
                         bindless.bind(d, cmd);
                         d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_march);
                         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
@@ -2530,8 +2641,8 @@ impl Demo {
             // точка на квадрат 2×2 пикселя, вчетверо меньше лучей (7.6б). «Сцена»
             // растягивает их обратно с оглядкой на глубину и нормаль.
             let half = vk::Extent2D {
-                width: frame.extent.width.div_ceil(2),
-                height: frame.extent.height.div_ceil(2),
+                width: ext.width.div_ceil(2),
+                height: ext.height.div_ceil(2),
             };
             let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
             graph.add_pass(
@@ -2543,7 +2654,7 @@ impl Demo {
                 move |p| {
                     let push = space_push(
                         &camera,
-                        frame.extent,
+                        ext,
                         frame.time,
                         frame.space_address,
                         SpaceSlots {
@@ -2572,7 +2683,7 @@ impl Demo {
             // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
             // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
             let edges = frame.space_edges.map(|(list, list_buffer)| {
-                let edges = graph.create("края 3D", frame.extent, EDGE_FORMAT);
+                let edges = graph.create("края 3D", ext, EDGE_FORMAT);
                 graph.add_pass(
                     "края 3D: поиск",
                     &[
@@ -2582,7 +2693,7 @@ impl Demo {
                     move |p| {
                         let push = space_push(
                             &camera,
-                            frame.extent,
+                            ext,
                             frame.time,
                             frame.space_address,
                             SpaceSlots {
@@ -2651,12 +2762,7 @@ impl Demo {
                                 self.space_edge_find,
                             );
                             d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                            d.cmd_dispatch(
-                                cmd,
-                                frame.extent.width.div_ceil(8),
-                                frame.extent.height.div_ceil(8),
-                                1,
-                            );
+                            d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
                             d.cmd_pipeline_barrier2(
                                 cmd,
                                 &vk::DependencyInfo::default().memory_barriers(&after),
@@ -2676,7 +2782,7 @@ impl Demo {
                 graph.add_pass("края 3D", &uses, move |p| {
                     let push = space_push(
                         &camera,
-                        frame.extent,
+                        ext,
                         frame.time,
                         frame.space_address,
                         SpaceSlots {
@@ -2701,18 +2807,66 @@ impl Demo {
                 });
                 edges
             });
-            (gbuffer, shadows, edges)
+            // Уменьшенное разрешение (7.14): освещение здесь же, в своей картинке того же
+            // размера; «сцена» растянет её на весь кадр.
+            let color = (ext != frame.extent).then(|| {
+                let color = graph.create("цвет 3D", ext, SPACE_COLOR_FORMAT);
+                let mut uses = vec![
+                    (gbuffer, Access::Sampled),
+                    (shadows, Access::Sampled),
+                    (color, Access::ColorAttachment),
+                ];
+                if let Some(e) = edges {
+                    uses.push((e, Access::Sampled));
+                }
+                graph.add_pass("освещение 3D", &uses, move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            gbuffer: p.texture(gbuffer),
+                            shadows: p.texture(shadows),
+                            target: edges.map_or(0, |e| p.texture(e)),
+                            ..SpaceSlots::default()
+                        },
+                        u32::from(edges.is_some()) * SPACE_FLAG_EDGES,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинки 3D в чтение, а цвет в цель рисования;
+                    // буфер сцены этого кадра жив, пока кадр рисуется.
+                    unsafe {
+                        begin_color_pass(d, cmd, p.view(color), ext);
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.space_shade_small,
+                        );
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                });
+                color
+            });
+            (gbuffer, shadows, edges, color)
         });
 
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
             (stencil, Access::StencilAttachment),
         ];
-        if let Some((g, s, e)) = gbuffer {
-            uses.push((g, Access::Sampled));
-            uses.push((s, Access::Sampled));
-            if let Some(e) = e {
-                uses.push((e, Access::Sampled));
+        if let Some((g, s, e, color)) = gbuffer {
+            if let Some(c) = color {
+                uses.push((c, Access::Sampled));
+            } else {
+                uses.push((g, Access::Sampled));
+                uses.push((s, Access::Sampled));
+                if let Some(e) = e {
+                    uses.push((e, Access::Sampled));
+                }
             }
         }
         if let Some(f) = field {
@@ -2767,7 +2921,23 @@ impl Demo {
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
-                if let Some((g, s, e)) = gbuffer {
+                if let Some((_, _, _, Some(c))) = gbuffer {
+                    // Растяжение уменьшенной сцены «3D» на весь кадр (7.14).
+                    let push = space_push(
+                        &self.space_camera,
+                        frame.extent,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            target: p.texture(c),
+                            ..SpaceSlots::default()
+                        },
+                        0,
+                    );
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_upscale);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                } else if let Some((g, s, e, None)) = gbuffer {
                     let push = space_push(
                         &self.space_camera,
                         frame.extent,
@@ -3290,6 +3460,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_edges, None);
             ctx.device.destroy_pipeline(self.space_field_bake, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
+            ctx.device.destroy_pipeline(self.space_shade_small, None);
+            ctx.device.destroy_pipeline(self.space_upscale, None);
             ctx.device.destroy_pipeline(self.light, None);
             ctx.device.destroy_pipeline(self.object, None);
             ctx.device.destroy_pipeline(self.object_mask, None);
@@ -3315,6 +3487,8 @@ impl Demo {
         self.space_edges = vk::Pipeline::null();
         self.space_field_bake = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
+        self.space_shade_small = vk::Pipeline::null();
+        self.space_upscale = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
         self.object = vk::Pipeline::null();
         self.object_mask = vk::Pipeline::null();
@@ -3526,6 +3700,8 @@ const SPACE_FLAG_EDGES: u32 = 2;
 const EDGE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
 const CONE_TILE: u32 = 8;
+/// Освещённая сцена «3D» в уменьшенном разрешении (7.14), до растяжения на кадр.
+const SPACE_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
 const SHADOW3D_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Каскады лучей (опыт 4.6): цвет, принесённый лучом, и пропустил ли он свет дальше.
@@ -3999,12 +4175,35 @@ mod tests {
             m = m.next();
             seen.push(m);
         }
+
         assert_eq!(seen, [Msaa::X2, Msaa::X4, Msaa::X8, Msaa::Off]);
         // Видеокарта без 2×: берётся ближайшее меньшее.
         let no_x2 = vk::SampleCountFlags::TYPE_1 | vk::SampleCountFlags::TYPE_4;
         assert_eq!(Msaa::X2.supported(no_x2), Msaa::Off);
         assert_eq!(Msaa::X8.supported(no_x2), Msaa::X4);
         assert_eq!(Msaa::from_name("2"), Some(Msaa::X2));
+    }
+
+    /// Разрешение 3D (7.14): на встроенной половина, у нечётных сторон с запасом.
+    #[test]
+    fn space_scale_by_adapter() {
+        assert_eq!(
+            SpaceScale::for_adapter(AdapterKind::Integrated),
+            SpaceScale::Half
+        );
+        assert_eq!(
+            SpaceScale::for_adapter(AdapterKind::Discrete),
+            SpaceScale::Full
+        );
+        let e = vk::Extent2D {
+            width: 1921,
+            height: 1081,
+        };
+        assert_eq!(SpaceScale::Full.apply(e), e);
+        let half = SpaceScale::Half.apply(e);
+        assert_eq!((half.width, half.height), (961, 541));
+        let three = SpaceScale::ThreeQuarters.apply(e);
+        assert_eq!((three.width, three.height), (1441, 811));
     }
 
     #[test]

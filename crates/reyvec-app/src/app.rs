@@ -288,6 +288,11 @@ impl App {
             );
         }
         renderer.set_msaa(msaa);
+        tracing::info!(
+            "Разрешение 3D по умолчанию для видеокарты «{}»: {}",
+            renderer.adapter().name,
+            renderer.space_scale().title()
+        );
         renderer.set_perceptual_edges(self.config.perceptual_edges);
         renderer.set_fill(self.config.fill);
         renderer.set_zoom(self.config.zoom);
@@ -379,6 +384,10 @@ impl App {
             PanelAction::SpaceSmooth(on) => {
                 r.set_space_smooth(on);
                 tracing::info!("Сглаживание 3D: {}", if on { "вкл" } else { "выкл" });
+            }
+            PanelAction::SpaceScale(scale) => {
+                r.set_space_scale(scale);
+                tracing::info!("Разрешение 3D: {}", scale.title());
             }
             PanelAction::SpaceField(on) => {
                 r.set_space_field(on);
@@ -579,6 +588,7 @@ impl App {
                 space_in_view: renderer.space_in_view(),
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
+                space_scale: renderer.space_scale(),
                 space_field: renderer.space_field(),
                 space_ao_field: renderer.space_ao_field(),
                 field_bench: field_bench_text.as_deref(),
