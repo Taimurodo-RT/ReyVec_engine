@@ -436,8 +436,7 @@ fn render(
             // него.
             demo.set_dither(false);
             demo.set_cascades(scene.cascades);
-            // Поле по умолчанию выключено (пока медленнее точного расчёта на RTX 5080), а
-            // тесты поля включают его сами.
+            // Тесты поля сравнивают кадры с полем и без него и с «углами из поля» и без них.
             #[cfg(test)]
             demo.set_space_field(!tests::FIELD_OFF.get());
             #[cfg(test)]
