@@ -126,7 +126,7 @@ pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4) -> ViewCullStats {
         lamps: &frame.lamps,
         floor,
     };
-    let total = frame.shapes.len() + frame.proxies.len();
+    let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
     let keep = |s: &Shape3| match s.bounds() {
         None => true,
         Some((c, r)) => frustum.sphere(c, r + AO_MARGIN) || shadows.casts(&frustum, c, r),
@@ -134,9 +134,13 @@ pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4) -> ViewCullStats {
     frame.shapes.retain(keep);
     // Заменители моделей невидимы: им важны только тени и углы.
     frame.proxies.retain(keep);
+    // Теней светящиеся не дают: нужны, только если их видно.
+    frame
+        .glows
+        .retain(|s| s.bounds().is_none_or(|(c, r)| frustum.sphere(c, r)));
     ViewCullStats {
         total,
-        kept: frame.shapes.len() + frame.proxies.len(),
+        kept: frame.shapes.len() + frame.proxies.len() + frame.glows.len(),
     }
 }
 

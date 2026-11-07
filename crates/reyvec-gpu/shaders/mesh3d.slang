@@ -5,14 +5,13 @@
 // в углах и свет дальше общие (raymarch_shadow.slang, raymarch_shade.slang).
 //
 // Вершины лежат в буфере сцены (crates/reyvec-gpu/src/space.rs): слово 7 заголовка —
-// начало раздела моделей; в разделе число вершин, 3 запасных, матрица «мир → экран»
-// столбцами, потом вершины по 4 слова (место и номер материала), по 3 на треугольник.
+// начало раздела моделей (раскладка — MESH_HEADER_WORDS в space.slang), потом вершины
+// по 4 слова (место и номер материала), по 3 на треугольник.
 // Грани плоские: нормаль — по наклону соседних точек.
 
 #define SPACE_OWN_VERTEX
 #include "include/space.slang"
 
-static const uint MESH_HEADER_WORDS = 20;
 static const uint VERTEX_WORDS = 4;
 
 struct MeshOut
@@ -38,7 +37,7 @@ MeshOut vs_main(uint vertex : SV_VulkanVertexID)
     }
     uint v = at + MESH_HEADER_WORDS + vertex * VERTEX_WORDS;
     float3 p = float3(asfloat(pc.scene[v]), asfloat(pc.scene[v + 1]), asfloat(pc.scene[v + 2]));
-    uint m = at + 4;
+    uint m = at + MESH_VIEW_PROJ;
     float4 clip = float4(0.0, 0.0, 0.0, 0.0);
     for (uint c = 0; c < 4; c++)
     {

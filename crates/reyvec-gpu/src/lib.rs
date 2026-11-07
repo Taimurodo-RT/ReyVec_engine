@@ -65,6 +65,7 @@ pub use headless::{
     FieldSnapshot, FrameImage, HeadlessImage, HeadlessPlay, HeadlessScene, PlayInput,
     render_headless, render_headless_play, render_triangle_headless,
 };
+pub use level3d::LevelRender;
 pub use particles::ParticleStats;
 pub use pipeline::CLEAR_COLOR;
 pub use resources::{BufferId, BufferMemory, TextureId};

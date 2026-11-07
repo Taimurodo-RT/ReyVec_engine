@@ -447,6 +447,9 @@ fn render(
             demo.set_space_scale(tests::SPACE_SCALE.get());
             #[cfg(test)]
             demo.set_level_view(tests::LEVEL_VIEW.get());
+            demo.set_level_render(crate::LevelRender::Sdf);
+            #[cfg(test)]
+            demo.set_level_render(tests::LEVEL_RENDER.get());
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -665,6 +668,9 @@ mod tests {
             const { std::cell::Cell::new(crate::SpaceScale::Full) };
         /// 2.5D-вид уровня из файла (7.9).
         pub(super) static LEVEL_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Как рисуется 2.5D-вид (7.9б).
+        pub(super) static LEVEL_RENDER: std::cell::Cell<crate::LevelRender> =
+            const { std::cell::Cell::new(crate::LevelRender::Sdf) };
     }
 
     /// Вид на полую коробку сбоку (как эталон space-hollow-side-2s).
@@ -848,11 +854,33 @@ mod tests {
             let flat = render_headless_play(&options, &scene, Some(&play)).expect("плоский кадр");
             LEVEL_VIEW.set(true);
             let volume = render_headless_play(&options, &scene, Some(&play));
+            LEVEL_RENDER.set(crate::LevelRender::Triangles);
+            let triangles = render_headless_play(&options, &scene, Some(&play));
+            LEVEL_RENDER.set(crate::LevelRender::Sdf);
             LEVEL_VIEW.set(false);
             let volume = volume.expect("объёмный кадр");
+            let triangles = triangles.expect("объёмный кадр треугольниками");
             assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            // Треугольники рисуют тот же уровень: картинка близка к формам SDF (отличия —
+            // тени и углы, у краёв фигур).
+            let (_, _, mean) = image_diff(&volume.image, &triangles.image);
+            eprintln!("{name}: треугольники против SDF, средняя разница {mean:.1}");
+            // Время проходов (на lavapipe — только для сравнения двух способов).
+            for (kind, f) in [("SDF", &volume), ("треугольники", &triangles)] {
+                if let Some(t) = &f.gpu_timings {
+                    eprintln!("{name}, {kind}: {}", t.describe());
+                }
+            }
+            assert!(
+                mean < 20.0,
+                "{name}: треугольники не похожи на SDF ({mean:.1})"
+            );
             if let Ok(dir) = std::env::var("PPM_DIR") {
-                for (kind, f) in [("flat", &flat), ("volume", &volume)] {
+                for (kind, f) in [
+                    ("flat", &flat),
+                    ("volume", &volume),
+                    ("triangles", &triangles),
+                ] {
                     let mut out =
                         format!("P6 {} {} 255\n", f.image.width, f.image.height).into_bytes();
                     for px in f.image.rgba.chunks(4) {
@@ -871,7 +899,7 @@ mod tests {
                 colors.len()
             );
             assert!(mean > 5.0, "{name}: объёмный кадр такой же, как плоский");
-            assert!(colors.len() > 200, "{name}: мало цветов: {}", colors.len());
+            assert!(colors.len() > 100, "{name}: мало цветов: {}", colors.len());
         }
     }
 

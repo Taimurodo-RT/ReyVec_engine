@@ -20,13 +20,23 @@
 //!
 //! Форма фигуры (её поле расстояний) готовится один раз на фигуру библиотеки и потом
 //! только переставляется: сдвиг, поворот, размер и отражение героя, бегущего влево.
+//!
+//! Два способа рисовать (7.9б, [`LevelRender`]):
+//! - **SDF** — всё выше формами реймарчинга: точные мягкие тени и затенение в углах, но
+//!   каждый шаг луча перебирает плитки рядом, а в комнате их десятки (встроенной видеокарте
+//!   не по силам);
+//! - **треугольники** — плитки и бруски становятся призмами из треугольников (лицевая
+//!   сторона и бока; задняя не видна ни камере, ни лампам перед уровнем), их видеокарта
+//!   рисует растеризацией, а тени от них — картами теней двух ближних ламп. Формами SDF
+//!   остаются стена, земля и SDF-объекты (слизь, огоньки).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use glam::Vec3;
 use reyvec_sdf::profile2d::Profile;
 use reyvec_sdf::shape3d::Shape3;
-use reyvec_sdf::space_file::SpaceFrame;
+use reyvec_sdf::space_file::{MeshFrame, SpaceFrame};
 use reyvec_sdf::{Camera3D, Lamp3, Material3};
 use reyvec_vector::{
     Affine, BezPath, Color, Paint, PathEl, SceneItem, ShapeId, ShapeLibrary, kurbo,
@@ -71,10 +81,104 @@ enum Flat {
     Profile(Profile),
 }
 
+/// Как рисуется 2.5D-вид уровня (7.9б).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LevelRender {
+    /// Всё формами SDF: точные мягкие тени и затенение в углах.
+    #[default]
+    Sdf,
+    /// Плитки и бруски — треугольники с картами теней, SDF только у мягких предметов.
+    Triangles,
+}
+
+impl LevelRender {
+    /// Все способы по порядку (для панели).
+    pub const ALL: [Self; 2] = [Self::Sdf, Self::Triangles];
+
+    /// Название для панели и журнала.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Sdf => "SDF",
+            Self::Triangles => "треугольники",
+        }
+    }
+
+    /// По умолчанию для видеокарты: на встроенной — треугольники.
+    pub fn for_adapter(kind: crate::adapter::AdapterKind) -> Self {
+        match kind {
+            crate::adapter::AdapterKind::Integrated => Self::Triangles,
+            _ => Self::Sdf,
+        }
+    }
+}
+
+/// Треугольники фигуры в её координатах: лицевая сторона (по три точки) и контуры (для
+/// боков призмы).
+#[derive(Debug, Default)]
+struct FlatMesh {
+    triangles: Vec<[f32; 2]>,
+    outlines: Vec<Vec<[f32; 2]>>,
+}
+
 /// 2.5D-вид: формы фигур, готовые к перестановке.
 #[derive(Default)]
 pub(crate) struct Level3d {
     flats: HashMap<ShapeId, Option<Flat>>,
+    meshes: HashMap<ShapeId, Option<Arc<FlatMesh>>>,
+}
+
+/// Треугольники кадра по материалам (в мире).
+#[derive(Default)]
+struct Prisms {
+    by_material: HashMap<u32, Vec<[Vec3; 3]>>,
+}
+
+impl Prisms {
+    /// Призма: лицевая сторона из `front` (треугольники на плоскости, по три точки) на
+    /// глубине `z_front`, бока вдоль контуров `outlines` до `z_back`. Точки уже в мире
+    /// (x, y).
+    fn add(
+        &mut self,
+        material: u32,
+        front: impl IntoIterator<Item = [[f32; 2]; 3]>,
+        outlines: impl IntoIterator<Item = Vec<[f32; 2]>>,
+        z_front: f32,
+        z_back: f32,
+    ) {
+        let list = self.by_material.entry(material).or_default();
+        let at = |p: [f32; 2], z: f32| Vec3::new(p[0], p[1], z);
+        for [a, b, c] in front {
+            list.push([at(a, z_front), at(b, z_front), at(c, z_front)]);
+        }
+        for outline in outlines {
+            let n = outline.len();
+            if n < 2 {
+                continue;
+            }
+            for i in 0..n {
+                let (a, b) = (outline[i], outline[(i + 1) % n]);
+                if a == b {
+                    continue;
+                }
+                list.push([at(a, z_front), at(b, z_front), at(b, z_back)]);
+                list.push([at(a, z_front), at(b, z_back), at(a, z_back)]);
+            }
+        }
+    }
+
+    fn into_meshes(self) -> Vec<MeshFrame> {
+        let mut out: Vec<MeshFrame> = self
+            .by_material
+            .into_iter()
+            .map(|(material, triangles)| MeshFrame {
+                triangles,
+                material,
+            })
+            .collect();
+        // Порядок не важен для картинки, но одинаковый от кадра к кадру.
+        out.sort_by_key(|m| m.material);
+        out
+    }
 }
 
 /// Объёмная сцена одного кадра и её материалы.
@@ -111,13 +215,25 @@ impl Level3d {
     /// Забывает формы фигур (сцена сменилась).
     pub fn clear(&mut self) {
         self.flats.clear();
+        self.meshes.clear();
     }
 
     /// Объёмная сцена из снимка мира `scene`; формы фигур берутся из `library`.
-    pub fn frame(&mut self, scene: &reyvec_scene::Scene, library: &ShapeLibrary) -> LevelFrame {
+    /// `render` — формами SDF или плитки и бруски треугольниками.
+    pub fn frame(
+        &mut self,
+        scene: &reyvec_scene::Scene,
+        library: &ShapeLibrary,
+        render: LevelRender,
+    ) -> LevelFrame {
         if self.flats.len() > MAX_CACHED {
             self.flats.clear();
         }
+        if self.meshes.len() > MAX_CACHED {
+            self.meshes.clear();
+        }
+        let triangles = render == LevelRender::Triangles;
+        let mut prisms = Prisms::default();
         let mut materials = Materials::default();
         let mut shapes = Vec::new();
         let s = LEVEL_SCALE;
@@ -150,7 +266,14 @@ impl Level3d {
         // Твёрдое: бруски.
         let solid = materials.get(SOLID, 0.0);
         for c in &scene.solids {
-            if let Some(shape) = solid_shape(c) {
+            if triangles {
+                if let Some(outline) = solid_outline(c) {
+                    let outline: Vec<[f32; 2]> =
+                        outline.iter().map(|p| [p[0] * s, p[1] * s]).collect();
+                    let front = fan(&outline);
+                    prisms.add(solid, front, [outline], SOLID_FRONT, SOLID_BACK);
+                }
+            } else if let Some(shape) = solid_shape(c) {
                 shapes.push(shape.paint(solid));
             }
         }
@@ -166,10 +289,32 @@ impl Level3d {
                     let Some(color) = shape_color(library, instance.shape, instance.tint) else {
                         continue;
                     };
+                    let front = SOLID_FRONT + PLATE * 0.5 + layer as f32 * LAYER_STEP;
+                    if triangles {
+                        let Some(mesh) = self.mesh(library, instance.shape) else {
+                            continue;
+                        };
+                        layer += 1;
+                        let world = Affine::scale(f64::from(s)) * instance.transform;
+                        let put = |p: [f32; 2]| {
+                            let q = world * kurbo::Point::new(f64::from(p[0]), f64::from(p[1]));
+                            [q.x as f32, q.y as f32]
+                        };
+                        let front_tris = mesh
+                            .triangles
+                            .chunks_exact(3)
+                            .map(|t| [put(t[0]), put(t[1]), put(t[2])]);
+                        let outlines = mesh
+                            .outlines
+                            .iter()
+                            .map(|o| o.iter().map(|&p| put(p)).collect::<Vec<_>>());
+                        let material = materials.get(color, 0.0);
+                        prisms.add(material, front_tris, outlines, front, front - PLATE);
+                        continue;
+                    }
                     let Some(flat) = self.flat(library, instance.shape) else {
                         continue;
                     };
-                    let front = SOLID_FRONT + PLATE * 0.5 + layer as f32 * LAYER_STEP;
                     layer += 1;
                     if let Some(shape) = plate(&flat, instance.transform, front) {
                         shapes.push(shape.paint(materials.get(color, 0.0)));
@@ -180,14 +325,14 @@ impl Level3d {
         }
 
         // SDF-объекты: капсулы у переднего края. Светящийся объект у лампы (огонёк бра,
-        // шар-светильник) — на глубине лампы: луч тени не доходит до лампы 35 см, и
-        // огонёк не бросает тень от своей же лампы на стену.
+        // шар-светильник) — на глубине лампы, там же, где свет.
         let lights: Vec<[f32; 2]> = scene
             .lights
             .iter()
             .filter(|l| l.kind == reyvec_scene::LightKind::Local)
             .map(|l| [(l.a[0] + l.b[0]) * 0.5, (l.a[1] + l.b[1]) * 0.5])
             .collect();
+        let mut glows = Vec::new();
         for o in &scene.objects {
             let at_lamp = o.glow
                 && o.parts.iter().any(|p| {
@@ -202,7 +347,14 @@ impl Level3d {
                 SOLID_FRONT + PLATE * 0.5
             };
             if let Some((shape, color, glow)) = object_shape(o, z) {
-                shapes.push(shape.paint(materials.get(color, glow)));
+                let shape = shape.paint(materials.get(color, glow));
+                // Светящиеся теней не дают: иначе шар у лампы бросает от неё кольца
+                // полутени на стену.
+                if o.glow {
+                    glows.push(shape);
+                } else {
+                    shapes.push(shape);
+                }
             }
         }
 
@@ -210,11 +362,20 @@ impl Level3d {
             frame: SpaceFrame {
                 shapes,
                 lamps: Vec::new(),
-                meshes: Vec::new(),
+                meshes: prisms.into_meshes(),
                 proxies: Vec::new(),
+                glows,
             },
             materials: materials.list,
         }
+    }
+
+    /// Треугольники фигуры `id` (готовятся при первой встрече).
+    fn mesh(&mut self, library: &ShapeLibrary, id: ShapeId) -> Option<Arc<FlatMesh>> {
+        self.meshes
+            .entry(id)
+            .or_insert_with(|| library.shape(id).and_then(mesh_of).map(Arc::new))
+            .clone()
     }
 
     /// Форма фигуры `id` (готовится при первой встрече).
@@ -257,6 +418,20 @@ pub(crate) fn lamps(scene: &reyvec_scene::Scene, target: [f32; 2]) -> Vec<Lamp3>
     lamps.into_iter().take(MAX_LAMPS).map(|(_, l)| l).collect()
 }
 
+/// Угол карты тени лампы (7.9б), градусы: лампа перед уровнем видит его весь под этим
+/// углом, кроме самых косых мест сбоку, куда её свет почти не доходит.
+const SHADOW_MAP_FOV_DEG: f32 = 140.0;
+
+/// Матрица «мир → карта тени» лампы (7.9б): лампа смотрит на уровень (вдоль −Z), глубина
+/// обратная, как у камеры.
+pub(crate) fn lamp_view_proj(lamp: &Lamp3) -> glam::Mat4 {
+    let at = Vec3::from(lamp.at);
+    let view = glam::Mat4::look_at_rh(at, at - Vec3::Z, Vec3::Y);
+    let far = lamp.range.max(1.0) + 1.0;
+    let proj = glam::Mat4::perspective_rh(SHADOW_MAP_FOV_DEG.to_radians(), 1.0, far, 0.05);
+    proj * view
+}
+
 /// Камера 2.5D-вида: сбоку с лёгким наклоном сверху, смотрит на середину 2D-камеры
 /// `center`; при увеличении `zoom` видна та же высота уровня, что в плоском виде.
 /// `orbit` — облёт для осмотра: поворот вокруг середины влево-вправо и вверх-вниз,
@@ -276,6 +451,36 @@ pub(crate) fn camera(center: [f64; 2], zoom: f64, orbit: [f32; 2]) -> Camera3D {
             pitch.cos() * yaw.cos(),
         ) * distance;
     Camera3D::looking_at(eye, target)
+}
+
+/// Контур бруска твёрдого на плоскости (единицы 2D), против часовой стрелки:
+/// прямоугольник или у склона четырёхугольник со скошенным верхом.
+fn solid_outline(c: &reyvec_scene::game::Collider) -> Option<Vec<[f32; 2]>> {
+    let (lo, hi) = (c.aabb.min, c.aabb.max);
+    if hi[0] <= lo[0] || hi[1] <= lo[1] {
+        return None;
+    }
+    let drop = c.slope.abs().min(hi[1] - lo[1]);
+    let (left_top, right_top) = if c.slope > 0.0 {
+        (hi[1] - drop, hi[1])
+    } else if c.slope < 0.0 {
+        (hi[1], hi[1] - drop)
+    } else {
+        (hi[1], hi[1])
+    };
+    Some(vec![
+        [lo[0] as f32, lo[1] as f32],
+        [hi[0] as f32, lo[1] as f32],
+        [hi[0] as f32, right_top as f32],
+        [lo[0] as f32, left_top as f32],
+    ])
+}
+
+/// Треугольники выпуклого многоугольника веером от первой точки.
+fn fan(points: &[[f32; 2]]) -> Vec<[[f32; 2]; 3]> {
+    (1..points.len().saturating_sub(1))
+        .map(|i| [points[0], points[i], points[i + 1]])
+        .collect()
 }
 
 /// Брусок твёрдого (склон — выдавленный многоугольник).
@@ -372,6 +577,66 @@ fn flat_of(shape: &reyvec_vector::Shape) -> Option<Flat> {
     let long = size.width.max(size.height) as f32;
     let cell = (long / MIN_PROFILE_CELLS).clamp(PROFILE_CELL, PROFILE_CELL * 10.0);
     Profile::from_bez(&path, cell).ok().map(Flat::Profile)
+}
+
+/// Треугольники фигуры для призмы: заливка контура (у обводки — её полосы) и контуры
+/// ломаными. Точность — сотая доля размера фигуры.
+fn mesh_of(shape: &reyvec_vector::Shape) -> Option<FlatMesh> {
+    let (path, rule) = match shape.style {
+        reyvec_vector::Style::Fill(rule) => (shape.path.clone(), rule),
+        reyvec_vector::Style::Stroke(stroke) => (
+            kurbo::stroke(
+                shape.path.iter(),
+                &kurbo::Stroke::new(stroke.width),
+                &kurbo::StrokeOpts::default(),
+                stroke.width * 0.05,
+            ),
+            reyvec_vector::FillRule::NonZero,
+        ),
+    };
+    let size = kurbo::Shape::bounding_box(&path).size();
+    let long = size.width.max(size.height);
+    if long.is_nan() || long <= 0.0 {
+        return None;
+    }
+    let tolerance = long / 100.0;
+    let fill = reyvec_vector::Shape {
+        path: path.clone(),
+        style: reyvec_vector::Style::Fill(rule),
+        paint: shape.paint.clone(),
+    };
+    let tess = reyvec_vector::tessellate(&fill, tolerance).ok()?;
+    let triangles = tess
+        .indices
+        .iter()
+        .map(|&i| tess.vertices[i as usize])
+        .collect();
+    let mut outlines = Vec::new();
+    let mut current: Vec<[f32; 2]> = Vec::new();
+    kurbo::flatten(path.iter(), tolerance, |el| match el {
+        PathEl::MoveTo(p) => {
+            if current.len() > 1 {
+                outlines.push(std::mem::take(&mut current));
+            }
+            current.clear();
+            current.push([p.x as f32, p.y as f32]);
+        }
+        PathEl::LineTo(p) => current.push([p.x as f32, p.y as f32]),
+        PathEl::ClosePath => {
+            if current.len() > 1 {
+                outlines.push(std::mem::take(&mut current));
+            }
+            current.clear();
+        }
+        _ => {}
+    });
+    if current.len() > 1 {
+        outlines.push(current);
+    }
+    Some(FlatMesh {
+        triangles,
+        outlines,
+    })
 }
 
 /// Прямоугольник по осям: четыре угла и замыкание.

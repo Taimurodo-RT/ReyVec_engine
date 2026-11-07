@@ -5,7 +5,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, RichText};
-use reyvec_gpu::{DemoScene, FillMode, GpuFrameTimings, GraphReport, Msaa, SpaceScale, UiFrame};
+use reyvec_gpu::{
+    DemoScene, FillMode, GpuFrameTimings, GraphReport, LevelRender, Msaa, SpaceScale, UiFrame,
+};
 use winit::event::WindowEvent;
 
 use crate::game_ui::{GameUi, GameView};
@@ -35,6 +37,8 @@ pub(crate) enum PanelAction {
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
     LevelView(bool),
+    /// Как рисуется 2.5D-вид (7.9б).
+    LevelRender(LevelRender),
     /// Запечённое поле расстояний сцены «3D» (7.10б).
     SpaceField(bool),
     /// Затенение в углах из поля (7.10г).
@@ -125,6 +129,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
     pub level_view: bool,
+    /// Как рисуется 2.5D-вид (7.9б).
+    pub level_render: LevelRender,
     /// Запечённое поле расстояний (7.10б): включено ли и умеет ли видеокарта.
     pub space_field: (bool, bool),
     /// Затенение в углах из поля: включено ли и можно ли (поле включено).
@@ -659,6 +665,25 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         {
             actions.push(PanelAction::LevelView(level));
         }
+        if info.level_view {
+            ui.label("2.5D рисуется").on_hover_text(
+                "SDF — всё формами реймарчинга: точные мягкие тени и затенение в углах, \
+                 но дорого (по умолчанию на отдельной видеокарте). Треугольники — плитки \
+                 и бруски обычными треугольниками, тени от них картами теней двух ближних \
+                 ламп, формы SDF только у мягких предметов: быстро (по умолчанию на \
+                 встроенной)",
+            );
+            ui.horizontal(|ui| {
+                for render in LevelRender::ALL {
+                    if ui
+                        .selectable_label(info.level_render == render, render.title())
+                        .clicked()
+                    {
+                        actions.push(PanelAction::LevelRender(render));
+                    }
+                }
+            });
+        }
     }
     let volume = info.scene_id == DemoScene::Space || info.level_view;
     if volume {
@@ -1103,6 +1128,7 @@ mod tests {
             space_smooth: (true, true),
             space_scale: SpaceScale::Full,
             level_view: false,
+            level_render: LevelRender::Sdf,
             space_field: (true, true),
             space_ao_field: (true, true),
             field_bench: Some("Сравнение поля (среднее за 240 кадров):\nбез поля: тени 0.722"),

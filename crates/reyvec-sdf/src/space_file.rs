@@ -205,6 +205,9 @@ pub struct SpaceFrame {
     /// Полигональные модели и их заменители для теней (7.6ж).
     pub meshes: Vec<MeshFrame>,
     pub proxies: Vec<Shape3>,
+    /// Светящиеся предметы без теней (2.5D-вид, 7.9б): глаз их видит, тени и затенение
+    /// в углах — нет.
+    pub glows: Vec<Shape3>,
 }
 
 /// Свечение шарика лампы: ярче 1, чтобы вокруг был ореол.
@@ -373,6 +376,7 @@ impl SpaceScene {
             lamps,
             meshes,
             proxies,
+            glows: Vec::new(),
         }
     }
 }

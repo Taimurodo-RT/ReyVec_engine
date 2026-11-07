@@ -398,6 +398,8 @@ pub(crate) struct FrameData {
     /// Вершин полигональных моделей сцены «3D» (7.6ж; 0 — моделей нет, проход
     /// «полигоны 3D» не нужен).
     space_vertices: u32,
+    /// Карт теней ламп от треугольников (7.9б; 0 — тени ламп только по формам SDF).
+    space_shadow_maps: u32,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
@@ -434,6 +436,8 @@ pub(crate) struct Demo {
     space_march: vk::Pipeline,
     /// Полигональные модели сцены «3D» (7.6ж, `mesh3d.slang`) в свой буфер геометрии.
     space_mesh: vk::Pipeline,
+    /// Карты теней ламп от треугольников (7.9б, `mesh_shadow.slang`).
+    space_mesh_shadow: vk::Pipeline,
     space_cone: vk::Pipeline,
     /// …тени и затенение в углах по нему (7.4, `raymarch_shadow.slang`)…
     space_shadow: vk::Pipeline,
@@ -465,6 +469,8 @@ pub(crate) struct Demo {
     level_view: bool,
     /// Облёт 2.5D-вида: влево-вправо и вверх-вниз от обычного вида, градусы.
     level_orbit: [f32; 2],
+    /// Как рисуется 2.5D-вид: формами SDF или треугольниками (7.9б).
+    level_render: crate::level3d::LevelRender,
     level: crate::level3d::Level3d,
     space_shade_small: vk::Pipeline,
     space_upscale: vk::Pipeline,
@@ -731,6 +737,7 @@ impl Demo {
             sdf: vk::Pipeline::null(),
             space_march: vk::Pipeline::null(),
             space_mesh: vk::Pipeline::null(),
+            space_mesh_shadow: vk::Pipeline::null(),
             space_cone: vk::Pipeline::null(),
             space_shadow: vk::Pipeline::null(),
             space_march_compute: vk::Pipeline::null(),
@@ -748,6 +755,7 @@ impl Demo {
             space_scale: SpaceScale::for_adapter(ctx.adapter.kind),
             level_view: false,
             level_orbit: [0.0, 0.0],
+            level_render: crate::level3d::LevelRender::for_adapter(ctx.adapter.kind),
             level: Default::default(),
             space_shade_small: vk::Pipeline::null(),
             space_upscale: vk::Pipeline::null(),
@@ -899,6 +907,15 @@ impl Demo {
                 shaders,
                 "mesh3d",
                 GBUFFER_FORMAT,
+                Msaa::Off,
+                Some(MESH_DEPTH_FORMAT),
+            )?;
+            demo.space_mesh_shadow = build(
+                ctx,
+                res,
+                shaders,
+                "mesh_shadow",
+                SHADOW_MAP_FORMAT,
                 Msaa::Off,
                 Some(MESH_DEPTH_FORMAT),
             )?;
@@ -1163,6 +1180,16 @@ impl Demo {
             (y + yaw).clamp(-LEVEL_ORBIT_YAW, LEVEL_ORBIT_YAW),
             (p + pitch).clamp(-LEVEL_ORBIT_DOWN, LEVEL_ORBIT_UP),
         ];
+    }
+
+    /// Как рисуется 2.5D-вид (7.9б).
+    pub fn level_render(&self) -> crate::level3d::LevelRender {
+        self.level_render
+    }
+
+    /// Меняет способ рисования 2.5D-вида со следующего кадра.
+    pub fn set_level_render(&mut self, render: crate::level3d::LevelRender) {
+        self.level_render = render;
     }
 
     /// Возвращает 2.5D-вид из облёта к обычному.
@@ -1918,6 +1945,12 @@ impl Demo {
                     Msaa::Off,
                     Some(MESH_DEPTH_FORMAT),
                 ),
+                "mesh_shadow" => (
+                    &mut self.space_mesh_shadow,
+                    SHADOW_MAP_FORMAT,
+                    Msaa::Off,
+                    Some(MESH_DEPTH_FORMAT),
+                ),
                 "raymarch_shadow" => (&mut self.space_shadow, SHADOW3D_FORMAT, Msaa::Off, None),
                 "particles" => {
                     match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
@@ -2275,6 +2308,7 @@ impl Demo {
         res.write_buffer(blob_buffer, 0, &blob_bytes);
         let space_buffer = self.space_buffers[slot];
         let mut space_vertices = 0;
+        let mut space_shadow_maps = 0;
         let space_compute =
             (level || self.space.compute) && self.space_march_compute != vk::Pipeline::null();
         if scene == DemoScene::Space {
@@ -2295,9 +2329,11 @@ impl Demo {
                 let _zone = crate::cpu_zone!("уровень в объёме");
                 let center = [self.camera.center.x, self.camera.center.y];
                 space_camera = crate::level3d::camera(center, self.camera.zoom, self.level_orbit);
-                let made = self
-                    .level
-                    .frame(&self.file_scene, &self.vector_demo.library);
+                let made = self.level.frame(
+                    &self.file_scene,
+                    &self.vector_demo.library,
+                    self.level_render,
+                );
                 let mut frame = made.frame;
                 frame.lamps =
                     crate::level3d::lamps(&self.file_scene, [center[0] as f32, center[1] as f32]);
@@ -2330,6 +2366,20 @@ impl Demo {
                 self.space_field.ao_from_field,
             );
             space_vertices = packed.vertices;
+            if level {
+                crate::space::set_no_sun(&mut packed.words);
+                // Треугольники (7.9б): карты теней двух первых ламп, если есть чем рисовать.
+                if space_vertices > 0 && self.space_mesh_shadow != vk::Pipeline::null() {
+                    let maps: Vec<glam::Mat4> = frame
+                        .lamps
+                        .iter()
+                        .take(crate::space::MAX_SHADOW_MAPS)
+                        .map(crate::level3d::lamp_view_proj)
+                        .collect();
+                    crate::space::set_shadow_maps(&mut packed.words, &maps);
+                    space_shadow_maps = maps.len() as u32;
+                }
+            }
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
         } else {
@@ -2344,6 +2394,7 @@ impl Demo {
             sprite_count: count as u32,
             space_address: res.buffer_address(space_buffer),
             space_vertices,
+            space_shadow_maps,
             space_compute,
             space_edges,
             space_field,
@@ -2712,42 +2763,100 @@ impl Demo {
                 width: ext.width.div_ceil(2),
                 height: ext.height.div_ceil(2),
             };
-            let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
-            graph.add_pass(
-                "тени 3D",
-                &[
-                    (gbuffer, Access::Sampled),
-                    (shadows, Access::ColorAttachment),
-                ],
-                move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots {
-                            gbuffer: p.texture(gbuffer),
-                            ..SpaceSlots::default()
-                        },
-                        0,
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл буфер геометрии в чтение, а тени в цель
-                    // рисования; буфер сцены этого кадра жив, пока кадр рисуется.
-                    unsafe {
-                        begin_color_pass(d, cmd, p.view(shadows), half);
-                        bindless.bind(d, cmd);
-                        d.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            self.space_shadow,
+            // Карты теней ламп от треугольников (7.9б): квадраты рядом в одной картинке.
+            let shadow_maps = (frame.space_shadow_maps > 0).then(|| {
+                let count = frame.space_shadow_maps;
+                let size = vk::Extent2D {
+                    width: SHADOW_MAP_SIZE * count,
+                    height: SHADOW_MAP_SIZE,
+                };
+                let maps = graph.create("карты теней ламп", size, SHADOW_MAP_FORMAT);
+                let depth = graph.create("глубина карт теней", size, MESH_DEPTH_FORMAT);
+                graph.add_pass(
+                    "карты теней ламп",
+                    &[
+                        (maps, Access::ColorAttachment),
+                        (depth, Access::StencilAttachment),
+                    ],
+                    move |p| {
+                        let push = space_push(
+                            &camera,
+                            ext,
+                            frame.time,
+                            frame.space_address,
+                            SpaceSlots::default(),
+                            0,
                         );
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_draw(cmd, 3, 1, 0, 0);
-                        d.cmd_end_rendering(cmd);
-                    }
-                },
-            );
+                        let (d, cmd) = (p.device, p.cmd);
+                        // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
+                        // этого кадра жив, пока кадр рисуется.
+                        unsafe {
+                            begin_depth_pass(
+                                d,
+                                cmd,
+                                p.view(maps),
+                                p.view(depth),
+                                size,
+                                [1e9, 0.0, 0.0, 0.0],
+                            );
+                            bindless.bind(d, cmd);
+                            d.cmd_bind_pipeline(
+                                cmd,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                self.space_mesh_shadow,
+                            );
+                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                            for k in 0..count {
+                                let viewport = vk::Viewport::default()
+                                    .x((k * SHADOW_MAP_SIZE) as f32)
+                                    .width(SHADOW_MAP_SIZE as f32)
+                                    .height(SHADOW_MAP_SIZE as f32)
+                                    .max_depth(1.0);
+                                d.cmd_set_viewport(cmd, 0, &[viewport]);
+                                d.cmd_draw(cmd, frame.space_vertices, 1, 0, k);
+                            }
+                            d.cmd_end_rendering(cmd);
+                        }
+                    },
+                );
+                maps
+            });
+            // Флаг и номер картинки карт теней для «теней 3D» и «краёв 3D».
+            let map_flags = move |p: &PassContext| {
+                shadow_maps.map_or(0, |m| SPACE_FLAG_SHADOW_MAP | (p.texture(m) << 16))
+            };
+            let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
+            let mut uses = vec![
+                (gbuffer, Access::Sampled),
+                (shadows, Access::ColorAttachment),
+            ];
+            if let Some(m) = shadow_maps {
+                uses.push((m, Access::Sampled));
+            }
+            graph.add_pass("тени 3D", &uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        gbuffer: p.texture(gbuffer),
+                        ..SpaceSlots::default()
+                    },
+                    map_flags(p),
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл буфер геометрии в чтение, а тени в цель
+                // рисования; буфер сцены этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(shadows), half);
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_shadow);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            });
             // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
             // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
             let edges = frame.space_edges.map(|(list, list_buffer)| {
@@ -2852,6 +2961,9 @@ impl Demo {
                 if let Some(m) = meshes {
                     uses.push((m, Access::ComputeSampled));
                 }
+                if let Some(m) = shadow_maps {
+                    uses.push((m, Access::ComputeSampled));
+                }
                 graph.add_pass("края 3D", &uses, move |p| {
                     let push = space_push(
                         &camera,
@@ -2866,7 +2978,7 @@ impl Demo {
                             meshes: meshes.map_or(0, |m| p.texture(m)),
                             edges: list,
                         },
-                        (u32::from(meshes.is_some()) * SPACE_FLAG_MESHES) | pairs,
+                        (u32::from(meshes.is_some()) * SPACE_FLAG_MESHES) | pairs | map_flags(p),
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
@@ -3526,6 +3638,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.space_march, None);
             ctx.device.destroy_pipeline(self.space_mesh, None);
+            ctx.device.destroy_pipeline(self.space_mesh_shadow, None);
             ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
             ctx.device.destroy_pipeline(self.space_march_compute, None);
@@ -3553,6 +3666,7 @@ impl Demo {
         self.sdf = vk::Pipeline::null();
         self.space_march = vk::Pipeline::null();
         self.space_mesh = vk::Pipeline::null();
+        self.space_mesh_shadow = vk::Pipeline::null();
         self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
         self.space_march_compute = vk::Pipeline::null();
@@ -3772,6 +3886,13 @@ const SPACE_FLAG_EDGES: u32 = 2;
 /// Флаг сцены «3D»: края по два луча на пиксель вместо четырёх (7.15) — при уменьшенном
 /// разрешении 3D, где растяжение и так смягчает края (как в space.slang).
 const SPACE_FLAG_EDGE_PAIRS: u32 = 4;
+/// Флаг сцены «3D»: тени ламп от треугольников по картам теней (7.9б); номер картинки
+/// карт — в старших 16 битах флагов (как в space.slang).
+const SPACE_FLAG_SHADOW_MAP: u32 = 8;
+/// Карта тени лампы (7.9б): расстояние от лампы до ближней поверхности.
+const SHADOW_MAP_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
+/// Сторона карты тени лампы, точек.
+const SHADOW_MAP_SIZE: u32 = 1024;
 /// Цвет краёв форм сцены «3D» (7.6о); прозрачность 0 — пиксель не на краю.
 const EDGE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
@@ -3971,7 +4092,7 @@ fn build(
         stencil.map(|format| Stencil {
             format,
             // Полигоны сцены «3D» (7.6ж) — с глубиной, остальным трафарет не нужен.
-            usage: if name == "mesh3d" {
+            usage: if name == "mesh3d" || name == "mesh_shadow" {
                 StencilUse::Depth
             } else {
                 StencilUse::Ignore

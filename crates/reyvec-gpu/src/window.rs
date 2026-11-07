@@ -710,6 +710,20 @@ impl WindowRenderer {
         }
     }
 
+    /// Как рисуется 2.5D-вид (7.9б).
+    pub fn level_render(&self) -> crate::LevelRender {
+        self.demo
+            .as_ref()
+            .map_or_else(Default::default, Demo::level_render)
+    }
+
+    /// Меняет способ рисования 2.5D-вида со следующего кадра.
+    pub fn set_level_render(&mut self, render: crate::LevelRender) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_level_render(render);
+        }
+    }
+
     /// Возвращает 2.5D-вид из облёта к обычному.
     pub fn reset_level_orbit(&mut self) {
         if let Some(demo) = self.demo.as_mut() {

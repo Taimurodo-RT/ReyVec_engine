@@ -158,6 +158,69 @@ float ambient_occlusion(float3 p, float3 n)
     return pow(visible / 5.0, AO_STRENGTH);
 }
 
+// Размер лампы для полутени карт теней: 1/k теней SDF.
+static const float MAP_PENUMBRA = 0.1;
+// Полутень карт теней не шире стольких точек карты (столько же — округа поиска
+// заслоняющего).
+static const int MAP_SEARCH = 24;
+
+// Карта тени лампы `lamp` (7.9б): доля света точки `p` от треугольников. Сравнивает
+// расстояние до лампы с картой (mesh_shadow.slang) в точках вокруг: край тени мягкий.
+// Точка вне карты (вбок от лампы шире её угла) — без тени.
+
+float map_shadow(float3 p, uint lamp)
+{
+    uint at = pc.scene[7];
+    if (lamp >= pc.scene[at + 1])
+        return 1.0;
+    uint m = at + MESH_SHADOW_PROJ + lamp * 16;
+    float4 clip = float4(0.0, 0.0, 0.0, 0.0);
+    for (uint c = 0; c < 4; c++)
+    {
+        float4 column = float4(asfloat(pc.scene[m + 4 * c]), asfloat(pc.scene[m + 4 * c + 1]),
+                               asfloat(pc.scene[m + 4 * c + 2]), asfloat(pc.scene[m + 4 * c + 3]));
+        clip += column * (c < 3 ? p[c] : 1.0);
+    }
+    if (clip.w <= 1e-4)
+        return 1.0;
+    float2 ndc = clip.xy / clip.w;
+    if (any(abs(ndc) > 0.995))
+        return 1.0;
+    Texture2D map = textures[pc.flags >> 16];
+    uint w, h;
+    map.GetDimensions(w, h);
+    int side = int(h);
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * float(side);
+    float d = length(p - read_lamp(lamp).at);
+    float bias = 0.02 + 0.01 * d;
+    int2 lo = int2(int(lamp) * side, 0);
+    int2 hi = lo + side - 1;
+    int2 center = int2(floor(uv)) + lo;
+    // Полутень как у теней SDF с k = 10: лампа как диск радиуса d/k, полутень на точке
+    // шире во столько раз, во сколько заслоняющее ближе к лампе, чем к точке. Сначала
+    // ближайший заслоняющий в округе (9 проб), потом 25 проб по квадрату такого размера.
+    float blocker = d;
+    for (int k = 0; k < 9; k++)
+    {
+        int2 o = (int2(k % 3, k / 3) - 1) * MAP_SEARCH;
+        blocker = min(blocker, map.Load(int3(clamp(center + o, lo, hi), 0)).x);
+    }
+    if (blocker >= d - bias)
+        return 1.0;
+    // Мир на карте у точки: 2·d·tan 70° на сторону.
+    float texel = 5.5 * d / float(side);
+    float world = (d - blocker) / max(blocker, 0.05) * d * MAP_PENUMBRA;
+    float radius = clamp(world / texel, 1.0, float(MAP_SEARCH));
+    float lit = 0.0;
+    for (int k = 0; k < 25; k++)
+    {
+        float2 o = (float2(k % 5, k / 5) - 2.0) * (radius * 0.5);
+        int2 q = clamp(int2(floor(uv + o)) + lo, lo, hi);
+        lit += d - bias <= map.Load(int3(q, 0)).x ? 1.0 : 0.0;
+    }
+    return lit / 25.0;
+}
+
 // Одна из четырёх долей света точки `surface` (на поверхности, нормаль `n`, `t` —
 // расстояние вдоль луча глаза): 0 — солнце, 1 — затенение в углах, 2 и 3 — две первые
 // лампы. Порядок — как в картинке теней (x, y, z, w).
@@ -169,6 +232,9 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
     float3 p = surface + n * (0.01 + 0.002 * t);
     if (part == 1)
         return ambient_occlusion(p, n);
+    // 2.5D-вид (7.9б): уровень в помещении, солнца нет.
+    if (part == 0 && (pc.scene[11] & SCENE_NO_SUN) != 0)
+        return 0.0;
     float3 dir = SUN;
     float far = 30.0;
     float k_hard = 12.0;
@@ -193,5 +259,13 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
     // Только там, куда свет падает: обратная сторона и так тёмная.
     if (dot(n, dir) <= 0.0 || far <= 0.0)
         return 1.0;
-    return soft_shadow(p, dir, far, k_hard);
+    // Треугольники (7.9б) заслоняют лампу по её карте; формы SDF — как обычно.
+    float by_map = 1.0;
+    if (part >= 2 && (pc.flags & SPACE_FLAG_SHADOW_MAP) != 0)
+    {
+        by_map = map_shadow(p, part - 2);
+        if (by_map <= 0.0)
+            return 0.0;
+    }
+    return by_map * soft_shadow(p, dir, far, k_hard);
 }
