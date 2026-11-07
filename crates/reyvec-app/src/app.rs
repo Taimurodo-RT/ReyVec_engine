@@ -123,6 +123,8 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         audio: reyvec_audio::Audio::new(true),
         fly: crate::fly::Fly::default(),
         last_frame: Instant::now(),
+        field_bench: None,
+        field_bench_report: None,
     };
     event_loop
         .run_app(&mut app)
@@ -192,6 +194,9 @@ struct App {
     /// Полёт камерой в сцене «3D» (7.1) и время прошлого кадра для шага полёта.
     fly: crate::fly::Fly,
     last_frame: Instant,
+    /// Идущее сравнение поля расстояний (7.10) и отчёт последнего.
+    field_bench: Option<crate::field_bench::FieldBench>,
+    field_bench_report: Option<String>,
 }
 
 impl App {
@@ -379,6 +384,20 @@ impl App {
                 r.set_space_field(on);
                 tracing::info!("Поле расстояний 3D: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::FieldBench => {
+                if self.field_bench.is_none() {
+                    let saved = (r.space_field().0, r.space_ao_field().0);
+                    let (field, ao) = crate::field_bench::FieldBench::first_mode();
+                    r.set_space_field(field);
+                    r.set_space_ao_field(ao);
+                    self.field_bench = Some(crate::field_bench::FieldBench::new(
+                        self.start.elapsed().as_secs_f32(),
+                        saved,
+                    ));
+                    self.field_bench_report = None;
+                    tracing::info!("Сравнение поля расстояний: начато");
+                }
+            }
             PanelAction::SpaceAoField(on) => {
                 r.set_space_ao_field(on);
                 tracing::info!("Углы из поля 3D: {}", if on { "вкл" } else { "выкл" });
@@ -483,7 +502,16 @@ impl App {
             }
         }
         let size = window.inner_size();
-        let time = self.start.elapsed().as_secs_f32();
+        // На сравнение поля время сцены замирает: все три замера видят один кадр.
+        let time = self
+            .field_bench
+            .as_ref()
+            .map_or_else(|| self.start.elapsed().as_secs_f32(), |b| b.time);
+        let field_bench_text = self
+            .field_bench
+            .as_ref()
+            .map(crate::field_bench::FieldBench::status)
+            .or_else(|| self.field_bench_report.clone());
         let msaa_options: Vec<Msaa> = [Msaa::Off, Msaa::X2, Msaa::X4, Msaa::X8]
             .into_iter()
             .filter(|m| renderer.msaa_supported(*m) == *m)
@@ -553,6 +581,8 @@ impl App {
                 space_smooth: renderer.space_smooth(),
                 space_field: renderer.space_field(),
                 space_ao_field: renderer.space_ao_field(),
+                field_bench: field_bench_text.as_deref(),
+                field_bench_running: self.field_bench.is_some(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),
@@ -595,6 +625,25 @@ impl App {
                 }
                 if let Some(client) = tracy_client::Client::running() {
                     client.frame_mark();
+                }
+                if let Some(bench) = self.field_bench.as_mut() {
+                    use crate::field_bench::Step;
+                    match bench.add(renderer.gpu_timings()) {
+                        Step::Continue => {}
+                        Step::Switch((field, ao)) => {
+                            renderer.set_space_field(field);
+                            renderer.set_space_ao_field(ao);
+                        }
+                        Step::Done(report) => {
+                            let (field, ao) = bench.saved;
+                            renderer.set_space_field(field);
+                            renderer.set_space_ao_field(ao);
+                            tracing::info!("{report}");
+                            self.field_bench_report = Some(report);
+                            self.field_bench = None;
+                            // Время сцены идёт дальше с того места, где замерло.
+                        }
+                    }
                 }
                 if let Some(t) = renderer.gpu_timings() {
                     self.stats.gpu.add(t);

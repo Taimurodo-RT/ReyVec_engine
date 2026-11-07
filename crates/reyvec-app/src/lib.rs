@@ -7,6 +7,7 @@ mod app;
 mod console;
 mod controls;
 mod editor;
+mod field_bench;
 mod fly;
 mod game_ui;
 mod gamepad;

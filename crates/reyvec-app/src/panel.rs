@@ -35,6 +35,8 @@ pub(crate) enum PanelAction {
     SpaceField(bool),
     /// Затенение в углах из поля (7.10г).
     SpaceAoField(bool),
+    /// Сравнить время кадра без поля, с полем и с «углами из поля» (7.10).
+    FieldBench,
     /// Фонтан частиц для замера (6.6).
     Fountain(bool),
     /// Музыка (6.7).
@@ -120,6 +122,10 @@ pub(crate) struct PanelInfo<'a> {
     pub space_field: (bool, bool),
     /// Затенение в углах из поля: включено ли и можно ли (поле включено).
     pub space_ao_field: (bool, bool),
+    /// Сравнение поля: что идёт сейчас или отчёт последнего.
+    pub field_bench: Option<&'a str>,
+    /// Сравнение поля идёт (кнопка недоступна).
+    pub field_bench_running: bool,
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -672,6 +678,24 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         {
             actions.push(PanelAction::SpaceAoField(ao));
         }
+        let (_, can_field) = info.space_field;
+        if ui
+            .add_enabled(
+                can_field && !info.field_bench_running,
+                egui::Button::new("Сравнить поле"),
+            )
+            .on_hover_text(
+                "Время сцены замирает, и по 240 кадров меряются три положения: без поля, \
+                 с полем, с полем и «углами из поля». Около 15 секунд; камеру не трогать. \
+                 Итог — здесь и в журнале",
+            )
+            .clicked()
+        {
+            actions.push(PanelAction::FieldBench);
+        }
+        if let Some(text) = info.field_bench {
+            ui.label(egui::RichText::new(text).small());
+        }
     }
     let mut dither = info.dither;
     if ui
@@ -1025,6 +1049,8 @@ mod tests {
             space_smooth: (true, true),
             space_field: (true, true),
             space_ao_field: (false, true),
+            field_bench: Some("Сравнение поля (среднее за 240 кадров):\nбез поля: тени 0.722"),
+            field_bench_running: false,
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {
