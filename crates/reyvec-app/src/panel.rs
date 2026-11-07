@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, RichText};
-use reyvec_gpu::{DemoScene, FillMode, GpuFrameTimings, GraphReport, Msaa, UiFrame};
+use reyvec_gpu::{DemoScene, FillMode, GpuFrameTimings, GraphReport, Msaa, SpaceScale, UiFrame};
 use winit::event::WindowEvent;
 
 use crate::game_ui::{GameUi, GameView};
@@ -31,6 +31,8 @@ pub(crate) enum PanelAction {
     Dither(bool),
     /// Сглаживание краёв форм сцены «3D» (7.6о).
     SpaceSmooth(bool),
+    /// Разрешение сцены «3D» (7.14).
+    SpaceScale(SpaceScale),
     /// Запечённое поле расстояний сцены «3D» (7.10б).
     SpaceField(bool),
     /// Затенение в углах из поля (7.10г).
@@ -118,6 +120,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_compute: (bool, bool),
     /// Сглаживание краёв форм «3D» (7.6о): включено ли и умеет ли видеокарта.
     pub space_smooth: (bool, bool),
+    /// Разрешение сцены «3D» (7.14).
+    pub space_scale: SpaceScale,
     /// Запечённое поле расстояний (7.10б): включено ли и умеет ли видеокарта.
     pub space_field: (bool, bool),
     /// Затенение в углах из поля: включено ли и можно ли (поле включено).
@@ -654,6 +658,22 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         {
             actions.push(PanelAction::SpaceSmooth(smooth));
         }
+        ui.label("Разрешение 3D").on_hover_text(
+            "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
+                 Меньше — быстрее, картинка растягивается на весь экран (по одному кадру, \
+                 без сглаживания по времени), но мягче. На встроенной видеокарте по \
+                 умолчанию 50 %, на отдельной 100 %",
+        );
+        ui.horizontal(|ui| {
+            for scale in SpaceScale::ALL {
+                if ui
+                    .selectable_label(info.space_scale == scale, scale.title())
+                    .clicked()
+                {
+                    actions.push(PanelAction::SpaceScale(scale));
+                }
+            }
+        });
         let (mut field, can) = info.space_field;
         if ui
             .add_enabled(can, egui::Checkbox::new(&mut field, "Поле расстояний"))
@@ -1050,6 +1070,7 @@ mod tests {
             space_in_view: Some((150, 202)),
             space_compute: (false, false),
             space_smooth: (true, true),
+            space_scale: SpaceScale::Full,
             space_field: (true, true),
             space_ao_field: (true, true),
             field_bench: Some("Сравнение поля (среднее за 240 кадров):\nбез поля: тени 0.722"),

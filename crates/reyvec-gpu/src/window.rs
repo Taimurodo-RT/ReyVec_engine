@@ -691,6 +691,20 @@ impl WindowRenderer {
         }
     }
 
+    /// Разрешение сцены «3D» (7.14).
+    pub fn space_scale(&self) -> crate::SpaceScale {
+        self.demo
+            .as_ref()
+            .map_or_else(Default::default, Demo::space_scale)
+    }
+
+    /// Меняет разрешение сцены «3D» со следующего кадра.
+    pub fn set_space_scale(&mut self, scale: crate::SpaceScale) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_scale(scale);
+        }
+    }
+
     /// Лучи сцены «3D» вычислительным шейдером: попросил ли файл и шли ли так лучи.
     pub fn space_compute(&self) -> (bool, bool) {
         self.demo

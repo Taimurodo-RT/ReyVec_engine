@@ -441,6 +441,10 @@ fn render(
             demo.set_space_field(!tests::FIELD_OFF.get());
             #[cfg(test)]
             demo.set_space_ao_field(tests::AO_FROM_FIELD.get());
+            // Эталоны — в полном разрешении 3D на любой видеокарте; тесты 7.14 уменьшают.
+            demo.set_space_scale(crate::SpaceScale::Full);
+            #[cfg(test)]
+            demo.set_space_scale(tests::SPACE_SCALE.get());
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -654,6 +658,9 @@ mod tests {
         pub(super) static FIELD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Кадр с «углами из поля» (7.10г).
         pub(super) static AO_FROM_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Разрешение сцены «3D» (7.14).
+        pub(super) static SPACE_SCALE: std::cell::Cell<crate::SpaceScale> =
+            const { std::cell::Cell::new(crate::SpaceScale::Full) };
     }
 
     /// Вид на полую коробку сбоку (как эталон space-hollow-side-2s).
@@ -764,6 +771,37 @@ mod tests {
             .count();
         eprintln!("чёрных пикселей: {black}");
         assert!(black < 50, "чёрных пикселей {black}");
+    }
+
+    /// Сцена «3D» в половинном и трёх четвертях разрешения (7.14, встроенная Radeon):
+    /// растянутый кадр похож на полный — отличается в основном по краям форм, без
+    /// сдвига картинки и без чёрных или пустых мест.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn space_scale_matches_full() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let mut scene = hollow_side();
+        (scene.width, scene.height) = (641, 361);
+        let full = render_headless(&options, &scene).expect("полный кадр");
+        for scale in [crate::SpaceScale::ThreeQuarters, crate::SpaceScale::Half] {
+            SPACE_SCALE.set(scale);
+            let small = render_headless(&options, &scene);
+            SPACE_SCALE.set(crate::SpaceScale::Full);
+            let small = small.expect("уменьшенный кадр");
+            let (changed, worst, mean) = image_diff(&full.image, &small.image);
+            let share = changed as f64 / f64::from(scene.width * scene.height);
+            eprintln!(
+                "{}: отличается {changed} пикселей ({:.1} %), наибольшая разница {worst}, \
+                 средняя {mean:.2}",
+                scale.title(),
+                share * 100.0
+            );
+            assert!(mean < 3.0, "{}: средняя разница {mean:.2}", scale.title());
+            assert!(share < 0.25, "{}: отличается {share:.3}", scale.title());
+        }
     }
 
     /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и
