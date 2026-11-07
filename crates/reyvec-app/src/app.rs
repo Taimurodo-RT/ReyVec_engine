@@ -733,21 +733,15 @@ fn space_text(c: &reyvec_sdf::Camera3D, speed: f32) -> String {
 }
 
 /// Клавиша выбора сцены песочницы. Клавиши по месту на клавиатуре, поэтому раскладка
-/// не важна.
+/// не важна. Ранних опытов, убранных из списка панели, здесь тоже нет.
 fn scene_for_key(code: KeyCode) -> Option<DemoScene> {
     match code {
-        KeyCode::Digit1 | KeyCode::Numpad1 => Some(DemoScene::Gpu),
-        KeyCode::Digit2 | KeyCode::Numpad2 => Some(DemoScene::Vector),
-        KeyCode::Digit3 | KeyCode::Numpad3 => Some(DemoScene::Morph),
-        KeyCode::Digit4 | KeyCode::Numpad4 => Some(DemoScene::Layers),
-        KeyCode::Digit5 | KeyCode::Numpad5 => Some(DemoScene::Masks),
-        KeyCode::Digit6 | KeyCode::Numpad6 => Some(DemoScene::Svg),
-        KeyCode::Digit7 | KeyCode::Numpad7 => Some(DemoScene::Motif),
-        KeyCode::Digit8 | KeyCode::Numpad8 => Some(DemoScene::Stream),
-        KeyCode::Digit9 | KeyCode::Numpad9 => Some(DemoScene::Text),
-        KeyCode::Digit0 | KeyCode::Numpad0 => Some(DemoScene::Stress),
+        KeyCode::Digit1 | KeyCode::Numpad1 => Some(DemoScene::Vector),
+        KeyCode::Digit2 | KeyCode::Numpad2 => Some(DemoScene::Svg),
+        KeyCode::Digit3 | KeyCode::Numpad3 => Some(DemoScene::Motif),
+        KeyCode::Digit4 | KeyCode::Numpad4 => Some(DemoScene::Text),
+        KeyCode::Digit5 | KeyCode::Numpad5 => Some(DemoScene::Stress),
         // Сцены этапа 4 и дальше — буквами: цифры заняты сценами этапов 2–3.
-        KeyCode::KeyL => Some(DemoScene::Light),
         KeyCode::KeyK => Some(DemoScene::Lamps),
         KeyCode::KeyJ => Some(DemoScene::Blobs),
         KeyCode::KeyH => Some(DemoScene::Lab),

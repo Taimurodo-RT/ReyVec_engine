@@ -52,27 +52,26 @@ pub(crate) enum PanelAction {
 }
 
 /// Сцены песочницы по этапам и клавиши, которые их включают.
+///
+/// Ранние опыты (треугольник этапа 2, перетекание, слои, маски, поток, свет без ламп)
+/// в список не входят: всё, что они показывают, есть в сценах ниже (текст — со слоем и
+/// маской, Motif и стресс — с перетеканием, картина в фоне сцены N — с потоком, лампы —
+/// со светом). Они остаются для тестов с эталонами и открываются `--scene`.
 const SCENES: &[(&str, &[(DemoScene, &str)])] = &[
-    ("Этап 2", &[(DemoScene::Gpu, "1")]),
     (
         "Этап 3: векторы",
         &[
-            (DemoScene::Vector, "2"),
-            (DemoScene::Morph, "3"),
-            (DemoScene::Layers, "4"),
-            (DemoScene::Masks, "5"),
-            (DemoScene::Svg, "6"),
-            (DemoScene::Motif, "7"),
-            (DemoScene::Stream, "8"),
-            (DemoScene::Text, "9"),
-            (DemoScene::Stress, "0"),
+            (DemoScene::Vector, "1"),
+            (DemoScene::Svg, "2"),
+            (DemoScene::Motif, "3"),
+            (DemoScene::Text, "4"),
+            (DemoScene::Stress, "5"),
             (DemoScene::StressMorph, "T"),
         ],
     ),
     (
         "Этап 4: свет",
         &[
-            (DemoScene::Light, "L"),
             (DemoScene::Lamps, "K"),
             (DemoScene::Blobs, "J"),
             (DemoScene::Lab, "H"),
