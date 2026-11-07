@@ -760,6 +760,11 @@ impl WindowRenderer {
             .map(|s| (s.kept, s.total))
     }
 
+    /// Сетка отсева последнего кадра сцены «3D» (`None` — её не было).
+    pub fn space_grid(&self) -> Option<crate::GridStats> {
+        self.demo.as_ref().and_then(Demo::space_grid)
+    }
+
     /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
     pub fn shader_error(&self) -> Option<String> {
         self.shaders.error()

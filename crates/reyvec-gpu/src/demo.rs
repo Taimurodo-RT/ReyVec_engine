@@ -478,6 +478,8 @@ pub(crate) struct Demo {
     space_camera: reyvec_sdf::Camera3D,
     /// Отсев по взгляду в последнем кадре сцены «3D» (7.6к).
     space_view: reyvec_sdf::view3d::ViewCullStats,
+    /// Сетка отсева последнего кадра сцены «3D» (`None` — сетки не было).
+    space_grid: Option<crate::space::GridStats>,
     /// Поле расстояний сцены «свет» (4.2): маска теней и проходы jump flooding.
     field: FieldPipelines,
     /// Линии фона сцены «свет» по полю из картинки (jump flooding), а не точному.
@@ -761,6 +763,7 @@ impl Demo {
             space_upscale: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
             space_view: Default::default(),
+            space_grid: None,
             field: FieldPipelines::default(),
             light_field: false,
             file_scene: reyvec_scene::Scene::default(),
@@ -1219,6 +1222,12 @@ impl Demo {
     /// скольких (`None` — выключен, `view_culling: false`).
     pub fn space_in_view(&self) -> Option<reyvec_sdf::view3d::ViewCullStats> {
         (!self.space.view_culling_off).then_some(self.space_view)
+    }
+
+    /// Сетка отсева последнего кадра сцены «3D»: клетка, размеры, длины списков
+    /// (`None` — сетки не было).
+    pub fn space_grid(&self) -> Option<crate::space::GridStats> {
+        self.space_grid
     }
 
     /// Лучи сцены «3D» вычислительным шейдером (опыт 7.6м): попросил ли файл
@@ -2354,11 +2363,14 @@ impl Demo {
             }
             let view_proj = space_camera.view_proj(aspect);
             if level || !self.space.view_culling_off {
-                self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj);
+                // У уровня солнца нет: его заслонки не держим, иначе в кадр комнаты
+                // тянулся бы коридор (разбор 2026-11-07).
+                self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj, !level);
             }
             let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             let culling = level || !self.space.culling_off;
             let mut packed = crate::space::pack(&frame, materials, culling);
+            self.space_grid = packed.grid;
             crate::space::set_view_proj(&mut packed.words, view_proj);
             crate::space::set_field(
                 &mut packed.words,

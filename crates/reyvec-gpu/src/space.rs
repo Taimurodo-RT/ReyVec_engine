@@ -28,6 +28,48 @@ pub(crate) struct Packed {
     pub words: Vec<u32>,
     /// Вершин полигональных моделей (по 3 на треугольник; 0 — моделей нет).
     pub vertices: u32,
+    /// Сетка отсева кадра (`None` — её нет).
+    pub grid: Option<GridStats>,
+}
+
+/// Сетка отсева кадра для панели: размер клетки, число клеток по осям и длины списков
+/// клеток (средняя и наибольшая). По ним видно, не растянул ли сетку один длинный
+/// предмет: пол в 53,6 м давал в комнате клетку 2 м и списки по 30–50 объектов
+/// (разбор 2026-11-07).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GridStats {
+    pub cell: f32,
+    pub dims: [u32; 3],
+    pub mean_list: f32,
+    pub max_list: u32,
+}
+
+/// Сетка отсева по словам сцены (раскладка — `Grid::write`); `None` — сетки нет.
+pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
+    let g = *words.get(6)? as usize;
+    if g == 0 {
+        return None;
+    }
+    let cell = f32::from_bits(*words.get(g + 3)?);
+    let dims = [*words.get(g + 4)?, *words.get(g + 5)?, *words.get(g + 6)?];
+    let cells = *words.get(g + 14)? as usize;
+    let count = dims.iter().map(|&d| d as usize).product::<usize>();
+    let (mut sum, mut max) = (0u64, 0u32);
+    for i in 0..count {
+        let n = *words.get(cells + i * reyvec_sdf::grid3d::CELL_WORDS + 1)?;
+        sum += u64::from(n);
+        max = max.max(n);
+    }
+    Some(GridStats {
+        cell,
+        dims,
+        mean_list: if count == 0 {
+            0.0
+        } else {
+            sum as f32 / count as f32
+        },
+        max_list: max,
+    })
 }
 
 /// Список слов сцены для видеокарты: программы объектов (и невидимых заменителей
@@ -44,11 +86,16 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
             words.len() + mesh_words
         );
         let words = pack_scene(&[], materials, &frame.lamps);
-        return Packed { words, vertices: 0 };
+        return Packed {
+            words,
+            vertices: 0,
+            grid: None,
+        };
     }
     if !culling {
         words[6] = 0;
     }
+    let grid = grid_stats(&words);
     words[7] = words.len() as u32;
     words.extend([(triangles * 3) as u32, 0, 0, 0]);
     words.extend([0u32; MESH_HEADER_WORDS - 4]);
@@ -63,6 +110,7 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
     Packed {
         words,
         vertices: (triangles * 3) as u32,
+        grid,
     }
 }
 
@@ -182,6 +230,24 @@ mod tests {
             let (_, m) = program.distance(glam::Vec3::ZERO);
             assert!((m as usize) < scene.materials.len());
         }
+    }
+
+    #[test]
+    fn grid_stats_match_the_grid() {
+        let text = include_str!("../../../scenes/3d/stress.ron");
+        let scene = reyvec_sdf::SpaceScene::parse(text).unwrap();
+        let frame = scene.frame(1.0);
+        let grid = reyvec_sdf::grid3d::Grid::build(&programs(&frame));
+        let stats = pack(&frame, &scene.materials, true).grid.unwrap();
+        assert_eq!(stats.cell, grid.cell);
+        assert_eq!(stats.dims, grid.dims);
+        assert_eq!(
+            stats.max_list,
+            grid.cells.iter().map(|c| c.count).max().unwrap_or(0)
+        );
+        let mean = grid.cells.iter().map(|c| c.count as f32).sum::<f32>() / grid.cells.len() as f32;
+        assert!((stats.mean_list - mean).abs() < 1e-3);
+        assert!(pack(&frame, &scene.materials, false).grid.is_none());
     }
 
     #[test]

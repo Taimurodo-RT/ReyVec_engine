@@ -69,6 +69,7 @@ pub use level3d::LevelRender;
 pub use particles::ParticleStats;
 pub use pipeline::CLEAR_COLOR;
 pub use resources::{BufferId, BufferMemory, TextureId};
+pub use space::GridStats;
 pub use timing::{GpuFrameTimings, GpuTimingAverage, PassTiming};
 pub use ui::UiFrame;
 pub use vector::{FillMode, MeshMemory};

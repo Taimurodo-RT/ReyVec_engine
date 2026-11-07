@@ -80,6 +80,8 @@ impl Frustum {
 /// Что известно о сцене кадра для проверки теней.
 struct Shadows<'a> {
     lamps: &'a [Lamp3],
+    /// Есть ли солнце. У 2.5D-уровня его нет (SCENE_NO_SUN), и заслонки солнца не нужны.
+    sun: bool,
     /// Ниже этой высоты видимых точек нет (весь мир над полом), или `None`.
     floor: Option<f32>,
 }
@@ -90,10 +92,12 @@ impl Shadows<'_> {
         // Солнце: луч от видимой точки p идёт к солнцу, объект на нём — p = c − SUN·t.
         // Над самым нижним видимым местом луч поднимается, поэтому тень не длиннее
         // подъёма от пола до верха объекта.
-        let length = self
-            .floor
-            .map_or(SUN_FAR, |y| ((c.y + r - y) / SUN.y).clamp(0.0, SUN_FAR));
-        let sun = frustum.capsule(c, c - SUN * length, r + length / SUN_HARDNESS);
+        let sun = self.sun && {
+            let length = self
+                .floor
+                .map_or(SUN_FAR, |y| ((c.y + r - y) / SUN.y).clamp(0.0, SUN_FAR));
+            frustum.capsule(c, c - SUN * length, r + length / SUN_HARDNESS)
+        };
         sun || self.lamps.iter().take(SHADOW_LAMPS).any(|l| {
             let at = Vec3::from(l.at);
             let d = c.distance(at);
@@ -118,12 +122,17 @@ pub struct ViewCullStats {
     pub kept: usize,
 }
 
-/// Убирает из кадра объекты, не влияющие на картинку камеры `view_proj`.
-pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4) -> ViewCullStats {
+/// Убирает из кадра объекты, не влияющие на картинку камеры `view_proj`. `sun` — есть ли
+/// солнце: без него (2.5D-уровень, SCENE_NO_SUN) объект остаётся только ради взгляда и
+/// ламп. Раньше уровень отсеивался как сцена с солнцем, а в нём есть стена, и
+/// [`lowest_visible`] не знал нижней границы: каждый объект проверялся как заслонка
+/// солнца конусом в 30 м, и в кадр комнаты попадали десятки объектов коридора.
+pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4, sun: bool) -> ViewCullStats {
     let frustum = Frustum::new(view_proj);
-    let floor = lowest_visible(frame);
+    let floor = if sun { lowest_visible(frame) } else { None };
     let shadows = Shadows {
         lamps: &frame.lamps,
+        sun,
         floor,
     };
     let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
@@ -192,6 +201,51 @@ mod tests {
         assert!(!f.sphere(Vec3::new(40.0, 1.0, 0.0), 1.0));
     }
 
+    /// Без солнца (2.5D-уровень) объект, который держался в кадре только как заслонка
+    /// солнца, отсеивается; видимый остаётся.
+    #[test]
+    fn no_sun_drops_sun_only_casters() {
+        let cam = Camera3D::looking_at(Vec3::new(0.0, 1.0, 5.0), Vec3::new(0.0, 1.0, 0.0));
+        let view_proj = cam.view_proj(16.0 / 9.0);
+        let frame = || SpaceFrame {
+            shapes: vec![
+                // Стена: с ней нижняя граница видимого неизвестна, и тень солнца
+                // считается во всю длину — как в уровне.
+                Shape3::Plane {
+                    normal: [0.0, 0.0, 1.0],
+                    offset: 3.0,
+                },
+                Shape3::Sphere { radius: 0.3 }.at([0.0, 1.0, 0.0]),
+                // Шар за спиной камеры, на луче от видимой точки к солнцу.
+                Shape3::Sphere { radius: 0.5 }
+                    .at((Vec3::new(0.0, 1.0, 0.0) + SUN * 15.0).to_array()),
+            ],
+            lamps: Vec::new(),
+            meshes: Vec::new(),
+            proxies: Vec::new(),
+            glows: Vec::new(),
+        };
+        let mut with_sun = frame();
+        assert_eq!(
+            cull_frame(&mut with_sun, view_proj, true).kept,
+            3,
+            "с солнцем заслонка нужна"
+        );
+        let mut no_sun = frame();
+        assert_eq!(
+            cull_frame(&mut no_sun, view_proj, false).kept,
+            2,
+            "без солнца она лишняя"
+        );
+        assert!(
+            no_sun
+                .shapes
+                .iter()
+                .any(|s| s.bounds().is_some_and(|(_, r)| (r - 0.3).abs() < 1e-6)),
+            "видимый шар остался"
+        );
+    }
+
     /// Лучи глаза и тени от солнца и ламп по урезанной сцене дают ровно то же, что по
     /// полной: отсев картинку не меняет.
     #[test]
@@ -213,7 +267,7 @@ mod tests {
         for (k, cam) in cameras.iter().enumerate() {
             let full = scene.frame(1.3);
             let mut part = scene.frame(1.3);
-            let stats = cull_frame(&mut part, cam.view_proj(aspect));
+            let stats = cull_frame(&mut part, cam.view_proj(aspect), true);
             culled_any |= stats.kept < stats.total;
             let progs = |f: &SpaceFrame| -> Vec<Program> {
                 f.shapes.iter().map(|s| compile(s).unwrap()).collect()
