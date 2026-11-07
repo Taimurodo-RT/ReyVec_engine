@@ -6,12 +6,20 @@
 use reyvec_sdf::SpaceFrame;
 use reyvec_sdf::shape3d::{Material3, Program, Shape3, compile, pack_scene};
 
-/// Сколько слов помещается в буфер сцены кадра (1 МБ).
-pub(crate) const MAX_WORDS: usize = 256 * 1024;
+/// Сколько слов помещается в буфер сцены кадра (4 МБ: треугольники 2.5D-вида, 7.9б).
+pub(crate) const MAX_WORDS: usize = 1024 * 1024;
 
-/// Слов в заголовке раздела моделей: число вершин, 3 запасных, матрица «мир → экран»
-/// (16 чисел, столбцами; пишет [`set_view_proj`]).
-const MESH_HEADER_WORDS: usize = 20;
+/// Слов в заголовке раздела моделей: число вершин, число карт теней ламп, 2 запасных,
+/// матрица «мир → экран» (16 чисел, столбцами; пишет [`set_view_proj`]) и матрицы двух
+/// ламп для карт теней (пишет [`set_shadow_maps`]), как в `include/space.slang`.
+const MESH_HEADER_WORDS: usize = 52;
+/// Где в разделе моделей матрица камеры и матрицы ламп.
+const MESH_VIEW_PROJ: usize = 4;
+const MESH_SHADOW_PROJ: usize = 20;
+/// Карт теней не больше (как SHADOW_LAMPS: тени есть только у двух первых ламп).
+pub(crate) const MAX_SHADOW_MAPS: usize = 2;
+/// Слово 11 заголовка сцены, бит 1: солнца нет (как SCENE_NO_SUN в `space.slang`).
+const SCENE_NO_SUN: u32 = 2;
 /// Слов на вершину: место (3 числа) и номер материала.
 const VERTEX_WORDS: usize = 4;
 
@@ -43,7 +51,7 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
     }
     words[7] = words.len() as u32;
     words.extend([(triangles * 3) as u32, 0, 0, 0]);
-    words.extend([0u32; 16]);
+    words.extend([0u32; MESH_HEADER_WORDS - 4]);
     for m in &frame.meshes {
         for t in &m.triangles {
             for v in t {
@@ -61,12 +69,13 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
 /// Программы форм кадра: предметы, потом невидимые заменители моделей (7.6ж). Форма,
 /// которую не вышло превратить в программу, пропускается с записью в журнал.
 fn programs(frame: &SpaceFrame) -> Vec<Program> {
-    let build = |shapes: &[Shape3], shadow_only: bool| -> Vec<Program> {
+    let build = |shapes: &[Shape3], shadow_only: bool, no_shadow: bool| -> Vec<Program> {
         shapes
             .iter()
             .filter_map(|s| match compile(s) {
                 Ok(mut p) => {
                     p.shadow_only = shadow_only;
+                    p.no_shadow = no_shadow;
                     Some(p)
                 }
                 Err(e) => {
@@ -76,15 +85,19 @@ fn programs(frame: &SpaceFrame) -> Vec<Program> {
             })
             .collect()
     };
-    let mut programs = build(&frame.shapes, false);
-    programs.extend(build(&frame.proxies, true));
+    let mut programs = build(&frame.shapes, false, false);
+    programs.extend(build(&frame.proxies, true, false));
+    programs.extend(build(&frame.glows, false, true));
     programs
 }
 
 /// Формы для запечённого поля (7.10б): все предметы и заменители кадра, до отсева по
-/// взгляду.
+/// взгляду. Светящихся без теней в поле нет: поле читают только тени и углы.
 pub(crate) fn field_programs(frame: &SpaceFrame) -> Vec<Program> {
     programs(frame)
+        .into_iter()
+        .filter(|p| !p.no_shadow)
+        .collect()
 }
 
 /// Слов в разделе запечённого поля: адрес буфера поля (2 слова), точек по стороне слоя,
@@ -124,9 +137,29 @@ pub(crate) fn set_field(
 
 /// Матрица камеры «мир → экран» в раздел моделей (вершинный шейдер «полигонов 3D»).
 pub(crate) fn set_view_proj(words: &mut [u32], view_proj: glam::Mat4) {
-    let at = words[7] as usize + 4;
+    write_matrix(words, words[7] as usize + MESH_VIEW_PROJ, view_proj);
+}
+
+/// Матрицы ламп для карт теней (7.9б) в раздел моделей; их число — слово 1 раздела.
+pub(crate) fn set_shadow_maps(words: &mut [u32], maps: &[glam::Mat4]) {
+    let at = words[7] as usize;
+    let count = maps.len().min(MAX_SHADOW_MAPS);
+    if let Some(w) = words.get_mut(at + 1) {
+        *w = count as u32;
+    }
+    for (k, m) in maps.iter().take(count).enumerate() {
+        write_matrix(words, at + MESH_SHADOW_PROJ + 16 * k, *m);
+    }
+}
+
+/// Солнца нет (2.5D-вид: уровень в помещении).
+pub(crate) fn set_no_sun(words: &mut [u32]) {
+    words[11] |= SCENE_NO_SUN;
+}
+
+fn write_matrix(words: &mut [u32], at: usize, m: glam::Mat4) {
     if let Some(slot) = words.get_mut(at..at + 16) {
-        for (w, v) in slot.iter_mut().zip(view_proj.to_cols_array()) {
+        for (w, v) in slot.iter_mut().zip(m.to_cols_array()) {
             *w = v.to_bits();
         }
     }

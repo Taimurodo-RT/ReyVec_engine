@@ -85,6 +85,7 @@ static const uint MAX_PROGRAM_WORDS = 16384;
 
 static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
 static const uint OBJECT_SHADOW_ONLY = 1; // как shape3d::OBJECT_SHADOW_ONLY
+static const uint OBJECT_NO_SHADOW = 8; // как shape3d::OBJECT_NO_SHADOW
 static const uint OBJECT_PLANE = 2; // как shape3d::OBJECT_PLANE
 static const uint OBJECT_CHAIN = 4; // как shape3d::OBJECT_CHAIN
 static const uint MAX_PLANES = 8; // как shape3d::MAX_PLANES
@@ -94,6 +95,16 @@ static const uint SPACE_FLAG_EDGES = 2; // края форм сглажены (7
 // Края — по два луча на пиксель вместо четырёх (7.15, уменьшенное разрешение 3D):
 // поиск краёв считает группы по 32 пикселя, проход «края 3D» — по два потока на пиксель.
 static const uint SPACE_FLAG_EDGE_PAIRS = 4;
+// Тени ламп от треугольников — картами теней (7.9б, 2.5D-вид треугольниками): номер
+// картинки карт в общем списке текстур — старшие 16 бит pc.flags.
+static const uint SPACE_FLAG_SHADOW_MAP = 8;
+// Раздел полигонов (слово 7 заголовка сцены): число вершин, число карт теней, 2 запасных,
+// матрица камеры, матрицы ламп для карт теней (по 16 чисел, столбцами), потом вершины.
+static const uint MESH_HEADER_WORDS = 52;
+static const uint MESH_VIEW_PROJ = 4;
+static const uint MESH_SHADOW_PROJ = 20;
+// Слово 11 заголовка сцены, бит 1: солнца нет (2.5D-вид — уровень в помещении).
+static const uint SCENE_NO_SUN = 2;
 
 // Расстояние до ближайшего объекта (x) и его материал (y).
 //
@@ -164,6 +175,9 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
         uint w = objects + o * OBJECT_WORDS;
         uint flags = pc.scene[w + 2];
         if (!proxies && (flags & OBJECT_SHADOW_ONLY) != 0)
+            continue;
+        // Светящиеся без теней (7.9б) теням и углам не видны.
+        if (proxies && (flags & OBJECT_NO_SHADOW) != 0)
             continue;
         if (!planes && (flags & OBJECT_PLANE) != 0)
             continue;

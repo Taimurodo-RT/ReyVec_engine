@@ -468,6 +468,9 @@ pub struct Program {
     /// Невидимый заменитель полигональной модели (7.6ж): только тени и затенение в
     /// углах, лучи глаза его не видят.
     pub shadow_only: bool,
+    /// Светящийся предмет (огонёк, шар-светильник; 7.9б): виден, но теней и затенения
+    /// в углах не даёт. Иначе он у самой лампы и бросает от неё тень на всё вокруг.
+    pub no_shadow: bool,
 }
 
 /// Почему форму нельзя превратить в программу.
@@ -521,6 +524,7 @@ pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
         words,
         bounds: shape.bounds(),
         shadow_only: false,
+        no_shadow: false,
     })
 }
 
@@ -809,6 +813,8 @@ pub const OBJECT_PLANE: u32 = 2;
 /// Флаг объекта: программа — цепочка, где операции ждёт не больше одной формы
 /// ([`Program::chain`]); шейдер считает её без стека, в регистрах (7.6т).
 pub const OBJECT_CHAIN: u32 = 4;
+/// Флаг объекта: теней и затенения в углах не даёт ([`Program::no_shadow`]).
+pub const OBJECT_NO_SHADOW: u32 = 8;
 /// Больше плоскостей, считаемых формулой, не бывает (шейдер дальше не читает).
 pub const MAX_PLANES: usize = 8;
 /// Слов в заголовке сцены.
@@ -870,6 +876,9 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
         }
         if p.chain() {
             flags |= OBJECT_CHAIN;
+        }
+        if p.no_shadow {
+            flags |= OBJECT_NO_SHADOW;
         }
         let (n, c) = plane.unwrap_or((Vec3::ZERO, 0.0));
         out.extend([start as u32, p.words.len() as u32, flags, c.to_bits()]);

@@ -293,6 +293,10 @@ impl App {
             renderer.adapter().name,
             renderer.space_scale().title()
         );
+        tracing::info!(
+            "2.5D-вид по умолчанию для этой видеокарты рисуется: {}",
+            renderer.level_render().title()
+        );
         renderer.set_perceptual_edges(self.config.perceptual_edges);
         renderer.set_fill(self.config.fill);
         renderer.set_zoom(self.config.zoom);
@@ -392,6 +396,10 @@ impl App {
             PanelAction::LevelView(on) => {
                 r.set_level_view(on);
                 tracing::info!("2.5D-вид уровня: {}", if on { "вкл" } else { "выкл" });
+            }
+            PanelAction::LevelRender(render) => {
+                r.set_level_render(render);
+                tracing::info!("2.5D рисуется: {}", render.title());
             }
             PanelAction::SpaceField(on) => {
                 r.set_space_field(on);
@@ -595,6 +603,7 @@ impl App {
                 space_smooth: renderer.space_smooth(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
+                level_render: renderer.level_render(),
                 space_field: renderer.space_field(),
                 space_ao_field: renderer.space_ao_field(),
                 field_bench: field_bench_text.as_deref(),
