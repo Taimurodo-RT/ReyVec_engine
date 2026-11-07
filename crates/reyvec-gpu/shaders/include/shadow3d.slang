@@ -113,10 +113,30 @@ float ambient_occlusion(float3 p, float3 n)
             h = far_probe ? 0.4 : 0.16;
             weight = far_probe ? 0.45 : 0.6;
         }
+        float plane = h * dot(dir, n);
+        float3 q = p + dir * h;
+        // Запечённое поле (7.10г). Проба закрыта, только если форма ближе `plane`: если
+        // уже нижняя оценка поля не меньше, проба ничего не даёт, и формы не считаем.
+        // Картинка от этого не меняется.
+        float estimate;
+        float lower = field_lower(q, estimate);
+        float planes_d = planes_distance(q);
+        if (min(lower, planes_d) >= plane)
+        {
+            total += weight;
+            continue;
+        }
+        float d;
+        // «Углы из поля» (переключатель в панели): дальние пробы берут само число поля
+        // вместо расчёта форм. Ближняя проба вдоль нормали (4 см, чуть больше шага поля)
+        // считается точно. Картинка чуть другая: у тонких краёв, тоньше шага поля.
+        if (i > 0 && (pc.scene[11] & 1) != 0 && estimate > -1e29)
+            d = min(estimate, planes_d);
+        else
+            d = scene_near(q, 1e9, true, true).x;
         // Дальше AO_REACH расстояние не различаем: так объекты, отсеянные по взгляду
         // (7.6к, они дальше этого от любой пробы), на углы не влияют.
-        float d = min(scene_near(p + dir * h, 1e9, true, true).x, AO_REACH);
-        float plane = h * dot(dir, n);
+        d = min(d, AO_REACH);
         occlusion += weight * saturate((plane - d) / plane);
         total += weight;
     }

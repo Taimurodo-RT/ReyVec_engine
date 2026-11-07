@@ -379,6 +379,10 @@ impl App {
                 r.set_space_field(on);
                 tracing::info!("Поле расстояний 3D: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::SpaceAoField(on) => {
+                r.set_space_ao_field(on);
+                tracing::info!("Углы из поля 3D: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::Dither(on) => {
                 r.set_dither(on);
                 tracing::info!("Шум против полос: {}", if on { "вкл" } else { "выкл" });
@@ -548,6 +552,7 @@ impl App {
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
                 space_field: renderer.space_field(),
+                space_ao_field: renderer.space_ao_field(),
                 gamepad: self.gamepads.name(),
                 follow: renderer.follow(),
                 particles: renderer.particle_stats(),

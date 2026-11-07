@@ -93,14 +93,17 @@ const FIELD_SECTION_WORDS: usize = 4 + 3 * reyvec_sdf::field3d::FIELD_LEVELS;
 
 /// Раздел запечённого поля (7.10) в конец сцены кадра; слово 10 заголовка — где он.
 /// Раздел начинается с чётного слова: адрес буфера шейдер читает 8-байтным указателем.
-/// `None` — поля в этом кадре нет (шейдер считает формы как раньше).
+/// `None` — поля в этом кадре нет (шейдер считает формы как раньше). `ao_from_field` —
+/// дальние пробы затенения в углах берут число поля (7.10г, бит 0 слова 11).
 pub(crate) fn set_field(
     words: &mut Vec<u32>,
     field: Option<(u64, &reyvec_sdf::field3d::FieldWindow)>,
+    ao_from_field: bool,
 ) {
     let Some((address, window)) = field else {
         return;
     };
+    words[11] = u32::from(ao_from_field);
     if words.len() % 2 == 1 {
         words.push(0);
     }

@@ -440,6 +440,8 @@ fn render(
             if tests::FIELD_OFF.get() {
                 demo.set_space_field(false);
             }
+            #[cfg(test)]
+            demo.set_space_ao_field(tests::AO_FROM_FIELD.get());
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -651,6 +653,76 @@ mod tests {
     thread_local! {
         /// Кадр без запечённого поля (для сравнения с кадром с полем).
         pub(super) static FIELD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Кадр с «углами из поля» (7.10г).
+        pub(super) static AO_FROM_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Вид на полую коробку сбоку (как эталон space-hollow-side-2s).
+    fn hollow_side() -> HeadlessScene {
+        let space = include_str!("../../../scenes/3d/space.ron").replacen(
+            "version: 1,",
+            "version: 1,\n    camera: Some((eye: (4.9, 0.9, 3.3), look_at: (3.4, 0.6, 2.6))),",
+            1,
+        );
+        HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 2.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::Off,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(space.into()),
+                ..Default::default()
+            },
+            cascades: false,
+        }
+    }
+
+    /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и
+    /// средняя разница.
+    fn image_diff(a: &FrameImage, b: &FrameImage) -> (usize, u8, f64) {
+        let (mut changed, mut worst, mut sum) = (0, 0, 0u64);
+        for (a, b) in a.rgba.chunks(4).zip(b.rgba.chunks(4)) {
+            let d = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap_or(0);
+            worst = worst.max(d);
+            sum += u64::from(d);
+            if d > 2 {
+                changed += 1;
+            }
+        }
+        (changed, worst, sum as f64 / (a.rgba.len() / 4) as f64)
+    }
+
+    /// «Углы из поля» (7.10г) меняют картинку чуть-чуть: только у тонких краёв.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn ao_from_field_stays_close() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let exact = render_headless(&options, &hollow_side()).expect("кадр");
+        AO_FROM_FIELD.set(true);
+        let field = render_headless(&options, &hollow_side());
+        AO_FROM_FIELD.set(false);
+        let field = field.expect("кадр с углами из поля");
+        let (changed, worst, mean) = image_diff(&exact.image, &field.image);
+        eprintln!("углы из поля: {changed} пикселей, наибольшая {worst}, средняя {mean:.3}");
+        let total = exact.image.rgba.len() / 4;
+        assert!(
+            changed * 20 < total,
+            "отличаются {changed} пикселей из {total}"
+        );
+        assert!(mean < 1.0, "средняя разница {mean}");
     }
 
     /// Тени по полю (7.10в) рисуют то же, что точные: поле лишь пропускает точки луча, где
@@ -664,50 +736,17 @@ mod tests {
             validation: true,
             gpu: None,
         };
-        let space = include_str!("../../../scenes/3d/space.ron").replacen(
-            "version: 1,",
-            "version: 1,\n    camera: Some((eye: (4.9, 0.9, 3.3), look_at: (3.4, 0.6, 2.6))),",
-            1,
-        );
-        let files = crate::UserFiles {
-            space: Some(space.into()),
-            ..Default::default()
-        };
-        let scene = HeadlessScene {
-            width: 640,
-            height: 360,
-            time: 2.0,
-            shader_error: false,
-            scene: DemoScene::Space,
-            msaa: Msaa::Off,
-            perceptual_edges: false,
-            fill: crate::FillMode::default(),
-            zoom: false,
-            files,
-            cascades: false,
-        };
-        let with = render_headless(&options, &scene).expect("кадр с полем");
+        let with = render_headless(&options, &hollow_side()).expect("кадр с полем");
         assert!(with.field.is_some(), "поле считалось");
         FIELD_OFF.set(true);
-        let without = render_headless(&options, &scene);
+        let without = render_headless(&options, &hollow_side());
         FIELD_OFF.set(false);
         let without = without.expect("кадр без поля");
         assert!(without.field.is_none(), "поле выключено");
-        let (mut changed, mut worst) = (0, 0);
-        for (a, b) in with.image.rgba.chunks(4).zip(without.image.rgba.chunks(4)) {
-            let d = a
-                .iter()
-                .zip(b)
-                .map(|(x, y)| x.abs_diff(*y))
-                .max()
-                .unwrap_or(0);
-            worst = worst.max(d);
-            if d > 2 {
-                changed += 1;
-            }
-        }
+        let (changed, worst, _) = image_diff(&with.image, &without.image);
+        eprintln!("поле: {changed} пикселей, наибольшая {worst}");
         // Полосы полутени сдвигаются чуть-чуть (до 21 из 255 у стыка стенок на lavapipe),
-        // пятен с резкими краями нет.
+        // пятен с резкими краями нет. Пропуск свободных проб углов картинку не меняет.
         let total = with.image.rgba.len() / 4;
         assert!(
             changed * 200 < total,

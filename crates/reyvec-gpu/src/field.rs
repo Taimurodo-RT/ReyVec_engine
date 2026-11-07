@@ -71,6 +71,8 @@ pub(crate) struct SpaceField {
     pub enabled: bool,
     /// Кубиков в последнем кадре (для журнала и панели).
     pub last_bricks: usize,
+    /// Дальние пробы затенения в углах берут число поля (7.10г, настройка в панели).
+    pub ao_from_field: bool,
 }
 
 impl SpaceField {
@@ -82,6 +84,7 @@ impl SpaceField {
             previous: None,
             enabled: true,
             last_bricks: 0,
+            ao_from_field: false,
         }
     }
 
