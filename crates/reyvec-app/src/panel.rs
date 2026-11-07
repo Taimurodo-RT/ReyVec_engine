@@ -659,8 +659,8 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             .add_enabled(can, egui::Checkbox::new(&mut field, "Поле расстояний"))
             .on_hover_text(
                 "Запечённое поле расстояний вокруг камеры (7.10): тени и затенение в углах \
-                 не считают формы там, где поле уже говорит, что рядом пусто. Картинка та же. \
-                 Пока выключено по умолчанию: на RTX 5080 вышло медленнее точного расчёта",
+                 не считают формы там, где поле уже говорит, что рядом пусто. Картинка та же; \
+                 время поля — строка «поле» в счётчиках",
             )
             .changed()
         {
@@ -1048,7 +1048,7 @@ mod tests {
             space_compute: (false, false),
             space_smooth: (true, true),
             space_field: (true, true),
-            space_ao_field: (false, true),
+            space_ao_field: (true, true),
             field_bench: Some("Сравнение поля (среднее за 240 кадров):\nбез поля: тени 0.722"),
             field_bench_running: false,
             logic: Some((600, 0.012)),

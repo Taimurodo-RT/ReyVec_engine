@@ -141,9 +141,9 @@ impl SpaceField {
             previous: None,
             volumes: None,
             copies: FieldCopies::default(),
-            enabled: false,
+            enabled: true,
             last_bricks: 0,
-            ao_from_field: false,
+            ao_from_field: true,
         }
     }
 
