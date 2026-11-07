@@ -737,6 +737,35 @@ mod tests {
         assert!(dots < 150, "тёмных точек {dots}");
     }
 
+    /// Под большой коробкой нет чёрного клина (7.13, снимок Романа: камера у пола между
+    /// коробками). Пол под скруглённым низом не освещён солнцем, а прежнее затенение в
+    /// углах давало ему 1 % неба: на этом виде было 2556 чёрных пикселей из 960×504.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn no_black_wedge_under_box() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let space = include_str!("../../../scenes/3d/space.ron").replacen(
+            "version: 1,",
+            "version: 1,\n    camera: Some((eye: (1.8, 0.3, 0.4), look_at: (2.733, 0.178, 0.74))),",
+            1,
+        );
+        let mut scene = hollow_side();
+        (scene.width, scene.height) = (960, 504);
+        scene.files.space = Some(space.into());
+        let frame = render_headless(&options, &scene).expect("кадр");
+        let black = frame
+            .image
+            .rgba
+            .chunks(4)
+            .filter(|p| p[..3].iter().all(|&c| c < 12))
+            .count();
+        eprintln!("чёрных пикселей: {black}");
+        assert!(black < 50, "чёрных пикселей {black}");
+    }
+
     /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и
     /// средняя разница.
     fn image_diff(a: &FrameImage, b: &FrameImage) -> (usize, u8, f64) {
