@@ -670,6 +670,20 @@ impl WindowRenderer {
         }
     }
 
+    /// Затенение в углах из поля (7.10г): включено ли и можно ли.
+    pub fn space_ao_field(&self) -> (bool, bool) {
+        self.demo
+            .as_ref()
+            .map_or((false, false), Demo::space_ao_field)
+    }
+
+    /// Дальние пробы затенения в углах берут число поля вместо расчёта форм.
+    pub fn set_space_ao_field(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_ao_field(on);
+        }
+    }
+
     /// Включает или выключает сглаживание краёв форм сцены «3D» со следующего кадра.
     pub fn set_space_smooth(&mut self, on: bool) {
         if let Some(demo) = self.demo.as_mut() {

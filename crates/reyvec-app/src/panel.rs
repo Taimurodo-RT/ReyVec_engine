@@ -33,6 +33,8 @@ pub(crate) enum PanelAction {
     SpaceSmooth(bool),
     /// Запечённое поле расстояний сцены «3D» (7.10б).
     SpaceField(bool),
+    /// Затенение в углах из поля (7.10г).
+    SpaceAoField(bool),
     /// Фонтан частиц для замера (6.6).
     Fountain(bool),
     /// Музыка (6.7).
@@ -116,6 +118,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_smooth: (bool, bool),
     /// Запечённое поле расстояний (7.10б): включено ли и умеет ли видеокарта.
     pub space_field: (bool, bool),
+    /// Затенение в углах из поля: включено ли и можно ли (поле включено).
+    pub space_ao_field: (bool, bool),
     pub gamepad: Option<&'a str>,
     pub follow: bool,
     /// Частицы сцены «из файла» (6.6).
@@ -648,13 +652,25 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         if ui
             .add_enabled(can, egui::Checkbox::new(&mut field, "Поле расстояний"))
             .on_hover_text(
-                "Запечённое поле расстояний вокруг камеры (7.10). Пока только считается: \
-                 его время — строка «поле» в счётчиках. Тени и затенение в углах начнут \
-                 брать из него расстояния в следующих шагах",
+                "Запечённое поле расстояний вокруг камеры (7.10): тени и затенение в углах \
+                 не считают формы там, где поле уже говорит, что рядом пусто. Картинка та же; \
+                 время поля — строка «поле» в счётчиках",
             )
             .changed()
         {
             actions.push(PanelAction::SpaceField(field));
+        }
+        let (mut ao, can) = info.space_ao_field;
+        if ui
+            .add_enabled(can, egui::Checkbox::new(&mut ao, "Углы из поля"))
+            .on_hover_text(
+                "Затенение в углах берёт дальние пробы прямо из поля расстояний (7.10г): \
+                 быстрее, но у тонких краёв (тоньше 3 см) углы чуть другие",
+            )
+            .on_disabled_hover_text("Нужно включённое поле расстояний")
+            .changed()
+        {
+            actions.push(PanelAction::SpaceAoField(ao));
         }
     }
     let mut dither = info.dither;
@@ -1008,6 +1024,7 @@ mod tests {
             space_compute: (false, false),
             space_smooth: (true, true),
             space_field: (true, true),
+            space_ao_field: (false, true),
             logic: Some((600, 0.012)),
             player: Some(reyvec_gpu::PlayerStats {
                 view: reyvec_scene::PlayerView {

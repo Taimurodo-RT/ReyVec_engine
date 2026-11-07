@@ -1026,6 +1026,17 @@ impl Demo {
         self.space_field.skip();
     }
 
+    /// Затенение в углах из поля (7.10г): включено ли и можно ли (поле включено).
+    pub fn space_ao_field(&self) -> (bool, bool) {
+        let (on, can) = self.space_field();
+        (self.space_field.ao_from_field, on && can)
+    }
+
+    /// Дальние пробы затенения в углах берут число поля вместо расчёта форм.
+    pub fn set_space_ao_field(&mut self, on: bool) {
+        self.space_field.ao_from_field = on;
+    }
+
     /// Буфер запечённого поля (для проверки в тестах: читается после кадра).
     pub(crate) fn space_field_buffer(
         &self,
@@ -2139,6 +2150,7 @@ impl Demo {
             crate::space::set_field(
                 &mut packed.words,
                 space_field.map(|f| (f.field, &self.space_field.window)),
+                self.space_field.ao_from_field,
             );
             space_vertices = packed.vertices;
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
