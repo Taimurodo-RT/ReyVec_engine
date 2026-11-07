@@ -681,6 +681,62 @@ mod tests {
         }
     }
 
+    /// Вид на полую коробку спереди сверху: её низ касается пола наклонной линией (камера
+    /// со снимка Романа, 7.11).
+    fn hollow_contact(width: u32, height: u32) -> HeadlessScene {
+        let space = include_str!("../../../scenes/3d/space.ron").replacen(
+            "version: 1,",
+            "version: 1,\n    camera: Some((eye: (4.4, 1.1, 4.7), look_at: (3.4, 0.4, 2.6))),",
+            1,
+        );
+        let mut scene = hollow_side();
+        scene.width = width;
+        scene.height = height;
+        scene.files.space = Some(space.into());
+        scene
+    }
+
+    /// Отдельных тёмных точек: пиксель темнее соседей сверху и снизу (через один — на 60
+    /// ступеней, рядом — на 20).
+    fn dark_dots(image: &FrameImage) -> usize {
+        let (w, h) = (image.width as usize, image.height as usize);
+        let light = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            i32::from(*image.rgba[i..i + 3].iter().max().unwrap_or(&0))
+        };
+        let mut dots = 0;
+        for y in 2..h - 2 {
+            for x in 0..w {
+                let l = light(x, y);
+                if light(x, y - 2) > l + 60
+                    && light(x, y + 2) > l + 60
+                    && light(x, y - 1) > l + 20
+                    && light(x, y + 1) > l + 20
+                {
+                    dots += 1;
+                }
+            }
+        }
+        dots
+    }
+
+    /// Под коробкой у пола нет ряда чёрных точек (7.11). Пол под скруглённым низом
+    /// поднимался для луча тени внутрь скругления и считался освещённым, а соседний —
+    /// тёмным; на наклонной линии касания выходили «зубцы». Было 586 точек на весь кадр
+    /// 1920×1080, стало 46 (тонкие линии сетки и края дыр).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn no_dark_dots_under_boxes() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let frame = render_headless(&options, &hollow_contact(1920, 1080)).expect("кадр");
+        let dots = dark_dots(&frame.image);
+        eprintln!("тёмных точек: {dots}");
+        assert!(dots < 150, "тёмных точек {dots}");
+    }
+
     /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и
     /// средняя разница.
     fn image_diff(a: &FrameImage, b: &FrameImage) -> (usize, u8, f64) {

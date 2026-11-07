@@ -20,6 +20,9 @@ float grid(float2 p, float step, float width, float2 fw)
 }
 
 static const uint MATERIAL_GRID = 1;
+// Свет снизу: отражённый от освещённого пола (7.11). Без него низ форм, смотрящий в пол,
+// не получал света вовсе и у пола выходил чёрной полосой.
+static const float3 GROUND = float3(0.12, 0.12, 0.13);
 
 // Тени для пикселя `px` из половинного разрешения (7.6б). Точка теней h посчитана для
 // пикселя кадра 2h, поэтому пиксель кадра лежит между четырьмя ближайшими точками.
@@ -127,10 +130,11 @@ float3 shade_lit(float2 screen, float4 g, float4 shadows)
         albedo = lerp(albedo, float3(0.15, 0.35, 0.95), axis.y); // ось Z (вдоль x = 0)
     }
 
-    // Солнце с мягкой тенью и свет неба, который затеняют углы.
+    // Солнце с мягкой тенью; свет неба сверху и отражённый от пола снизу, их затеняют углы.
     float sun_light = saturate(dot(n, SUN)) * shadows.x;
     float3 light = float3(1.0, 0.95, 0.85) * sun_light;
-    light += float3(0.25, 0.30, 0.40) * (0.5 + 0.5 * n.y) * shadows.y;
+    float3 ambient = float3(0.25, 0.30, 0.40) * (0.5 + 0.5 * n.y) + GROUND * (0.5 - 0.5 * n.y);
+    light += ambient * shadows.y;
     // Лампы: у двух первых тени из прохода «тени 3D», остальные светят без теней.
     float3 h = normalize(SUN - ray.dir);
     float specular = pow(saturate(dot(n, h)), 48.0) * shadows.x;
