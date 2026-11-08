@@ -69,8 +69,9 @@ pub struct SpaceStats {
     /// Сцена не поместилась в буфер ([`MAX_SCENE_WORDS`] слов): сколько было нужно;
     /// рисуется пустая.
     pub overflow: Option<usize>,
-    /// Пикселей края в прошлом кадре этой ячейки (счётчик прохода «края 3D: поиск»,
-    /// прочитан с видеокарты); `None` — сглаживание краёв выключено или список не создан.
+    /// Пикселей края в последнем кадре этой ячейки со сглаживанием (счётчик прохода
+    /// «края 3D: поиск», прочитан с видеокарты; в первом кадре ячейки — 0); `None` —
+    /// сглаживание краёв выключено или список не создан.
     pub edge_pixels: Option<u32>,
     /// Пикселей в кадре 3D (с учётом «Разрешения 3D»): для доли краёв.
     pub pixels: u32,
@@ -534,6 +535,8 @@ pub(crate) struct Demo {
     space_grid: Option<crate::space::GridStats>,
     /// Был ли в последнем кадре сцены «3D» отсев по взгляду (у уровня — всегда).
     space_view_culled: bool,
+    /// Была ли в последнем кадре сцены «3D» сетка отсева (у уровня — всегда).
+    space_culled: bool,
     /// Счётчики последнего кадра сцены «3D» или 2.5D-вида (7.18б); `None` — кадр был
     /// не объёмный.
     space_stats: Option<SpaceStats>,
@@ -827,6 +830,7 @@ impl Demo {
             space_view: Default::default(),
             space_grid: None,
             space_view_culled: false,
+            space_culled: true,
             space_stats: None,
             field: FieldPipelines::default(),
             light_field: false,
@@ -1148,9 +1152,10 @@ impl Demo {
         self.space.object_count()
     }
 
-    /// Включена ли сетка отсева сцены «3D» (в файле `culling: false` выключает).
+    /// Включена ли сетка отсева в последнем объёмном кадре: в сцене «3D» её выключает
+    /// `culling: false` в файле, у 2.5D-вида она есть всегда.
     pub fn space_culling(&self) -> bool {
-        !self.space.culling_off
+        self.space_culled
     }
 
     /// Список пикселей краёв (7.6о) кадра `slot` для кадра размера `extent`: создаётся
@@ -1199,7 +1204,12 @@ impl Demo {
                 BufferMemory::GpuToCpu,
                 &format!("число краёв 3D, кадр {slot}"),
             ) {
-                Ok(id) => *count = Some(id),
+                Ok(id) => {
+                    // Панель читает буфер до первого кадра ячейки: пусть там будет 0, а не
+                    // старая память (память видна процессору сразу, HOST_COHERENT).
+                    res.write_buffer(id, 0, &[0; 16]);
+                    *count = Some(id);
+                }
                 Err(e) => {
                     tracing::warn!("буфер числа краёв 3D: {e}");
                     return None;
@@ -1287,9 +1297,10 @@ impl Demo {
     /// Опыт 7.18б: выдавленные фигуры верхнего уровня сцены «3D» (`Paint{Move{Extrude}}`,
     /// как их отдаёт файл сцены) рисуются через примитив «поле слоя» с полем на сетке
     /// самого профиля — картинка та же, путь другой: поле читается из картинки, а не из
-    /// слов сцены. Выдавливания внутри объединений и вырезаний не трогаются: с
-    /// бесконечным полем весь объект потерял бы шар-границу, а материал-оценка пролез бы
-    /// в выбор ближайшей части.
+    /// слов сцены. Шар-граница у поля та же, что у выдавливания (по прямоугольнику
+    /// профиля), так что отсев и пересчёт поля 7.10 не меняются. Выдавливания внутри
+    /// объединений и вырезаний не трогаются: опыту хватает верхнего уровня, а
+    /// материал-оценка поля в выборе ближайшей части не проверена.
     fn swap_extrudes(
         &mut self,
         ctx: &GpuContext,
@@ -1353,6 +1364,12 @@ impl Demo {
             return Some(field.clone());
         }
         let mut field = LayerField::from_profile(profile, EXTRUDE_FIELD_BAND);
+        // Тест 7.18б проверяет и бесконечный путь поля уровня 7.18в: поле без
+        // прямоугольника фигуры, без шара-границы.
+        #[cfg(test)]
+        if crate::headless::tests::FIELD_NO_RECT.get() {
+            field = field.without_rect();
+        }
         let (nx, ny) = field.size();
         let extent = vk::Extent2D {
             width: nx,
@@ -2606,6 +2623,7 @@ impl Demo {
             }
             let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             let culling = level || !self.space.culling_off;
+            self.space_culled = culling;
             let mut packed = crate::space::pack(&frame, materials, culling);
             self.space_grid = packed.grid;
             crate::space::set_view_proj(&mut packed.words, view_proj);

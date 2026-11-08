@@ -318,20 +318,20 @@ mod tests {
         assert_eq!(grid.unbounded, vec![0], "пол считается всегда");
     }
 
-    /// Поле слоя (7.18б) — бесконечный объект без плоскости: в начале `unbounded`,
-    /// перед плоскостями; сетку оно не растягивает; за полосой его материал не известен.
+    /// Поле слоя без прямоугольника фигуры (так будет у поля уровня, 7.18в) — бесконечный
+    /// объект без плоскости: в начале `unbounded`, перед плоскостями; сетку оно не
+    /// растягивает; за полосой его материал не известен. Поле фигуры с прямоугольником —
+    /// обычный объект с шаром-границей.
     #[test]
     fn field_layer_is_unbounded_and_its_estimate_has_no_material() {
         use crate::layer_field::LayerField;
         use crate::profile2d::Profile;
         use crate::shape3d::FieldRef;
         let profile = Profile::new("M -1 -1 L 1 -1 L 1 1 L -1 1 Z").unwrap();
-        let field = |band: f32| {
+        let shape = |layer: LayerField| {
             compile(
                 &Shape3::Field {
-                    field: FieldRef(std::sync::Arc::new(LayerField::from_profile(
-                        &profile, band,
-                    ))),
+                    field: FieldRef(std::sync::Arc::new(layer)),
                     depth: 0.4,
                     round: 0.0,
                 }
@@ -339,9 +339,22 @@ mod tests {
             )
             .unwrap()
         };
+        let field = |band: f32| shape(LayerField::from_profile(&profile, band));
         let plain = programs(include_str!("../../../scenes/3d/stress.ron"));
+        let mut bounded = plain.clone();
+        bounded.push(field(1.0));
+        let grid = Grid::build(&bounded);
+        assert_eq!(
+            grid.unbounded,
+            vec![0],
+            "поле фигуры — в клетках, как форма"
+        );
+        assert_eq!(grid.unbounded_solid, 0);
+        check(&bounded);
         let mut objects = plain.clone();
-        objects.push(field(1.0));
+        objects.push(shape(
+            LayerField::from_profile(&profile, 1.0).without_rect(),
+        ));
         let grid = Grid::build(&objects);
         let last = (objects.len() - 1) as u32;
         assert_eq!(
@@ -357,11 +370,25 @@ mod tests {
         );
         check(&objects);
         // Узкая полоса: далеко от квадрата поле знает только «не ближе полосы».
-        let narrow = [field(0.05)];
+        let narrow = [shape(
+            LayerField::from_profile(&profile, 0.05).without_rect(),
+        )];
         let g = Grid::build(&narrow);
         let (d, m) = g.near(&narrow, Vec3::new(1.5, 0.0, 0.0), 1e9);
         assert_eq!(m, None, "за полосой материала нет");
-        assert!((d - 0.5).abs() < 1e-3, "{d}: по прямоугольнику фигуры");
+        assert!(
+            d > 0.05 && d < 0.5 + 1e-3,
+            "{d}: от края сетки, не дальше прямоугольника"
+        );
+        let (d, m) = g.near(&narrow, Vec3::ZERO, 1e9);
+        assert_eq!(m, Some(1));
+        assert!(d < 0.0, "{d}");
+        // У поля фигуры то же внутри шара-границы.
+        let narrow = [field(0.05)];
+        let g = Grid::build(&narrow);
+        let (d, m) = g.near(&narrow, Vec3::new(1.2, 0.0, 0.0), 1e9);
+        assert_eq!(m, None, "за полосой материала нет");
+        assert!(d > 0.05 - 1e-3 && d < 0.2 + 1e-3, "{d}");
         let (d, m) = g.near(&narrow, Vec3::ZERO, 1e9);
         assert_eq!(m, Some(1));
         assert!(d < 0.0, "{d}");

@@ -69,8 +69,9 @@ pub enum Shape3 {
     },
     /// Поле слоя (7.18б, `docs/decisions/0020-level-field.md`): выдавливание 2D-поля,
     /// которое лежит в картинке видеокарты ([`LayerField`]), толщиной `depth` по Z, рёбра
-    /// скруглены на `round`. Границы (шара) у него нет: поле бесконечно, за сеткой
-    /// расстояние считается от её края. В файл сцены не записывается — его создаёт код
+    /// скруглены на `round`. За сеткой расстояние считается от её края. Если у поля задан
+    /// прямоугольник фигуры, шар-граница — как у выдавливания этого прямоугольника; поле
+    /// без него (поле уровня, 7.18в) бесконечно. В файл сцены не записывается — его создаёт код
     /// (подмена выдавливания в сцене «3D», запекание уровня 7.18в).
     #[serde(skip)]
     Field {
@@ -339,12 +340,16 @@ impl Shape3 {
             )),
             Self::Torus { radius, thickness } => Some((Vec3::ZERO, radius.abs() + thickness.abs())),
             Self::Plane { .. } => None,
-            // Поле слоя бесконечно: за сеткой оно продолжается оценкой от края (7.18б).
-            Self::Field { .. } => None,
+            // Поле фигуры с прямоугольником — шар как у выдавливания: за сеткой расстояние
+            // не меньше, чем до прямоугольника. Поле слоя без него бесконечно: за сеткой
+            // оно продолжается оценкой от края (7.18б).
+            Self::Field { field, depth, .. } => field
+                .0
+                .rect()
+                .map(|(lo, hi)| extrude_bounds(lo, hi, *depth)),
             Self::Extrude { profile, depth, .. } => {
                 let (lo, hi) = profile.bounds();
-                let half = ((hi - lo) * 0.5).extend(depth.abs() * 0.5);
-                Some((((lo + hi) * 0.5).extend(0.0), half.length()))
+                Some(extrude_bounds(lo, hi, *depth))
             }
             Self::Revolve { profile, offset } => {
                 let (lo, hi) = profile.bounds();
@@ -384,6 +389,12 @@ impl Shape3 {
             Self::Animate { .. } => self.at_time(0.0).bounds(),
         }
     }
+}
+
+/// Шар-граница выдавленного прямоугольника `lo..hi` толщиной `depth`.
+fn extrude_bounds(lo: Vec2, hi: Vec2, depth: f32) -> (Vec3, f32) {
+    let half = ((hi - lo) * 0.5).extend(depth.abs() * 0.5);
+    (((lo + hi) * 0.5).extend(0.0), half.length())
 }
 
 /// Наименьший шар, в котором оба шара.
@@ -1377,10 +1388,10 @@ mod tests {
         )
     }
 
-    /// Поле слоя считается как выдавливание (с точностью half), границы не имеет,
+    /// Поле слоя считается как выдавливание (с точностью half), шар-граница у него та же,
     /// в сцену ложится обычным объектом без флагов плоскости и цепочки.
     #[test]
-    fn field_primitive_mirrors_extrude_without_bounds() {
+    fn field_primitive_mirrors_extrude() {
         let (extrude, field) = extrude_and_field();
         let a = compile(&extrude).unwrap();
         let b = compile(&field).unwrap();
@@ -1393,8 +1404,11 @@ mod tests {
         // Материал, матрица, масштаб, половина толщины и скругление — как у выдавливания.
         assert_eq!(&a.words[1..17], &b.words[1..17]);
         assert_eq!(f32::from_bits(b.words[18]), 1.0, "полоса B");
-        assert_eq!(field.bounds(), None);
-        assert_eq!(b.bounds, None);
+        // Шар-граница по прямоугольнику фигуры — тот же, что у выдавливания: отсев по
+        // взгляду, сетка отсева и пересчёт поля 7.10 видят их одинаково.
+        assert!(field.bounds().is_some());
+        assert_eq!(field.bounds(), extrude.bounds());
+        assert_eq!(b.bounds, a.bounds);
         assert!(!b.chain() && b.plane().is_none());
         for p in points() {
             let (da, _) = a.distance(p);
@@ -1407,16 +1421,12 @@ mod tests {
             assert!((dt - db).abs() < 1e-5, "{p}: дерево {dt}, программа {db}");
             assert_eq!(m, 3, "{p}: на собственной сетке поле всегда знает материал");
         }
-        let union = Shape3::Union {
-            smooth: 0.0,
-            shapes: vec![field.clone(), Shape3::Sphere { radius: 1.0 }],
-        };
-        assert_eq!(union.bounds(), None);
-        // В сцене: радиус границы −1, не плоскость и не цепочка, в списке плоскостей нет.
         let w = pack_scene(std::slice::from_ref(&b), &[], &[]);
-        assert_eq!(f32::from_bits(w[HEADER_WORDS + 7]), -1.0);
-        assert_eq!(w[HEADER_WORDS + 2] & (OBJECT_PLANE | OBJECT_CHAIN), 0);
-        assert_eq!(w[9], 0, "плоскостей нет");
+        assert_eq!(
+            f32::from_bits(w[HEADER_WORDS + 7]),
+            a.bounds.unwrap().1,
+            "радиус границы в сцене"
+        );
         // Из файла сцены поле не читается, его создаёт только код.
         assert!(ron::from_str::<Shape3>("Field(depth: 1.0)").is_err());
         // Программы равны, пока ссылаются на одно поле; другое поле с теми же словами —
@@ -1425,6 +1435,81 @@ mod tests {
         let other = compile(&extrude_and_field().1).unwrap();
         assert_eq!(other.words, b.words);
         assert_ne!(other, b);
+    }
+
+    /// Поле без прямоугольника фигуры (так будет у поля уровня, 7.18в) бесконечно: в сцене
+    /// радиус границы −1, не плоскость и не цепочка.
+    #[test]
+    fn field_without_a_rectangle_is_unbounded() {
+        let profile = Profile::new(STAR).unwrap();
+        let field = FieldRef(Arc::new(
+            LayerField::from_profile(&profile, 1.0).without_rect(),
+        ));
+        let field = Shape3::Field {
+            field,
+            depth: 0.3,
+            round: 0.02,
+        }
+        .placed([0.5, 1.0, -0.3], [10.0, 25.0, 0.0])
+        .paint(3);
+        let b = compile(&field).unwrap();
+        assert_eq!(field.bounds(), None);
+        assert_eq!(b.bounds, None);
+        let union = Shape3::Union {
+            smooth: 0.0,
+            shapes: vec![field.clone(), Shape3::Sphere { radius: 1.0 }],
+        };
+        assert_eq!(union.bounds(), None);
+        let w = pack_scene(std::slice::from_ref(&b), &[], &[]);
+        assert_eq!(f32::from_bits(w[HEADER_WORDS + 7]), -1.0);
+        assert_eq!(w[HEADER_WORDS + 2] & (OBJECT_PLANE | OBJECT_CHAIN), 0);
+        assert_eq!(w[9], 0, "плоскостей нет");
+    }
+
+    /// Шар-граница поля фигуры держит тело: всё, что внутри, — в шаре, а снаружи шара
+    /// расстояние не меньше расстояния до шара (или полосы B, дальше которой поле не
+    /// знает) с точностью клетки.
+    #[test]
+    fn field_bounds_hold_the_whole_shape() {
+        let (_, field) = extrude_and_field();
+        let Shape3::Paint { shape: moved, .. } = &field else {
+            unreachable!()
+        };
+        let Shape3::Move { shape: inner, .. } = moved.as_ref() else {
+            unreachable!()
+        };
+        let Shape3::Field { field: f, .. } = inner.as_ref() else {
+            unreachable!()
+        };
+        let cell = f.0.cell();
+        let (c, r) = field.bounds().unwrap();
+        let (mut inside, mut outside_tested) = (0, 0);
+        let n = 24;
+        for i in 0..=n {
+            for j in 0..=n {
+                for k in 0..=n {
+                    let t = Vec3::new(i as f32, j as f32, k as f32) / n as f32 * 2.0 - 1.0;
+                    let p = c + t * r * 1.6;
+                    let d = field.distance(p);
+                    let outside = (p - c).length() - r;
+                    if d <= 0.0 {
+                        assert!(outside <= 1e-4, "{p}: тело за шаром на {outside}");
+                        inside += 1;
+                    }
+                    if outside > 0.0 {
+                        assert!(
+                            d >= outside.min(1.0) - cell,
+                            "{p}: до формы {d}, до границы {outside}"
+                        );
+                        outside_tested += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            inside > 20 && outside_tested > 1000,
+            "{inside} внутри, {outside_tested} снаружи"
+        );
     }
 
     /// За полосой поле слоя — только оценка: материал-сторож, расстояние обрезано.

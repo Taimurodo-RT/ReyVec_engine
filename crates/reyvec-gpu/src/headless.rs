@@ -606,7 +606,7 @@ fn render(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::validation_error_count;
 
@@ -687,6 +687,8 @@ mod tests {
             const { std::cell::Cell::new(crate::LevelRender::Sdf) };
         /// Выдавленные фигуры сцены «3D» через поле слоя (опыт 7.18б).
         pub(super) static EXTRUDE_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// …и поле без прямоугольника фигуры, бесконечное, как у поля уровня 7.18в.
+        pub(crate) static FIELD_NO_RECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Сцена «3D» для опыта 7.18б: пол, две лампы и две выдавленные фигуры верхнего
@@ -737,7 +739,12 @@ mod tests {
 
     /// Выдавленная фигура через поле слоя (7.18б) и через слова программы — одна
     /// картинка: условие 0020 — изменившихся точек не больше 0,5 %, худшая не больше
-    /// 16/255. Поле 7.10 при этом выключено: сравнивается сам примитив. Третий кадр — с
+    /// 16/255. Поле 7.10 при этом выключено: сравнивается сам примитив. Поле без
+    /// прямоугольника фигуры — бесконечный путь поля уровня 7.18в: без шара-границы, в
+    /// списке бесконечных объектов, за сеткой только правило края. За маленькой сеткой
+    /// профиля оно занижает расстояние, полутени рядом чуть темнее (на lavapipe
+    /// 558 точек, худшая 15/255), поэтому худшая точка у него — до 48/255, как у поля 7.10;
+    /// у поля уровня сетка накрывает весь уровень. Последний кадр — с
     /// полем 7.10, которое печёт кубики и по примитиву «поле слоя» (field_bake.slang
     /// читает картинку): картинка с полем отличается от кадра без поля так же мало, как у
     /// обычных форм.
@@ -753,26 +760,44 @@ mod tests {
         let plain = render_headless(&options, &extruded_scene());
         EXTRUDE_FIELD.set(true);
         let field = render_headless(&options, &extruded_scene());
+        FIELD_NO_RECT.set(true);
+        let unbounded = render_headless(&options, &extruded_scene());
+        FIELD_NO_RECT.set(false);
         FIELD_OFF.set(false);
         let baked = render_headless(&options, &extruded_scene());
         EXTRUDE_FIELD.set(false);
         let plain = plain.expect("кадр выдавливанием");
         let field = field.expect("кадр через поле слоя");
+        let unbounded = unbounded.expect("кадр через поле слоя без прямоугольника");
         let baked = baked.expect("кадр через поле слоя с полем 7.10");
         assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
         assert_eq!(plain.field_shapes, 0);
         assert_eq!(field.field_shapes, 2, "сердце и облако через поле слоя");
+        assert_eq!(unbounded.field_shapes, 2);
         assert_eq!(baked.field_shapes, 2);
         assert!(baked.field.is_some(), "поле 7.10 считалось");
         let total = plain.image.rgba.len() / 4;
-        let (changed, worst, mean) = image_diff(&plain.image, &field.image);
-        eprintln!(
-            "поле слоя против выдавливания: {changed} пикселей, наибольшая {worst}, средняя {mean:.3}"
-        );
+        for (what, other, limit) in [("", &field, 16), (" без прямоугольника", &unbounded, 47)]
+        {
+            let (changed, worst, mean) = image_diff(&plain.image, &other.image);
+            eprintln!(
+                "поле слоя{what} против выдавливания: {changed} пикселей, наибольшая {worst}, \
+                 средняя {mean:.3}"
+            );
+            assert!(
+                changed * 200 <= total,
+                "поле слоя{what}: отличаются {changed} пикселей из {total}"
+            );
+            assert!(
+                worst <= limit,
+                "поле слоя{what}: наибольшая разница канала {worst}"
+            );
+        }
         if let Ok(dir) = std::env::var("PPM_DIR") {
             for (kind, f) in [
                 ("extrude", &plain),
                 ("layer-field", &field),
+                ("unbounded", &unbounded),
                 ("baked", &baked),
             ] {
                 let mut out = format!("P6 {} {} 255\n", f.image.width, f.image.height).into_bytes();
@@ -782,11 +807,6 @@ mod tests {
                 std::fs::write(format!("{dir}/extrude-{kind}.ppm"), out).expect("ppm");
             }
         }
-        assert!(
-            changed * 200 <= total,
-            "отличаются {changed} пикселей из {total}"
-        );
-        assert!(worst <= 16, "наибольшая разница канала {worst}");
         let (changed, worst, mean) = image_diff(&field.image, &baked.image);
         eprintln!(
             "поле слоя с полем 7.10 и без: {changed} пикселей, наибольшая {worst}, средняя {mean:.3}"
