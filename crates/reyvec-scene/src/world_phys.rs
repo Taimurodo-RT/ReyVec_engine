@@ -409,6 +409,8 @@ fn free_place(depth: f64) -> GlobalPlacement {
         depth,
         // Своя группа: без тени и прозрачности слой не нужен.
         group: u64::MAX,
+        // Пересобираются каждый шаг.
+        dynamic: true,
         ..GlobalPlacement::ROOT
     }
 }

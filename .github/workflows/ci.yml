@@ -181,6 +181,9 @@ jobs:
         run: |
           ./target/debug/reyvec-sandbox --snapshot "$RUNNER_TEMP/headless.png" --time 1.5 --size 800x450
           test -s "$RUNNER_TEMP/headless.png"
+          # 2.5D-вид с полем уровня (7.18в): поле печётся до первого кадра.
+          ./target/debug/reyvec-sandbox --validation --snapshot "$RUNNER_TEMP/level-field.png" --time 1.5 --size 800x450 --level-view field
+          test -s "$RUNNER_TEMP/level-field.png"
           xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/snapshot-check.sh ./target/debug/reyvec-sandbox
           # Камера мышью: колесо приближает, перетаскивание двигает (два снимка F12 разные).
           xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/camera-check.sh ./target/debug/reyvec-sandbox

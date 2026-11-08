@@ -30,7 +30,8 @@
 //! - `--frames <N>`: закрыть окно после N кадров;
 //! - `--seconds <S>`: закрыть окно через S секунд;
 //! - `--snapshot <файл.png>`: нарисовать кадр без окна и сохранить его в файл
-//!   (`--time <S>`: момент сцены, `--size <ШxВ>`: размер, по умолчанию 1280x720);
+//!   (`--time <S>`: момент сцены, `--size <ШxВ>`: размер, по умолчанию 1280x720;
+//!   `--level-view sdf|field|triangles`: сцена из файла в 2.5D-виде, рисуется так);
 //! - `--version`: показать версию.
 
 use std::process::ExitCode;
@@ -79,6 +80,8 @@ const HELP: &str = "\
   --snapshot <файл.png>  без окна: нарисовать кадр и сохранить в PNG
   --time <S>             для --snapshot: момент сцены в секундах (по умолчанию 0)
   --size <ШxВ>           для --snapshot: размер картинки (по умолчанию 1280x720)
+  --level-view <как>     для --snapshot: сцена из файла в 2.5D-виде, рисуется sdf,
+                         field (неподвижное запечено в поле) или triangles
   --version, -V          версия
   --help, -h             эта справка
 
@@ -109,6 +112,7 @@ struct Args {
     motif: Option<String>,
     scene_file: Option<String>,
     space_file: Option<String>,
+    level_view: Option<reyvec_app::LevelRender>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -186,6 +190,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     it.next()
                         .ok_or("после --space-file нужен путь к файлу сцены 3D .ron")?,
                 );
+            }
+            "--level-view" => {
+                let n = it
+                    .next()
+                    .ok_or("после --level-view нужно sdf, field или triangles")?;
+                out.level_view = Some(reyvec_app::LevelRender::from_name(&n).ok_or_else(|| {
+                    format!("--level-view: «{n}», а нужно sdf, field или triangles")
+                })?);
             }
             "--snapshot" => {
                 out.snapshot = Some(it.next().ok_or("после --snapshot нужно имя файла")?);
@@ -282,7 +294,11 @@ fn snapshot_headless(
         height,
         time: args.time.unwrap_or(0.0),
         shader_error: false,
-        scene: args.scene.unwrap_or_default(),
+        scene: args.scene.unwrap_or(if args.level_view.is_some() {
+            reyvec_app::DemoScene::File
+        } else {
+            reyvec_app::DemoScene::default()
+        }),
         msaa: args.msaa.unwrap_or_default(),
         perceptual_edges: args.editor_edges,
         fill: args.fill.unwrap_or_default(),
@@ -294,7 +310,12 @@ fn snapshot_headless(
         validation,
         gpu: args.gpu.clone(),
     };
-    let image = match reyvec_app::render_headless(&options, &scene) {
+    // 2.5D-вид (7.9): сцена из файла, сыгранная до момента --time, рисуется объёмом.
+    let play = args.level_view.map(|render| reyvec_app::HeadlessPlay {
+        level: Some(render),
+        ..Default::default()
+    });
+    let image = match reyvec_app::render_headless_play(&options, &scene, play.as_ref()) {
         Ok(img) => img,
         Err(e) => {
             tracing::error!("Не удалось нарисовать кадр без окна: {e}");
@@ -315,6 +336,9 @@ fn snapshot_headless(
     );
     if let Some(t) = &image.gpu_timings {
         tracing::info!("Видеокарта на кадр: {}", t.describe());
+    }
+    if args.level_view.is_some() {
+        tracing::info!("Поле уровня: {:?}", image.level_field);
     }
     let errors = reyvec_app::validation_error_count();
     if errors > 0 {
@@ -506,6 +530,11 @@ mod tests {
         assert_eq!(parse_size("0x10"), None);
         assert!(parse("--size big").is_err());
         assert!(parse("--time -1").is_err());
+        assert_eq!(
+            parse("--level-view field").unwrap().level_view,
+            Some(reyvec_app::LevelRender::Field)
+        );
+        assert!(parse("--level-view 3d").is_err());
     }
 
     #[test]

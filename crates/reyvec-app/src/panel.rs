@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, RichText};
 use reyvec_gpu::{
-    DemoScene, FillMode, GpuFrameTimings, GraphReport, LevelRender, Msaa, SpaceScale, UiFrame,
+    DemoScene, FillMode, GpuFrameTimings, GraphReport, LevelFieldStatus, LevelRender, Msaa,
+    SpaceScale, UiFrame,
 };
 use winit::event::WindowEvent;
 
@@ -139,6 +140,8 @@ pub(crate) struct PanelInfo<'a> {
     pub level_view: bool,
     /// Как рисуется 2.5D-вид (7.9б).
     pub level_render: LevelRender,
+    /// Поле уровня 2.5D-вида (7.18в).
+    pub level_field: LevelFieldStatus,
     /// Запечённое поле расстояний (7.10б): включено ли и умеет ли видеокарта.
     pub space_field: (bool, bool),
     /// Затенение в углах из поля: включено ли и можно ли (поле включено).
@@ -454,6 +457,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         // слоя с формами; снимок панели в точке «комната» — база для 7.18в.
         if info.level_view {
             ui.label(mono(format!("2.5D-вид: {}", grid_text(info))));
+            if let Some(text) = level_field_text(info.level_field) {
+                ui.label(mono(text));
+            }
             if let Some(stats) = &info.space_stats {
                 space_stats_lines(ui, stats);
             }
@@ -682,10 +688,13 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         if info.level_view {
             ui.label("2.5D рисуется").on_hover_text(
                 "SDF — всё формами реймарчинга: точные мягкие тени и затенение в углах, \
-                 но дорого (по умолчанию на отдельной видеокарте). Треугольники — плитки \
-                 и бруски обычными треугольниками, тени от них картами теней двух ближних \
-                 ламп, формы SDF только у мягких предметов: быстро (по умолчанию на \
-                 встроенной)",
+                 но дорого (по умолчанию на отдельной видеокарте). Поле — то же, только \
+                 всё неподвижное заранее запечено в одно поле (печётся в фоне доли \
+                 секунды после загрузки уровня, до тех пор кадр как у SDF): картинка та \
+                 же, кадр быстрее; подвижное (герой, лифт, монеты) — формами. Треугольники \
+                 — плитки и бруски обычными треугольниками, тени от них картами теней двух \
+                 ближних ламп, формы SDF только у мягких предметов: быстро (по умолчанию \
+                 на встроенной)",
             );
             ui.horizontal(|ui| {
                 for render in LevelRender::ALL {
@@ -1041,6 +1050,32 @@ fn grid_text(info: &PanelInfo) -> String {
     }
 }
 
+/// Строка поля уровня (7.18в); `None` — способ рисовать не «поле».
+fn level_field_text(status: LevelFieldStatus) -> Option<String> {
+    Some(match status {
+        LevelFieldStatus::Off => return None,
+        LevelFieldStatus::Baking { reason } => {
+            format!("Поле уровня: печётся ({reason}), пока кадр как у SDF")
+        }
+        LevelFieldStatus::Ready {
+            size,
+            cell,
+            plates,
+            solids,
+            shapes,
+            bake_ms,
+            megabytes,
+        } => format!(
+            "Поле уровня: {}×{} по {:.0} см ({megabytes:.0} МБ), в нём плит {plates} и \
+             брусков {solids}, формами {shapes}; пеклось {bake_ms:.0} мс",
+            size.0,
+            size.1,
+            cell * 100.0
+        ),
+        LevelFieldStatus::Failed(reason) => format!("Поле уровня: нет ({reason}), кадр как у SDF"),
+    })
+}
+
 /// Счётчики объёмного кадра (7.18б): пиксели края, время процессора, размер данных сцены;
 /// у пределов — жёлтым с 75 %, красным при нарушении (раньше о нём писал только журнал).
 fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
@@ -1250,6 +1285,7 @@ mod tests {
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,
+            level_field: LevelFieldStatus::Off,
             space_field: (true, true),
             space_ao_field: (true, true),
             space_extrude_field: (false, true),
