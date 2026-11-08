@@ -9,6 +9,8 @@
 // crates/reyvec-sdf/src/profile2d.rs). Операция (2 слова): код (2 — объединить, 3 —
 // вырезать, 4 — пересечь) и ширина плавного перехода.
 
+#include "textures.slang"
+
 static const uint OP_PRIM = 1;
 static const uint OP_UNION = 2;
 static const uint OP_SUBTRACT = 3;

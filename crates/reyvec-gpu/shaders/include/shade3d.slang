@@ -1,7 +1,7 @@
 // Освещение точки сцены «3D» (этапы 7.3–7.4): общее для прохода «сцена»
 // (raymarch_shade.slang) и краёв форм (7.6о, raymarch_edges.slang). Перед подключением
-// должны быть объявлены `textures[]` и подключён space.slang. Буфер геометрии —
-// `textures[pc.gbuffer]`, тени — `textures[pc.shadows]`.
+// должен быть подключён space.slang (с ним приходит и список картинок `textures[]`).
+// Буфер геометрии — `textures[pc.gbuffer]`, тени — `textures[pc.shadows]`.
 
 // Небо: к горизонту светлее.
 float3 sky(float3 dir)

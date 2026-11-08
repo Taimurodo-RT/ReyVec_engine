@@ -1,6 +1,6 @@
 // Шагание луча глаза (7.3): общее для прохода «реймарчинг» (raymarch.slang) и краёв
-// форм (7.6о, raymarch_edges.slang). Перед подключением должен быть объявлен
-// `textures[]`. Начальные длины — `textures[pc.cone]`, полигоны — `textures[pc.meshes]`.
+// форм (7.6о, raymarch_edges.slang). Список картинок `textures[]` приходит из
+// textures.slang. Начальные длины — `textures[pc.cone]`, полигоны — `textures[pc.meshes]`.
 
 #include "space.slang"
 

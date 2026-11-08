@@ -14,7 +14,6 @@
 // берёт эти точные доли, попавший на другую — растянутые из картинки теней. Точные
 // доли считаются, только если растянутые для точки пикселя ненадёжны (7.6с).
 
-[[vk::binding(0, 0)]] Texture2D textures[];
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
 
 #include "include/march.slang"
