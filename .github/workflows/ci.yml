@@ -29,7 +29,8 @@ jobs:
         shell: pwsh
         run: |
           $url = "https://github.com/shader-slang/slang/releases/download/v$env:SLANG_VERSION/slang-$env:SLANG_VERSION-windows-x86_64.zip"
-          Invoke-WebRequest -Uri $url -OutFile slang.zip
+          # GitHub Releases иногда отвечает 5xx (504 — 2026-11-08): до 8 повторов с паузой 15 с.
+          Invoke-WebRequest -Uri $url -OutFile slang.zip -MaximumRetryCount 8 -RetryIntervalSec 15
           Expand-Archive slang.zip -DestinationPath "$env:RUNNER_TEMP\slang"
           Remove-Item slang.zip
           "$env:RUNNER_TEMP\slang\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
@@ -93,7 +94,11 @@ jobs:
       - name: Install Slang shader compiler
         run: |
           mkdir -p "$RUNNER_TEMP/slang"
-          curl -sSfL "https://github.com/shader-slang/slang/releases/download/v$SLANG_VERSION/slang-$SLANG_VERSION-linux-x86_64.tar.gz" | tar xz -C "$RUNNER_TEMP/slang"
+          # GitHub Releases иногда отвечает 5xx (504 — 2026-11-08): до 8 повторов с паузой 15 с.
+          # Сначала в файл, потом распаковка: повтор посреди потока сломал бы tar.
+          curl -sSfL --retry 8 --retry-all-errors --retry-delay 15 -o "$RUNNER_TEMP/slang.tar.gz" \
+            "https://github.com/shader-slang/slang/releases/download/v$SLANG_VERSION/slang-$SLANG_VERSION-linux-x86_64.tar.gz"
+          tar xzf "$RUNNER_TEMP/slang.tar.gz" -C "$RUNNER_TEMP/slang"
           echo "REYVEC_SLANGC=$RUNNER_TEMP/slang/bin/slangc" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/slang/bin/slangc" -v
       # Включая проверку перезагрузки шейдеров: правка файла пересобирает шейдер,
