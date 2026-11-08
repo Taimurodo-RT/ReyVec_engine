@@ -10,8 +10,8 @@
 
 // Длины, с которых начинать лучи (7.8, raymarch_cone.slang): точка на квадрат 8×8,
 // номер картинки в поле `cone` констант. Буфер геометрии полигональных моделей (7.6ж,
-// mesh3d.slang) — в поле `meshes`, если стоит флаг SPACE_FLAG_MESHES.
-[[vk::binding(0, 0)]] Texture2D textures[];
+// mesh3d.slang) — в поле `meshes`, если стоит флаг SPACE_FLAG_MESHES. Сам список
+// `textures[]` объявлен в include/textures.slang (через sdf3d.slang).
 // Запись в картинки (binding 2 общего списка): сюда вычислительный вариант кладёт буфер
 // геометрии, номер — в поле `target` констант.
 [[vk::binding(2, 0)]] [format("rgba32f")] RWTexture2D<float4> images[];

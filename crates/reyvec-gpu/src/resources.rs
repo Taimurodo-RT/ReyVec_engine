@@ -338,25 +338,34 @@ impl GpuResources {
             "размер пикселей"
         );
         let id = self.create_texture_empty(ctx, width, height, srgb, name)?;
-        let image = self.texture_image(id).expect("текстура только что создана");
-        let extent = vk::Extent2D { width, height };
-        let staging = match self.staging(ctx, pixels) {
-            Ok(s) => s,
-            Err(e) => {
-                self.destroy_texture(id);
-                return Err(e);
-            }
-        };
+        if let Err(e) = self.upload_texture_bytes(ctx, id, vk::Extent2D { width, height }, pixels) {
+            self.destroy_texture(id);
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// Загружает в только что созданную пустую текстуру `id` (раскладка UNDEFINED)
+    /// плотные строки байтов `bytes` любого формата и ждёт окончания. После этого
+    /// текстуру читают шейдеры (пиксельные и вычислительные). Для загрузки при старте и
+    /// при создании поля слоя (7.18б), не каждый кадр.
+    pub fn upload_texture_bytes(
+        &mut self,
+        ctx: &GpuContext,
+        id: TextureId,
+        extent: vk::Extent2D,
+        bytes: &[u8],
+    ) -> Result<(), GpuError> {
+        let image = self
+            .texture_image(id)
+            .ok_or_else(|| GpuError::Memory(format!("текстуры {} нет", id.0)))?;
+        let staging = self.staging(ctx, bytes)?;
         let result = self.immediate(ctx, |d, cmd| {
             // SAFETY: картинка и временный буфер живы до конца немедленной отправки.
             unsafe { record_texture_upload(d, cmd, image, staging.raw, [0, 0], extent, true) };
         });
         destroy_buffer(ctx, staging);
-        if let Err(e) = result {
-            self.destroy_texture(id);
-            return Err(e);
-        }
-        Ok(id)
+        result
     }
 
     /// Создаёт текстуру RGBA8 без содержимого (раскладка UNDEFINED) и сразу кладёт её в
@@ -375,11 +384,34 @@ impl GpuResources {
         } else {
             vk::Format::R8G8B8A8_UNORM
         };
+        self.create_texture_format(
+            ctx,
+            width,
+            height,
+            format,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            name,
+        )
+    }
+
+    /// Создаёт текстуру формата `format` без содержимого (раскладка UNDEFINED) в
+    /// постоянной ячейке общего списка текстур (7.18б: поле слоя R16G16_SFLOAT). Формат
+    /// должен уметь то, что от него ждут шейдеры (линейную фильтрацию для поля слоя
+    /// Vulkan гарантирует у R16G16_SFLOAT).
+    pub fn create_texture_format(
+        &mut self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        name: &str,
+    ) -> Result<TextureId, GpuError> {
         let texture = create_texture(
             ctx,
             vk::Extent2D { width, height },
             format,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            usage,
             vk::SampleCountFlags::TYPE_1,
             name,
         )?;
@@ -817,13 +849,15 @@ pub(crate) unsafe fn record_texture_upload(
             height: extent.height,
             depth: 1,
         })];
+    // Читают и пиксельные, и вычислительные шейдеры (лучи сцены «3D» идут вычислительным,
+    // а поле слоя 7.18б читается прямо в расчёте форм).
     let to_read = [image_barrier(
         image,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         vk::PipelineStageFlags2::COPY,
         vk::AccessFlags2::TRANSFER_WRITE,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
         vk::AccessFlags2::SHADER_SAMPLED_READ,
     )];
     // SAFETY: условие функции.

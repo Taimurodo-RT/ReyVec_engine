@@ -11,9 +11,6 @@
 // (2x, 2y) — левого верхнего в квадрате 2×2. Растягивает обратно raymarch_shade.slang.
 
 #include "include/space.slang"
-
-[[vk::binding(0, 0)]] Texture2D textures[];
-
 #include "include/shadow3d.slang"
 
 [shader("fragment")]

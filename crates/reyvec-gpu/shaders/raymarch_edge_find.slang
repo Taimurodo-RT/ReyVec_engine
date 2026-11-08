@@ -13,7 +13,6 @@
 
 #include "include/space.slang"
 
-[[vk::binding(0, 0)]] Texture2D textures[];
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
 
 // Точка экрана центра пикселя `px` кадра размером `size`.

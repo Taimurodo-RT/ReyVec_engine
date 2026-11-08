@@ -11,10 +11,6 @@
 
 #include "include/space.slang"
 
-[[vk::binding(0, 0)]] Texture2D textures[];
-
-[[vk::binding(1, 0)]] SamplerState samplers[2];
-
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {

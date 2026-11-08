@@ -43,6 +43,8 @@ pub(crate) enum PanelAction {
     SpaceField(bool),
     /// Затенение в углах из поля (7.10г).
     SpaceAoField(bool),
+    /// Выдавливание через поле слоя в сцене «3D» (опыт 7.18б).
+    SpaceExtrudeField(bool),
     /// Сравнить время кадра без поля, с полем и с «углами из поля» (7.10).
     FieldBench,
     /// Фонтан частиц для замера (6.6).
@@ -117,12 +119,16 @@ pub(crate) struct PanelInfo<'a> {
     pub space_file: Option<&'a str>,
     pub space_error: Option<String>,
     pub space_objects: usize,
-    /// Сетка отсева сцены «3D» включена (в файле `culling: false` выключает).
+    /// Была ли сетка отсева в последнем объёмном кадре: в сцене «3D» её выключает
+    /// `culling: false` в файле, у 2.5D-вида она есть всегда.
     pub space_culling: bool,
     /// Отсев по взгляду: объектов в кадре и всего (`None` — выключен).
     pub space_in_view: Option<(usize, usize)>,
     /// Сетка отсева последнего кадра: клетка, размеры, длины списков (`None` — её нет).
     pub space_grid: Option<reyvec_gpu::GridStats>,
+    /// Счётчики последнего объёмного кадра (7.18б): время процессора, объекты и слова
+    /// сцены, пиксели края (`None` — кадр был не объёмный).
+    pub space_stats: Option<reyvec_gpu::SpaceStats>,
     /// Лучи «3D» вычислительным шейдером (опыт 7.6м): попросил ли файл и шли ли так.
     pub space_compute: (bool, bool),
     /// Сглаживание краёв форм «3D» (7.6о): включено ли и умеет ли видеокарта.
@@ -137,6 +143,9 @@ pub(crate) struct PanelInfo<'a> {
     pub space_field: (bool, bool),
     /// Затенение в углах из поля: включено ли и можно ли (поле включено).
     pub space_ao_field: (bool, bool),
+    /// Выдавливание через поле слоя (опыт 7.18б): включено ли и есть ли в кадре
+    /// выдавленные фигуры верхнего уровня, которые подменяются.
+    pub space_extrude_field: (bool, bool),
     /// Сравнение поля: что идёт сейчас или отчёт последнего.
     pub field_bench: Option<&'a str>,
     /// Сравнение поля идёт (кнопка недоступна).
@@ -384,19 +393,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — смотреть \
              вокруг, колесо — скорость, Tab — перспектива или плоская, R — в начало",
         );
-        let grid = match (info.space_culling, info.space_grid) {
-            (false, _) => "сетка отсева выключена (culling: false)".to_string(),
-            (true, None) => "сетка отсева включена".to_string(),
-            (true, Some(g)) => format!(
-                "сетка отсева: клетка {:.2} м, {}×{}×{}, в списке клетки в среднем {:.1}, \
-                 не больше {}",
-                g.cell, g.dims[0], g.dims[1], g.dims[2], g.mean_list, g.max_list
-            ),
-        };
-        let culling = match info.space_in_view {
-            Some((kept, total)) => format!("{grid}, в кадре {kept} из {total}"),
-            None => format!("{grid}, отсев по взгляду выключен (view_culling: false)"),
-        };
+        let culling = grid_text(info);
         let rays = match info.space_compute {
             (_, true) => "лучи вычислительным шейдером",
             (true, false) => {
@@ -425,6 +422,9 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 ));
             }
         }
+        if let Some(stats) = &info.space_stats {
+            space_stats_lines(ui, stats);
+        }
     }
     if info.scene_id == DemoScene::File {
         match (&info.scene_error, info.scene_file) {
@@ -449,6 +449,14 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
         if let Some(p) = info.player {
             ui.label(mono(player_text(&p.view, info.follow)));
             ui.label(mono(input_text(&p, info.gamepad)));
+        }
+        // 2.5D-вид (7.18б): те же счётчики, что у сцены «3D», — по ним сравнивается поле
+        // слоя с формами; снимок панели в точке «комната» — база для 7.18в.
+        if info.level_view {
+            ui.label(mono(format!("2.5D-вид: {}", grid_text(info))));
+            if let Some(stats) = &info.space_stats {
+                space_stats_lines(ui, stats);
+            }
         }
         if let Some(p) = &info.physics {
             ui.label(mono(physics_text(p)));
@@ -781,6 +789,26 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         if let Some(text) = info.field_bench {
             ui.label(egui::RichText::new(text).small());
         }
+        let (mut via_field, can) = info.space_extrude_field;
+        if ui
+            .add_enabled(
+                can,
+                egui::Checkbox::new(&mut via_field, "Выдавливание через поле (опыт)"),
+            )
+            .on_hover_text(
+                "Выдавленные фигуры верхнего уровня (в vector.ron — сердце и облако) \
+                 рисуются через примитив «поле слоя» (7.18б): их поле лежит в картинке, а \
+                 не в словах сцены. Картинка та же, время не хуже. Звезда и указатель \
+                 остаются формами: их выдавливание внутри вырезания и объединения",
+            )
+            .on_disabled_hover_text(
+                "В кадре нет выдавленных фигур верхнего уровня (есть в \
+                 --space-file scenes\\3d\\vector.ron)",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::SpaceExtrudeField(via_field));
+        }
     }
     let mut dither = info.dither;
     if ui
@@ -996,6 +1024,82 @@ const RAYMARCH_PASSES: [&str; 5] = [
 ];
 const RAYMARCH_BUDGET_MS: f64 = 2.0;
 
+/// Строка сетки отсева и отсева по взгляду объёмного кадра (сцена «3D» и 2.5D-вид).
+fn grid_text(info: &PanelInfo) -> String {
+    let grid = match (info.space_culling, info.space_grid) {
+        (false, _) => "сетка отсева выключена (culling: false)".to_string(),
+        (true, None) => "сетка отсева включена".to_string(),
+        (true, Some(g)) => format!(
+            "сетка отсева: клетка {:.2} м, {}×{}×{}, в списке клетки в среднем {:.1}, \
+             не больше {}",
+            g.cell, g.dims[0], g.dims[1], g.dims[2], g.mean_list, g.max_list
+        ),
+    };
+    match info.space_in_view {
+        Some((kept, total)) => format!("{grid}, в кадре {kept} из {total}"),
+        None => format!("{grid}, отсев по взгляду выключен (view_culling: false)"),
+    }
+}
+
+/// Счётчики объёмного кадра (7.18б): пиксели края, время процессора, размер данных сцены;
+/// у пределов — жёлтым с 75 %, красным при нарушении (раньше о нём писал только журнал).
+fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
+    let mono = |text: String| RichText::new(text).family(FontFamily::Monospace);
+    let red = Color32::from_rgb(255, 90, 80);
+    let edges = match s.edge_pixels {
+        Some(n) => {
+            let share = if s.pixels > 0 {
+                f64::from(n) / f64::from(s.pixels) * 100.0
+            } else {
+                0.0
+            };
+            let tail = if n > reyvec_gpu::MAX_EDGE_PIXELS {
+                format!(
+                    ", в список вошло {}, остальные одним лучом",
+                    reyvec_gpu::MAX_EDGE_PIXELS
+                )
+            } else {
+                String::new()
+            };
+            format!("Края 3D: {n} пикселей ({share:.1} % кадра 3D){tail}")
+        }
+        None => "Края 3D: число пикселей неизвестно (сглаживание выключено)".to_string(),
+    };
+    ui.label(mono(edges));
+    ui.label(mono(format!(
+        "Процессор: сборка форм 3D {:.2} мс, отсев, упаковка и запись {:.2} мс",
+        s.build_ms, s.pack_ms
+    )));
+    let (max_objects, max_words) = (reyvec_gpu::MAX_SCENE_OBJECTS, reyvec_gpu::MAX_SCENE_WORDS);
+    let share = (f64::from(s.objects) / max_objects as f64).max(s.words as f64 / max_words as f64);
+    ui.label(
+        mono(format!(
+            "Данные сцены 3D: объектов {} из {max_objects}, слов {} из {max_words} ({:.2} МБ из 4)",
+            s.objects,
+            s.words,
+            s.words as f64 * 4.0 / (1024.0 * 1024.0)
+        ))
+        .color(budget_color(share, 1.0)),
+    );
+    if s.dropped > 0 {
+        ui.label(
+            mono(format!(
+                "Объектов больше предела {max_objects}: {} не рисуются",
+                s.dropped
+            ))
+            .color(red),
+        );
+    }
+    if let Some(needed) = s.overflow {
+        ui.label(
+            mono(format!(
+                "Сцена 3D не поместилась в буфер: нужно {needed} слов из {max_words}, рисуется пустой"
+            ))
+            .color(red),
+        );
+    }
+}
+
 /// Зелёный, пока время укладывается в бюджет с запасом, жёлтый у края, красный сверх.
 fn budget_color(ms: f64, budget: f64) -> Color32 {
     if ms <= budget * 0.75 {
@@ -1131,6 +1235,16 @@ mod tests {
             space_culling: true,
             space_in_view: Some((150, 202)),
             space_grid: None,
+            space_stats: Some(reyvec_gpu::SpaceStats {
+                build_ms: 0.41,
+                pack_ms: 0.22,
+                objects: 155,
+                words: 141_500,
+                dropped: 0,
+                overflow: None,
+                edge_pixels: Some(61_200),
+                pixels: 1280 * 720,
+            }),
             space_compute: (false, false),
             space_smooth: (true, true),
             space_scale: SpaceScale::Full,
@@ -1138,6 +1252,7 @@ mod tests {
             level_render: LevelRender::Sdf,
             space_field: (true, true),
             space_ao_field: (true, true),
+            space_extrude_field: (false, true),
             field_bench: Some("Сравнение поля (среднее за 240 кадров):\nбез поля: тени 0.722"),
             field_bench_running: false,
             logic: Some((600, 0.012)),

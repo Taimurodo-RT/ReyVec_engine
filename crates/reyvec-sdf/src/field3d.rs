@@ -505,4 +505,39 @@ mod tests {
         assert_eq!(changed_bounds(&a, &a), Some(vec![]));
         assert_eq!(changed_bounds(&a, &a[1..]), None);
     }
+
+    /// Движущееся поле фигуры (опыт 7.18б) пересчитывает поле только вокруг себя, как
+    /// выдавливание; поле без прямоугольника (как у уровня) — всё поле.
+    #[test]
+    fn moving_layer_field_of_a_shape_is_a_local_change() {
+        use crate::Shape3;
+        use crate::layer_field::LayerField;
+        use crate::profile2d::Profile;
+        use crate::shape3d::FieldRef;
+        let profile = Profile::new("M -0.5 -0.5 L 0.5 -0.5 L 0 0.5 Z").unwrap();
+        let layer = LayerField::from_profile(&profile, 1.0);
+        let at = |field: &FieldRef, x: f32| {
+            compile(
+                &Shape3::Field {
+                    field: field.clone(),
+                    depth: 0.2,
+                    round: 0.0,
+                }
+                .placed([x, 1.0, 0.0], [0.0; 3])
+                .paint(1),
+            )
+            .unwrap()
+        };
+        let bounded = FieldRef(std::sync::Arc::new(layer));
+        let changed = changed_bounds(&[at(&bounded, 0.0)], &[at(&bounded, 0.1)]).unwrap();
+        assert_eq!(changed.len(), 2, "старое и новое место");
+        assert!(changed.iter().all(|(_, r)| *r < 1.0), "{changed:?}");
+        let unbounded = FieldRef(std::sync::Arc::new(
+            LayerField::from_profile(&profile, 1.0).without_rect(),
+        ));
+        assert_eq!(
+            changed_bounds(&[at(&unbounded, 0.0)], &[at(&unbounded, 0.1)]),
+            None
+        );
+    }
 }

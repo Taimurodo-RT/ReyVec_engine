@@ -6,8 +6,14 @@
 // материал, матрица «мир → форма» тремя строками по 4 числа (поворот и сдвиг), множитель
 // расстояния (масштаб), 4 параметра. Биты 16–31 команды — сколько слов данных идёт после
 // примитива: поле 2D-фигуры у выдавливания и вращения (7.7, раскладка — в
-// crates/reyvec-sdf/src/profile2d.rs). Операция (2 слова): код (2 — объединить, 3 —
+// crates/reyvec-sdf/src/profile2d.rs), заголовок поля слоя (7.18б, раскладка — в
+// crates/reyvec-sdf/src/layer_field.rs). Операция (2 слова): код (2 — объединить, 3 —
 // вырезать, 4 — пересечь) и ширина плавного перехода.
+//
+// Материал результата −1 — «только оценка» (7.18б): ближайшая часть — поле слоя за его
+// полосой, расстояние там не больше настоящего, материала нет (тени не пишут полутень).
+
+#include "textures.slang"
 
 static const uint OP_PRIM = 1;
 static const uint OP_UNION = 2;
@@ -22,9 +28,13 @@ static const uint PRIM_TORUS = 4;
 static const uint PRIM_PLANE = 5;
 static const uint PRIM_EXTRUDE = 6;
 static const uint PRIM_REVOLVE = 7;
+static const uint PRIM_FIELD = 8;
 
 static const uint PRIM_WORDS = 19;
 static const uint FIELD_HEADER_WORDS = 8;
+// Слов данных у поля слоя: номер картинки поля, номер картинки материалов, угол (x, y),
+// шаг, nx | ny << 16, прямоугольник фигуры (4), 2 запасных (shape3d::FIELD_PRIM_WORDS).
+static const uint FIELD_PRIM_WORDS = 12;
 static const uint OP_WORDS = 2;
 static const uint SDF_STACK = 8;
 
@@ -90,6 +100,40 @@ float sd2_field(uint* code, uint at, float2 p)
     return v;
 }
 
+// Расстояние до фигуры поля слоя (7.18б) по заголовку с слова `at` и картинке из общего
+// списка (зеркало LayerField::distance2 в layer_field.rs). Внутри сетки — линейная
+// смесь четырёх точек картинки (samplers[0]: линейный, края прижаты); снаружи — оценка
+// снизу от ближайшей точки края сетки и, если задан, от прямоугольника фигуры. Значения
+// обрезаны полосой `band`: где поле не ближе band − клетка, это только оценка
+// (`estimate`), настоящая поверхность может быть дальше.
+float sd2_layer(uint* code, uint at, float2 p, float band, out bool estimate)
+{
+    uint slot = code[at];
+    float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
+    float cell = asfloat(code[at + 4]);
+    uint nx = code[at + 5] & 0xffff;
+    uint ny = code[at + 5] >> 16;
+    float2 g = (p - corner) / cell - 0.5;
+    float2 top = float2(float(nx) - 1.0, float(ny) - 1.0);
+    float2 gc = clamp(g, float2(0.0, 0.0), top);
+    float e = length(g - gc) * cell;
+    float2 uv = (gc + 0.5) / float2(float(nx), float(ny));
+    float v = textures[NonUniformResourceIndex(slot)].SampleLevel(samplers[0], uv, 0.0).x;
+    estimate = v >= band - cell;
+    if (e > 0.0)
+    {
+        float vp = max(v, 0.0);
+        float d = sqrt(e * e + vp * vp);
+        float2 lo = float2(asfloat(code[at + 6]), asfloat(code[at + 7]));
+        float2 hi = float2(asfloat(code[at + 8]), asfloat(code[at + 9]));
+        // Пустой прямоугольник (lo > hi) — прямоугольника нет (поле уровня, 7.18в).
+        if (lo.x <= hi.x && lo.y <= hi.y)
+            d = max(d, length(max(max(lo - p, p - hi), 0.0)));
+        return d;
+    }
+    return v;
+}
+
 // Выдавливание: d2 — расстояние до 2D-фигуры в точке (x, y), толщина ±half по Z.
 float sd3_extrude(float3 p, float d2, float half_depth, float round)
 {
@@ -141,6 +185,15 @@ float2 sdf_primitive(uint* code, uint i, float3 p)
         d = sd3_extrude(q, sd2_field(code, i + PRIM_WORDS, q.xy), a.x, a.y);
     else if (kind == PRIM_REVOLVE)
         d = sd2_field(code, i + PRIM_WORDS, float2(length(q.xz) - a.x, q.y));
+    else if (kind == PRIM_FIELD)
+    {
+        // Поле слоя (7.18б): a.x — половина толщины, a.y — скругление рёбер, a.z —
+        // половина толщины второго слоя (запас), a.w — полоса B.
+        bool estimate;
+        d = sd3_extrude(q, sd2_layer(code, i + PRIM_WORDS, q.xy, a.w, estimate), a.x, a.y);
+        if (estimate)
+            material = -1.0;
+    }
     else
         d = sd3_plane(q, a.xyz, a.w);
     return float2(d * scale, material);

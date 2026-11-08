@@ -3,9 +3,6 @@
 // солнце с мягкой тенью, свет неба с затенением в углах, лампы, свечение, блик и дымка.
 
 #include "include/space.slang"
-
-[[vk::binding(0, 0)]] Texture2D textures[];
-
 #include "include/shade3d.slang"
 
 [shader("fragment")]

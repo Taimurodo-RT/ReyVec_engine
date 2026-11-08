@@ -423,6 +423,13 @@ impl App {
                 r.set_space_ao_field(on);
                 tracing::info!("Углы из поля 3D: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::SpaceExtrudeField(on) => {
+                r.set_space_extrude_field(on);
+                tracing::info!(
+                    "Выдавливание через поле слоя (опыт): {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::Dither(on) => {
                 r.set_dither(on);
                 tracing::info!("Шум против полос: {}", if on { "вкл" } else { "выкл" });
@@ -600,6 +607,7 @@ impl App {
                 space_culling: renderer.space_culling(),
                 space_in_view: renderer.space_in_view(),
                 space_grid: renderer.space_grid(),
+                space_stats: renderer.space_stats(),
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
                 space_scale: renderer.space_scale(),
@@ -607,6 +615,7 @@ impl App {
                 level_render: renderer.level_render(),
                 space_field: renderer.space_field(),
                 space_ao_field: renderer.space_ao_field(),
+                space_extrude_field: renderer.space_extrude_field(),
                 field_bench: field_bench_text.as_deref(),
                 field_bench_running: self.field_bench.is_some(),
                 gamepad: self.gamepads.name(),

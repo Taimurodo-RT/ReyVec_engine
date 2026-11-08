@@ -264,6 +264,22 @@ pub fn field_distance(words: &[u32], p: Vec2) -> f32 {
     }
 }
 
+/// Точные расстояния по контуру для тестов других модулей (поле слоя, 7.18б).
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// Контур SVG → замкнутые ломаные.
+    pub fn flatten_path(path: &str) -> Vec<Vec<Vec2>> {
+        flatten(&BezPath::from_svg(path).unwrap())
+    }
+
+    /// Точное расстояние со знаком до фигуры из ломаных.
+    pub fn exact_distance(contours: &[Vec<Vec2>], p: Vec2) -> f32 {
+        exact(contours, p)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

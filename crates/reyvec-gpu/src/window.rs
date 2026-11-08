@@ -646,7 +646,7 @@ impl WindowRenderer {
         self.demo.as_ref().map_or(0, Demo::space_objects)
     }
 
-    /// Включена ли сетка отсева сцены «3D».
+    /// Включена ли сетка отсева в последнем объёмном кадре (сцена «3D» или 2.5D-вид).
     pub fn space_culling(&self) -> bool {
         self.demo.as_ref().is_some_and(Demo::space_culling)
     }
@@ -688,6 +688,21 @@ impl WindowRenderer {
     pub fn set_space_smooth(&mut self, on: bool) {
         if let Some(demo) = self.demo.as_mut() {
             demo.set_space_smooth(on);
+        }
+    }
+
+    /// Выдавливание через поле слоя в сцене «3D» (опыт 7.18б): включено ли и есть ли в
+    /// кадре фигуры, которые подменяются.
+    pub fn space_extrude_field(&self) -> (bool, bool) {
+        self.demo
+            .as_ref()
+            .map_or((false, false), Demo::space_extrude_field)
+    }
+
+    /// Включает или выключает выдавливание через поле слоя со следующего кадра.
+    pub fn set_space_extrude_field(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_extrude_field(on);
         }
     }
 
@@ -763,6 +778,12 @@ impl WindowRenderer {
     /// Сетка отсева последнего кадра сцены «3D» (`None` — её не было).
     pub fn space_grid(&self) -> Option<crate::GridStats> {
         self.demo.as_ref().and_then(Demo::space_grid)
+    }
+
+    /// Счётчики последнего кадра сцены «3D» или 2.5D-вида (7.18б): время процессора,
+    /// объекты и слова сцены, пиксели края (`None` — кадр был не объёмный).
+    pub fn space_stats(&self) -> Option<crate::SpaceStats> {
+        self.demo.as_ref().and_then(Demo::space_stats)
     }
 
     /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
