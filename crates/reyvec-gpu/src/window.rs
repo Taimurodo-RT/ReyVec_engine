@@ -732,6 +732,13 @@ impl WindowRenderer {
             .map_or_else(Default::default, Demo::level_render)
     }
 
+    /// Поле уровня 2.5D-вида (7.18в): печётся, готово (размер, сколько в нём) или нет.
+    pub fn level_field(&self) -> crate::LevelFieldStatus {
+        self.demo
+            .as_ref()
+            .map_or_else(Default::default, Demo::level_field_status)
+    }
+
     /// Меняет способ рисования 2.5D-вида со следующего кадра.
     pub fn set_level_render(&mut self, render: crate::LevelRender) {
         if let Some(demo) = self.demo.as_mut() {

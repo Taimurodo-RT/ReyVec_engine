@@ -21,8 +21,8 @@ pub use editor::{EditorConfig, run_editor};
 pub use logging::{LogGuard, init_logging, init_logging_to};
 pub use reyvec_gpu::{
     AdapterInfo, CLEAR_COLOR, DemoScene, FillMode, FrameImage, GpuOptions, HeadlessImage,
-    HeadlessPlay, HeadlessScene, LIGHT_VECTOR_TOP, Msaa, PlayInput, UserFiles, list_adapters,
-    render_headless, render_headless_play, validation_error_count,
+    HeadlessPlay, HeadlessScene, LIGHT_VECTOR_TOP, LevelFieldStatus, LevelRender, Msaa, PlayInput,
+    UserFiles, list_adapters, render_headless, render_headless_play, validation_error_count,
 };
 
 /// Название движка.

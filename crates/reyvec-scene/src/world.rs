@@ -86,7 +86,15 @@ pub struct GlobalPlacement {
     pub group: u64,
     /// Вспышка: наибольшая у сущности и её предков.
     pub flash: f32,
+    /// Сущность или её предок двигается или меняется по ходу игры (метка [`Dynamic`]).
+    pub dynamic: bool,
 }
+
+/// Метка: сущность (с детьми) двигается или меняется по ходу игры — герой, тела физики,
+/// скрипты, движения, мишени, обломки. В снимке её фигуры стоят между
+/// `SceneItem::BeginDynamic` и `EndDynamic`: объёмный вид не запекает их в поле уровня.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct Dynamic;
 
 impl GlobalPlacement {
     const ROOT: Self = Self {
@@ -97,9 +105,10 @@ impl GlobalPlacement {
         opacity: 1.0,
         group: 0,
         flash: 0.0,
+        dynamic: false,
     };
 
-    fn then(&self, p: &Placement, me: Entity) -> Self {
+    fn then(&self, p: &Placement, me: Entity, dynamic: bool) -> Self {
         let own = p.shadow.is_some() || p.opacity < 1.0;
         Self {
             affine: self.affine
@@ -112,6 +121,7 @@ impl GlobalPlacement {
             opacity: self.opacity * p.opacity,
             group: if own { me.to_bits() } else { self.group },
             flash: self.flash.max(p.flash),
+            dynamic: self.dynamic || dynamic,
         }
     }
 
@@ -373,9 +383,10 @@ struct Pending {
     attack_at: Option<[f64; 2]>,
 }
 
-/// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест).
+/// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест) и для
+/// каждого — двигается ли он (метка [`Dynamic`] у него или предка).
 #[derive(Resource, Default)]
-struct Solids(Vec<Collider>);
+struct Solids(Vec<Collider>, Vec<bool>);
 
 /// Ввод игрока на этот шаг логики.
 #[derive(Resource, Default, Clone, Copy)]
@@ -415,7 +426,12 @@ pub struct SceneWorld {
     world: World,
     schedule: Schedule,
     entities: usize,
+    /// Номер мира (см. [`Scene::generation`]).
+    generation: u64,
 }
+
+/// Счётчик миров: у каждого построенного мира свой номер, начиная с 1.
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl SceneWorld {
     /// Строит мир по файлу. Новые формы фигур нарезаются в `library`.
@@ -528,6 +544,7 @@ impl SceneWorld {
             world,
             schedule,
             entities,
+            generation: GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
     }
 
@@ -554,6 +571,7 @@ impl SceneWorld {
     pub fn snapshot(&self) -> Scene {
         let mut scene = self.world.resource::<Snapshot>().0.clone();
         scene.entities = self.entities;
+        scene.generation = self.generation;
         scene
     }
 
@@ -753,6 +771,7 @@ impl Spawner<'_> {
                         order,
                         morph: None,
                     },
+                    Dynamic,
                 ),
                 None,
             );
@@ -838,7 +857,7 @@ impl Spawner<'_> {
                     ..n.clone()
                 };
                 let e = self.node_one(&copy, parent, path)?;
-                self.world.entity_mut(e).insert(SpawnSlot);
+                self.world.entity_mut(e).insert((SpawnSlot, Dynamic));
                 slots.push(e);
             }
             self.world
@@ -876,17 +895,20 @@ impl Spawner<'_> {
             parent,
         );
         if let Some(p) = &n.player {
-            self.world.entity_mut(me).insert(Player {
-                tuning: p.tuning(),
-                body: Body::new(placement.at),
-                spawn: placement.at,
-                attack: p.attack.tuning(),
-                fighter: Fighter::default(),
-                hits: 0,
-                anim: Animator::default(),
-                health: Health::new(p.hp),
-                god: false,
-            });
+            self.world.entity_mut(me).insert((
+                Player {
+                    tuning: p.tuning(),
+                    body: Body::new(placement.at),
+                    spawn: placement.at,
+                    attack: p.attack.tuning(),
+                    fighter: Fighter::default(),
+                    hits: 0,
+                    anim: Animator::default(),
+                    health: Health::new(p.hp),
+                    god: false,
+                },
+                Dynamic,
+            ));
         }
         if let Some(b) = &n.body {
             let mut res = self.world.resource_mut::<PhysicsRes>();
@@ -896,7 +918,7 @@ impl Spawner<'_> {
             res.bodies.push(id);
             res.extra.add_body(&name, id);
             res.extra.add_joints(n, id);
-            self.world.entity_mut(me).insert(PhysBody { id });
+            self.world.entity_mut(me).insert((PhysBody { id }, Dynamic));
             if n.joints.iter().any(|j| j.line.is_some()) {
                 self.units()?;
             }
@@ -917,12 +939,15 @@ impl Spawner<'_> {
             let id = res.scripts.load(&path);
             let touch = n.dummy.map(|d| d.size).or(n.touch).unwrap_or((0.1, 0.1));
             if let Some(actor) = res.scripts.actor(id) {
-                self.world.entity_mut(me).insert(Scripted {
-                    actor,
-                    touch: [touch.0, touch.1],
-                    opacity: n.opacity,
-                    collected: false,
-                });
+                self.world.entity_mut(me).insert((
+                    Scripted {
+                        actor,
+                        touch: [touch.0, touch.1],
+                        opacity: n.opacity,
+                        collected: false,
+                    },
+                    Dynamic,
+                ));
             }
         }
         if let Some(bone) = n.bone.as_deref().and_then(Bone::parse)
@@ -947,12 +972,15 @@ impl Spawner<'_> {
                 })
                 .fold((0.0, Color::WHITE), |a, b| if b.0 > a.0 { b } else { a })
                 .1;
-            self.world.entity_mut(me).insert(Target {
-                dummy: Dummy::new(placement.at, [d.size.0, d.size.1], d.hp, d.respawn),
-                opacity: n.opacity,
-                color,
-                contact: d.contact,
-            });
+            self.world.entity_mut(me).insert((
+                Target {
+                    dummy: Dummy::new(placement.at, [d.size.0, d.size.1], d.hp, d.respawn),
+                    opacity: n.opacity,
+                    color,
+                    contact: d.contact,
+                },
+                Dynamic,
+            ));
             self.debris_pool()?;
         }
         for s in &n.solids {
@@ -1018,12 +1046,15 @@ impl Spawner<'_> {
             }
         }
         if n.spin != 0.0 || n.swing.is_some() || n.bob.is_some() {
-            self.world.entity_mut(me).insert(Motion {
-                base: placement,
-                spin: n.spin,
-                swing: n.swing.map(|w| (w.angle, w.period)),
-                bob: n.bob.map(|b| ([b.by.0, b.by.1], b.period)),
-            });
+            self.world.entity_mut(me).insert((
+                Motion {
+                    base: placement,
+                    spin: n.spin,
+                    swing: n.swing.map(|w| (w.angle, w.period)),
+                    bob: n.bob.map(|b| ([b.by.0, b.by.1], b.period)),
+                },
+                Dynamic,
+            ));
         }
         for (j, shape) in n.shapes.iter().enumerate() {
             let id = shape
@@ -1767,6 +1798,7 @@ fn pose_bones(
 /// Твёрдые прямоугольники в координатах сцены и на сколько каждый сдвинулся за шаг.
 fn gather_solids(mut q: Query<(Entity, &mut Solid, &GlobalPlacement)>, mut solids: ResMut<Solids>) {
     solids.0.clear();
+    solids.1.clear();
     for (e, mut s, g) in &mut q {
         let [hx, hy] = s.half;
         let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[x, y]| {
@@ -1797,6 +1829,7 @@ fn gather_solids(mut q: Query<(Entity, &mut Solid, &GlobalPlacement)>, mut solid
             moved,
             slope,
         });
+        solids.1.push(g.dynamic);
     }
 }
 
@@ -1806,7 +1839,7 @@ fn propagate_again(roots: Roots, nodes: Nodes, out: Query<&mut GlobalPlacement>)
 }
 
 type Roots<'w, 's> = Query<'w, 's, Entity, (With<Placement>, Without<ChildOf>)>;
-type Nodes<'w, 's> = Query<'w, 's, (&'static Placement, Option<&'static Children>)>;
+type Nodes<'w, 's> = Query<'w, 's, (&'static Placement, Option<&'static Children>, Has<Dynamic>)>;
 
 /// Итоговые места: от корней к листьям.
 fn propagate(roots: Roots, nodes: Nodes, mut out: Query<&mut GlobalPlacement>) {
@@ -1821,10 +1854,10 @@ fn visit(
     nodes: &Nodes,
     out: &mut Query<&mut GlobalPlacement>,
 ) {
-    let Ok((p, children)) = nodes.get(e) else {
+    let Ok((p, children, dynamic)) = nodes.get(e) else {
         return;
     };
-    let g = parent.then(p, e);
+    let g = parent.then(p, e, dynamic);
     if let Ok(mut slot) = out.get_mut(e) {
         *slot = g;
     }
@@ -1889,10 +1922,21 @@ fn collect(
     let mut shape_count = 0;
     // Слой: подряд идущие фигуры одной группы с одинаковой тенью и прозрачностью.
     let mut open: Option<(u64, bool, f32)> = None;
+    // Подряд идущие движущиеся фигуры: метки ставятся на сменах, независимо от слоёв.
+    let mut moving = false;
     for (what, g) in &drawn {
         if g.opacity <= 0.0 {
             // Не видно (взмах вне удара, разбитый манекен): не рисуется и не даёт тени.
             continue;
+        }
+        let dynamic = g.dynamic || matches!(what, Drawn::Shape(s) if s.morph.is_some());
+        if dynamic != moving {
+            items.push(if dynamic {
+                SceneItem::BeginDynamic
+            } else {
+                SceneItem::EndDynamic
+            });
+            moving = dynamic;
         }
         let key = (g.group, g.shadow, g.opacity);
         if open != Some(key) {
@@ -1932,6 +1976,9 @@ fn collect(
     if open.is_some() {
         items.push(SceneItem::EndLayer);
     }
+    if moving {
+        items.push(SceneItem::EndDynamic);
+    }
 
     let mut lit: Vec<(u32, SceneLight)> = lights
         .iter()
@@ -1946,6 +1993,8 @@ fn collect(
     let jellies = phys.extra.jelly_objects(&phys.physics);
 
     snapshot.0 = Scene {
+        // Ставит `SceneWorld::snapshot`.
+        generation: 0,
         background: settings.background,
         ambient: settings.ambient,
         shapes: shape_count,
@@ -1981,6 +2030,7 @@ fn collect(
         },
         events: events.list.iter().copied().collect(),
         solids: solids.0.clone(),
+        solids_dynamic: solids.1.clone(),
         scripts: crate::ScriptInfo {
             files: scripts.scripts.len(),
             actors: scripted.iter().count(),

@@ -1131,6 +1131,9 @@ pub struct SceneObject {
 /// Сцена, готовая к рисованию.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Scene {
+    /// Номер мира, из которого снят снимок: новый при каждой загрузке и правке файла
+    /// сцены, 0 — пустая сцена. Объёмный вид по смене номера перепекает поле уровня.
+    pub generation: u64,
     pub background: Background,
     /// Линейный цвет общего света.
     pub ambient: [f32; 3],
@@ -1154,6 +1157,9 @@ pub struct Scene {
     pub events: Vec<(u64, GameEvent)>,
     /// Твёрдое уровня на последнем шаге (6.6): от него отскакивают частицы.
     pub solids: Vec<reyvec_game::Collider>,
+    /// Для каждого из `solids`: двигается ли он (лифт, тело, скрипт). Неподвижные
+    /// объёмный вид запекает в поле уровня (7.18в).
+    pub solids_dynamic: Vec<bool>,
     /// Скрипты (6.9): сколько файлов, сколько раз перечитаны, ошибки.
     pub scripts: ScriptInfo,
     /// Физика для панели (6.13), если в сцене есть тела.
@@ -2159,8 +2165,8 @@ pub use logic::{STEP, SceneLogic, TIME_SCALE};
 pub use reyvec_game as game;
 pub use tiles::TilesDesc;
 pub use world::{
-    DebugCommand, GlobalPlacement, LightSource, Motion, Placement, Pointer, SceneTime, SceneWorld,
-    SdfShape, SvgPicture, VectorShape,
+    DebugCommand, Dynamic, GlobalPlacement, LightSource, Motion, Placement, Pointer, SceneTime,
+    SceneWorld, SdfShape, SvgPicture, VectorShape,
 };
 
 #[cfg(test)]

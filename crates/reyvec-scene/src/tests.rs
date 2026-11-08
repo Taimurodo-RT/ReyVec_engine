@@ -620,6 +620,93 @@ fn motion_moves_children_over_time() {
     );
 }
 
+/// Список кадра буквами: S фигура, D{ … } движущиеся, L( … ) слой.
+fn marks(items: &[SceneItem]) -> String {
+    items
+        .iter()
+        .map(|i| match i {
+            SceneItem::Shape(_) => "S",
+            SceneItem::Text(_) => "T",
+            SceneItem::BeginLayer { .. } => "L(",
+            SceneItem::EndLayer => ")",
+            SceneItem::BeginMask { .. } => "M[",
+            SceneItem::EndMask => "]",
+            SceneItem::BeginDynamic => "D{",
+            SceneItem::EndDynamic => "}",
+        })
+        .collect()
+}
+
+#[test]
+fn moving_things_are_marked_in_the_snapshot() {
+    // Неподвижная полка, лифт (покачивание) с твёрдой площадкой и ещё одна неподвижная
+    // фигура поверх: метки окружают только лифт, твёрдое помечено так же.
+    let text = minimal(
+        r##"nodes: [
+            (depth: 0.0, shapes: [Rect(at: (0.0, 0.0), size: (1.0, 0.2), color: "#fff", solid: true)]),
+            (depth: 1.0, bob: (by: (0.0, 0.5), period: 2.0), children: [
+                (shapes: [Rect(at: (2.0, 0.0), size: (1.0, 0.1), color: "#888", solid: true),
+                          Circle(at: (2.0, 0.3), r: 0.05, color: "#888")])]),
+            (depth: 2.0, shapes: [Circle(at: (-2.0, 0.0), r: 0.1, color: "#f00")]),
+        ]"##,
+    );
+    let mut w = world(&text);
+    w.update_at(0.25);
+    let scene = w.snapshot();
+    assert_eq!(marks(&scene.items), "SD{SS}S");
+    assert_eq!(scene.solids.len(), 2);
+    assert_eq!(scene.solids_dynamic.len(), 2);
+    let lift = scene
+        .solids
+        .iter()
+        .position(|c| c.aabb.min[0] > 1.0)
+        .expect("площадка лифта");
+    assert!(scene.solids_dynamic[lift]);
+    assert!(!scene.solids_dynamic[1 - lift]);
+
+    // Номер мира один на все снимки мира и новый у нового мира; у пустой сцены — 0.
+    let first = scene.generation;
+    assert_ne!(first, 0);
+    w.update_at(0.5);
+    assert_eq!(w.snapshot().generation, first);
+    assert_ne!(world(&text).snapshot().generation, first);
+    assert_eq!(Scene::default().generation, 0);
+}
+
+#[test]
+fn example_scene_marks_the_hero_and_the_lift() {
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let scene = file.build(&mut library(), &mut ShapeCache::new()).unwrap();
+    let mut depth = 0;
+    let (mut moving, mut still) = (0, 0);
+    for item in &scene.items {
+        match item {
+            SceneItem::BeginDynamic => {
+                assert_eq!(depth, 0, "метки не вкладываются");
+                depth += 1;
+            }
+            SceneItem::EndDynamic => {
+                assert_eq!(depth, 1, "конец без начала");
+                depth -= 1;
+            }
+            SceneItem::Shape(_) if depth > 0 => moving += 1,
+            SceneItem::Shape(_) => still += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(depth, 0, "метки закрыты");
+    // Герой, лифт, стрелки часов, лампа, шар, монеты со скриптами — подвижные; мебель,
+    // стены и пол — нет, и их больше.
+    assert!(moving >= 17, "{moving} подвижных");
+    assert!(still > moving, "{still} неподвижных, {moving} подвижных");
+    // Площадка лифта — единственное движущееся твёрдое первой комнаты.
+    let lift: Vec<_> = (0..scene.solids.len())
+        .filter(|&i| scene.solids_dynamic[i])
+        .collect();
+    assert!(!lift.is_empty(), "лифт помечен");
+    assert!(lift.len() < scene.solids.len() / 4, "{lift:?}");
+}
+
 #[test]
 fn bad_motion_is_reported() {
     let e = error(&minimal(
@@ -755,7 +842,31 @@ fn loader_cuts_in_background_and_frame_only_appends() {
     lib.remove(gone);
     loader.submit(LoadJob::Discard(lib.take_trash()));
     assert!(lib.take_trash().is_empty());
-    assert_eq!(loader.pending(), 5);
+    // Поле уровня (7.18в) считается тут же, со своим номером запроса.
+    use reyvec_sdf::layer_bake::{Flat2, LayerBake, Placed2};
+    loader.submit(LoadJob::LevelField {
+        ticket: 7,
+        bake: Box::new(LayerBake {
+            cell: 0.05,
+            band: 0.5,
+            first: vec![Placed2 {
+                flat: Flat2::Rect {
+                    center: glam::Vec2::ZERO,
+                    half: glam::Vec2::ONE,
+                },
+                at: glam::Vec2::ZERO,
+                angle: 0.0,
+                scale: 1.0,
+                mirror: false,
+                material: 0,
+            }],
+            second: Vec::new(),
+            second_layer: None,
+            threads: 2,
+            cancel: Default::default(),
+        }),
+    });
+    assert_eq!(loader.pending(), 6);
     let mut kinds = Vec::new();
     while let Some(done) = loader.wait() {
         match done.result {
@@ -804,10 +915,19 @@ fn loader_cuts_in_background_and_frame_only_appends() {
                 assert_eq!(n, 1);
                 kinds.push("discard");
             }
+            LoadResult::LevelField { ticket, result } => {
+                assert_eq!(ticket, 7);
+                let (field, stats) = *result.expect("поле уровня");
+                assert_eq!(stats.points, (field.size().0 * field.size().1) as usize);
+                kinds.push("field");
+            }
         }
     }
     // По порядку заданий.
-    assert_eq!(kinds, ["svg", "motif", "scene", "details", "discard"]);
+    assert_eq!(
+        kinds,
+        ["svg", "motif", "scene", "details", "discard", "field"]
+    );
     assert_eq!(loader.pending(), 0);
     assert!(loader.poll().is_none());
 }

@@ -241,12 +241,7 @@ impl Shape3 {
                 field,
                 depth,
                 round,
-            } => sd_extrude(
-                p,
-                field.0.distance2(Vec2::new(p.x, p.y), 0).0,
-                *depth * 0.5,
-                *round,
-            ),
+            } => field.0.sample(p, *depth * 0.5, *round, 0).0,
             Self::Union { shapes, smooth } => shapes
                 .iter()
                 .map(|s| s.distance(p))
@@ -343,10 +338,15 @@ impl Shape3 {
             // Поле фигуры с прямоугольником — шар как у выдавливания: за сеткой расстояние
             // не меньше, чем до прямоугольника. Поле слоя без него бесконечно: за сеткой
             // оно продолжается оценкой от края (7.18б).
-            Self::Field { field, depth, .. } => field
-                .0
-                .rect()
-                .map(|(lo, hi)| extrude_bounds(lo, hi, *depth)),
+            Self::Field { field, depth, .. } => field.0.rect().map(|(lo, hi)| {
+                let half = depth.abs() * 0.5;
+                // Второй слой — свой отрезок по Z: шар накрывает оба.
+                let (z0, z1) = field.0.second().map_or((-half, half), |s| {
+                    ((-half).min(s.shift - s.half), half.max(s.shift + s.half))
+                });
+                let (c, r) = extrude_bounds(lo, hi, z1 - z0);
+                (c + Vec3::Z * (z0 + z1) * 0.5, r)
+            }),
             Self::Extrude { profile, depth, .. } => {
                 let (lo, hi) = profile.bounds();
                 Some(extrude_bounds(lo, hi, *depth))
@@ -683,10 +683,12 @@ fn emit(
         } => {
             let header = field.0.header_words();
             let half = *depth * 0.5;
-            // Второй слой (запас под слой твёрдого, 7.18в) — той же толщины.
+            // a.z — половина толщины второго слоя (0 — его нет), его место и материал —
+            // в словах 10 и 11 заголовка.
+            let second = field.0.second().map_or(0.0, |s| s.half);
             prim_with(
                 prim::FIELD,
-                [half, *round, half, field.0.band()],
+                [half, *round, second, field.0.band()],
                 &header,
                 out,
             )?;
@@ -839,13 +841,14 @@ impl Program {
                     prim::FIELD if data >= FIELD_PRIM_WORDS => {
                         // Числа поля — из картинки, которую держит программа; без неё
                         // (испорченная программа) поля нет: бесконечно далеко.
-                        let (d2, estimate) = fields.next().map_or((f32::MAX, false), |f| {
-                            f.0.distance2(Vec2::new(local.x, local.y), 0)
-                        });
-                        if estimate {
-                            material = ESTIMATE_MATERIAL;
+                        match fields.next() {
+                            Some(f) => {
+                                let (d, m) = f.0.sample(local, a[0], a[1], material);
+                                material = m;
+                                d
+                            }
+                            None => f32::MAX,
                         }
-                        sd_extrude(local, d2, a[0], a[1])
                     }
                     _ => {
                         debug_assert!(kind == prim::PLANE, "неизвестный вид примитива {kind}");

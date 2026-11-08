@@ -9,7 +9,8 @@
 //!
 //! Задания идут по одному и по порядку. Набор фигур остаётся в потоке кадра, поэтому
 //! никаких замков вокруг него нет: в фон уходят копии (текст файла, байты рисунка, копия
-//! фигуры для уровня детализации), назад приходят готовые пачки.
+//! фигуры для уровня детализации), назад приходят готовые пачки. Поле уровня 2.5D-вида
+//! (7.18в) считается здесь же, само по себе — несколькими потоками.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -19,6 +20,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use reyvec_motif::{MorphFile, load_morph_file};
+use reyvec_sdf::layer_bake::{BakeStats, LayerBake};
+use reyvec_sdf::layer_field::LayerField;
 use reyvec_svg::{SvgDrawing, SvgOptions, load_svg};
 use reyvec_vector::{DetailJob, PreparedDetail, ShapeBatch, ShapeTrash, Tessellator};
 
@@ -46,6 +49,9 @@ pub enum LoadJob {
     Details(Vec<DetailJob>),
     /// Память удалённых фигур (5.5б): освободить здесь, а не в кадре.
     Discard(ShapeTrash),
+    /// Поле уровня 2.5D-вида (7.18в): неподвижные фигуры и твёрдое в одно поле.
+    /// `ticket` — номер запроса у того, кто просил (вернётся с результатом).
+    LevelField { ticket: u64, bake: Box<LayerBake> },
 }
 
 /// Что получилось.
@@ -66,6 +72,12 @@ pub enum LoadResult {
     Details(Vec<PreparedDetail>),
     /// Сколько удалённых фигур освобождено.
     Discarded(usize),
+    /// Запечённое поле уровня по запросу `ticket`; `None` — фигур нет или запекание
+    /// отменено.
+    LevelField {
+        ticket: u64,
+        result: Option<Box<(LayerField, BakeStats)>>,
+    },
 }
 
 /// Готовое задание.
@@ -190,6 +202,10 @@ fn run(job: LoadJob, tessellator: Tessellator) -> LoadResult {
             LoadResult::Motif { name, result }
         }
         LoadJob::Discard(trash) => LoadResult::Discarded(trash.len()),
+        LoadJob::LevelField { ticket, bake } => LoadResult::LevelField {
+            ticket,
+            result: bake.run().map(Box::new),
+        },
         LoadJob::Details(jobs) => LoadResult::Details(
             jobs.into_iter()
                 .filter_map(|job| {

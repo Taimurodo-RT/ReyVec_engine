@@ -18,10 +18,25 @@
 //! `include/sdf3d.slang` (`sd2_layer`) читает те же слова той же формулой, что
 //! [`LayerField::distance2`], только значения берёт из картинки с линейным смешиванием.
 
-use glam::Vec2;
+use glam::{Vec2, Vec3};
 
 use crate::profile2d::{FIELD_HEADER_WORDS, Profile};
-use crate::shape3d::FIELD_PRIM_WORDS;
+use crate::shape3d::{ESTIMATE_MATERIAL, FIELD_PRIM_WORDS, sd_extrude};
+
+/// Ближе этого к форме (в её координатах) материал берётся из картинки номеров; дальше
+/// он не нужен (материал смотрят только в точке попадания), и картинку не читают.
+pub const MATERIAL_NEAR: f32 = 0.05;
+
+/// Второй слой поля (7.18в, слой твёрдого уровня): своя толщина и своё место по Z.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SecondLayer {
+    /// Середина слоя по Z относительно середины первого.
+    pub shift: f32,
+    /// Половина толщины (больше нуля).
+    pub half: f32,
+    /// Материал всего слоя.
+    pub material: u32,
+}
 
 /// Поле слоя: сетка значений и всё, что о ней нужно знать зеркалу на процессоре.
 pub struct LayerField {
@@ -36,11 +51,19 @@ pub struct LayerField {
     /// Прямоугольник фигуры (без запаса), если известен: за сеткой расстояние не меньше
     /// расстояния до него. У поля целого уровня (7.18в) его нет.
     rect: Option<(Vec2, Vec2)>,
-    /// Значения по строкам снизу вверх, на точку два слоя (R16G16): основной и второй
-    /// (пока везде `+B`, занят под слой твёрдого 7.18в).
-    halves: Vec<[u16; 2]>,
+    /// Значения по строкам снизу вверх, на точку два слоя (R16G16_SFLOAT, младший байт
+    /// первым — как их читает видеокарта): основной и второй (у поля одной фигуры везде
+    /// `+B`, у поля уровня — слой твёрдого).
+    texels: Vec<u8>,
+    /// Номера материалов первого слоя по точкам (R16_UNORM, младший байт первым); пусто —
+    /// материал из слова примитива.
+    materials: Vec<u8>,
+    /// Второй слой, если он есть.
+    second: Option<SecondLayer>,
     /// Номер картинки в общем списке текстур; ставит видеокарта после загрузки.
     texture: u32,
+    /// Номер картинки материалов (0 — её нет).
+    material_texture: Option<u32>,
 }
 
 impl LayerField {
@@ -58,7 +81,7 @@ impl LayerField {
                 let d = f32::from_bits(bits).clamp(-band, band);
                 [f32_to_half_toward_zero(d), plus_band]
             })
-            .collect();
+            .collect::<Vec<_>>();
         Self::new(
             Vec2::new(f(0), f(1)),
             f(2),
@@ -81,8 +104,38 @@ impl LayerField {
         rect: Option<(Vec2, Vec2)>,
         halves: Vec<[u16; 2]>,
     ) -> Self {
-        assert!(nx >= 2 && ny >= 2, "сетка поля слоя {nx}×{ny}");
         assert_eq!(halves.len(), (nx * ny) as usize, "значений поля слоя");
+        let texels = halves
+            .iter()
+            .flat_map(|[a, b]| {
+                let [a0, a1] = a.to_le_bytes();
+                let [b0, b1] = b.to_le_bytes();
+                [a0, a1, b0, b1]
+            })
+            .collect();
+        Self::from_texels(corner, cell, nx, ny, band, rect, texels, Vec::new())
+    }
+
+    /// Поле из готовых байтов картинки (`texels`, 4 байта на точку) и номеров материалов
+    /// (`materials`, 2 байта на точку или пусто).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_texels(
+        corner: Vec2,
+        cell: f32,
+        nx: u32,
+        ny: u32,
+        band: f32,
+        rect: Option<(Vec2, Vec2)>,
+        texels: Vec<u8>,
+        materials: Vec<u8>,
+    ) -> Self {
+        assert!(nx >= 2 && ny >= 2, "сетка поля слоя {nx}×{ny}");
+        let points = nx as usize * ny as usize;
+        assert_eq!(texels.len(), points * 4, "значений поля слоя");
+        assert!(
+            materials.is_empty() || materials.len() == points * 2,
+            "номеров материалов"
+        );
         assert!(cell > 0.0 && band > 0.0);
         Self {
             corner,
@@ -91,9 +144,94 @@ impl LayerField {
             ny,
             band,
             rect,
-            halves,
+            texels,
+            materials,
+            second: None,
             texture: 0,
+            material_texture: None,
         }
+    }
+
+    /// То же поле со вторым слоем `second` (у поля уровня — слой твёрдого).
+    pub fn with_second(mut self, second: SecondLayer) -> Self {
+        assert!(second.half > 0.0, "толщина второго слоя");
+        self.second = Some(second);
+        self
+    }
+
+    /// Второй слой, если он есть.
+    pub fn second(&self) -> Option<SecondLayer> {
+        self.second
+    }
+
+    /// Байты картинки номеров материалов (R16_UNORM, строки снизу вверх), если они есть.
+    pub fn material_bytes(&self) -> Option<&[u8]> {
+        (!self.materials.is_empty()).then_some(&self.materials[..])
+    }
+
+    /// Ячейка картинки материалов (`None` — её нет или она ещё не загружена).
+    pub fn material_texture(&self) -> Option<u32> {
+        self.material_texture
+    }
+
+    /// Ставит ячейку, в которую загружены [`LayerField::material_bytes`]. Ячейка 0 тоже
+    /// настоящая (её отдают заново после удаления других картинок), поэтому в заголовке
+    /// хранится ячейка + 1, а 0 там значит «картинки нет».
+    pub fn set_material_texture(&mut self, texture: u32) {
+        self.material_texture = Some(texture);
+    }
+
+    /// Левый нижний угол клетки (0, 0).
+    pub fn corner(&self) -> Vec2 {
+        self.corner
+    }
+
+    /// Номер материала первого слоя в ближайшей к `p` точке сетки (`None` — номеров нет).
+    pub fn material_at(&self, p: Vec2) -> Option<u32> {
+        if self.materials.is_empty() {
+            return None;
+        }
+        let g = ((p - self.corner) / self.cell).floor();
+        let i = (g.x.max(0.0) as u32).min(self.nx - 1);
+        let j = (g.y.max(0.0) as u32).min(self.ny - 1);
+        let k = (j * self.nx + i) as usize * 2;
+        Some(u32::from(u16::from_le_bytes([
+            self.materials[k],
+            self.materials[k + 1],
+        ])))
+    }
+
+    /// Расстояние до формы поля в точке `p` её координат (первый слой толщиной ±`half`
+    /// по Z с рёбрами, скруглёнными на `round`, второй — по [`SecondLayer`]) и материал
+    /// ближайшего слоя: [`ESTIMATE_MATERIAL`], если поле там только оценка; у первого
+    /// слоя вблизи формы — из номеров, иначе `material`. Зеркало ветки `PRIM_FIELD` в
+    /// `include/sdf3d.slang`.
+    pub fn sample(&self, p: Vec3, half: f32, round: f32, material: u32) -> (f32, u32) {
+        let xy = Vec2::new(p.x, p.y);
+        let (d2, estimate) = self.distance2(xy, 0);
+        let mut d = sd_extrude(p, d2, half, round);
+        let mut estimate = estimate;
+        let mut first = true;
+        if let Some(second) = self.second {
+            let (d2, e2) = self.distance2(xy, 1);
+            let q = Vec3::new(p.x, p.y, p.z - second.shift);
+            let ds = sd_extrude(q, d2, second.half, round);
+            if ds < d {
+                d = ds;
+                estimate = e2;
+                first = false;
+            }
+        }
+        let material = if estimate {
+            ESTIMATE_MATERIAL
+        } else if !first {
+            self.second.map_or(material, |s| s.material)
+        } else if d < MATERIAL_NEAR {
+            self.material_at(xy).unwrap_or(material)
+        } else {
+            material
+        };
+        (d, material)
     }
 
     /// Номер картинки в общем списке текстур.
@@ -137,28 +275,27 @@ impl LayerField {
 
     /// Байты картинки R16G16_SFLOAT: строки снизу вверх, в точке два half (младший байт
     /// первым, как читает видеокарта).
-    pub fn bytes(&self) -> Vec<u8> {
-        self.halves
-            .iter()
-            .flat_map(|[a, b]| {
-                let [a0, a1] = a.to_le_bytes();
-                let [b0, b1] = b.to_le_bytes();
-                [a0, a1, b0, b1]
-            })
-            .collect()
+    pub fn bytes(&self) -> &[u8] {
+        &self.texels
     }
 
     /// Слова данных примитива `PRIM_FIELD` (раскладка — в `shape3d::FIELD_PRIM_WORDS`):
-    /// номер картинки поля, номер картинки материалов (0 — нет, материал из слова
+    /// номер картинки поля, ячейка картинки материалов + 1 (0 — нет, материал из слова
     /// примитива), угол, шаг, `nx | ny << 16`, прямоугольник фигуры (левый нижний и
-    /// правый верхний углы; «нет прямоугольника» — `+∞, −∞`, то есть пустой), 2 запасных.
+    /// правый верхний углы; «нет прямоугольника» — `+∞, −∞`, то есть пустой), середина
+    /// второго слоя по Z и его материал (у поля без второго слоя — нули).
     pub fn header_words(&self) -> [u32; FIELD_PRIM_WORDS] {
         let (lo, hi) = self
             .rect
             .unwrap_or((Vec2::splat(f32::INFINITY), Vec2::splat(f32::NEG_INFINITY)));
+        let (shift, material) = self.second.map_or((0.0, 0), |s| (s.shift, s.material));
+        let materials = match self.material_texture {
+            Some(slot) if !self.materials.is_empty() => slot + 1,
+            _ => 0,
+        };
         [
             self.texture,
-            0,
+            materials,
             self.corner.x.to_bits(),
             self.corner.y.to_bits(),
             self.cell.to_bits(),
@@ -167,14 +304,15 @@ impl LayerField {
             lo.y.to_bits(),
             hi.x.to_bits(),
             hi.y.to_bits(),
-            0,
-            0,
+            shift.to_bits(),
+            material,
         ]
     }
 
     /// Значение слоя `layer` в точке сетки `(i, j)`.
     pub fn value(&self, i: u32, j: u32, layer: usize) -> f32 {
-        half_to_f32(self.halves[(j * self.nx + i) as usize][layer])
+        let k = (j * self.nx + i) as usize * 4 + layer * 2;
+        half_to_f32(u16::from_le_bytes([self.texels[k], self.texels[k + 1]]))
     }
 
     /// Расстояние до фигуры слоя `layer` в точке `p` (локальные координаты формы) и

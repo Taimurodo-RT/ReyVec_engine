@@ -76,6 +76,8 @@ pub struct HeadlessPlay {
     pub inputs: Vec<PlayInput>,
     /// Фонтан частиц для замера (6.6) с начала сценария.
     pub fountain: bool,
+    /// 2.5D-вид уровня (7.9) и как он рисуется; `None` — плоский вид.
+    pub level: Option<crate::LevelRender>,
 }
 
 /// Нажатие (`down`) или отпускание действия в момент `at`, секунды.
@@ -125,6 +127,8 @@ pub struct HeadlessImage {
     pub space_stats: Option<crate::SpaceStats>,
     /// Сколько фигур сцены «3D» нарисовано через поле слоя (опыт 7.18б).
     pub field_shapes: usize,
+    /// Поле уровня 2.5D-вида (7.18в).
+    pub level_field: crate::LevelFieldStatus,
 }
 
 /// Запечённое поле расстояний, прочитанное с видеокарты: где стоят слои и числа.
@@ -265,6 +269,7 @@ pub fn render_headless_play(
         field: frame.field,
         space_stats: frame.space_stats,
         field_shapes: frame.field_shapes,
+        level_field: frame.level_field,
     })
 }
 
@@ -277,6 +282,7 @@ struct Rendered {
     field: Option<FieldSnapshot>,
     space_stats: Option<crate::SpaceStats>,
     field_shapes: usize,
+    level_field: crate::LevelFieldStatus,
 }
 
 /// Читает буфер запечённого поля после законченного кадра.
@@ -452,6 +458,10 @@ fn render(
             demo.set_level_render(crate::LevelRender::Sdf);
             #[cfg(test)]
             demo.set_level_render(tests::LEVEL_RENDER.get());
+            if let Some(render) = play.and_then(|p| p.level) {
+                demo.set_level_view(true);
+                demo.set_level_render(render);
+            }
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -592,6 +602,10 @@ fn render(
             _ => None,
         };
         let field_shapes = r.demo.as_ref().map_or(0, Demo::field_shapes);
+        let level_field = r
+            .demo
+            .as_ref()
+            .map_or_else(Default::default, Demo::level_field_status);
         Ok(Rendered {
             rgba: pixels,
             timings,
@@ -601,6 +615,7 @@ fn render(
             field,
             space_stats,
             field_shapes,
+            level_field,
         })
     }
 }
@@ -986,6 +1001,9 @@ pub(crate) mod tests {
             ("room", 1.0, [-0.6, -0.5]),
             ("lift", 3.0, [9.6, 0.6]),
             ("slope", 1.0, [14.2, 0.2]),
+            // У левой стены (7.18в): левая треть вида — за краем уровня и за сеткой поля
+            // уровня; там не должно появиться стены, которой нет.
+            ("left", 1.0, [-1.75, 0.0]),
         ];
         for (name, time, start) in plays {
             let scene = HeadlessScene {
@@ -1001,11 +1019,50 @@ pub(crate) mod tests {
             let volume = render_headless_play(&options, &scene, Some(&play));
             LEVEL_RENDER.set(crate::LevelRender::Triangles);
             let triangles = render_headless_play(&options, &scene, Some(&play));
+            LEVEL_RENDER.set(crate::LevelRender::Field);
+            let field = render_headless_play(&options, &scene, Some(&play));
             LEVEL_RENDER.set(crate::LevelRender::Sdf);
             LEVEL_VIEW.set(false);
             let volume = volume.expect("объёмный кадр");
             let triangles = triangles.expect("объёмный кадр треугольниками");
+            let field = field.expect("объёмный кадр с полем уровня");
             assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            // Поле уровня (7.18в): готово с первого кадра (без потока загрузки печётся в
+            // кадре), неподвижное в нём, подвижное формами, и картинка та же, что у SDF.
+            eprintln!("{name}: поле уровня {:?}", field.level_field);
+            let crate::LevelFieldStatus::Ready {
+                plates,
+                solids,
+                shapes,
+                ..
+            } = field.level_field
+            else {
+                panic!("{name}: поле уровня не готово: {:?}", field.level_field);
+            };
+            assert!(
+                plates > 50 && solids > 20 && shapes > 0,
+                "{name}: {:?}",
+                field.level_field
+            );
+            let field_stats = field.space_stats.expect("счётчики кадра с полем");
+            eprintln!("{name}: счётчики с полем {field_stats:?}");
+            assert!(
+                field_stats.objects < stats_objects(&volume),
+                "{name}: с полем объектов не меньше"
+            );
+            let (changed, worst, mean) = image_diff(&volume.image, &field.image);
+            let pixels = (field.image.width * field.image.height) as usize;
+            eprintln!(
+                "{name}: поле против SDF: отличается {changed} пикселей из {pixels}, \
+                 наибольшая {worst}, средняя {mean:.2}"
+            );
+            if let Some(t) = &field.gpu_timings {
+                eprintln!("{name}, поле: {}", t.describe());
+            }
+            // Неподвижные стопки в поле — в одной плоскости, а не через 2 мм: отличия в
+            // пиксель по краям деталей (корешки книг, картинка на полке) и полутени в
+            // пределах нескольких ступеней.
+            let field_same = changed * 1000 <= pixels * 25 && mean < 1.0;
             // Счётчики панели (7.18б): плоский кадр их не имеет, объёмный — имеет, с
             // объектами, без переполнения и с прочитанным с видеокарты числом краёв.
             assert!(
@@ -1042,6 +1099,7 @@ pub(crate) mod tests {
                     ("flat", &flat),
                     ("volume", &volume),
                     ("triangles", &triangles),
+                    ("field", &field),
                 ] {
                     let mut out =
                         format!("P6 {} {} 255\n", f.image.width, f.image.height).into_bytes();
@@ -1051,6 +1109,10 @@ pub(crate) mod tests {
                     std::fs::write(format!("{dir}/level-{name}-{kind}.ppm"), out).expect("ppm");
                 }
             }
+            assert!(
+                field_same,
+                "{name}: поле рисует не то, что SDF (снимки — PPM_DIR=папка)"
+            );
             let (changed, _, mean) = image_diff(&flat.image, &volume.image);
             let mut colors = std::collections::HashSet::new();
             for px in volume.image.rgba.chunks(4) {
@@ -1063,6 +1125,10 @@ pub(crate) mod tests {
             assert!(mean > 5.0, "{name}: объёмный кадр такой же, как плоский");
             assert!(colors.len() > 100, "{name}: мало цветов: {}", colors.len());
         }
+    }
+
+    fn stats_objects(f: &HeadlessImage) -> u32 {
+        f.space_stats.map_or(0, |s| s.objects)
     }
 
     /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и

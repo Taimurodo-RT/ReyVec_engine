@@ -511,6 +511,8 @@ mod tests {
                 SceneItem::EndLayer => ")",
                 SceneItem::BeginMask { .. } => "M[",
                 SceneItem::EndMask => "]",
+                SceneItem::BeginDynamic => "D{",
+                SceneItem::EndDynamic => "}",
             })
             .collect()
     }

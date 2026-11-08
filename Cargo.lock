@@ -3330,10 +3330,12 @@ name = "reyvec-scene"
 version = "0.1.0"
 dependencies = [
  "bevy_ecs",
+ "glam 0.30.10",
  "notify",
  "reyvec-game",
  "reyvec-motif",
  "reyvec-script",
+ "reyvec-sdf",
  "reyvec-svg",
  "reyvec-vector",
  "ron",

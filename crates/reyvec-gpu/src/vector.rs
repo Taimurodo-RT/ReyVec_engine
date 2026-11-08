@@ -2066,6 +2066,11 @@ fn pack_frame(
     let mut overflow = false;
 
     for item in items {
+        // Метки движущихся фигур нужны только объёмному виду: 2D их не видит и не рвёт на
+        // них ни пачку трафарета, ни склейку одинаковых фигур.
+        if matches!(item, SceneItem::BeginDynamic | SceneItem::EndDynamic) {
+            continue;
+        }
         let skipping = matches!(stack.last(), Some(Open::Skip { .. }));
         // Всё, кроме фигур, сначала дописывает накопленные фигуры трафаретом: порядок
         // рисования сохраняется.
@@ -2159,6 +2164,7 @@ fn pack_frame(
                 }
                 continue;
             }
+            SceneItem::BeginDynamic | SceneItem::EndDynamic => continue,
             SceneItem::Shape(_) | SceneItem::Text(_) if skipping => continue,
             SceneItem::Text(t) => {
                 last = None;

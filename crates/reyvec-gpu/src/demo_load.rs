@@ -80,7 +80,18 @@ pub(crate) struct DemoLoading {
     picture: Option<SvgDrawing>,
     pictures: u32,
     stats: LoadStats,
+    /// Готовые из фона поля уровня (7.18в): номер запроса, поле (или `None` — отменено)
+    /// и сколько пеклось.
+    level_fields: Vec<(u64, LevelFieldResult, std::time::Duration)>,
 }
+
+/// Запечённое поле уровня из фона.
+pub(crate) type LevelFieldResult = Option<
+    Box<(
+        reyvec_sdf::layer_field::LayerField,
+        reyvec_sdf::layer_bake::BakeStats,
+    )>,
+>;
 
 impl DemoLoading {
     /// Включает поток загрузки (окно). Без него всё грузится прямо в кадре.
@@ -205,6 +216,27 @@ impl DemoLoading {
         true
     }
 
+    /// Отдаёт запекание поля уровня в фон. `false`, если фона нет (печь в кадре).
+    pub fn submit_level_field(
+        &mut self,
+        ticket: u64,
+        bake: reyvec_sdf::layer_bake::LayerBake,
+    ) -> Result<(), reyvec_sdf::layer_bake::LayerBake> {
+        let Some(loader) = self.loader.as_mut() else {
+            return Err(bake);
+        };
+        loader.submit(LoadJob::LevelField {
+            ticket,
+            bake: Box::new(bake),
+        });
+        Ok(())
+    }
+
+    /// Готовые с прошлого раза поля уровня.
+    pub fn take_level_fields(&mut self) -> Vec<(u64, LevelFieldResult, std::time::Duration)> {
+        std::mem::take(&mut self.level_fields)
+    }
+
     /// Забирает всё готовое из фона и кладёт в набор. Возвращает загруженный файл
     /// сцены, если он пришёл.
     pub fn poll(
@@ -246,6 +278,10 @@ impl DemoLoading {
                     }
                 }
                 LoadResult::Svg { .. } | LoadResult::Motif { .. } | LoadResult::Discarded(_) => {
+                    continue;
+                }
+                LoadResult::LevelField { ticket, result } => {
+                    self.level_fields.push((ticket, result, done.took));
                     continue;
                 }
                 LoadResult::Details(details) => {
@@ -375,6 +411,53 @@ fn hsv(h: f64, s: f64, v: f64) -> (u8, u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Поле уровня (7.18в) печётся в потоке загрузки и возвращается со своим номером
+    /// запроса; без потока задание возвращается тому, кто просил (печь в кадре).
+    #[test]
+    fn level_field_bakes_in_the_background() {
+        use reyvec_sdf::layer_bake::{Flat2, LayerBake, Placed2};
+        let bake = || LayerBake {
+            cell: 0.02,
+            band: 0.5,
+            first: vec![Placed2 {
+                flat: Flat2::Rect {
+                    center: glam::Vec2::ZERO,
+                    half: glam::Vec2::new(1.0, 0.2),
+                },
+                at: glam::Vec2::ZERO,
+                angle: 0.0,
+                scale: 1.0,
+                mirror: false,
+                material: 3,
+            }],
+            second: Vec::new(),
+            second_layer: None,
+            threads: 2,
+            cancel: Default::default(),
+        };
+        let mut lib = ShapeLibrary::new(0.001);
+        let mut cache = ShapeCache::new();
+        let mut loading = DemoLoading::default();
+        assert!(
+            loading.submit_level_field(1, bake()).is_err(),
+            "без потока — в кадре"
+        );
+        loading.start(&mut lib);
+        assert!(loading.submit_level_field(5, bake()).is_ok());
+        let started = Instant::now();
+        let mut got = Vec::new();
+        while got.is_empty() && started.elapsed().as_secs() < 30 {
+            loading.poll(&mut lib, &mut cache);
+            got = loading.take_level_fields();
+            std::thread::yield_now();
+        }
+        assert_eq!(got.len(), 1);
+        let (ticket, result, _) = got.pop().unwrap();
+        assert_eq!(ticket, 5);
+        let (field, _) = *result.expect("поле");
+        assert_eq!(field.material_at(glam::Vec2::ZERO), Some(3));
+    }
 
     #[test]
     fn picture_is_heavy_and_new_every_time() {

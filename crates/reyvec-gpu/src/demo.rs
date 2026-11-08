@@ -525,6 +525,9 @@ pub(crate) struct Demo {
     /// Как рисуется 2.5D-вид: формами SDF или треугольниками (7.9б).
     level_render: crate::level3d::LevelRender,
     level: crate::level3d::Level3d,
+    /// Картинки полей уровня (7.18в) по номеру запроса: значения и номера материалов.
+    /// Остаются только у готового поля, остальные удаляются (отложенно).
+    level_field_textures: Vec<(u64, [TextureId; 2])>,
     space_shade_small: vk::Pipeline,
     space_upscale: vk::Pipeline,
     /// Камера сцены «3D».
@@ -823,7 +826,12 @@ impl Demo {
             level_view: false,
             level_orbit: [0.0, 0.0],
             level_render: crate::level3d::LevelRender::for_adapter(ctx.adapter.kind),
-            level: Default::default(),
+            level: {
+                let mut level = crate::level3d::Level3d::default();
+                level.set_field_limit(limits.max_image_dimension2_d);
+                level
+            },
+            level_field_textures: Vec::new(),
             space_shade_small: vk::Pipeline::null(),
             space_upscale: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
@@ -1385,7 +1393,7 @@ impl Demo {
                 &format!("поле слоя {nx}×{ny}"),
             )
             .and_then(
-                |id| match res.upload_texture_bytes(ctx, id, extent, &field.bytes()) {
+                |id| match res.upload_texture_bytes(ctx, id, extent, field.bytes()) {
                     Ok(()) => Ok(id),
                     Err(e) => {
                         res.destroy_texture(id);
@@ -1441,6 +1449,127 @@ impl Demo {
     /// Возвращает 2.5D-вид из облёта к обычному.
     pub fn reset_level_orbit(&mut self) {
         self.level_orbit = [0.0, 0.0];
+    }
+
+    /// Поле уровня 2.5D-вида для панели (7.18в).
+    pub fn level_field_status(&self) -> crate::level3d::LevelFieldStatus {
+        self.level.field_status()
+    }
+
+    /// Готовое поле уровня — на видеокарту и в 2.5D-вид (7.18в). Если запрос устарел
+    /// или картинки не создались, поле не нужно.
+    fn install_level_field(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        ticket: u64,
+        result: crate::demo_load::LevelFieldResult,
+        took: std::time::Duration,
+    ) {
+        let Some(baked) = result else {
+            self.level.field_failed(ticket, None);
+            return;
+        };
+        // Устаревшее поле (мир сменился, вид выключен, набор уже другой) не грузится.
+        if !self.level.field_pending(ticket) {
+            return;
+        }
+        let (mut field, stats) = *baked;
+        let (nx, ny) = field.size();
+        let extent = vk::Extent2D {
+            width: nx,
+            height: ny,
+        };
+        let mut made = Vec::with_capacity(2);
+        let mut upload = |format: vk::Format, bytes: &[u8], name: &str| {
+            let id = res.create_texture_format(
+                ctx,
+                nx,
+                ny,
+                format,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                &format!("{name} {nx}×{ny}"),
+            )?;
+            made.push(id);
+            res.upload_texture_bytes(ctx, id, extent, bytes)?;
+            Ok::<_, crate::GpuError>(id)
+        };
+        let ids = upload(vk::Format::R16G16_SFLOAT, field.bytes(), "поле уровня").and_then(|a| {
+            let m = upload(
+                vk::Format::R16_UNORM,
+                field.material_bytes().unwrap_or(&[]),
+                "материалы поля уровня",
+            )?;
+            Ok([a, m])
+        });
+        match ids {
+            Ok([a, m]) => {
+                field.set_texture(a.0);
+                field.set_material_texture(m.0);
+                let field = reyvec_sdf::shape3d::FieldRef(std::sync::Arc::new(field));
+                let ms = took.as_secs_f64() * 1000.0;
+                if self.level.install_field(ticket, field, stats, ms) {
+                    self.level_field_textures.push((ticket, [a, m]));
+                } else {
+                    res.destroy_texture(a);
+                    res.destroy_texture(m);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("картинки поля уровня не созданы: {e}");
+                for id in made {
+                    res.destroy_texture(id);
+                }
+                self.level
+                    .field_failed(ticket, Some("видеокарта не дала картинку поля"));
+            }
+        }
+    }
+
+    /// Кадр 2.5D-вида: в режиме «поле» — с запеканием поля уровня, в фоне или (без потока
+    /// загрузки: снимки, тесты) прямо здесь, тогда кадр собирается заново уже с полем.
+    /// Возвращает кадр и сколько пеклось прямо здесь.
+    fn level_frame(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+    ) -> (crate::level3d::LevelFrame, std::time::Duration) {
+        for (ticket, result, took) in self.loading.take_level_fields() {
+            self.install_level_field(ctx, res, ticket, result, took);
+        }
+        let mut made = self.level.frame(
+            &self.file_scene,
+            &self.vector_demo.library,
+            self.level_render,
+        );
+        let mut inline = std::time::Duration::ZERO;
+        if let Some((ticket, bake)) = self.level.take_field_request()
+            && let Err(bake) = self.loading.submit_level_field(ticket, bake)
+        {
+            let _zone = crate::cpu_zone!("поле уровня в кадре");
+            let started = std::time::Instant::now();
+            let result = bake.run().map(Box::new);
+            let took = started.elapsed();
+            self.install_level_field(ctx, res, ticket, result, took);
+            inline = started.elapsed();
+            made = self.level.frame(
+                &self.file_scene,
+                &self.vector_demo.library,
+                self.level_render,
+            );
+        }
+        // Картинки полей, которые больше не готовы (новый мир, новое поле), — удалить.
+        let keep = self.level.baked_ticket();
+        self.level_field_textures.retain(|(ticket, ids)| {
+            let kept = Some(*ticket) == keep;
+            if !kept {
+                for id in ids {
+                    res.destroy_texture(*id);
+                }
+            }
+            kept
+        });
+        (made, inline)
     }
 
     /// Включает или выключает 2.5D-вид уровня со следующего кадра. Игра не меняется.
@@ -2581,15 +2710,13 @@ impl Demo {
             // (он закончен: его забор дождались перед подготовкой), времена — отсюда.
             let edge_pixels = space_edges.and_then(|_| self.edge_pixels(res, slot));
             let started = std::time::Instant::now();
+            let mut baked_inline = std::time::Duration::ZERO;
             let (mut frame, level_materials) = if level {
                 let _zone = crate::cpu_zone!("уровень в объёме");
                 let center = [self.camera.center.x, self.camera.center.y];
                 space_camera = crate::level3d::camera(center, self.camera.zoom, self.level_orbit);
-                let made = self.level.frame(
-                    &self.file_scene,
-                    &self.vector_demo.library,
-                    self.level_render,
-                );
+                let (made, inline) = self.level_frame(ctx, res);
+                baked_inline = inline;
                 let mut frame = made.frame;
                 frame.lamps =
                     crate::level3d::lamps(&self.file_scene, [center[0] as f32, center[1] as f32]);
@@ -2649,7 +2776,8 @@ impl Demo {
             }
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
-            let build_ms = (built - started).as_secs_f64() * 1000.0;
+            // Запекание поля уровня прямо в кадре (снимки, тесты) — не сборка кадра.
+            let build_ms = (built - started).saturating_sub(baked_inline).as_secs_f64() * 1000.0;
             let pack_ms = built.elapsed().as_secs_f64() * 1000.0;
             // Сглаживание, как у векторного кадра: числа на панели не прыгают.
             let smooth = |old: Option<f64>, new: f64| old.map_or(new, |o| o * 0.9 + new * 0.1);

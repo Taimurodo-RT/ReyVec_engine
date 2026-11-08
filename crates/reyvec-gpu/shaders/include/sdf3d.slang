@@ -100,13 +100,13 @@ float sd2_field(uint* code, uint at, float2 p)
     return v;
 }
 
-// Расстояние до фигуры поля слоя (7.18б) по заголовку с слова `at` и картинке из общего
-// списка (зеркало LayerField::distance2 в layer_field.rs). Внутри сетки — линейная
-// смесь четырёх точек картинки (samplers[0]: линейный, края прижаты); снаружи — оценка
-// снизу от ближайшей точки края сетки и, если задан, от прямоугольника фигуры. Значения
-// обрезаны полосой `band`: где поле не ближе band − клетка, это только оценка
-// (`estimate`), настоящая поверхность может быть дальше.
-float sd2_layer(uint* code, uint at, float2 p, float band, out bool estimate)
+// Расстояние до фигур обоих слоёв поля слоя (7.18б, 7.18в) по заголовку с слова `at` и
+// картинке из общего списка (зеркало LayerField::distance2 в layer_field.rs): x — первый
+// слой, y — второй. Внутри сетки — линейная смесь четырёх точек картинки (samplers[0]:
+// линейный, края прижаты); снаружи — оценка снизу от ближайшей точки края сетки и, если
+// задан, от прямоугольника фигуры. Значения обрезаны полосой `band`: где поле не ближе
+// band − клетка, это только оценка (`estimate`), настоящая поверхность может быть дальше.
+float2 sd2_layer(uint* code, uint at, float2 p, float band, out bool2 estimate)
 {
     uint slot = code[at];
     float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
@@ -118,12 +118,12 @@ float sd2_layer(uint* code, uint at, float2 p, float band, out bool estimate)
     float2 gc = clamp(g, float2(0.0, 0.0), top);
     float e = length(g - gc) * cell;
     float2 uv = (gc + 0.5) / float2(float(nx), float(ny));
-    float v = textures[NonUniformResourceIndex(slot)].SampleLevel(samplers[0], uv, 0.0).x;
+    float2 v = textures[NonUniformResourceIndex(slot)].SampleLevel(samplers[0], uv, 0.0).xy;
     estimate = v >= band - cell;
     if (e > 0.0)
     {
-        float vp = max(v, 0.0);
-        float d = sqrt(e * e + vp * vp);
+        float2 vp = max(v, 0.0);
+        float2 d = sqrt(e * e + vp * vp);
         float2 lo = float2(asfloat(code[at + 6]), asfloat(code[at + 7]));
         float2 hi = float2(asfloat(code[at + 8]), asfloat(code[at + 9]));
         // Пустой прямоугольник (lo > hi) — прямоугольника нет (поле уровня, 7.18в).
@@ -132,6 +132,25 @@ float sd2_layer(uint* code, uint at, float2 p, float band, out bool estimate)
         return d;
     }
     return v;
+}
+
+// Ближе этого к форме поля слоя (в её координатах) материал первого слоя берётся из
+// картинки номеров (LayerField::MATERIAL_NEAR); дальше он не нужен.
+static const float LAYER_MATERIAL_NEAR = 0.05;
+
+// Номер материала первого слоя поля слоя в ближайшей к `p` точке сетки: картинка номеров
+// R16_UNORM (номер / 65535) в ячейке `mslot` (зеркало LayerField::material_at).
+// `mslot` — слово заголовка: ячейка картинки + 1, 0 — картинки нет.
+float layer_material(uint* code, uint at, uint mslot, float2 p)
+{
+    float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
+    float cell = asfloat(code[at + 4]);
+    int nx = int(code[at + 5] & 0xffff);
+    int ny = int(code[at + 5] >> 16);
+    int2 ij = int2(floor(max((p - corner) / cell, 0.0)));
+    ij = min(ij, int2(nx - 1, ny - 1));
+    float id = textures[NonUniformResourceIndex(mslot - 1)].Load(int3(ij, 0)).x;
+    return floor(id * 65535.0 + 0.5);
 }
 
 // Выдавливание: d2 — расстояние до 2D-фигуры в точке (x, y), толщина ±half по Z.
@@ -187,12 +206,32 @@ float2 sdf_primitive(uint* code, uint i, float3 p)
         d = sd2_field(code, i + PRIM_WORDS, float2(length(q.xz) - a.x, q.y));
     else if (kind == PRIM_FIELD)
     {
-        // Поле слоя (7.18б): a.x — половина толщины, a.y — скругление рёбер, a.z —
-        // половина толщины второго слоя (запас), a.w — полоса B.
-        bool estimate;
-        d = sd3_extrude(q, sd2_layer(code, i + PRIM_WORDS, q.xy, a.w, estimate), a.x, a.y);
-        if (estimate)
+        // Поле слоя (7.18б, 7.18в): a.x — половина толщины, a.y — скругление рёбер,
+        // a.z — половина толщины второго слоя (0 — его нет; середина по Z и материал — в
+        // словах 10 и 11 заголовка), a.w — полоса B. Зеркало LayerField::sample.
+        uint at = i + PRIM_WORDS;
+        bool2 estimate;
+        float2 d2 = sd2_layer(code, at, q.xy, a.w, estimate);
+        d = sd3_extrude(q, d2.x, a.x, a.y);
+        bool est = estimate.x;
+        bool first = true;
+        if (a.z > 0.0)
+        {
+            float3 qs = float3(q.xy, q.z - asfloat(code[at + 10]));
+            float ds = sd3_extrude(qs, d2.y, a.z, a.y);
+            if (ds < d)
+            {
+                d = ds;
+                est = estimate.y;
+                first = false;
+                material = float(code[at + 11]);
+            }
+        }
+        uint mslot = code[at + 1];
+        if (est)
             material = -1.0;
+        else if (first && mslot != 0 && d < LAYER_MATERIAL_NEAR)
+            material = layer_material(code, at, mslot, q.xy);
     }
     else
         d = sd3_plane(q, a.xyz, a.w);
