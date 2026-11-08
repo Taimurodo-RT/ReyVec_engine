@@ -15,7 +15,7 @@
 //! десятки микросекунд. Шейдер (`include/space.slang`, `scene_near`) и зеркало здесь
 //! ([`Grid::near`]) читают одно и то же; тесты сверяют зеркало с полным перебором.
 
-use crate::shape3d::Program;
+use crate::shape3d::{ESTIMATE_MATERIAL, Program};
 use glam::Vec3;
 
 /// К этому числу клеток подбирается размер клетки.
@@ -243,7 +243,8 @@ impl Grid {
             }
             let (d, m) = o.distance(p);
             if d < best.0 {
-                best = (d, Some(m));
+                // У поля слоя за полосой материал не известен: только оценка (7.18б).
+                best = (d, (m != ESTIMATE_MATERIAL).then_some(m));
             }
         }
         best
@@ -315,6 +316,55 @@ mod tests {
         let longest = grid.cells.iter().map(|c| c.count).max().unwrap();
         assert!(longest <= 16, "в клетке {longest} объектов");
         assert_eq!(grid.unbounded, vec![0], "пол считается всегда");
+    }
+
+    /// Поле слоя (7.18б) — бесконечный объект без плоскости: в начале `unbounded`,
+    /// перед плоскостями; сетку оно не растягивает; за полосой его материал не известен.
+    #[test]
+    fn field_layer_is_unbounded_and_its_estimate_has_no_material() {
+        use crate::layer_field::LayerField;
+        use crate::profile2d::Profile;
+        use crate::shape3d::FieldRef;
+        let profile = Profile::new("M -1 -1 L 1 -1 L 1 1 L -1 1 Z").unwrap();
+        let field = |band: f32| {
+            compile(
+                &Shape3::Field {
+                    field: FieldRef(std::sync::Arc::new(LayerField::from_profile(
+                        &profile, band,
+                    ))),
+                    depth: 0.4,
+                    round: 0.0,
+                }
+                .paint(1),
+            )
+            .unwrap()
+        };
+        let plain = programs(include_str!("../../../scenes/3d/stress.ron"));
+        let mut objects = plain.clone();
+        objects.push(field(1.0));
+        let grid = Grid::build(&objects);
+        let last = (objects.len() - 1) as u32;
+        assert_eq!(
+            grid.unbounded,
+            vec![last, 0],
+            "поле слоя — перед плоскостями"
+        );
+        assert_eq!(grid.unbounded_solid, 1);
+        assert_eq!(
+            grid.dims,
+            Grid::build(&plain).dims,
+            "сетку поле не растягивает"
+        );
+        check(&objects);
+        // Узкая полоса: далеко от квадрата поле знает только «не ближе полосы».
+        let narrow = [field(0.05)];
+        let g = Grid::build(&narrow);
+        let (d, m) = g.near(&narrow, Vec3::new(1.5, 0.0, 0.0), 1e9);
+        assert_eq!(m, None, "за полосой материала нет");
+        assert!((d - 0.5).abs() < 1e-3, "{d}: по прямоугольнику фигуры");
+        let (d, m) = g.near(&narrow, Vec3::ZERO, 1e9);
+        assert_eq!(m, Some(1));
+        assert!(d < 0.0, "{d}");
     }
 
     #[test]

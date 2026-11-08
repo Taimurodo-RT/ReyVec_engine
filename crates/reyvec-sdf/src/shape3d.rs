@@ -4,7 +4,8 @@
 //! Форма описывается данными ([`Shape3`]), а не кодом шейдера: так её можно менять на лету,
 //! читать из файла сцены (7.5) и собирать мышкой в будущем редакторе. Дерево:
 //!
-//! - **примитивы**: шар, коробка (со скруглением), капсула, цилиндр, тор, плоскость;
+//! - **примитивы**: шар, коробка (со скруглением), капсула, цилиндр, тор, плоскость,
+//!   выдавленная и повёрнутая 2D-фигура (7.7), поле слоя (7.18б);
 //! - **операции**: объединить, вырезать, пересечь — резко или плавно (`smooth` — ширина
 //!   плавного перехода в метрах);
 //! - **сдвиг, поворот и масштаб** ([`Shape3::Move`]) и **материал** ([`Shape3::Paint`]).
@@ -18,9 +19,12 @@
 //! После плавных операций и масштаба поле остаётся «снизу» (не больше настоящего
 //! расстояния), поэтому по нему можно шагать лучом и не проскочить поверхность.
 
+use std::sync::Arc;
+
 use glam::{Mat3, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
+use crate::layer_field::LayerField;
 use crate::profile2d::{FIELD_HEADER_WORDS, Profile, field_distance};
 
 /// Объёмная форма: примитив, операция над формами, сдвиг или материал.
@@ -62,6 +66,18 @@ pub enum Shape3 {
         profile: Profile,
         #[serde(default)]
         offset: f32,
+    },
+    /// Поле слоя (7.18б, `docs/decisions/0020-level-field.md`): выдавливание 2D-поля,
+    /// которое лежит в картинке видеокарты ([`LayerField`]), толщиной `depth` по Z, рёбра
+    /// скруглены на `round`. Границы (шара) у него нет: поле бесконечно, за сеткой
+    /// расстояние считается от её края. В файл сцены не записывается — его создаёт код
+    /// (подмена выдавливания в сцене «3D», запекание уровня 7.18в).
+    #[serde(skip)]
+    Field {
+        field: FieldRef,
+        depth: f32,
+        #[serde(default)]
+        round: f32,
     },
     /// Объединение: всё, что есть хотя бы в одной форме.
     Union {
@@ -111,6 +127,24 @@ pub enum Shape3 {
 
 fn one() -> f32 {
     1.0
+}
+
+/// Поле слоя, общее для формы и её программы: программа держит его, чтобы расчёт на
+/// процессоре ([`Program::distance`]) читал те же числа, что видеокарта из картинки.
+/// Две ссылки равны, если это одно и то же поле (по адресу).
+#[derive(Clone)]
+pub struct FieldRef(pub Arc<LayerField>);
+
+impl PartialEq for FieldRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for FieldRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
 }
 
 /// Покачивание туда-обратно: сдвиг `by · sin(2π·t / period)`.
@@ -202,6 +236,16 @@ impl Shape3 {
                 *round,
             ),
             Self::Revolve { profile, offset } => profile.distance(revolve_point(p, *offset)),
+            Self::Field {
+                field,
+                depth,
+                round,
+            } => sd_extrude(
+                p,
+                field.0.distance2(Vec2::new(p.x, p.y), 0).0,
+                *depth * 0.5,
+                *round,
+            ),
             Self::Union { shapes, smooth } => shapes
                 .iter()
                 .map(|s| s.distance(p))
@@ -295,6 +339,8 @@ impl Shape3 {
             )),
             Self::Torus { radius, thickness } => Some((Vec3::ZERO, radius.abs() + thickness.abs())),
             Self::Plane { .. } => None,
+            // Поле слоя бесконечно: за сеткой оно продолжается оценкой от края (7.18б).
+            Self::Field { .. } => None,
             Self::Extrude { profile, depth, .. } => {
                 let (lo, hi) = profile.bounds();
                 let half = ((hi - lo) * 0.5).extend(depth.abs() * 0.5);
@@ -446,11 +492,24 @@ pub mod prim {
     pub const PLANE: u32 = 5;
     pub const EXTRUDE: u32 = 6;
     pub const REVOLVE: u32 = 7;
+    /// Поле слоя (7.18б): 2D-поле в картинке, выдавленное в толщину слоя.
+    pub const FIELD: u32 = 8;
 }
 
 /// Слов на примитив: команда, материал, 12 матрицы, масштаб, 4 параметра (без данных
 /// поля 2D-фигуры).
 pub const PRIM_WORDS: usize = 19;
+/// Слов данных у примитива «поле слоя» (7.18б; `FIELD_PRIM_WORDS` в `include/sdf3d.slang`,
+/// менять вместе): номер картинки поля, номер картинки материалов (0 — нет), левый нижний
+/// угол сетки (x, y), шаг, `nx | ny << 16`, прямоугольник фигуры (левый нижний и правый
+/// верхний углы; пустой — прямоугольника нет), 2 запасных. Параметры примитива: половина
+/// толщины, скругление рёбер, половина толщины второго слоя (запас), полоса `B`.
+pub const FIELD_PRIM_WORDS: usize = 12;
+/// Материал «только оценка» у поля слоя (7.18б): поле в точке обрезано полосой `B`,
+/// поверхность может быть дальше, материал не известен. Шейдер в этом случае отдаёт
+/// материал −1 (тени не пишут полутень), на процессоре [`crate::grid3d::Grid::near`]
+/// отдаёт `None`.
+pub const ESTIMATE_MATERIAL: u32 = u32::MAX;
 /// Длиннее программа одной формы не бывает: шейдер дальше не читает (MAX_PROGRAM_WORDS
 /// в `include/space.slang`, менять вместе).
 pub const MAX_PROGRAM_WORDS: usize = 16384;
@@ -471,6 +530,9 @@ pub struct Program {
     /// Светящийся предмет (огонёк, шар-светильник; 7.9б): виден, но теней и затенения
     /// в углах не даёт. Иначе он у самой лампы и бросает от неё тень на всё вокруг.
     pub no_shadow: bool,
+    /// Поля слоя (7.18б) в порядке примитивов `PRIM_FIELD` в словах: по ним считает
+    /// зеркало на процессоре, видеокарта читает картинки по номерам из слов.
+    pub fields: Vec<FieldRef>,
 }
 
 /// Почему форму нельзя превратить в программу.
@@ -515,17 +577,25 @@ impl Placement {
 
 /// Дерево формы → программа.
 pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
-    let mut words = Vec::new();
-    emit(shape, Placement::IDENTITY, 0, 0, &mut words)?;
-    if words.len() > MAX_PROGRAM_WORDS {
+    let mut out = Emit::default();
+    emit(shape, Placement::IDENTITY, 0, 0, &mut out)?;
+    if out.words.len() > MAX_PROGRAM_WORDS {
         return Err(CompileError::TooLong);
     }
     Ok(Program {
-        words,
+        words: out.words,
         bounds: shape.bounds(),
         shadow_only: false,
         no_shadow: false,
+        fields: out.fields,
     })
+}
+
+/// Куда пишется программа: слова и поля слоя по порядку их примитивов.
+#[derive(Default)]
+struct Emit {
+    words: Vec<u32>,
+    fields: Vec<FieldRef>,
 }
 
 /// Пишет команды формы и возвращает, сколько места на стеке ей понадобилось (`base` уже
@@ -535,15 +605,16 @@ fn emit(
     at: Placement,
     material: u32,
     base: usize,
-    out: &mut Vec<u32>,
+    out: &mut Emit,
 ) -> Result<usize, CompileError> {
     if base >= STACK {
         return Err(CompileError::TooDeep);
     }
-    let prim_with = |kind: u32, params: [f32; 4], data: &[u32], out: &mut Vec<u32>| {
+    let prim_with = |kind: u32, params: [f32; 4], data: &[u32], out: &mut Emit| {
         if data.len() > 0xffff {
             return Err(CompileError::TooLong);
         }
+        let out = &mut out.words;
         out.push(op::PRIM | (kind << 8) | ((data.len() as u32) << 16));
         out.push(material);
         for row in 0..3 {
@@ -555,7 +626,7 @@ fn emit(
         out.extend_from_slice(data);
         Ok(1)
     };
-    let prim = |kind: u32, params: [f32; 4], out: &mut Vec<u32>| prim_with(kind, params, &[], out);
+    let prim = |kind: u32, params: [f32; 4], out: &mut Emit| prim_with(kind, params, &[], out);
     match shape {
         Shape3::Sphere { radius } => prim(prim::SPHERE, [*radius, 0.0, 0.0, 0.0], out),
         Shape3::Box { size, round } => prim(
@@ -594,6 +665,23 @@ fn emit(
             profile.words(),
             out,
         ),
+        Shape3::Field {
+            field,
+            depth,
+            round,
+        } => {
+            let header = field.0.header_words();
+            let half = *depth * 0.5;
+            // Второй слой (запас под слой твёрдого, 7.18в) — той же толщины.
+            prim_with(
+                prim::FIELD,
+                [half, *round, half, field.0.band()],
+                &header,
+                out,
+            )?;
+            out.fields.push(field.clone());
+            Ok(1)
+        }
         Shape3::Union { shapes, smooth } => {
             chain(shapes, op::UNION, *smooth, at, material, base, out)
         }
@@ -608,7 +696,7 @@ fn emit(
             let mut need = emit(b, at, material, base, out)?;
             for c in cut {
                 need = need.max(1 + emit(c, at, material, base + 1, out)?);
-                out.extend([op::SUBTRACT, smooth.to_bits()]);
+                out.words.extend([op::SUBTRACT, smooth.to_bits()]);
             }
             Ok(need)
         }
@@ -636,13 +724,13 @@ fn chain(
     at: Placement,
     material: u32,
     base: usize,
-    out: &mut Vec<u32>,
+    out: &mut Emit,
 ) -> Result<usize, CompileError> {
     let (first, rest) = shapes.split_first().ok_or(CompileError::Empty)?;
     let mut need = emit(first, at, material, base, out)?;
     for s in rest {
         need = need.max(1 + emit(s, at, material, base + 1, out)?);
-        out.extend([code, smooth.to_bits()]);
+        out.words.extend([code, smooth.to_bits()]);
     }
     Ok(need)
 }
@@ -699,17 +787,19 @@ impl Program {
     }
 
     /// Расстояние до формы в точке `p` и материал ближайшей части: то же, что считает
-    /// шейдер по этой программе.
+    /// шейдер по этой программе. Материал [`ESTIMATE_MATERIAL`] — ближайшая часть —
+    /// поле слоя, и там оно только оценка снизу (7.18б).
     pub fn distance(&self, p: Vec3) -> (f32, u32) {
         let w = &self.words;
         let f = |i: usize| f32::from_bits(w[i]);
         let mut stack: Vec<(f32, u32)> = Vec::with_capacity(STACK);
         let mut i = 0;
+        let mut fields = self.fields.iter();
         while i < w.len() {
             let code = w[i] & 0xff;
             if code == op::PRIM {
                 let kind = (w[i] >> 8) & 0xff;
-                let material = w[i + 1];
+                let mut material = w[i + 1];
                 let m = |r: usize| Vec3::new(f(i + 2 + 4 * r), f(i + 3 + 4 * r), f(i + 4 + 4 * r));
                 let local = Vec3::new(
                     m(0).dot(p) + f(i + 5),
@@ -735,7 +825,21 @@ impl Program {
                     prim::REVOLVE if data >= FIELD_HEADER_WORDS => {
                         field_distance(field, revolve_point(local, a[0]))
                     }
-                    _ => sd_plane(local, Vec3::new(a[0], a[1], a[2]), a[3]),
+                    prim::FIELD if data >= FIELD_PRIM_WORDS => {
+                        // Числа поля — из картинки, которую держит программа; без неё
+                        // (испорченная программа) поля нет: бесконечно далеко.
+                        let (d2, estimate) = fields.next().map_or((f32::MAX, false), |f| {
+                            f.0.distance2(Vec2::new(local.x, local.y), 0)
+                        });
+                        if estimate {
+                            material = ESTIMATE_MATERIAL;
+                        }
+                        sd_extrude(local, d2, a[0], a[1])
+                    }
+                    _ => {
+                        debug_assert!(kind == prim::PLANE, "неизвестный вид примитива {kind}");
+                        sd_plane(local, Vec3::new(a[0], a[1], a[2]), a[3])
+                    }
                 };
                 stack.push((d * scale, material));
                 i += PRIM_WORDS + data;
@@ -1249,6 +1353,98 @@ mod tests {
         };
         let (c, r) = two.bounds().unwrap();
         assert!(c.length() < 1e-6 && (r - 3.0).abs() < 1e-6);
+    }
+
+    const STAR: &str = "M 0 1 L 0.22 0.3 L 0.95 0.31 L 0.36 -0.12 L 0.59 -0.81 \
+                        L 0 -0.38 L -0.59 -0.81 L -0.36 -0.12 L -0.95 0.31 L -0.22 0.3 Z";
+
+    /// Выдавленная звезда и она же через поле слоя (7.18б), одинаково поставленные.
+    fn extrude_and_field() -> (Shape3, Shape3) {
+        let profile = Profile::new(STAR).unwrap();
+        let field = FieldRef(Arc::new(LayerField::from_profile(&profile, 1.0)));
+        let place = |s: Shape3| s.placed([0.5, 1.0, -0.3], [10.0, 25.0, 0.0]).paint(3);
+        (
+            place(Shape3::Extrude {
+                profile,
+                depth: 0.3,
+                round: 0.02,
+            }),
+            place(Shape3::Field {
+                field,
+                depth: 0.3,
+                round: 0.02,
+            }),
+        )
+    }
+
+    /// Поле слоя считается как выдавливание (с точностью half), границы не имеет,
+    /// в сцену ложится обычным объектом без флагов плоскости и цепочки.
+    #[test]
+    fn field_primitive_mirrors_extrude_without_bounds() {
+        let (extrude, field) = extrude_and_field();
+        let a = compile(&extrude).unwrap();
+        let b = compile(&field).unwrap();
+        assert_eq!(b.fields.len(), 1);
+        assert_eq!(b.words.len(), PRIM_WORDS + FIELD_PRIM_WORDS);
+        assert_eq!(
+            b.words[0],
+            op::PRIM | (prim::FIELD << 8) | ((FIELD_PRIM_WORDS as u32) << 16)
+        );
+        // Материал, матрица, масштаб, половина толщины и скругление — как у выдавливания.
+        assert_eq!(&a.words[1..17], &b.words[1..17]);
+        assert_eq!(f32::from_bits(b.words[18]), 1.0, "полоса B");
+        assert_eq!(field.bounds(), None);
+        assert_eq!(b.bounds, None);
+        assert!(!b.chain() && b.plane().is_none());
+        for p in points() {
+            let (da, _) = a.distance(p);
+            let (db, m) = b.distance(p);
+            let dt = field.distance(p);
+            assert!(
+                (da - db).abs() <= da.abs() * 2f32.powi(-10) + 1e-4,
+                "{p}: выдавливание {da}, поле {db}"
+            );
+            assert!((dt - db).abs() < 1e-5, "{p}: дерево {dt}, программа {db}");
+            assert_eq!(m, 3, "{p}: на собственной сетке поле всегда знает материал");
+        }
+        let union = Shape3::Union {
+            smooth: 0.0,
+            shapes: vec![field.clone(), Shape3::Sphere { radius: 1.0 }],
+        };
+        assert_eq!(union.bounds(), None);
+        // В сцене: радиус границы −1, не плоскость и не цепочка, в списке плоскостей нет.
+        let w = pack_scene(std::slice::from_ref(&b), &[], &[]);
+        assert_eq!(f32::from_bits(w[HEADER_WORDS + 7]), -1.0);
+        assert_eq!(w[HEADER_WORDS + 2] & (OBJECT_PLANE | OBJECT_CHAIN), 0);
+        assert_eq!(w[9], 0, "плоскостей нет");
+        // Из файла сцены поле не читается, его создаёт только код.
+        assert!(ron::from_str::<Shape3>("Field(depth: 1.0)").is_err());
+        // Программы равны, пока ссылаются на одно поле; другое поле с теми же словами —
+        // другая программа (поле 7.10 тогда пересчитается, 7.18б).
+        assert_eq!(b.clone(), b);
+        let other = compile(&extrude_and_field().1).unwrap();
+        assert_eq!(other.words, b.words);
+        assert_ne!(other, b);
+    }
+
+    /// За полосой поле слоя — только оценка: материал-сторож, расстояние обрезано.
+    #[test]
+    fn field_estimate_beyond_the_band_is_marked() {
+        let profile = Profile::new("M -1 -1 L 1 -1 L 1 1 L -1 1 Z").unwrap();
+        let field = FieldRef(Arc::new(LayerField::from_profile(&profile, 0.05)));
+        let shape = Shape3::Field {
+            field,
+            depth: 0.4,
+            round: 0.0,
+        }
+        .paint(2);
+        let program = compile(&shape).unwrap();
+        let (d, m) = program.distance(Vec3::new(1.5, 0.0, 0.0));
+        assert_eq!(m, ESTIMATE_MATERIAL);
+        assert!((d - 0.5).abs() < 1e-3, "{d}: по прямоугольнику фигуры");
+        let (d, m) = program.distance(Vec3::ZERO);
+        assert_eq!(m, 2);
+        assert!((d + 0.05).abs() < 1e-3, "{d}");
     }
 
     #[test]

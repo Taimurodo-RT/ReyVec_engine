@@ -127,6 +127,8 @@ jobs:
       # Включая проверку перезагрузки шейдеров: правка файла пересобирает шейдер,
       # ошибка в шейдере не ломает прошлую версию.
       - name: GPU tests (headless scene with validation, shader hot reload)
+        # Зависший шейдер (например, у нового примитива) не должен держать CI часами.
+        timeout-minutes: 20
         run: cargo test -p reyvec-gpu -- --include-ignored
       # Кадры без окна сравниваются с эталонными картинками (crates/reyvec-app/tests/reference).
       - name: Frames match reference images

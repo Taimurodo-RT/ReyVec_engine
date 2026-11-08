@@ -13,6 +13,7 @@ use reyvec_sdf::Program;
 use reyvec_sdf::field3d::{BrickJob, FIELD_LEVELS, FieldWindow, brick_objects, changed_bounds};
 use reyvec_sdf::shape3d::pack_scene;
 
+use crate::bindless::Bindless;
 use crate::context::GpuContext;
 use crate::resources::{BufferId, BufferMemory, GpuResources};
 
@@ -279,6 +280,7 @@ impl SpaceField {
     pub unsafe fn record(
         d: &ash::Device,
         cmd: vk::CommandBuffer,
+        bindless: &Bindless,
         layout: vk::PipelineLayout,
         pipeline: vk::Pipeline,
         frame: &FieldFrame,
@@ -354,6 +356,8 @@ impl SpaceField {
         // этим кадром; куски копирования лежат внутри буфера и слоёв (brick_copies).
         unsafe {
             d.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().memory_barriers(&before));
+            // Формы читают общий список текстур: поле слоя (7.18б) лежит в картинке.
+            bindless.bind_compute(d, cmd);
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
             d.cmd_dispatch(cmd, frame.count, 1, 1);

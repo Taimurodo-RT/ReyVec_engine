@@ -43,6 +43,8 @@ pub(crate) enum PanelAction {
     SpaceField(bool),
     /// Затенение в углах из поля (7.10г).
     SpaceAoField(bool),
+    /// Выдавливание через поле слоя в сцене «3D» (опыт 7.18б).
+    SpaceExtrudeField(bool),
     /// Сравнить время кадра без поля, с полем и с «углами из поля» (7.10).
     FieldBench,
     /// Фонтан частиц для замера (6.6).
@@ -140,6 +142,9 @@ pub(crate) struct PanelInfo<'a> {
     pub space_field: (bool, bool),
     /// Затенение в углах из поля: включено ли и можно ли (поле включено).
     pub space_ao_field: (bool, bool),
+    /// Выдавливание через поле слоя (опыт 7.18б): включено ли и есть ли в кадре
+    /// выдавленные фигуры верхнего уровня, которые подменяются.
+    pub space_extrude_field: (bool, bool),
     /// Сравнение поля: что идёт сейчас или отчёт последнего.
     pub field_bench: Option<&'a str>,
     /// Сравнение поля идёт (кнопка недоступна).
@@ -783,6 +788,28 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
         if let Some(text) = info.field_bench {
             ui.label(egui::RichText::new(text).small());
         }
+        let (mut via_field, can) = info.space_extrude_field;
+        if ui
+            .add_enabled(
+                can,
+                egui::Checkbox::new(&mut via_field, "Выдавливание через поле (опыт)"),
+            )
+            .on_hover_text(
+                "Выдавленные фигуры верхнего уровня (в vector.ron — сердце и облако) \
+                 рисуются через примитив «поле слоя» (7.18б): их поле лежит в картинке, а \
+                 не в словах сцены. Картинка та же, время не хуже. «В кадре N из M» может \
+                 вырасти: у поля нет шара-границы, и его проверяют как заслонку солнца. \
+                 Звезда и указатель остаются формами: их выдавливание внутри вырезания и \
+                 объединения",
+            )
+            .on_disabled_hover_text(
+                "В кадре нет выдавленных фигур верхнего уровня (есть в \
+                 --space-file scenes\\3d\\vector.ron)",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::SpaceExtrudeField(via_field));
+        }
     }
     let mut dither = info.dither;
     if ui
@@ -1226,6 +1253,7 @@ mod tests {
             level_render: LevelRender::Sdf,
             space_field: (true, true),
             space_ao_field: (true, true),
+            space_extrude_field: (false, true),
             field_bench: Some("Сравнение поля (среднее за 240 кадров):\nбез поля: тени 0.722"),
             field_bench_running: false,
             logic: Some((600, 0.012)),

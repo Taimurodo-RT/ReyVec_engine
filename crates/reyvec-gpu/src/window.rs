@@ -691,6 +691,21 @@ impl WindowRenderer {
         }
     }
 
+    /// Выдавливание через поле слоя в сцене «3D» (опыт 7.18б): включено ли и есть ли в
+    /// кадре фигуры, которые подменяются.
+    pub fn space_extrude_field(&self) -> (bool, bool) {
+        self.demo
+            .as_ref()
+            .map_or((false, false), Demo::space_extrude_field)
+    }
+
+    /// Включает или выключает выдавливание через поле слоя со следующего кадра.
+    pub fn set_space_extrude_field(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_extrude_field(on);
+        }
+    }
+
     /// 2.5D-вид уровня из файла (7.9): включён ли.
     pub fn level_view(&self) -> bool {
         self.demo.as_ref().is_some_and(Demo::level_view)

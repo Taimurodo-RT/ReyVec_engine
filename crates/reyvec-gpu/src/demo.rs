@@ -83,6 +83,10 @@ pub const MAX_SCENE_WORDS: usize = crate::space::MAX_WORDS;
 /// Больше пикселей края в список не входит (`MAX_EDGES` в `raymarch_edge_find.slang`);
 /// остальные рисуются одним лучом.
 pub const MAX_EDGE_PIXELS: u32 = 65535 * 16;
+/// Полоса `B` поля слоя у выдавливания через поле (опыт 7.18б), м: как у поля уровня в
+/// `docs/decisions/0020-level-field.md`. На собственной сетке профиля значения до неё не
+/// доходят; в заголовке примитива она нужна порогу «только оценка».
+const EXTRUDE_FIELD_BAND: f32 = 1.0;
 
 /// Сколько времени кадра можно тратить на постройку недостающих уровней детализации, мс.
 const DETAIL_BUDGET_MS: f64 = 1.0;
@@ -493,6 +497,17 @@ pub(crate) struct Demo {
     space_edge_counts: Vec<Option<BufferId>>,
     /// Включено ли сглаживание краёв (настройка, X).
     space_smooth: bool,
+    /// Выдавливание через поле слоя (опыт 7.18б): подменять ли в сцене «3D» выдавленные
+    /// фигуры верхнего уровня примитивом «поле слоя».
+    space_extrude_field: bool,
+    /// Поля слоя опытных фигур по контуру и шагу сетки профиля: картинка и само поле.
+    field_textures:
+        std::collections::HashMap<(String, u32), (TextureId, reyvec_sdf::shape3d::FieldRef)>,
+    /// Сбросить поля слоя при следующей подготовке кадра (сменился файл сцены).
+    field_textures_stale: bool,
+    /// Сколько фигур последнего кадра сцены «3D» нарисовано через поле слоя и сколько
+    /// выдавленных фигур верхнего уровня в кадре было.
+    field_shapes: (usize, usize),
     /// Запечённое поле расстояний (7.10б) и его проход «поле» (`field_bake.slang`).
     space_field: crate::field::SpaceField,
     space_field_bake: vk::Pipeline,
@@ -791,6 +806,10 @@ impl Demo {
             space_edge_lists: vec![None; frames_in_flight],
             space_edge_counts: vec![None; frames_in_flight],
             space_smooth: true,
+            space_extrude_field: false,
+            field_textures: std::collections::HashMap::new(),
+            field_textures_stale: false,
+            field_shapes: (0, 0),
             space_field: crate::field::SpaceField::new(
                 frames_in_flight,
                 reyvec_sdf::field3d::FIELD_SIZE,
@@ -1110,6 +1129,7 @@ impl Demo {
                 }
                 self.space = space;
                 self.space_error = None;
+                self.field_textures_stale = true;
             }
             Err(e) => {
                 tracing::warn!("Файл сцены 3D не принят: {e}");
@@ -1246,6 +1266,129 @@ impl Demo {
     /// Сглаживание краёв форм сцены «3D» (7.6о): включено ли и умеет ли видеокарта.
     pub fn space_smooth(&self) -> (bool, bool) {
         (self.space_smooth, self.space_edges != vk::Pipeline::null())
+    }
+
+    /// Выдавливание через поле слоя в сцене «3D» (опыт 7.18б): включено ли и есть ли в
+    /// кадре выдавленные фигуры верхнего уровня, которые подменяются.
+    pub fn space_extrude_field(&self) -> (bool, bool) {
+        (self.space_extrude_field, self.field_shapes.1 > 0)
+    }
+
+    /// Включает или выключает выдавливание через поле слоя со следующего кадра.
+    pub fn set_space_extrude_field(&mut self, on: bool) {
+        self.space_extrude_field = on;
+    }
+
+    /// Сколько фигур последнего кадра сцены «3D» нарисовано через поле слоя (7.18б).
+    pub fn field_shapes(&self) -> usize {
+        self.field_shapes.0
+    }
+
+    /// Опыт 7.18б: выдавленные фигуры верхнего уровня сцены «3D» (`Paint{Move{Extrude}}`,
+    /// как их отдаёт файл сцены) рисуются через примитив «поле слоя» с полем на сетке
+    /// самого профиля — картинка та же, путь другой: поле читается из картинки, а не из
+    /// слов сцены. Выдавливания внутри объединений и вырезаний не трогаются: с
+    /// бесконечным полем весь объект потерял бы шар-границу, а материал-оценка пролез бы
+    /// в выбор ближайшей части.
+    fn swap_extrudes(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        frame: &mut reyvec_sdf::SpaceFrame,
+    ) {
+        use reyvec_sdf::Shape3;
+        if self.field_textures_stale || !self.space_extrude_field {
+            for (id, _) in self.field_textures.drain().map(|(_, v)| v) {
+                res.destroy_texture(id);
+            }
+            self.field_textures_stale = false;
+        }
+        let (mut swapped, mut candidates) = (0, 0);
+        for shape in &mut frame.shapes {
+            let Shape3::Paint { shape: moved, .. } = shape else {
+                continue;
+            };
+            let Shape3::Move { shape: inner, .. } = moved.as_mut() else {
+                continue;
+            };
+            let Shape3::Extrude {
+                profile,
+                depth,
+                round,
+            } = inner.as_ref()
+            else {
+                continue;
+            };
+            candidates += 1;
+            if !self.space_extrude_field {
+                continue;
+            }
+            let (depth, round) = (*depth, *round);
+            let Some(field) = self.field_for(ctx, res, profile) else {
+                break;
+            };
+            **inner = Shape3::Field {
+                field,
+                depth,
+                round,
+            };
+            swapped += 1;
+        }
+        self.field_shapes = (swapped, candidates);
+    }
+
+    /// Поле слоя для профиля (7.18б): из кэша или новая картинка R16G16_SFLOAT на сетке
+    /// профиля. Если видеокарта картинку не дала, опыт выключается с записью в журнал.
+    fn field_for(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        profile: &reyvec_sdf::profile2d::Profile,
+    ) -> Option<reyvec_sdf::shape3d::FieldRef> {
+        use reyvec_sdf::layer_field::LayerField;
+        use reyvec_sdf::shape3d::FieldRef;
+        // Один контур с другой клеткой — другие слова: в ключе и контур, и шаг.
+        let key = (profile.path().to_owned(), profile.words()[2]);
+        if let Some((_, field)) = self.field_textures.get(&key) {
+            return Some(field.clone());
+        }
+        let mut field = LayerField::from_profile(profile, EXTRUDE_FIELD_BAND);
+        let (nx, ny) = field.size();
+        let extent = vk::Extent2D {
+            width: nx,
+            height: ny,
+        };
+        let made = res
+            .create_texture_format(
+                ctx,
+                nx,
+                ny,
+                vk::Format::R16G16_SFLOAT,
+                vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                &format!("поле слоя {nx}×{ny}"),
+            )
+            .and_then(
+                |id| match res.upload_texture_bytes(ctx, id, extent, &field.bytes()) {
+                    Ok(()) => Ok(id),
+                    Err(e) => {
+                        res.destroy_texture(id);
+                        Err(e)
+                    }
+                },
+            );
+        match made {
+            Ok(id) => {
+                field.set_texture(id.0);
+                let field = FieldRef(std::sync::Arc::new(field));
+                self.field_textures.insert(key, (id, field.clone()));
+                Some(field)
+            }
+            Err(e) => {
+                tracing::warn!("поле слоя не создано, выдавливание через поле выключено: {e}");
+                self.space_extrude_field = false;
+                None
+            }
+        }
     }
 
     /// Включает или выключает сглаживание краёв форм сцены «3D».
@@ -2437,6 +2580,11 @@ impl Demo {
             } else {
                 (self.space.frame(time), None)
             };
+            if level {
+                self.field_shapes = (0, 0);
+            } else {
+                self.swap_extrudes(ctx, res, &mut frame);
+            }
             let built = std::time::Instant::now();
             // Поле расстояний — только у сцены «3D»: у уровня почти всё движется вместе
             // с камерой и героем, пересчёт стоил бы дороже, чем экономит (7.12).
@@ -2720,7 +2868,7 @@ impl Demo {
                     // поля и задания кадра живы, пока кадр выполняется.
                     unsafe {
                         crate::field::SpaceField::record(
-                            p.device, p.cmd, layout, bake, &field, &copies,
+                            p.device, p.cmd, bindless, layout, bake, &field, &copies,
                         );
                     }
                 });

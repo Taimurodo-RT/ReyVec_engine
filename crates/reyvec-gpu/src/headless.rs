@@ -123,6 +123,8 @@ pub struct HeadlessImage {
     /// Счётчики сцены «3D» или 2.5D-вида этого кадра (7.18б): объекты и слова сцены,
     /// время процессора, пиксели края (прочитаны после кадра). `None` — кадр плоский.
     pub space_stats: Option<crate::SpaceStats>,
+    /// Сколько фигур сцены «3D» нарисовано через поле слоя (опыт 7.18б).
+    pub field_shapes: usize,
 }
 
 /// Запечённое поле расстояний, прочитанное с видеокарты: где стоят слои и числа.
@@ -140,17 +142,7 @@ impl FieldSnapshot {
     }
 }
 
-/// half float (IEEE 754, 16 бит) в f32.
-fn half_to_f32(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = i32::from((h >> 10) & 0x1f);
-    let frac = f32::from(h & 0x3ff);
-    sign * match exp {
-        0 => frac * 2f32.powi(-24),
-        31 => f32::INFINITY,
-        _ => (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
-    }
-}
+use reyvec_sdf::layer_field::half_to_f32;
 
 impl HeadlessImage {
     /// Пиксель под точкой сцены `p` (с учётом камеры), если он в кадре.
@@ -272,6 +264,7 @@ pub fn render_headless_play(
         particles: frame.particles,
         field: frame.field,
         space_stats: frame.space_stats,
+        field_shapes: frame.field_shapes,
     })
 }
 
@@ -283,6 +276,7 @@ struct Rendered {
     particles: crate::ParticleStats,
     field: Option<FieldSnapshot>,
     space_stats: Option<crate::SpaceStats>,
+    field_shapes: usize,
 }
 
 /// Читает буфер запечённого поля после законченного кадра.
@@ -446,6 +440,9 @@ fn render(
             demo.set_space_field(!tests::FIELD_OFF.get());
             #[cfg(test)]
             demo.set_space_ao_field(tests::AO_FROM_FIELD.get());
+            // Опыт 7.18б: выдавленные фигуры через поле слоя.
+            #[cfg(test)]
+            demo.set_space_extrude_field(tests::EXTRUDE_FIELD.get());
             // Эталоны — в полном разрешении 3D на любой видеокарте; тесты 7.14 уменьшают.
             demo.set_space_scale(crate::SpaceScale::Full);
             #[cfg(test)]
@@ -594,6 +591,7 @@ fn render(
             }),
             _ => None,
         };
+        let field_shapes = r.demo.as_ref().map_or(0, Demo::field_shapes);
         Ok(Rendered {
             rgba: pixels,
             timings,
@@ -602,6 +600,7 @@ fn render(
             particles,
             field,
             space_stats,
+            field_shapes,
         })
     }
 }
@@ -686,6 +685,117 @@ mod tests {
         /// Как рисуется 2.5D-вид (7.9б).
         pub(super) static LEVEL_RENDER: std::cell::Cell<crate::LevelRender> =
             const { std::cell::Cell::new(crate::LevelRender::Sdf) };
+        /// Выдавленные фигуры сцены «3D» через поле слоя (опыт 7.18б).
+        pub(super) static EXTRUDE_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Сцена «3D» для опыта 7.18б: пол, две лампы и две выдавленные фигуры верхнего
+    /// уровня, как сердце и облако в scenes/3d/vector.ron (со скруглением рёбер и без).
+    fn extruded_scene() -> HeadlessScene {
+        const SPACE: &str = r#"(
+    format: "reyvec-space",
+    version: 1,
+    camera: Some((eye: (0.4, 2.3, 6.0), look_at: (0.0, 0.8, 0.0))),
+    materials: [
+        (name: "пол", color: (0.18, 0.19, 0.21), grid: true),
+        (name: "красный", color: (0.85, 0.15, 0.20)),
+        (name: "облако", color: (0.85, 0.88, 0.95)),
+    ],
+    lamps: [
+        (at: (-1.0, 2.4, 2.0), color: (1.0, 0.65, 0.35), power: 7.0, range: 7.0, bulb: 0.08),
+        (at: (2.4, 2.2, 0.5), color: (0.40, 0.65, 1.0), power: 5.0, range: 6.0, bulb: 0.08),
+    ],
+    objects: [
+        (name: "пол", material: "пол", shape: Plane(normal: (0.0, 1.0, 0.0), offset: 0.0)),
+        (name: "сердце", material: "красный", at: (-0.6, 1.2, 0.8), turn: (0.0, -15.0, 0.0),
+            shape: Extrude(
+                profile: "M 0 -0.6 C -0.2 -0.4 -0.7 -0.1 -0.7 0.25 C -0.7 0.55 -0.45 0.7 -0.25 0.7 C -0.1 0.7 0 0.6 0 0.5 C 0 0.6 0.1 0.7 0.25 0.7 C 0.45 0.7 0.7 0.55 0.7 0.25 C 0.7 -0.1 0.2 -0.4 0 -0.6 Z",
+                depth: 0.35, round: 0.1)),
+        (name: "облако", material: "облако", at: (0.0, 2.4, -3.0),
+            shape: Extrude(
+                profile: "M -1.0 0 A 0.35 0.35 0 0 0 -0.5 0.3 A 0.45 0.45 0 0 0 0.3 0.45 A 0.4 0.4 0 0 0 0.9 0.2 A 0.25 0.25 0 0 0 1.0 0 Z",
+                depth: 0.03)),
+    ],
+)"#;
+        HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::Off,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(SPACE.into()),
+                ..Default::default()
+            },
+            cascades: false,
+        }
+    }
+
+    /// Выдавленная фигура через поле слоя (7.18б) и через слова программы — одна
+    /// картинка: условие 0020 — изменившихся точек не больше 0,5 %, худшая не больше
+    /// 16/255. Поле 7.10 при этом выключено: сравнивается сам примитив. Третий кадр — с
+    /// полем 7.10, которое печёт кубики и по примитиву «поле слоя» (field_bake.slang
+    /// читает картинку): картинка с полем отличается от кадра без поля так же мало, как у
+    /// обычных форм.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn extrude_through_a_layer_field_draws_the_same_picture() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        FIELD_OFF.set(true);
+        let plain = render_headless(&options, &extruded_scene());
+        EXTRUDE_FIELD.set(true);
+        let field = render_headless(&options, &extruded_scene());
+        FIELD_OFF.set(false);
+        let baked = render_headless(&options, &extruded_scene());
+        EXTRUDE_FIELD.set(false);
+        let plain = plain.expect("кадр выдавливанием");
+        let field = field.expect("кадр через поле слоя");
+        let baked = baked.expect("кадр через поле слоя с полем 7.10");
+        assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+        assert_eq!(plain.field_shapes, 0);
+        assert_eq!(field.field_shapes, 2, "сердце и облако через поле слоя");
+        assert_eq!(baked.field_shapes, 2);
+        assert!(baked.field.is_some(), "поле 7.10 считалось");
+        let total = plain.image.rgba.len() / 4;
+        let (changed, worst, mean) = image_diff(&plain.image, &field.image);
+        eprintln!(
+            "поле слоя против выдавливания: {changed} пикселей, наибольшая {worst}, средняя {mean:.3}"
+        );
+        if let Ok(dir) = std::env::var("PPM_DIR") {
+            for (kind, f) in [
+                ("extrude", &plain),
+                ("layer-field", &field),
+                ("baked", &baked),
+            ] {
+                let mut out = format!("P6 {} {} 255\n", f.image.width, f.image.height).into_bytes();
+                for px in f.image.rgba.chunks(4) {
+                    out.extend_from_slice(&px[..3]);
+                }
+                std::fs::write(format!("{dir}/extrude-{kind}.ppm"), out).expect("ppm");
+            }
+        }
+        assert!(
+            changed * 200 <= total,
+            "отличаются {changed} пикселей из {total}"
+        );
+        assert!(worst <= 16, "наибольшая разница канала {worst}");
+        let (changed, worst, mean) = image_diff(&field.image, &baked.image);
+        eprintln!(
+            "поле слоя с полем 7.10 и без: {changed} пикселей, наибольшая {worst}, средняя {mean:.3}"
+        );
+        assert!(
+            changed * 200 < total,
+            "с полем 7.10 отличаются {changed} пикселей из {total}"
+        );
+        assert!(worst < 48, "с полем 7.10 наибольшая разница канала {worst}");
     }
 
     /// Вид на полую коробку сбоку (как эталон space-hollow-side-2s).

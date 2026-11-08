@@ -14,6 +14,7 @@
 pub mod camera3d;
 pub mod field3d;
 pub mod grid3d;
+pub mod layer_field;
 pub mod mesh3d;
 pub mod profile2d;
 pub mod shape3d;
