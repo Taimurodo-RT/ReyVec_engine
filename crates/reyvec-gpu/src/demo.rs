@@ -1729,6 +1729,10 @@ impl Demo {
             .release_unused(&mut self.vector_demo.library);
         let mut world = world;
         let fresh = std::mem::take(&mut self.fresh_scene);
+        if fresh {
+            // Другой уровень: поле прежнего не правится по кускам, а печётся заново.
+            self.level.clear();
+        }
         if !fresh && let Some(body) = self.file_world.as_mut().and_then(|w| w.player_body()) {
             world.set_player_body(body);
         }

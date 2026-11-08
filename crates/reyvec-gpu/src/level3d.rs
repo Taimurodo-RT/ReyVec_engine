@@ -170,6 +170,9 @@ pub(crate) const FIELD_MAX_SIDE: u32 = 8192;
 /// простоит столько кадров: иначе то, что меняется каждый кадр, перепекалось бы каждый
 /// кадр. До того она рисуется формой.
 const FIELD_STABLE_FRAMES: u32 = 30;
+
+/// Сколько отказанных наборов помнит поле уровня.
+const FIELD_FAILED_KEEP: usize = 8;
 /// Возвраты в поле — не больше стольких точек сетки за кадр (0020, 7.18г): кусок вокруг
 /// фигуры в 1 м при полосе 1 м — около 90 000 точек, доли миллисекунды на процессоре.
 const FIELD_ADD_POINTS: usize = 50_000;
@@ -237,12 +240,16 @@ struct FieldState {
     next_ticket: u64,
     /// Неподвижное, которого нет в поле: сколько кадров подряд оно стоит на месте.
     fresh: HashMap<u64, u32>,
-    /// Сколько раз неподвижная плита выходила из поля, оказавшись над подвижным: каждый
-    /// раз ждать возврата вдвое дольше (подвижное, качающееся у края большой плиты, не
-    /// должно перепекать её по кругу).
+    /// Сколько раз неподвижная плита выходила из поля, оказавшись над подвижным или над
+    /// формой (нижняя плита изменилась): каждый раз ждать возврата вдвое дольше
+    /// (подвижное, качающееся у края большой плиты, или мигающая без пометки нижняя плита
+    /// не должны перепекать её по кругу).
     bounces: HashMap<u64, u32>,
     /// Набор неподвижного (подпись), для которого поля не будет, и почему.
-    failed: Option<(u64, &'static str)>,
+    /// Последние наборы (до [`FIELD_FAILED_KEEP`]), для которых поля не будет: набор,
+    /// который то появляется, то пропадает (подвижное заезжает под плиту), не просится
+    /// снова при каждом возврате.
+    failed: Vec<(u64, &'static str)>,
     /// Куски, перепечённые в кадре и ещё не отданные видеокарте.
     patches: Vec<FieldPatch>,
     /// Сторона картинки поля не больше (0 — [`FIELD_MAX_SIDE`]).
@@ -295,6 +302,15 @@ struct StillShape {
     rect: Rect2,
     /// Прямоугольник плиты в мире для правила слоёв (как у [`overlaps`]); у брусков пуст.
     layer: kurbo::Rect,
+}
+
+/// Запоминает отказанный набор (последние [`FIELD_FAILED_KEEP`]).
+fn remember_failed(list: &mut Vec<(u64, &'static str)>, set: u64, reason: &'static str) {
+    list.retain(|(s, _)| *s != set);
+    list.push((set, reason));
+    if list.len() > FIELD_FAILED_KEEP {
+        list.remove(0);
+    }
 }
 
 /// Перекрытия плит поля, поменявшихся местами в порядке рисования: `now` и `was` — одни и
@@ -642,6 +658,7 @@ impl Level3d {
     pub fn drop_field(&mut self) {
         self.field.baked = None;
         self.field.patches.clear();
+        self.field.failed.clear();
     }
 
     /// Запечённое поле по запросу `ticket` (картинки уже на видеокарте). `false` — запрос
@@ -679,6 +696,7 @@ impl Level3d {
         });
         // Куски старого поля видеокарте больше не нужны: картинки у нового свои.
         self.field.patches.retain(|patch| patch.ticket == ticket);
+        self.field.failed.clear();
         true
     }
 
@@ -689,7 +707,7 @@ impl Level3d {
             && let Some(reason) = reason
         {
             tracing::warn!("Поле уровня не готово: {reason}");
-            self.field.failed = Some((p.signature, reason));
+            remember_failed(&mut self.field.failed, p.signature, reason);
         }
     }
 
@@ -727,7 +745,7 @@ impl Level3d {
         // Неподвижные плиты, не накрывающие подвижное (с накрытыми новыми неподвижными
         // формами): их кадры покоя идут, и их берёт полное запекание.
         let mut full_plates: Vec<StillShape> = Vec::new();
-        // Неподвижные плиты над подвижным (для счёта выходов из поля).
+        // Неподвижные плиты над подвижным или над формой (для счёта выходов из поля).
         let mut held: Vec<u64> = Vec::new();
         let s = LEVEL_SCALE;
 
@@ -882,8 +900,10 @@ impl Level3d {
                             if over || form {
                                 front_rects.push(in_world.abs());
                             }
-                            let placed = if over_moving {
+                            if over_moving || over {
                                 held.push(key);
+                            }
+                            let placed = if over_moving {
                                 None
                             } else {
                                 plate_placed(&flat, instance.transform, material)
@@ -1067,7 +1087,7 @@ impl Level3d {
         // поверх непростоявшей, после запекания окажется над её формой и тут же уйдёт из
         // поля — её тоже не берём (цепочка — по тому же правилу слоёв, что в кадре).
         let (full, solids_full): (Vec<StillShape>, Vec<StillShape>) =
-            if f.baked.is_none() && f.failed.is_none() {
+            if f.baked.is_none() && f.failed.is_empty() {
                 (full, solids.clone())
             } else {
                 let empty = HashMap::new();
@@ -1103,14 +1123,17 @@ impl Level3d {
         let Some(b) = f.baked.as_mut() else {
             // Поля для этого набора не будет; после отказа набор — только простоявшее, и
             // пока его нет, просить нечего.
-            if let Some((failed, reason)) = f.failed
-                && (failed == set.0 || full.is_empty() && solids_full.is_empty())
-            {
-                f.status = LevelFieldStatus::Failed(reason);
-                return None;
-            }
             if let Some(p) = &f.pending {
                 f.status = LevelFieldStatus::Baking { reason: p.reason };
+                return None;
+            }
+            let refused = f.failed.iter().find(|(failed, _)| *failed == set.0);
+            let last = f
+                .failed
+                .last()
+                .filter(|_| full.is_empty() && solids_full.is_empty());
+            if let Some(&(_, reason)) = refused.or(last) {
+                f.status = LevelFieldStatus::Failed(reason);
                 return None;
             }
             let reason = "новый уровень";
@@ -1153,7 +1176,8 @@ impl Level3d {
             .filter(|(k, _)| !now_solids.contains(k))
             .map(|(k, _)| k)
             .collect();
-        // Ушла, оказавшись над подвижным, — выход засчитан (возврат ждёт дольше).
+        // Ушла, оказавшись над подвижным или над формой (нижняя изменилась), — выход
+        // засчитан: следующий возврат ждёт дольше.
         for k in &gone_plates {
             if held.contains(k) {
                 *f.bounces.entry(*k).or_default() += 1;
@@ -1339,7 +1363,7 @@ impl Level3d {
                 .filter(|k| b.plates.contains_key(k))
                 .collect();
         }
-        let gave_up = f.failed.is_some_and(|(failed, _)| failed == set.0);
+        let gave_up = f.failed.iter().any(|(failed, _)| *failed == set.0);
         if outside && f.pending.is_none() && !gave_up {
             let reason = "новое за краем поля";
             Self::request_full(f, materials, &full, &solids_full, solid, set.0, reason);
@@ -1411,9 +1435,14 @@ impl Level3d {
         } else {
             f.max_side.min(FIELD_MAX_SIDE)
         };
-        let failed = if bake.extent().is_none() {
-            Some("неподвижного нет")
-        } else if !bake.fit(&FIELD_CELLS, max_side) {
+        if bake.extent().is_none() {
+            // Пустой набор не запоминается: следующий кадр с неподвижным просит сразу.
+            if f.baked.is_none() {
+                f.status = LevelFieldStatus::Failed("неподвижного нет");
+            }
+            return;
+        }
+        let failed = if !bake.fit(&FIELD_CELLS, max_side) {
             Some("уровень слишком большой для картинки поля")
         } else {
             None
@@ -1421,7 +1450,7 @@ impl Level3d {
         if let Some(reason) = failed {
             // Для этого набора поля не будет: кадр не просит его снова. Готовое поле (если
             // есть) продолжает работать, новое за краем остаётся формой.
-            f.failed = Some((set, reason));
+            remember_failed(&mut f.failed, set, reason);
             if f.baked.is_none() {
                 f.status = LevelFieldStatus::Failed(reason);
             }
@@ -2856,6 +2885,102 @@ mod tests {
         }
         level.take_field_patches();
         assert!(level.take_field_request().is_none());
+    }
+
+    /// Нижняя плита без пометки «подвижное» мигает (меняет цвет) раз в несколько секунд:
+    /// верхняя каждый раз уходит из поля, а возвращается всё позже.
+    #[test]
+    fn plate_over_blinking_one_waits_longer_each_time() {
+        let mut library = ShapeLibrary::new(0.01);
+        let scene_with = stack_scene(&mut library);
+        let tint = |t: f32| Color::linear(t, 1.0, 1.0, 1.0);
+        let mut level = Level3d::default();
+        drop(level.frame(&scene_with(tint(1.0), false), &library, LevelRender::Field));
+        bake_level_field(&mut level);
+        let all_in = |level: &Level3d| {
+            matches!(
+                level.field_status(),
+                LevelFieldStatus::Ready { plates: 3, .. }
+            )
+        };
+        drop(level.frame(&scene_with(tint(1.0), false), &library, LevelRender::Field));
+        assert!(all_in(&level));
+        let mut waits = Vec::new();
+        for blink in 0..3 {
+            let scene = scene_with(tint(0.5 + 0.1 * blink as f32), false);
+            let mut frames = 0;
+            loop {
+                drop(level.frame(&scene, &library, LevelRender::Field));
+                frames += 1;
+                if all_in(&level) {
+                    break;
+                }
+                assert!(frames <= 8 * FIELD_STABLE_FRAMES);
+            }
+            waits.push(frames);
+        }
+        // Камень входит через FIELD_STABLE_FRAMES кадров, трава — сразу за ним (кадры покоя
+        // у неё считаются со второго кадра), потом трава ждёт вдвое дольше.
+        assert_eq!(
+            waits,
+            [
+                FIELD_STABLE_FRAMES + 1,
+                2 * FIELD_STABLE_FRAMES + 1,
+                4 * FIELD_STABLE_FRAMES + 1
+            ]
+        );
+        assert!(level.take_field_request().is_none());
+    }
+
+    /// Видеокарта отказывает в картинке поля, а подвижная плита то заезжает под
+    /// неподвижную, то уезжает: два набора чередуются, но каждый просится один раз.
+    #[test]
+    fn failed_field_with_alternating_set_is_not_baked_again() {
+        let mut library = ShapeLibrary::new(0.01);
+        let square = kurbo::Shape::to_path(&kurbo::Rect::new(-0.5, -0.5, 0.5, 0.5), 0.1);
+        let ids: Vec<ShapeId> = (0..3)
+            .map(|i| {
+                library
+                    .add(reyvec_vector::Shape::fill(
+                        square.clone(),
+                        Paint::Solid(Color::linear(0.3 + 0.2 * i as f32, 0.5, 0.5, 1.0)),
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        let scene_with = |m: f64| reyvec_scene::Scene {
+            generation: 1,
+            items: vec![
+                SceneItem::BeginDynamic,
+                SceneItem::Shape(reyvec_vector::Instance::new(
+                    ids[0],
+                    Affine::translate((m, 0.0)),
+                )),
+                SceneItem::EndDynamic,
+                SceneItem::Shape(reyvec_vector::Instance::new(ids[1], Affine::IDENTITY)),
+                SceneItem::Shape(reyvec_vector::Instance::new(
+                    ids[2],
+                    Affine::translate((3.0, 0.0)),
+                )),
+            ],
+            ..reyvec_scene::Scene::default()
+        };
+        let (far, under) = (scene_with(-10.0), scene_with(0.0));
+        let mut level = Level3d::default();
+        let mut requests = 0;
+        for cycle in 0..4 {
+            for (scene, frames) in [(&under, 5), (&far, 2 * FIELD_STABLE_FRAMES)] {
+                for _ in 0..frames {
+                    drop(level.frame(scene, &library, LevelRender::Field));
+                    if let Some((ticket, _)) = level.take_field_request() {
+                        requests += 1;
+                        level.field_failed(ticket, Some("видеокарта не дала картинку поля"));
+                    }
+                }
+            }
+            assert!(requests <= 3, "цикл {cycle}: запросов {requests}");
+        }
+        assert!(matches!(level.field_status(), LevelFieldStatus::Failed(_)));
     }
 
     /// Видеокарта не дала картинку поля: для этого набора поле больше не просится (и
