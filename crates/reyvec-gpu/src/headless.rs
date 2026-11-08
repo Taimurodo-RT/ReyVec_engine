@@ -463,6 +463,23 @@ fn render(
                 demo.set_level_render(render);
             }
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
+            // Перепекание поля на месте (7.18г): кадр до правки (поле печётся целиком),
+            // потом правка снимка — и снимаемый кадр перепекает поле кусками.
+            #[cfg(test)]
+            {
+                if tests::LEVEL_WARM.get() {
+                    let _ = demo.prepare(
+                        ctx,
+                        gpu,
+                        0,
+                        extent,
+                        scene.time,
+                        scene.shader_error,
+                        scene.scene,
+                    );
+                }
+                demo.set_level_edit(tests::LEVEL_EDIT.get());
+            }
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -624,6 +641,7 @@ fn render(
 pub(crate) mod tests {
     use super::*;
     use crate::validation_error_count;
+    use reyvec_vector::SceneItem;
 
     /// Поле, посчитанное видеокартой (7.10б), совпадает с моделью на процессоре
     /// (`reyvec_sdf::field3d`) в случайных точках всех слоёв.
@@ -704,6 +722,11 @@ pub(crate) mod tests {
         pub(super) static EXTRUDE_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// …и поле без прямоугольника фигуры, бесконечное, как у поля уровня 7.18в.
         pub(crate) static FIELD_NO_RECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Правка снимка мира в 2.5D-виде (7.18г)…
+        pub(super) static LEVEL_EDIT: std::cell::Cell<Option<fn(&mut reyvec_scene::Scene)>> =
+            const { std::cell::Cell::new(None) };
+        /// …и кадр до неё, чтобы поле испеклось без правки и перепеклось кусками.
+        pub(super) static LEVEL_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Сцена «3D» для опыта 7.18б: пол, две лампы и две выдавленные фигуры верхнего
@@ -972,6 +995,112 @@ pub(crate) mod tests {
             assert!(mean < 3.0, "{}: средняя разница {mean:.2}", scale.title());
             assert!(share < 0.25, "{}: отличается {share:.3}", scale.title());
         }
+    }
+
+    /// Убирает из снимка неподвижную фигуру у стола в комнате (ближайшую к точке
+    /// (−0,45; −0,45)): как будто её убрали из файла сцены.
+    fn remove_still_near_table(scene: &mut reyvec_scene::Scene) {
+        let mut dynamic = 0u32;
+        let mut best: Option<(usize, f64)> = None;
+        for (i, item) in scene.items.iter().enumerate() {
+            match item {
+                SceneItem::BeginDynamic => dynamic += 1,
+                SceneItem::EndDynamic => dynamic = dynamic.saturating_sub(1),
+                SceneItem::Shape(instance) if dynamic == 0 => {
+                    let t = instance.transform.translation();
+                    let d = (t.x + 0.45).hypot(t.y + 0.45);
+                    if best.is_none_or(|(_, b)| d < b) {
+                        best = Some((i, d));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some((i, _)) = best {
+            scene.items.remove(i);
+        }
+    }
+
+    /// Перепекание поля на месте (7.18г) на видеокарте: поле испеклось по кадру до
+    /// правки, потом из уровня убрали неподвижную фигуру — кадр перепекает кусок вокруг
+    /// неё и грузит его в картинки поля до лучей. Картинка — та же, что у SDF и у поля,
+    /// испечённого целиком уже без неё; без ошибок проверки Vulkan.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_field_patch_matches_full_bake() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        let play = HeadlessPlay {
+            start: Some([-0.6, -0.5]),
+            ..Default::default()
+        };
+        let errors = validation_error_count();
+        LEVEL_VIEW.set(true);
+        LEVEL_EDIT.set(Some(remove_still_near_table));
+        let sdf = render_headless_play(&options, &scene, Some(&play));
+        LEVEL_RENDER.set(crate::LevelRender::Field);
+        let whole = render_headless_play(&options, &scene, Some(&play));
+        LEVEL_WARM.set(true);
+        let patched = render_headless_play(&options, &scene, Some(&play));
+        LEVEL_WARM.set(false);
+        LEVEL_EDIT.set(None);
+        let unedited = render_headless_play(&options, &scene, Some(&play));
+        LEVEL_RENDER.set(crate::LevelRender::Sdf);
+        LEVEL_VIEW.set(false);
+        // Убранная фигура видна в кадре: иначе одинаковые картинки ничего не доказывают
+        // (без загрузки куска она осталась бы в картинке поля).
+        let unedited = unedited.expect("кадр без правки");
+        let (changed, _, _) = image_diff(&unedited.image, &patched.as_ref().expect("кадр").image);
+        assert!(
+            changed > 200,
+            "убранная фигура не видна: {changed} пикселей"
+        );
+        let (sdf, whole, patched) = (
+            sdf.expect("кадр SDF"),
+            whole.expect("кадр с полем целиком"),
+            patched.expect("кадр с перепечённым полем"),
+        );
+        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+        eprintln!("поле по кускам: {:?}", patched.level_field);
+        let crate::LevelFieldStatus::Ready {
+            patched: Some(p), ..
+        } = patched.level_field
+        else {
+            panic!("поле не перепеклось на месте: {:?}", patched.level_field);
+        };
+        assert!(p.pieces >= 1 && p.points > 0, "{p:?}");
+        let pixels = (sdf.image.width * sdf.image.height) as usize;
+        let (changed, worst, mean) = image_diff(&whole.image, &patched.image);
+        eprintln!(
+            "по кускам против целиком: {changed} пикселей, наибольшая {worst}, средняя {mean:.3}"
+        );
+        assert!(
+            changed * 1000 <= pixels,
+            "по кускам и целиком — одна картинка"
+        );
+        let (changed, worst, mean) = image_diff(&sdf.image, &patched.image);
+        eprintln!(
+            "по кускам против SDF: {changed} пикселей, наибольшая {worst}, средняя {mean:.2}"
+        );
+        assert!(
+            changed * 1000 <= pixels * 25 && mean < 1.0,
+            "по кускам — та же картинка, что у SDF"
+        );
     }
 
     /// 2.5D-вид уровня (7.9): встроенный уровень из файла рисуется объёмом — кадр не

@@ -1065,13 +1065,27 @@ fn level_field_text(status: LevelFieldStatus) -> Option<String> {
             shapes,
             bake_ms,
             megabytes,
-        } => format!(
-            "Поле уровня: {}×{} по {:.0} см ({megabytes:.0} МБ), в нём плит {plates} и \
-             брусков {solids}, формами {shapes}; пеклось {bake_ms:.0} мс",
-            size.0,
-            size.1,
-            cell * 100.0
-        ),
+            patched,
+            rebaking,
+        } => {
+            let mut text = format!(
+                "Поле уровня: {}×{} по {:.0} см ({megabytes:.0} МБ), в нём плит {plates} и \
+                 брусков {solids}, формами {shapes}; пеклось {bake_ms:.0} мс",
+                size.0,
+                size.1,
+                cell * 100.0
+            );
+            if let Some(p) = patched {
+                text += &format!(
+                    "; перепечено на месте: кусков {}, точек {}, {:.2} мс",
+                    p.pieces, p.points, p.ms
+                );
+            }
+            if rebaking {
+                text += "; печётся целиком заново в фоне";
+            }
+            text
+        }
         LevelFieldStatus::Failed(reason) => format!("Поле уровня: нет ({reason}), кадр как у SDF"),
     })
 }

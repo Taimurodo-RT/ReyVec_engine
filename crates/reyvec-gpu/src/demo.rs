@@ -467,6 +467,13 @@ pub(crate) struct FrameData {
     space_camera: reyvec_sdf::Camera3D,
 }
 
+/// Загрузка кусков поля уровня в кадре (7.18г): буфер-источник и области копий по
+/// картинкам (значения, номера материалов).
+struct LevelPatch {
+    src: vk::Buffer,
+    images: Vec<(vk::Image, Vec<vk::BufferImageCopy>)>,
+}
+
 pub(crate) struct Demo {
     triangle: vk::Pipeline,
     /// Сцена «свет»: SDF-фигуры одним треугольником на весь экран (`sdf_demo.slang`).
@@ -528,6 +535,12 @@ pub(crate) struct Demo {
     /// Картинки полей уровня (7.18в) по номеру запроса: значения и номера материалов.
     /// Остаются только у готового поля, остальные удаляются (отложенно).
     level_field_textures: Vec<(u64, [TextureId; 2])>,
+    /// Куски поля уровня, перепечённые в этом кадре (7.18г): буфер-источник (удаляется,
+    /// когда видеокарта закончит кадр) и области копий в обе картинки поля.
+    level_patch: Option<LevelPatch>,
+    /// Правка снимка мира перед 2.5D-видом (тесты перепекания поля 7.18г).
+    #[cfg(test)]
+    level_edit: Option<fn(&mut reyvec_scene::Scene)>,
     space_shade_small: vk::Pipeline,
     space_upscale: vk::Pipeline,
     /// Камера сцены «3D».
@@ -832,6 +845,9 @@ impl Demo {
                 level
             },
             level_field_textures: Vec::new(),
+            level_patch: None,
+            #[cfg(test)]
+            level_edit: None,
             space_shade_small: vk::Pipeline::null(),
             space_upscale: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
@@ -1546,6 +1562,9 @@ impl Demo {
         if let Some((ticket, bake)) = self.level.take_field_request()
             && let Err(bake) = self.loading.submit_level_field(ticket, bake)
         {
+            // Первый кадр больше не нужен; поле в нём держало бы готовое поле, и следующий
+            // кадр не смог бы перепечь его на месте.
+            drop(made);
             let _zone = crate::cpu_zone!("поле уровня в кадре");
             let started = std::time::Instant::now();
             let result = bake.run().map(Box::new);
@@ -1569,7 +1588,94 @@ impl Demo {
             }
             kept
         });
+        // Куски, перепечённые на месте (7.18г), — в картинки готового поля до проходов 3D.
+        let patches = self.level.take_field_patches();
+        if !patches.is_empty() && !self.patch_level_field(ctx, res, &patches) {
+            // Картинка разошлась бы с полем: кадр без поля, оно печётся заново.
+            tracing::warn!("куски поля уровня не загружены, поле печётся заново");
+            self.level.drop_field();
+            made = self.level.frame(
+                &self.file_scene,
+                &self.vector_demo.library,
+                self.level_render,
+            );
+        }
         (made, inline)
+    }
+
+    /// Готовит загрузку кусков поля уровня `patches` в его картинки: буфер-источник и
+    /// области копий (сама копия — проход «правка поля уровня»). `false` — не вышло.
+    fn patch_level_field(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        patches: &[crate::level3d::FieldPatch],
+    ) -> bool {
+        let Some(ticket) = self.level.baked_ticket() else {
+            return true;
+        };
+        let areas: Vec<[u32; 4]> = patches
+            .iter()
+            .filter(|p| p.ticket == ticket)
+            .map(|p| p.area)
+            .collect();
+        if areas.is_empty() {
+            return true;
+        }
+        let (Some(field), Some((_, [a, m]))) = (
+            self.level.baked_field(),
+            self.level_field_textures.iter().find(|(t, _)| *t == ticket),
+        ) else {
+            return false;
+        };
+        let (Some(field_image), Some(material_image)) =
+            (res.texture_image(*a), res.texture_image(*m))
+        else {
+            return false;
+        };
+        let (field_regions, end) = crate::resources::patch_regions(&areas, 4, 0);
+        let (material_regions, size) = crate::resources::patch_regions(&areas, 2, end);
+        let mut bytes = vec![0u8; size as usize];
+        for ((area, f), mr) in areas.iter().zip(&field_regions).zip(&material_regions) {
+            let (texels, materials) = field.area_bytes(*area);
+            let at = f.buffer_offset as usize;
+            bytes[at..at + texels.len()].copy_from_slice(&texels);
+            let at = mr.buffer_offset as usize;
+            bytes[at..at + materials.len()].copy_from_slice(&materials);
+        }
+        let staging = match res.create_buffer(
+            ctx,
+            size.max(16),
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            BufferMemory::CpuToGpu,
+            "куски поля уровня",
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!("буфер кусков поля уровня не создан: {e}");
+                return false;
+            }
+        };
+        res.write_buffer(staging, 0, &bytes);
+        let Some(src) = res.buffer_raw(staging) else {
+            return false;
+        };
+        // Удаляется, когда видеокарта закончит этот кадр.
+        res.destroy_buffer(staging);
+        self.level_patch = Some(LevelPatch {
+            src,
+            images: vec![
+                (field_image, field_regions),
+                (material_image, material_regions),
+            ],
+        });
+        true
+    }
+
+    /// Правка снимка мира перед каждым кадром 2.5D-вида (тесты перепекания поля).
+    #[cfg(test)]
+    pub(crate) fn set_level_edit(&mut self, edit: Option<fn(&mut reyvec_scene::Scene)>) {
+        self.level_edit = edit;
     }
 
     /// Включает или выключает 2.5D-вид уровня со следующего кадра. Игра не меняется.
@@ -2567,6 +2673,8 @@ impl Demo {
         scene: DemoScene,
     ) -> FrameData {
         let aspect = extent.width as f32 / extent.height.max(1) as f32;
+        // Буфер кусков прошлого кадра уже отдан на удаление.
+        self.level_patch = None;
         if self.loading.is_background() {
             let _zone = crate::cpu_zone!("готовое из загрузки");
             self.poll_loading();
@@ -2715,6 +2823,10 @@ impl Demo {
                 let _zone = crate::cpu_zone!("уровень в объёме");
                 let center = [self.camera.center.x, self.camera.center.y];
                 space_camera = crate::level3d::camera(center, self.camera.zoom, self.level_orbit);
+                #[cfg(test)]
+                if let Some(edit) = self.level_edit {
+                    edit(&mut self.file_scene);
+                }
                 let (made, inline) = self.level_frame(ctx, res);
                 baked_inline = inline;
                 let mut frame = made.frame;
@@ -3004,6 +3116,21 @@ impl Demo {
         let gbuffer = (frame.scene == DemoScene::Space).then(|| {
             let camera = frame.space_camera;
             let ext = frame.space_extent;
+            // Куски поля уровня, перепечённые в этом кадре (7.18г), — до всех лучей кадра.
+            if let Some(patch) = &self.level_patch {
+                graph.add_pass("правка поля уровня", &[], move |p| {
+                    // SAFETY: проход вне рисования; картинки поля живы, пока поле готово
+                    // (удаляются отложенно), буфер-источник — до конца кадра.
+                    unsafe {
+                        crate::resources::record_texture_patches(
+                            p.device,
+                            p.cmd,
+                            patch.src,
+                            &patch.images,
+                        );
+                    }
+                });
+            }
             // Запечённое поле расстояний (7.10б): кубики у сдвинутых предметов и вошедшие
             // в слои при полёте камеры — до всех лучей кадра.
             if let Some(field) = frame.space_field {

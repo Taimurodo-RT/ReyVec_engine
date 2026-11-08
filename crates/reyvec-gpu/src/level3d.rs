@@ -166,9 +166,17 @@ const FIELD_BAND: f32 = 1.0;
 const FIELD_CELLS: [f32; 2] = [0.01, 0.02];
 /// Сторона картинки поля не больше (0020), даже если видеокарта может больше.
 pub(crate) const FIELD_MAX_SIDE: u32 = 8192;
-/// Изменившееся неподвижное (без метки «движется») перепекается, когда простоит столько
-/// кадров: иначе то, что меняется каждый кадр, запускало бы запекание каждый кадр.
+/// Новая или изменившаяся неподвижная фигура (без метки «движется») входит в поле, когда
+/// простоит столько кадров: иначе то, что меняется каждый кадр, перепекалось бы каждый
+/// кадр. До того она рисуется формой.
 const FIELD_STABLE_FRAMES: u32 = 30;
+/// Возвраты в поле — не больше стольких точек сетки за кадр (0020, 7.18г): кусок вокруг
+/// фигуры в 1 м при полосе 1 м — около 90 000 точек, доли миллисекунды на процессоре.
+const FIELD_ADD_POINTS: usize = 50_000;
+/// Ушедшее из поля перепекается в тот же кадр, если кусков вместе не больше стольких
+/// точек (около 10 × 10 м при клетке 1 см); больше — поле выключается до полного
+/// запекания в фоне, кадр — как в SDF.
+const FIELD_REMOVE_POINTS: usize = 1_000_000;
 
 /// Поле уровня на панели (7.18в).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -190,10 +198,35 @@ pub enum LevelFieldStatus {
         /// Сколько пеклось в фоне, мс, и сколько занимают картинки, МБ.
         bake_ms: f64,
         megabytes: f64,
+        /// Последнее перепекание на месте (7.18г): кусков, точек и мс на процессоре.
+        patched: Option<FieldPatched>,
+        /// Поле целиком печётся заново в фоне (новая фигура за краем сетки); пока —
+        /// старое поле и эта фигура формой.
+        rebaking: bool,
     },
     /// Поля нет: кадр — как в SDF.
     Failed(&'static str),
 }
+
+/// Перепекание поля на месте (7.18г) для панели.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FieldPatched {
+    pub pieces: usize,
+    pub points: usize,
+    pub ms: f64,
+}
+
+/// Кусок поля уровня, перепечённый в кадре: его надо загрузить на видеокарту в обе
+/// картинки поля запроса `ticket` до проходов 3D этого кадра. `area` — `[i0, j0, w, h]`
+/// в точках сетки (строки снизу вверх).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldPatch {
+    pub ticket: u64,
+    pub area: [u32; 4],
+}
+
+/// Прямоугольник фигуры в метрах уровня (левый нижний и правый верхний углы).
+type Rect2 = (Vec2, Vec2);
 
 /// Поле уровня: готовое, в работе и запрос на запекание.
 #[derive(Default)]
@@ -202,55 +235,76 @@ struct FieldState {
     pending: Option<Pending>,
     request: Option<(u64, LayerBake)>,
     next_ticket: u64,
-    /// Набор неподвижного прошлого кадра (номер мира, подпись) и сколько кадров подряд
-    /// он не менялся.
-    last: Option<(u64, u64)>,
-    stable: u32,
-    /// Набор, для которого поля не будет, и почему.
-    failed: Option<(u64, u64, &'static str)>,
+    /// Неподвижное, которого нет в поле: сколько кадров подряд оно стоит на месте.
+    fresh: HashMap<u64, u32>,
+    /// Набор неподвижного (подпись), для которого поля не будет, и почему.
+    failed: Option<(u64, &'static str)>,
+    /// Куски, перепечённые в кадре и ещё не отданные видеокарте.
+    patches: Vec<FieldPatch>,
     /// Сторона картинки поля не больше (0 — [`FIELD_MAX_SIDE`]).
     max_side: u32,
     status: LevelFieldStatus,
 }
 
-/// Готовое поле: для какого набора неподвижного и с какими материалами.
+/// Готовое поле: какие плиты и бруски в нём (ключ — экземпляр, значение — его
+/// прямоугольник) и с какими материалами.
 struct Baked {
     ticket: u64,
     field: FieldRef,
-    generation: u64,
-    /// Подпись набора вместе с плитами «поверх» (см. [`Level3d::field_frame`]).
-    signature: u64,
-    /// Подпись одного неподвижного набора, без плит «поверх».
-    base: u64,
     materials: Materials,
-    /// Неподвижные плиты, нарисованные поверх подвижных: они не в поле, а формами.
-    over: std::collections::HashSet<u64>,
-    plates: usize,
-    solids: usize,
+    plates: HashMap<u64, Rect2>,
+    solids: HashMap<u64, Rect2>,
     bake_ms: f64,
+    patched: Option<FieldPatched>,
 }
 
 /// Поле в работе.
 struct Pending {
     ticket: u64,
-    generation: u64,
-    signature: u64,
-    base: u64,
     materials: Materials,
-    over: std::collections::HashSet<u64>,
-    plates: usize,
-    solids: usize,
+    plates: HashMap<u64, Rect2>,
+    solids: HashMap<u64, Rect2>,
     cancel: Arc<AtomicBool>,
     reason: &'static str,
 }
 
 /// Форма кадра 2.5D-вида в режиме «поле»: подвижная, неподвижный брусок или
-/// неподвижная плита (с ключом: номер фигуры, место, оттенок).
+/// неподвижная плита (с ключом экземпляра).
 #[derive(Clone, Copy)]
 enum Still {
     Moving,
-    Solid,
+    Solid(u64),
     Plate(u64),
+}
+
+/// Неподвижное кадра для поля: ключ экземпляра и фигура на месте.
+struct StillShape {
+    key: u64,
+    placed: Placed2,
+    rect: Rect2,
+}
+
+/// Пары таблицы по порядку ключей (чтобы порядок работы не зависел от хеша).
+fn sorted(map: &HashMap<u64, Rect2>) -> Vec<(u64, Rect2)> {
+    let mut list: Vec<(u64, Rect2)> = map.iter().map(|(k, r)| (*k, *r)).collect();
+    list.sort_by_key(|(k, _)| *k);
+    list
+}
+
+/// Ключи экземпляров кадра: одинаковые экземпляры (та же фигура на том же месте) различаются
+/// номером повтора, так что у каждого свой ключ.
+#[derive(Default)]
+struct Keys(HashMap<u64, u64>);
+
+impl Keys {
+    fn key(&mut self, base: u64) -> u64 {
+        let n = self.0.entry(base).or_insert(0);
+        let mut key = Signature::new();
+        key.add(base);
+        key.add(*n);
+        *n += 1;
+        key.0
+    }
 }
 
 /// Подпись набора неподвижного (FNV-1a): одинаковая у одинаковых наборов в одном
@@ -500,6 +554,25 @@ impl Level3d {
             .is_some_and(|p| p.ticket == ticket)
     }
 
+    /// Куски поля, перепечённые в кадрах после прошлого вызова (их надо загрузить на
+    /// видеокарту до проходов 3D этого кадра).
+    pub fn take_field_patches(&mut self) -> Vec<FieldPatch> {
+        std::mem::take(&mut self.field.patches)
+    }
+
+    /// Готовое поле уровня на процессоре (то же, что в картинках запроса
+    /// [`Level3d::baked_ticket`]).
+    pub fn baked_field(&self) -> Option<&reyvec_sdf::layer_field::LayerField> {
+        self.field.baked.as_ref().map(|b| &*b.field.0)
+    }
+
+    /// Картинки поля разошлись с полем на процессоре (кусок не загрузился): поле
+    /// выключается и печётся заново целиком.
+    pub fn drop_field(&mut self) {
+        self.field.baked = None;
+        self.field.patches.clear();
+    }
+
     /// Запечённое поле по запросу `ticket` (картинки уже на видеокарте). `false` — запрос
     /// устарел, поле не нужно (его картинки можно удалять).
     pub fn install_field(
@@ -518,23 +591,22 @@ impl Level3d {
             field.0.size().0,
             field.0.size().1,
             field.0.cell() * 100.0,
-            p.plates,
-            p.solids,
+            p.plates.len(),
+            p.solids.len(),
             ms,
             stats.per_tile
         );
         self.field.baked = Some(Baked {
             ticket,
             field,
-            generation: p.generation,
-            signature: p.signature,
-            base: p.base,
             materials: p.materials,
-            over: p.over,
             plates: p.plates,
             solids: p.solids,
             bake_ms: ms,
+            patched: None,
         });
+        // Куски старого поля видеокарте больше не нужны: картинки у нового свои.
+        self.field.patches.retain(|patch| patch.ticket == ticket);
         true
     }
 
@@ -545,7 +617,11 @@ impl Level3d {
             && let Some(reason) = reason
         {
             tracing::warn!("Поле уровня не готово: {reason}");
-            self.field.failed = Some((p.generation, p.signature, reason));
+            let mut set = Signature::new();
+            for (k, _) in sorted(&p.plates).into_iter().chain(sorted(&p.solids)) {
+                set.add(k);
+            }
+            self.field.failed = Some((set.0, reason));
         }
     }
 
@@ -566,18 +642,20 @@ impl Level3d {
         let triangles = render == LevelRender::Triangles;
         let field_mode = render == LevelRender::Field;
         let mut prisms = Prisms::default();
-        // Материалы готового поля этого мира — первыми: номера в его картинке остаются
-        // верными, новые цвета (подвижное) идут следом.
+        // Материалы готового поля — первыми: номера в его картинке остаются верными, новые
+        // цвета (подвижное, новые фигуры) идут следом.
         let mut materials = match &self.field.baked {
-            Some(b) if field_mode && b.generation == scene.generation => b.materials.clone(),
+            Some(b) if field_mode => b.materials.clone(),
             _ => Materials::default(),
         };
         let mut shapes = Vec::new();
-        // Форма неподвижного (в поле её не будет, если поле готово).
+        // Форма неподвижного (в поле её не будет, если поле готово и она в нём).
         let mut still: Vec<Still> = Vec::new();
-        let mut signature = Signature::new();
-        let mut bake_plates = Vec::new();
-        let mut bake_solids = Vec::new();
+        let mut keys = Keys::default();
+        // Неподвижные плиты кадра по порядку рисования; плиты «поверх» подвижных в поле не
+        // идут.
+        let mut bake_plates: Vec<StillShape> = Vec::new();
+        let mut bake_solids: Vec<StillShape> = Vec::new();
         let s = LEVEL_SCALE;
 
         // Стена и земля.
@@ -619,8 +697,13 @@ impl Level3d {
                 }
             } else {
                 let moving = scene.solids_dynamic.get(i).copied().unwrap_or(true);
-                let fixed = field_mode && !moving;
-                if fixed {
+                let mut kind = Still::Moving;
+                if field_mode
+                    && !moving
+                    && let Some(placed) = solid_placed(c)
+                {
+                    let mut base = Signature::new();
+                    base.add(1);
                     for w in [
                         c.aabb.min[0],
                         c.aabb.min[1],
@@ -628,15 +711,16 @@ impl Level3d {
                         c.aabb.max[1],
                         c.slope,
                     ] {
-                        signature.add(w.to_bits());
+                        base.add(w.to_bits());
                     }
-                    if let Some(placed) = solid_placed(c) {
-                        bake_solids.push(placed);
-                    }
+                    let key = keys.key(base.0);
+                    let rect = placed.world_bounds();
+                    bake_solids.push(StillShape { key, placed, rect });
+                    kind = Still::Solid(key);
                 }
                 for shape in solid_shapes(c) {
                     shapes.push(shape.paint(solid));
-                    still.push(if fixed { Still::Solid } else { Still::Moving });
+                    still.push(kind);
                 }
             }
         }
@@ -650,7 +734,6 @@ impl Level3d {
         // бы под неё) и сама становится такой плитой: стопка над ней тоже остаётся формами.
         let mut front_rects = Vec::new();
         let mut moving_plates = 0;
-        let mut over_now = Vec::new();
         for item in &scene.items {
             match item {
                 SceneItem::BeginMask { .. } => mask_depth += 1,
@@ -695,26 +778,26 @@ impl Level3d {
                         let material = materials.get(color, 0.0);
                         let fixed = field_mode && dynamic_depth == 0;
                         if fixed {
-                            let mut key = Signature::new();
-                            key.add(u64::from(instance.shape.0));
+                            let mut base = Signature::new();
+                            base.add(u64::from(instance.shape.0));
                             for c in instance.transform.as_coeffs() {
-                                key.add(c.to_bits());
+                                base.add(c.to_bits());
                             }
                             let t = instance.tint;
                             for c in [t.r, t.g, t.b, t.a] {
-                                key.add(u64::from(c.to_bits()));
+                                base.add(u64::from(c.to_bits()));
                             }
-                            signature.add(key.0);
+                            let key = keys.key(base.0);
                             let over = front_rects.iter().any(|&r| overlaps(in_world, r));
                             if over {
                                 front_rects.push(in_world.abs());
-                                over_now.push(key.0);
-                            }
-                            if let Some(placed) = plate_placed(&flat, instance.transform, material)
+                            } else if let Some(placed) =
+                                plate_placed(&flat, instance.transform, material)
                             {
-                                bake_plates.push((key.0, over, placed));
+                                let rect = placed.world_bounds();
+                                bake_plates.push(StillShape { key, placed, rect });
                             }
-                            still.push(Still::Plate(key.0));
+                            still.push(Still::Plate(key));
                         } else {
                             if field_mode {
                                 front_rects.push(in_world.abs());
@@ -730,15 +813,7 @@ impl Level3d {
         }
 
         if field_mode {
-            let ready = self.field_frame(
-                scene.generation,
-                signature.0,
-                &over_now,
-                &materials,
-                bake_plates,
-                bake_solids,
-                solid,
-            );
+            let ready = self.field_frame(&materials, bake_plates, bake_solids, solid);
             if let (Some(field), Some(baked)) = (ready, &self.field.baked) {
                 let mut forms = 0;
                 let mut kept: Vec<Shape3> = shapes
@@ -747,8 +822,8 @@ impl Level3d {
                     .filter_map(|(shape, still)| {
                         let keep = match still {
                             Still::Moving => true,
-                            Still::Solid => false,
-                            Still::Plate(key) => baked.over.contains(&key),
+                            Still::Solid(key) => !baked.solids.contains_key(&key),
+                            Still::Plate(key) => !baked.plates.contains_key(&key),
                         };
                         forms += usize::from(keep && !matches!(still, Still::Moving));
                         keep.then_some(shape)
@@ -810,130 +885,262 @@ impl Level3d {
         }
     }
 
-    /// Поле уровня в кадре: форма поля, если готово поле этого набора неподвижного
-    /// (`generation`, `base`) и в нём нет ни одной из плит `over_now` (неподвижных,
-    /// нарисованных в этом кадре поверх подвижных); иначе `None` (кадр рисуется как в
-    /// SDF) и, если пора, запрос на запекание `plates` и `solids` с материалами
-    /// `materials`. Подвижное, заехавшее под неподвижную плиту из поля, делает поле
-    /// неверным так же, как изменившееся неподвижное.
-    #[allow(clippy::too_many_arguments)]
+    /// Поле уровня в кадре: форма поля, если поле готово, иначе `None` (кадр рисуется
+    /// как в SDF). `plates` и `solids` — неподвижное кадра, которое может быть в поле
+    /// (плиты по порядку рисования). Готовое поле сверяется с ним каждый кадр (7.18г):
+    /// ушедшее из кадра (убранное, сдвинутое, изменившееся, оказавшееся поверх подвижного)
+    /// выходит из поля в тот же кадр — кусок вокруг него перепекается на месте; новое
+    /// входит, простояв [`FIELD_STABLE_FRAMES`] кадров, очередью не больше
+    /// [`FIELD_ADD_POINTS`] точек за кадр, а до того рисуется формой. Полное запекание в
+    /// фоне — только когда поля нет, кусок слишком велик или новое за краем сетки.
     fn field_frame(
         &mut self,
-        generation: u64,
-        base: u64,
-        over_now: &[u64],
         materials: &Materials,
-        plates: Vec<(u64, bool, Placed2)>,
-        solids: Vec<Placed2>,
+        plates: Vec<StillShape>,
+        solids: Vec<StillShape>,
         solid: u32,
     ) -> Option<Shape3> {
         let f = &mut self.field;
-        // Поле (готовое или в работе) того же набора верно, если все плиты «поверх» этого
-        // кадра в нём рисуются формами; тогда кадр берёт его подпись. Иначе подпись — набор
-        // вместе с плитами «поверх».
-        let covers = |g: u64, b: u64, set: &std::collections::HashSet<u64>| {
-            g == generation && b == base && over_now.iter().all(|k| set.contains(k))
-        };
-        let signature = if let Some(b) = f
-            .baked
-            .as_ref()
-            .filter(|b| covers(b.generation, b.base, &b.over))
-        {
-            b.signature
-        } else if let Some(p) = f
-            .pending
-            .as_ref()
-            .filter(|p| covers(p.generation, p.base, &p.over))
-        {
-            p.signature
-        } else {
-            let mut s = Signature::new();
-            s.add(base);
-            for &k in over_now {
-                s.add(k);
-            }
-            s.0
-        };
-        let key = (generation, signature);
-        if f.last == Some(key) {
-            f.stable = f.stable.saturating_add(1);
-        } else {
-            f.last = Some(key);
-            f.stable = 0;
+        let mut set = Signature::new();
+        for s in plates.iter().chain(&solids) {
+            set.add(s.key);
         }
-        if let Some(b) = f
-            .baked
-            .as_ref()
-            .filter(|b| (b.generation, b.signature) == key)
-        {
-            // Готовое поле верно — запекание другого набора больше не нужно.
-            if let Some(p) = f.pending.take() {
-                p.cancel.store(true, Ordering::Relaxed);
-            }
-            let (size, cell) = (b.field.0.size(), b.field.0.cell());
-            f.status = LevelFieldStatus::Ready {
-                size,
-                cell,
-                plates: b.plates,
-                solids: b.solids,
-                shapes: 0,
-                bake_ms: b.bake_ms,
-                megabytes: f64::from(size.0) * f64::from(size.1) * 6.0 / 1e6,
-            };
-            let front = plate_front(0);
-            return Some(
-                Shape3::Field {
-                    field: b.field.clone(),
-                    depth: PLATE,
-                    round: 0.0,
+        // Сколько кадров стоит неподвижное, которого нет в поле.
+        let in_field = |key: &u64, plate: bool| {
+            f.baked.as_ref().is_some_and(|b| {
+                if plate {
+                    b.plates.contains_key(key)
+                } else {
+                    b.solids.contains_key(key)
                 }
-                .at([0.0, 0.0, front - PLATE * 0.5])
-                .paint(solid),
-            );
-        }
-        if let Some((g, sg, reason)) = f.failed
-            && (g, sg) == key
-        {
-            f.status = LevelFieldStatus::Failed(reason);
-            return None;
-        }
-        if let Some(p) = f
-            .pending
-            .as_ref()
-            .filter(|p| (p.generation, p.signature) == key)
-        {
-            f.status = LevelFieldStatus::Baking { reason: p.reason };
-            return None;
-        }
-        // Новый мир печётся сразу; изменившееся неподвижное в том же мире — когда
-        // простоит FIELD_STABLE_FRAMES кадров.
-        let known = f.baked.as_ref().map(|b| b.generation) == Some(generation)
-            || f.pending.as_ref().map(|p| p.generation) == Some(generation);
-        let reason = if known {
-            "изменилось неподвижное"
-        } else {
-            "новый уровень"
+            })
         };
-        if known && f.stable < FIELD_STABLE_FRAMES {
-            f.status = LevelFieldStatus::Baking {
-                reason: "ждёт, пока неподвижное перестанет меняться",
-            };
+        let mut fresh = HashMap::new();
+        for (s, plate) in plates
+            .iter()
+            .map(|s| (s, true))
+            .chain(solids.iter().map(|s| (s, false)))
+        {
+            if !in_field(&s.key, plate) {
+                let n = f.fresh.get(&s.key).copied().unwrap_or(0);
+                fresh.insert(s.key, n.saturating_add(1));
+            }
+        }
+        f.fresh = fresh;
+
+        let Some(b) = f.baked.as_mut() else {
+            if let Some((failed, reason)) = f.failed
+                && failed == set.0
+            {
+                f.status = LevelFieldStatus::Failed(reason);
+                return None;
+            }
+            if let Some(p) = &f.pending {
+                f.status = LevelFieldStatus::Baking { reason: p.reason };
+                return None;
+            }
+            let reason = "новый уровень";
+            Self::request_full(f, materials, &plates, &solids, solid, set.0, reason);
+            return None;
+        };
+
+        // Сетка готового поля и кусок вокруг прямоугольника: фигура влияет на точки не
+        // дальше полосы (и двух клеток запаса на смешивание соседей).
+        let (corner, cell, (nx, ny)) = (b.field.0.corner(), b.field.0.cell(), b.field.0.size());
+        let area_of = |(lo, hi): Rect2| -> ([u32; 4], bool) {
+            let pad = Vec2::splat(FIELD_BAND + 2.0 * cell);
+            let a = ((lo - pad - corner) / cell).floor();
+            let z = ((hi + pad - corner) / cell).ceil();
+            let inside = a.x >= 0.0 && a.y >= 0.0 && z.x <= nx as f32 && z.y <= ny as f32;
+            let a = a.clamp(Vec2::ZERO, Vec2::new(nx as f32, ny as f32));
+            let z = z.clamp(a, Vec2::new(nx as f32, ny as f32));
+            (
+                [
+                    a.x as u32,
+                    a.y as u32,
+                    (z.x - a.x) as u32,
+                    (z.y - a.y) as u32,
+                ],
+                inside,
+            )
+        };
+        let points = |area: &[u32; 4]| area[2] as usize * area[3] as usize;
+
+        // Ушедшее из кадра — из поля в этот же кадр.
+        let now_plates: std::collections::HashSet<u64> = plates.iter().map(|s| s.key).collect();
+        let now_solids: std::collections::HashSet<u64> = solids.iter().map(|s| s.key).collect();
+        let gone_plates: Vec<u64> = sorted(&b.plates)
+            .into_iter()
+            .filter(|(k, _)| !now_plates.contains(k))
+            .map(|(k, _)| k)
+            .collect();
+        let gone_solids: Vec<u64> = sorted(&b.solids)
+            .into_iter()
+            .filter(|(k, _)| !now_solids.contains(k))
+            .map(|(k, _)| k)
+            .collect();
+        let mut areas: Vec<[u32; 4]> = gone_plates
+            .iter()
+            .map(|k| b.plates[k])
+            .chain(gone_solids.iter().map(|k| b.solids[k]))
+            .map(|r| area_of(r).0)
+            .filter(|a| points(a) > 0)
+            .collect();
+        let removed: usize = areas.iter().map(points).sum();
+        if removed > FIELD_REMOVE_POINTS {
+            tracing::info!(
+                "Поле уровня: из поля ушло {} фигур, кусок {removed} точек — запекание целиком",
+                gone_plates.len() + gone_solids.len()
+            );
+            f.baked = None;
+            f.patches.clear();
+            let reason = "изменилось много неподвижного";
+            if f.pending.is_none() {
+                Self::request_full(f, materials, &plates, &solids, solid, set.0, reason);
+            } else {
+                f.status = LevelFieldStatus::Baking { reason };
+            }
             return None;
         }
-        if let Some(p) = f.pending.take() {
-            p.cancel.store(true, Ordering::Relaxed);
+
+        // Простоявшее новое — в поле, очередью по порядку рисования.
+        let mut budget = FIELD_ADD_POINTS;
+        let mut outside = false;
+        let mut added_plates = Vec::new();
+        let mut added_solids = Vec::new();
+        for (s, plate) in plates
+            .iter()
+            .map(|s| (s, true))
+            .chain(solids.iter().map(|s| (s, false)))
+        {
+            let members = if plate { &b.plates } else { &b.solids };
+            if members.contains_key(&s.key)
+                || f.fresh.get(&s.key).copied().unwrap_or(0) < FIELD_STABLE_FRAMES
+            {
+                continue;
+            }
+            let (area, inside) = area_of(s.rect);
+            if !inside {
+                // Сетка мала: фигура остаётся формой до полного запекания.
+                outside = true;
+                continue;
+            }
+            // Первый кусок кадра входит, даже если он больше очереди.
+            if points(&area) > budget && budget < FIELD_ADD_POINTS {
+                continue;
+            }
+            budget = budget.saturating_sub(points(&area));
+            areas.push(area);
+            if plate {
+                added_plates.push(s.key);
+            } else {
+                added_solids.push(s.key);
+            }
         }
-        let over: std::collections::HashSet<u64> = over_now.iter().copied().collect();
-        let plates: Vec<Placed2> = plates
-            .into_iter()
-            .filter_map(|(_, over, placed)| (!over).then_some(placed))
-            .collect();
-        let (plate_count, solid_count) = (plates.len(), solids.len());
-        let mut bake = LayerBake {
+
+        if !areas.is_empty() {
+            let Some(field) = Arc::get_mut(&mut b.field.0) else {
+                // Поле ещё держит прошлый кадр: этот кадр — без поля, перепекание — в
+                // следующем (старое поле показывать нельзя).
+                f.status = LevelFieldStatus::Baking {
+                    reason: "поле занято прошлым кадром",
+                };
+                return None;
+            };
+            for k in &gone_plates {
+                b.plates.remove(k);
+            }
+            for k in &gone_solids {
+                b.solids.remove(k);
+            }
+            for s in &plates {
+                if added_plates.contains(&s.key) {
+                    b.plates.insert(s.key, s.rect);
+                }
+            }
+            for s in &solids {
+                if added_solids.contains(&s.key) {
+                    b.solids.insert(s.key, s.rect);
+                }
+            }
+            let bake = Self::bake_of(
+                plates
+                    .iter()
+                    .filter(|s| b.plates.contains_key(&s.key))
+                    .map(|s| s.placed.clone())
+                    .collect(),
+                solids
+                    .iter()
+                    .filter(|s| b.solids.contains_key(&s.key))
+                    .map(|s| s.placed.clone())
+                    .collect(),
+                solid,
+            );
+            let started = std::time::Instant::now();
+            let mut done = FieldPatched::default();
+            for area in &areas {
+                let Some(baked) = bake.run_area(corner, cell, *area) else {
+                    continue;
+                };
+                field.patch(*area, &baked.texels, &baked.materials);
+                done.pieces += 1;
+                done.points += baked.stats.points;
+                f.patches.push(FieldPatch {
+                    ticket: b.ticket,
+                    area: *area,
+                });
+            }
+            done.ms = started.elapsed().as_secs_f64() * 1000.0;
+            tracing::debug!(
+                "Поле уровня: перепечено на месте {} кусков, {} точек за {:.2} мс \
+                 (ушло {}, вошло {})",
+                done.pieces,
+                done.points,
+                done.ms,
+                gone_plates.len() + gone_solids.len(),
+                added_plates.len() + added_solids.len()
+            );
+            b.patched = Some(done);
+            // Номера новых фигур — в таблице поля.
+            b.materials = materials.clone();
+        }
+        if outside && f.pending.is_none() {
+            let reason = "новое за краем поля";
+            Self::request_full(f, materials, &plates, &solids, solid, set.0, reason);
+        }
+        let b = f.baked.as_ref()?;
+        let (size, cell) = (b.field.0.size(), b.field.0.cell());
+        f.status = LevelFieldStatus::Ready {
+            size,
+            cell,
+            plates: b.plates.len(),
+            solids: b.solids.len(),
+            shapes: 0,
+            bake_ms: b.bake_ms,
+            megabytes: f64::from(size.0) * f64::from(size.1) * 6.0 / 1e6,
+            patched: b.patched,
+            rebaking: f.pending.is_some(),
+        };
+        let front = plate_front(0);
+        Some(
+            Shape3::Field {
+                field: b.field.clone(),
+                depth: PLATE,
+                round: 0.0,
+            }
+            .at([0.0, 0.0, front - PLATE * 0.5])
+            .paint(solid),
+        )
+    }
+
+    /// Задание на запекание поля уровня из плит `first` и брусков `second` (сетка — по
+    /// ним, клетка — по [`Level3d::field_frame`] позже).
+    fn bake_of(first: Vec<Placed2>, second: Vec<Placed2>, solid: u32) -> LayerBake {
+        LayerBake {
             cell: FIELD_CELLS[0],
             band: FIELD_BAND,
-            first: plates,
-            second: solids,
+            first,
+            second,
             second_layer: Some(SecondLayer {
                 shift: (SOLID_FRONT + SOLID_BACK) * 0.5 - (plate_front(0) - PLATE * 0.5),
                 half: (SOLID_FRONT - SOLID_BACK) * 0.5,
@@ -942,7 +1149,27 @@ impl Level3d {
             threads: std::thread::available_parallelism()
                 .map_or(1, |n| n.get().saturating_sub(1).max(1)),
             cancel: Arc::new(AtomicBool::new(false)),
-        };
+        }
+    }
+
+    /// Запрос на полное запекание неподвижного кадра (прежний запрос отменяется).
+    fn request_full(
+        f: &mut FieldState,
+        materials: &Materials,
+        plates: &[StillShape],
+        solids: &[StillShape],
+        solid: u32,
+        set: u64,
+        reason: &'static str,
+    ) {
+        if let Some(p) = f.pending.take() {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
+        let mut bake = Self::bake_of(
+            plates.iter().map(|s| s.placed.clone()).collect(),
+            solids.iter().map(|s| s.placed.clone()).collect(),
+            solid,
+        );
         let max_side = if f.max_side == 0 {
             FIELD_MAX_SIDE
         } else {
@@ -956,32 +1183,32 @@ impl Level3d {
             None
         };
         if let Some(reason) = failed {
-            f.failed = Some((generation, signature, reason));
-            f.status = LevelFieldStatus::Failed(reason);
-            return None;
+            if f.baked.is_none() {
+                f.failed = Some((set, reason));
+                f.status = LevelFieldStatus::Failed(reason);
+            }
+            return;
         }
         f.next_ticket += 1;
         let ticket = f.next_ticket;
         tracing::info!(
-            "Поле уровня: запекание ({reason}), {plate_count} плит и {solid_count} брусков, \
-             шаг {} см",
+            "Поле уровня: запекание ({reason}), {} плит и {} брусков, шаг {} см",
+            plates.len(),
+            solids.len(),
             bake.cell * 100.0
         );
         f.pending = Some(Pending {
             ticket,
-            generation,
-            signature,
-            base,
             materials: materials.clone(),
-            over,
-            plates: plate_count,
-            solids: solid_count,
+            plates: plates.iter().map(|s| (s.key, s.rect)).collect(),
+            solids: solids.iter().map(|s| (s.key, s.rect)).collect(),
             cancel: bake.cancel.clone(),
             reason,
         });
         f.request = Some((ticket, bake));
-        f.status = LevelFieldStatus::Baking { reason };
-        None
+        if f.baked.is_none() {
+            f.status = LevelFieldStatus::Baking { reason };
+        }
     }
 
     /// Треугольники фигуры `id` (готовятся при первой встрече).
@@ -1796,14 +2023,16 @@ mod tests {
             "попаданий {hits}, в уровень {on_level}"
         );
         assert!(same * 100 >= hits * 97, "тот же цвет у {same} из {hits}");
-        // Новый мир — поле не подходит, кадр снова как у SDF.
+        // Новый мир с тем же неподвижным (уровень загружен заново) — поле то же, без
+        // запекания и без кусков.
         let other = reyvec_scene::Scene {
             generation: scene.generation + 1,
             ..scene.clone()
         };
         let again = level.frame(&other, &library, LevelRender::Field);
-        assert_eq!(again.frame.shapes.len(), sdf.frame.shapes.len());
-        assert!(level.take_field_request().is_some());
+        assert_eq!(again.frame.shapes.len(), made.frame.shapes.len());
+        assert!(level.take_field_request().is_none());
+        assert!(level.take_field_patches().is_empty());
     }
 
     /// Подвижная плита, заехавшая под неподвижную, нарисованную после неё: поле, где эта
@@ -1858,6 +2087,8 @@ mod tests {
         // Стена, M и поле.
         let made = level.frame(&far, &library, LevelRender::Field);
         assert_eq!(made.frame.shapes.len(), 3);
+        // Кадр держит поле; пока он жив, поле нельзя перепечь на месте.
+        drop(made);
         // M под B: поле неверно, всё формами (стена и четыре плиты), запекание ждёт покоя.
         let under = scene_with(0.0);
         let sdf = level.frame(&under, &library, LevelRender::Sdf);
@@ -1873,36 +2104,247 @@ mod tests {
                 })
                 .collect()
         };
-        let made = level.frame(&under, &library, LevelRender::Field);
-        assert_eq!(made.frame.shapes.len(), 5);
-        assert!(matches!(
-            level.field_status(),
-            LevelFieldStatus::Baking { .. }
-        ));
-        for _ in 0..FIELD_STABLE_FRAMES {
-            level.frame(&under, &library, LevelRender::Field);
-        }
-        bake_and_install(&mut level);
-        // Новое поле: стена, M, B и C формами (C — над B, поэтому тоже), D и всё прочее —
+        // B и C выходят из поля в этот же кадр (кусок вокруг B перепекается на месте),
+        // полное запекание не нужно. Стена, M, B и C формами (C — над B, поэтому тоже), D —
         // в поле. Слои форм — как у SDF: M, над ней B, над B — C.
         let made = level.frame(&under, &library, LevelRender::Field);
         assert_eq!(made.frame.shapes.len(), 5);
-        let LevelFieldStatus::Ready { plates, shapes, .. } = level.field_status() else {
+        assert!(level.take_field_request().is_none());
+        assert_eq!(level.take_field_patches().len(), 2, "куски вокруг B и C");
+        let LevelFieldStatus::Ready {
+            plates,
+            shapes,
+            patched,
+            ..
+        } = level.field_status()
+        else {
             panic!("поле не готово: {:?}", level.field_status());
         };
         assert_eq!((plates, shapes), (1, 3));
+        assert_eq!(patched.map(|p| p.pieces), Some(2));
         // Последняя форма — само поле, у лицевой грани неподвижного.
         let got = fronts(&made.frame.shapes);
         assert_eq!(got[..3], fronts(&sdf.frame.shapes)[..3]);
         assert_eq!(got[3], plate_front(0));
-        // M уехала: B и C остаются формами этого поля, новое запекание не нужно.
+        drop(made);
+        // M уехала: B и C — формами, пока не простоят FIELD_STABLE_FRAMES кадров, потом
+        // возвращаются в поле на месте.
+        for _ in 1..FIELD_STABLE_FRAMES {
+            let made = level.frame(&far, &library, LevelRender::Field);
+            assert_eq!(made.frame.shapes.len(), 5);
+        }
+        assert!(level.take_field_patches().is_empty());
+        // Очередь — не больше FIELD_ADD_POINTS точек за кадр: кусок вокруг квадрата больше,
+        // поэтому B и C входят по одному за кадр.
         let made = level.frame(&far, &library, LevelRender::Field);
-        assert_eq!(made.frame.shapes.len(), 5);
+        assert_eq!(made.frame.shapes.len(), 4);
+        assert_eq!(level.take_field_patches().len(), 1);
+        drop(made);
+        let made = level.frame(&far, &library, LevelRender::Field);
+        assert_eq!(made.frame.shapes.len(), 3);
+        assert_eq!(level.take_field_patches().len(), 1);
         assert!(level.take_field_request().is_none());
         assert!(matches!(
             level.field_status(),
-            LevelFieldStatus::Ready { .. }
+            LevelFieldStatus::Ready { plates: 3, .. }
         ));
+    }
+
+    /// Правка файла сцены на лету (7.18г): мир строится заново, а поле не печётся целиком —
+    /// сдвинутые ящики вынимаются из него на месте и потом вписываются на новом месте.
+    #[test]
+    fn edited_scene_file_is_patched_in_place() {
+        let dir = Some(std::path::Path::new(reyvec_scene::EXAMPLE_DIR));
+        let mut library = ShapeLibrary::new(0.001);
+        let mut cache = reyvec_scene::ShapeCache::new();
+        let mut build = |text: &str| {
+            reyvec_scene::SceneFile::parse_in(text, dir)
+                .unwrap()
+                .build(&mut library, &mut cache)
+                .unwrap()
+        };
+        let before = build(reyvec_scene::EXAMPLE);
+        // В файле сдвинули ящики под полкой и сохранили: мир строится заново из того же
+        // кэша форм, у остальных предметов те же ключи.
+        let moved = reyvec_scene::EXAMPLE.replacen("at: (1.95, -0.78)", "at: (2.05, -0.78)", 1);
+        assert_ne!(moved, reyvec_scene::EXAMPLE);
+        let after = build(&moved);
+        assert_ne!(after.generation, before.generation);
+        let mut level = Level3d::default();
+        level.frame(&before, &library, LevelRender::Field);
+        let (ticket, bake) = level.take_field_request().expect("запрос на запекание");
+        let (mut field, stats) = bake.run().expect("поле");
+        field.set_texture(1);
+        field.set_material_texture(2);
+        assert!(level.install_field(ticket, FieldRef(Arc::new(field)), stats, 1.0));
+        drop(level.frame(&before, &library, LevelRender::Field));
+        drop(level.frame(&after, &library, LevelRender::Field));
+        assert!(
+            level.take_field_request().is_none(),
+            "правка файла — не полное запекание"
+        );
+        assert!(
+            !level.take_field_patches().is_empty(),
+            "ящики вынуты на месте"
+        );
+        assert!(matches!(
+            level.field_status(),
+            LevelFieldStatus::Ready {
+                patched: Some(_),
+                rebaking: false,
+                ..
+            }
+        ));
+        // Простояв FIELD_STABLE_FRAMES кадров (первый — кадр правки), ящики на новом месте
+        // входят в поле.
+        for _ in 2..FIELD_STABLE_FRAMES {
+            drop(level.frame(&after, &library, LevelRender::Field));
+        }
+        assert!(level.take_field_patches().is_empty());
+        drop(level.frame(&after, &library, LevelRender::Field));
+        assert!(
+            !level.take_field_patches().is_empty(),
+            "ящики вписаны в поле"
+        );
+        assert!(level.take_field_request().is_none());
+    }
+
+    /// Перепекание на месте (7.18г): сдвинутая неподвижная фигура выходит из поля в тот же
+    /// кадр, на новом месте входит через FIELD_STABLE_FRAMES кадров, и поле после этого —
+    /// то же, что полное запекание нового набора (значения байт в байт, цвета — те же).
+    /// Новая фигура за краем сетки — формой, а поле печётся целиком в фоне.
+    #[test]
+    fn moved_still_shape_is_rebaked_in_place() {
+        let mut library = ShapeLibrary::new(0.01);
+        let rect = |w: f64, h: f64| kurbo::Shape::to_path(&kurbo::Rect::new(0.0, 0.0, w, h), 0.1);
+        let mut shape = |w: f64, h: f64, r: f32| {
+            library
+                .add(reyvec_vector::Shape::fill(
+                    rect(w, h),
+                    Paint::Solid(Color::linear(r, 0.4, 0.3, 1.0)),
+                ))
+                .unwrap()
+        };
+        // Широкий пол задаёт сетку поля, на нём ящик и бочка.
+        let (floor, crate_, barrel) = (
+            shape(4.0, 0.2, 0.2),
+            shape(0.3, 0.3, 0.5),
+            shape(0.2, 0.4, 0.8),
+        );
+        let put = |id: ShapeId, x: f64, y: f64| {
+            SceneItem::Shape(reyvec_vector::Instance::new(id, Affine::translate((x, y))))
+        };
+        let scene_with = |crate_x: f64, barrel_x: f64| reyvec_scene::Scene {
+            generation: 1,
+            items: vec![
+                put(floor, 0.0, 0.0),
+                put(crate_, crate_x, 0.2),
+                put(barrel, barrel_x, 0.2),
+            ],
+            ..reyvec_scene::Scene::default()
+        };
+        let bake_and_install = |level: &mut Level3d| {
+            let (ticket, bake) = level.take_field_request().expect("запрос на запекание");
+            let (mut field, stats) = bake.run().expect("поле");
+            field.set_texture(1);
+            field.set_material_texture(2);
+            assert!(level.install_field(ticket, FieldRef(Arc::new(field)), stats, 1.0));
+        };
+        let mut level = Level3d::default();
+        let before = scene_with(0.5, 3.0);
+        level.frame(&before, &library, LevelRender::Field);
+        bake_and_install(&mut level);
+        let ticket = level.baked_ticket();
+        // Стена и поле.
+        assert_eq!(
+            level
+                .frame(&before, &library, LevelRender::Field)
+                .frame
+                .shapes
+                .len(),
+            2
+        );
+        // Ящик сдвинулся: из поля — в этот же кадр (кусок вокруг старого места), на новом
+        // месте он форма.
+        let after = scene_with(2.0, 3.0);
+        let made = level.frame(&after, &library, LevelRender::Field);
+        assert_eq!(made.frame.shapes.len(), 3);
+        drop(made);
+        let patches = level.take_field_patches();
+        assert_eq!(patches.len(), 1);
+        assert!(patches.iter().all(|p| Some(p.ticket) == ticket));
+        let field = level.baked_field().unwrap();
+        let (corner, cell) = (field.corner(), field.cell());
+        let at = |x: f32, y: f32| Vec2::new(x, y) * LEVEL_SCALE;
+        // Где стоял ящик — теперь пусто над полом.
+        let (d, _) = field.distance2(at(0.65, 0.35), 0);
+        assert!(d > 0.3, "{d}");
+        // Первый кадр на новом месте уже был: ещё FIELD_STABLE_FRAMES − 2 кадра — форма.
+        for _ in 2..FIELD_STABLE_FRAMES {
+            assert_eq!(
+                level
+                    .frame(&after, &library, LevelRender::Field)
+                    .frame
+                    .shapes
+                    .len(),
+                3
+            );
+        }
+        assert!(level.take_field_patches().is_empty());
+        let made = level.frame(&after, &library, LevelRender::Field);
+        assert_eq!(made.frame.shapes.len(), 2, "ящик вернулся в поле");
+        let patched_materials = made.materials.clone();
+        drop(made);
+        assert_eq!(level.take_field_patches().len(), 1);
+        assert!(level.take_field_request().is_none());
+        assert_eq!(
+            level.baked_ticket(),
+            ticket,
+            "то же поле, без полного запекания"
+        );
+        // Полное запекание нового набора на той же сетке.
+        let mut fresh = Level3d::default();
+        let first = fresh.frame(&after, &library, LevelRender::Field);
+        let fresh_materials = first.materials.clone();
+        drop(first);
+        let (_, bake) = fresh.take_field_request().unwrap();
+        let (whole, _) = bake.run().unwrap();
+        let field = level.baked_field().unwrap();
+        assert_eq!((whole.corner(), whole.cell()), (corner, cell));
+        assert!(
+            whole.bytes() == field.bytes(),
+            "значения как у полного запекания"
+        );
+        let color = |list: &[Material3], id: Option<u32>| id.map(|i| list[i as usize].color);
+        // Пол, ящик на новом месте, бочка, пол.
+        for (x, y) in [(0.1, 0.1), (2.15, 0.35), (3.1, 0.4), (3.9, 0.1)] {
+            let p = at(x, y);
+            assert_eq!(
+                color(&patched_materials, field.material_at(p)),
+                color(&fresh_materials, whole.material_at(p)),
+                "цвет в ({x}, {y})"
+            );
+        }
+        // Бочка уехала за край сетки: из поля — сразу, на новом месте — форма, а поле
+        // печётся целиком в фоне (пока — старое).
+        let far = scene_with(2.0, 9.0);
+        for _ in 0..FIELD_STABLE_FRAMES {
+            level.frame(&far, &library, LevelRender::Field);
+        }
+        assert_eq!(level.take_field_patches().len(), 1);
+        assert!(level.take_field_request().is_some());
+        assert!(matches!(
+            level.field_status(),
+            LevelFieldStatus::Ready { rebaking: true, .. }
+        ));
+        assert_eq!(
+            level
+                .frame(&far, &library, LevelRender::Field)
+                .frame
+                .shapes
+                .len(),
+            3
+        );
     }
 
     /// Прямоугольник обводки шире самой линии, а у заливки — её путь.

@@ -818,10 +818,11 @@ pub(crate) unsafe fn record_texture_upload(
     let (old_layout, src_stage) = if first {
         (vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags2::NONE)
     } else {
-        // Прошлые кадры могли читать текстуру в пиксельном шейдере: ждём их чтения.
+        // Прошлые кадры могли читать текстуру в пиксельном или вычислительном шейдере
+        // (лучи сцены «3D»): ждём их чтения.
         (
             vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
         )
     };
     let to_dst = [image_barrier(
@@ -880,6 +881,116 @@ pub(crate) unsafe fn record_texture_upload(
     }
 }
 
+/// Куски `areas` (`[x, y, w, h]`, плотные строки по `texel` байт на точку) подряд в
+/// буфере-источнике начиная с `start`, каждый с границы 16 байт: области копирования и
+/// конец последнего куска.
+pub(crate) fn patch_regions(
+    areas: &[[u32; 4]],
+    texel: u64,
+    start: u64,
+) -> (Vec<vk::BufferImageCopy>, u64) {
+    let mut at = start;
+    let regions = areas
+        .iter()
+        .map(|&[x, y, w, h]| {
+            at = at.next_multiple_of(16);
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(at)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D {
+                    x: x as i32,
+                    y: y as i32,
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: w,
+                    height: h,
+                    depth: 1,
+                });
+            at += u64::from(w) * u64::from(h) * texel;
+            region
+        })
+        .collect();
+    (regions, at)
+}
+
+/// Записывает копии кусков из `src` в уже заполненные текстуры (`patches`: картинка и
+/// её области): одна смена раскладки на картинку до копий и одна после. Прошлые кадры
+/// могли читать картинки в пиксельном и вычислительном шейдерах — копия ждёт их чтения,
+/// а читающие после неё проходы видят новые данные.
+///
+/// # Safety
+/// `cmd` в состоянии записи, картинки в раскладке чтения, `src` и картинки живы, пока
+/// видеокарта выполняет команды.
+pub(crate) unsafe fn record_texture_patches(
+    d: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src: vk::Buffer,
+    patches: &[(vk::Image, Vec<vk::BufferImageCopy>)],
+) {
+    let readers =
+        vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER;
+    let to_dst: Vec<_> = patches
+        .iter()
+        .filter(|(_, regions)| !regions.is_empty())
+        .map(|(image, _)| {
+            image_barrier(
+                *image,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                readers,
+                vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            )
+        })
+        .collect();
+    if to_dst.is_empty() {
+        return;
+    }
+    let to_read: Vec<_> = patches
+        .iter()
+        .filter(|(_, regions)| !regions.is_empty())
+        .map(|(image, _)| {
+            image_barrier(
+                *image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                readers,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            )
+        })
+        .collect();
+    // SAFETY: условие функции.
+    unsafe {
+        d.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
+        );
+        for (image, regions) in patches {
+            if !regions.is_empty() {
+                d.cmd_copy_buffer_to_image(
+                    cmd,
+                    src,
+                    *image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    regions,
+                );
+            }
+        }
+        d.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_read),
+        );
+    }
+}
+
 pub(crate) fn destroy_texture(ctx: &GpuContext, t: Texture) {
     // SAFETY: вызывающий гарантирует, что видеокарта текстуру больше не читает;
     // null-вид допустим.
@@ -919,5 +1030,154 @@ mod tests {
         s.release(a);
         assert_eq!(s.insert('d'), 0);
         assert_eq!(s.get(0), Some(&'d'));
+    }
+
+    /// Области кусков идут подряд с границы 16 байт, плотными строками.
+    #[test]
+    fn patch_regions_are_packed_and_aligned() {
+        let (regions, end) = patch_regions(&[[1, 2, 3, 1], [0, 0, 2, 2]], 4, 0);
+        assert_eq!(regions[0].buffer_offset, 0);
+        assert_eq!(regions[1].buffer_offset, 16);
+        assert_eq!(end, 16 + 16);
+        assert_eq!(regions[0].image_offset.x, 1);
+        assert_eq!(regions[0].image_offset.y, 2);
+        assert_eq!(regions[1].image_extent.width, 2);
+        let (regions, end) = patch_regions(&[[0, 0, 3, 1]], 2, 33);
+        assert_eq!((regions[0].buffer_offset, end), (48, 54));
+    }
+
+    /// Куски поля уровня (7.18г) на настоящей видеокарте: в уже заполненную и прочитанную
+    /// картинку записываются два куска, остальное не меняется; без ошибок проверки Vulkan.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn texture_patches_change_only_their_areas() {
+        use crate::context::{Core, GpuOptions};
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let core = Core::new(true, None).expect("Vulkan");
+        let ctx = GpuContext::new(core, &options, None)
+            .map_err(|f| f.0)
+            .expect("устройство");
+        let errors = crate::context::validation_error_count();
+        let mut res = GpuResources::new(&ctx).expect("ресурсы");
+        let (w, h) = (37u32, 21u32);
+        let id = res
+            .create_texture_format(
+                &ctx,
+                w,
+                h,
+                vk::Format::R16G16_SFLOAT,
+                vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_DST
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                "куски",
+            )
+            .expect("картинка");
+        let extent = vk::Extent2D {
+            width: w,
+            height: h,
+        };
+        let mut want: Vec<u8> = (0..w * h * 4).map(|i| (i % 251) as u8).collect();
+        res.upload_texture_bytes(&ctx, id, extent, &want)
+            .expect("загрузка");
+        let areas = [[3u32, 4, 10, 5], [30, 15, 7, 6]];
+        let (regions, size) = patch_regions(&areas, 4, 0);
+        let mut bytes = vec![0u8; size as usize];
+        for (area, region) in areas.iter().zip(&regions) {
+            let [x, y, aw, ah] = *area;
+            for row in 0..ah {
+                for col in 0..aw {
+                    let value = [(x + col) as u8, (y + row) as u8, 200, 7];
+                    let at = region.buffer_offset as usize + ((row * aw + col) * 4) as usize;
+                    bytes[at..at + 4].copy_from_slice(&value);
+                    let k = (((y + row) * w + x + col) * 4) as usize;
+                    want[k..k + 4].copy_from_slice(&value);
+                }
+            }
+        }
+        let src = res
+            .create_buffer(
+                &ctx,
+                size,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                BufferMemory::CpuToGpu,
+                "куски: источник",
+            )
+            .expect("буфер");
+        res.write_buffer(src, 0, &bytes);
+        let read = res
+            .create_buffer(
+                &ctx,
+                u64::from(w * h * 4),
+                vk::BufferUsageFlags::TRANSFER_DST,
+                BufferMemory::GpuToCpu,
+                "куски: чтение",
+            )
+            .expect("буфер");
+        let image = res.texture_image(id).unwrap();
+        let (src_raw, read_raw) = (res.buffer_raw(src).unwrap(), res.buffer_raw(read).unwrap());
+        res.immediate(&ctx, |d, cmd| {
+            // SAFETY: картинка и буферы живы до конца немедленной отправки; картинка в
+            // раскладке чтения после загрузки.
+            unsafe {
+                record_texture_patches(d, cmd, src_raw, &[(image, regions.clone())]);
+                let to_src = [image_barrier(
+                    image,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    vk::PipelineStageFlags2::COPY,
+                    vk::AccessFlags2::TRANSFER_READ,
+                )];
+                d.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_src),
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: w,
+                        height: h,
+                        depth: 1,
+                    });
+                d.cmd_copy_image_to_buffer(
+                    cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    read_raw,
+                    &[region],
+                );
+                let to_host = [vk::BufferMemoryBarrier2::default()
+                    .buffer(read_raw)
+                    .size(vk::WHOLE_SIZE)
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
+                d.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
+                );
+            }
+        })
+        .expect("отправка");
+        let got = res.read_buffer(read, (w * h * 4) as usize).expect("чтение");
+        assert!(got == want, "куски и всё остальное");
+        res.destroy(&ctx);
+        assert_eq!(
+            crate::context::validation_error_count(),
+            errors,
+            "ошибки проверки Vulkan"
+        );
     }
 }

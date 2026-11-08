@@ -62,7 +62,7 @@ pub struct LayerField {
     second: Option<SecondLayer>,
     /// Номер картинки в общем списке текстур; ставит видеокарта после загрузки.
     texture: u32,
-    /// Номер картинки материалов (0 — её нет).
+    /// Ячейка картинки материалов (`None` — её нет или она ещё не загружена).
     material_texture: Option<u32>,
 }
 
@@ -179,6 +179,45 @@ impl LayerField {
     /// хранится ячейка + 1, а 0 там значит «картинки нет».
     pub fn set_material_texture(&mut self, texture: u32) {
         self.material_texture = Some(texture);
+    }
+
+    /// Кусок значений и номеров материалов (`[i0, j0, w, h]`, строки снизу вверх,
+    /// плотно), как его отдаёт `LayerBake::run_area`: перепекание на месте (7.18г). Кусок
+    /// за краем сетки обрезается; у поля без номеров они не пишутся.
+    pub fn patch(&mut self, area: [u32; 4], texels: &[u8], materials: &[u8]) {
+        let [i0, j0, w, h] = area;
+        assert_eq!(texels.len(), (w * h * 4) as usize);
+        assert!(materials.is_empty() || materials.len() == (w * h * 2) as usize);
+        let wc = w.min(self.nx.saturating_sub(i0)) as usize;
+        for row in 0..h.min(self.ny.saturating_sub(j0)) as usize {
+            let at = (j0 as usize + row) * self.nx as usize + i0 as usize;
+            let from = row * w as usize;
+            self.texels[at * 4..(at + wc) * 4].copy_from_slice(&texels[from * 4..(from + wc) * 4]);
+            if !self.materials.is_empty() && !materials.is_empty() {
+                self.materials[at * 2..(at + wc) * 2]
+                    .copy_from_slice(&materials[from * 2..(from + wc) * 2]);
+            }
+        }
+    }
+
+    /// Байты куска `[i0, j0, w, h]` картинки значений и картинки номеров (пусто, если
+    /// номеров нет), строки снизу вверх, плотно — для загрузки куска на видеокарту.
+    pub fn area_bytes(&self, area: [u32; 4]) -> (Vec<u8>, Vec<u8>) {
+        let [i0, j0, w, h] = area;
+        let mut texels = Vec::with_capacity((w * h * 4) as usize);
+        let mut materials = Vec::with_capacity(if self.materials.is_empty() {
+            0
+        } else {
+            (w * h * 2) as usize
+        });
+        for row in 0..h as usize {
+            let at = (j0 as usize + row) * self.nx as usize + i0 as usize;
+            texels.extend_from_slice(&self.texels[at * 4..(at + w as usize) * 4]);
+            if !self.materials.is_empty() {
+                materials.extend_from_slice(&self.materials[at * 2..(at + w as usize) * 2]);
+            }
+        }
+        (texels, materials)
     }
 
     /// Левый нижний угол клетки (0, 0).

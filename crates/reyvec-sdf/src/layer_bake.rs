@@ -177,10 +177,36 @@ impl LayerBake {
     /// Запекает поле. `None` — фигур нет или работу отменили.
     pub fn run(&self) -> Option<(LayerField, BakeStats)> {
         let cell = self.cell;
-        let band = self.band;
-        let (lo, _) = self.extent()?;
+        let (corner, _) = self.extent()?;
         let (nx, ny) = self.points(cell)?;
-        let corner = lo;
+        let area = self.run_area(corner, cell, [0, 0, nx, ny])?;
+        let mut field = LayerField::from_texels(
+            corner,
+            cell,
+            nx,
+            ny,
+            self.band,
+            None,
+            area.texels,
+            area.materials,
+        );
+        if let Some(second) = self.second_layer {
+            field = field.with_second(second);
+        }
+        Some((field, area.stats))
+    }
+
+    /// Запекает кусок сетки с углом `corner` и шагом `cell`: точки `i0..i0 + w` по X и
+    /// `j0..j0 + h` по Y (`area` = `[i0, j0, w, h]`), строки снизу вверх. Точка (i, j)
+    /// стоит там же, где при запекании всей сетки, поэтому кусок, запечённый по тем же
+    /// фигурам, совпадает с ней байт в байт (так поле перепекается на месте, 7.18г).
+    /// `None` — работу отменили.
+    pub fn run_area(&self, corner: Vec2, cell: f32, area: [u32; 4]) -> Option<BakedArea> {
+        let band = self.band;
+        let [i0, j0, nx, ny] = area;
+        if nx == 0 || ny == 0 {
+            return Some(BakedArea::default());
+        }
         let (tx, ty) = (nx.div_ceil(TILE), ny.div_ceil(TILE));
         // Фигуры по плиткам: плитка видит фигуру, если её прямоугольник, расширенный на
         // полосу, задевает плитку.
@@ -188,6 +214,7 @@ impl LayerBake {
         let mut first_bins: Vec<Vec<u32>> = vec![Vec::new(); tiles];
         let mut second_bins: Vec<Vec<u32>> = vec![Vec::new(); tiles];
         let span = TILE as f32 * cell;
+        let origin = corner + Vec2::new(i0 as f32, j0 as f32) * cell;
         let bin = |list: &[Placed2], bins: &mut [Vec<u32>]| -> Vec<(Vec2, Vec2)> {
             let mut boxes = Vec::with_capacity(list.len());
             for (k, p) in list.iter().enumerate() {
@@ -197,12 +224,18 @@ impl LayerBake {
                 if !(a.is_finite() && b.is_finite()) {
                     continue;
                 }
+                // Плитки куска, которые задевает прямоугольник; мимо куска — никакие.
+                let (lo, hi) = (origin, origin + Vec2::new(nx as f32, ny as f32) * cell);
+                if b.x < lo.x - cell || a.x > hi.x + cell || b.y < lo.y - cell || a.y > hi.y + cell
+                {
+                    continue;
+                }
                 // Точка (i, j) стоит в corner + (i + 0,5)·cell.
                 let t = |v: f32, o: f32, n: u32| {
                     ((v - o) / span).floor().clamp(0.0, (n - 1) as f32) as u32
                 };
-                for j in t(a.y, corner.y, ty)..=t(b.y, corner.y, ty) {
-                    for i in t(a.x, corner.x, tx)..=t(b.x, corner.x, tx) {
+                for j in t(a.y, origin.y, ty)..=t(b.y, origin.y, ty) {
+                    for i in t(a.x, origin.x, tx)..=t(b.x, origin.x, tx) {
                         bins[(j * tx + i) as usize].push(k as u32);
                     }
                 }
@@ -221,66 +254,53 @@ impl LayerBake {
         let threads = self.threads.max(1).min(tiles.max(1));
         // Плитки раздаются по одной; каждый поток пишет только свои точки, поэтому
         // результаты складываются после — так не нужны общие изменяемые массивы.
-        let results: Vec<Vec<TileBytes>> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut done = Vec::new();
-                        loop {
-                            if self.cancel.load(Ordering::Relaxed) {
-                                return done;
-                            }
-                            let t = next.fetch_add(1, Ordering::Relaxed);
-                            if t >= tiles {
-                                return done;
-                            }
-                            let (ti, tj) = (t as u32 % tx, t as u32 / tx);
-                            let (w, h) = (TILE.min(nx - ti * TILE), TILE.min(ny - tj * TILE));
-                            let mut tex = Vec::with_capacity((w * h * 4) as usize);
-                            let mut mat = Vec::with_capacity((w * h * 2) as usize);
-                            for j in tj * TILE..tj * TILE + h {
-                                for i in ti * TILE..ti * TILE + w {
-                                    let p =
-                                        corner + Vec2::new(i as f32 + 0.5, j as f32 + 0.5) * cell;
-                                    let (d1, m) =
-                                        nearest(&self.first, &first_boxes, &first_bins[t], p, band);
-                                    let d2 = if self.second_layer.is_some() {
-                                        nearest(
-                                            &self.second,
-                                            &second_boxes,
-                                            &second_bins[t],
-                                            p,
-                                            band,
-                                        )
-                                        .0
-                                    } else {
-                                        band
-                                    };
-                                    tex.extend(
-                                        f32_to_half_toward_zero(d1.clamp(-band, band))
-                                            .to_le_bytes(),
-                                    );
-                                    if self.second_layer.is_some() {
-                                        tex.extend(
-                                            f32_to_half_toward_zero(d2.clamp(-band, band))
-                                                .to_le_bytes(),
-                                        );
-                                    } else {
-                                        tex.extend(plus_band);
-                                    }
-                                    mat.extend(m.to_le_bytes());
-                                }
-                            }
-                            done.push((t, tex, mat));
+        let work = || {
+            let mut done = Vec::new();
+            loop {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return done;
+                }
+                let t = next.fetch_add(1, Ordering::Relaxed);
+                if t >= tiles {
+                    return done;
+                }
+                let (ti, tj) = (t as u32 % tx, t as u32 / tx);
+                let (w, h) = (TILE.min(nx - ti * TILE), TILE.min(ny - tj * TILE));
+                let mut tex = Vec::with_capacity((w * h * 4) as usize);
+                let mut mat = Vec::with_capacity((w * h * 2) as usize);
+                for j in tj * TILE..tj * TILE + h {
+                    for i in ti * TILE..ti * TILE + w {
+                        let p =
+                            corner + Vec2::new((i0 + i) as f32 + 0.5, (j0 + j) as f32 + 0.5) * cell;
+                        let (d1, m) = nearest(&self.first, &first_boxes, &first_bins[t], p, band);
+                        tex.extend(f32_to_half_toward_zero(d1.clamp(-band, band)).to_le_bytes());
+                        if self.second_layer.is_some() {
+                            let d2 =
+                                nearest(&self.second, &second_boxes, &second_bins[t], p, band).0;
+                            tex.extend(
+                                f32_to_half_toward_zero(d2.clamp(-band, band)).to_le_bytes(),
+                            );
+                        } else {
+                            tex.extend(plus_band);
                         }
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|w| w.join().unwrap_or_default())
-                .collect()
-        });
+                        mat.extend(m.to_le_bytes());
+                    }
+                }
+                done.push((t, tex, mat));
+            }
+        };
+        let results: Vec<Vec<TileBytes>> = if threads == 1 {
+            // Маленький кусок (перепекание в кадре) — без запуска потоков.
+            vec![work()]
+        } else {
+            std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads).map(|_| scope.spawn(work)).collect();
+                workers
+                    .into_iter()
+                    .map(|w| w.join().unwrap_or_default())
+                    .collect()
+            })
+        };
         if self.cancel.load(Ordering::Relaxed) {
             return None;
         }
@@ -301,22 +321,27 @@ impl LayerBake {
             filled += 1;
         }
         if filled != tiles {
-            // Поток упал: поле неполное, лучше без него.
+            // Поток упал: кусок неполный, лучше без него.
             return None;
         }
-        let mut field =
-            LayerField::from_texels(corner, cell, nx, ny, band, None, texels, materials);
-        if let Some(second) = self.second_layer {
-            field = field.with_second(second);
-        }
-        Some((
-            field,
-            BakeStats {
+        Some(BakedArea {
+            texels,
+            materials,
+            stats: BakeStats {
                 points,
                 per_tile: listed as f32 / tiles.max(1) as f32,
             },
-        ))
+        })
     }
+}
+
+/// Запечённый кусок сетки: байты значений (R16G16_SFLOAT) и номеров материалов
+/// (R16_UNORM), строки снизу вверх, плотно.
+#[derive(Clone, Debug, Default)]
+pub struct BakedArea {
+    pub texels: Vec<u8>,
+    pub materials: Vec<u8>,
+    pub stats: BakeStats,
 }
 
 /// Расстояние до ближайшей из фигур `bin` в точке `p` (не дальше полосы) и материал:
@@ -537,5 +562,64 @@ mod tests {
         assert_eq!(big.points(0.05).unwrap().0, side);
         assert!(side <= 100);
         assert!(!big.fit(&[0.01], 100));
+    }
+
+    /// Перепекание на месте (7.18г): кусок вокруг убранной и добавленной фигуры,
+    /// запечённый по новому списку и вписанный в старое поле, даёт то же поле, что
+    /// запекание всей сетки по новому списку, байт в байт.
+    #[test]
+    fn patched_area_matches_a_full_bake() {
+        let first = vec![
+            rect([0.0, 0.0], [2.0, 0.5], 1),
+            rect([1.0, 0.8], [0.3, 0.3], 2),
+            rect([-1.2, 0.7], [0.2, 0.4], 3),
+        ];
+        let second = vec![rect([0.0, -1.0], [3.0, 0.3], 0)];
+        let old = job(first.clone(), second.clone(), 3);
+        let (mut field, _) = old.run().unwrap();
+        let (corner, cell, (nx, ny)) = (field.corner(), field.cell(), field.size());
+        // Убираем вторую фигуру, ставим новую рядом, сдвигаем брусок.
+        let mut now = first.clone();
+        now.remove(1);
+        now.push(rect([0.4, 1.0], [0.25, 0.2], 4));
+        let mut moved = second.clone();
+        moved[0].at.x += 0.3;
+        let new = job(now.clone(), moved.clone(), 2);
+        let area_of = |p: &Placed2| {
+            let (a, b) = p.world_bounds();
+            let pad = Vec2::splat(new.band + 2.0 * cell);
+            let lo = ((a - pad - corner) / cell).floor().max(Vec2::ZERO);
+            let hi = ((b + pad - corner) / cell)
+                .ceil()
+                .min(Vec2::new(nx as f32, ny as f32));
+            [
+                lo.x as u32,
+                lo.y as u32,
+                (hi - lo).x as u32,
+                (hi - lo).y as u32,
+            ]
+        };
+        for changed in [&first[1], &now[2], &second[0], &moved[0]] {
+            let area = area_of(changed);
+            let baked = new.run_area(corner, cell, area).unwrap();
+            assert_eq!(baked.stats.points, (area[2] * area[3]) as usize);
+            field.patch(area, &baked.texels, &baked.materials);
+            let (tex, mat) = field.area_bytes(area);
+            assert_eq!((tex, mat), (baked.texels, baked.materials));
+        }
+        let whole = new.run_area(corner, cell, [0, 0, nx, ny]).unwrap();
+        assert!(field.bytes() == whole.texels.as_slice(), "значения");
+        assert!(
+            field.material_bytes() == Some(whole.materials.as_slice()),
+            "номера"
+        );
+        // Пустой кусок ничего не считает.
+        assert_eq!(
+            new.run_area(corner, cell, [5, 5, 0, 3])
+                .unwrap()
+                .stats
+                .points,
+            0
+        );
     }
 }
