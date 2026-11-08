@@ -25,14 +25,27 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Распакованный Slang хранится в кэше Actions: GitHub Releases иногда
+      # отвечает 5xx подолгу (504 весь час 2026-11-08), и без кэша каждая
+      # проверка зависела бы от него.
+      - name: Cache Slang shader compiler
+        id: slang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/slang
+          key: slang-${{ env.SLANG_VERSION }}-windows-x86_64
       - name: Install Slang shader compiler
+        if: steps.slang-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $url = "https://github.com/shader-slang/slang/releases/download/v$env:SLANG_VERSION/slang-$env:SLANG_VERSION-windows-x86_64.zip"
-          # GitHub Releases иногда отвечает 5xx (504 — 2026-11-08): до 8 повторов с паузой 15 с.
+          # До 8 повторов скачивания с паузой 15 с.
           Invoke-WebRequest -Uri $url -OutFile slang.zip -MaximumRetryCount 8 -RetryIntervalSec 15
           Expand-Archive slang.zip -DestinationPath "$env:RUNNER_TEMP\slang"
           Remove-Item slang.zip
+      - name: Slang shader compiler on PATH
+        shell: pwsh
+        run: |
           "$env:RUNNER_TEMP\slang\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
           & "$env:RUNNER_TEMP\slang\bin\slangc.exe" -v
       - name: Format
@@ -91,14 +104,24 @@ jobs:
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Кэш и повторы — см. задание Windows.
+      - name: Cache Slang shader compiler
+        id: slang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/slang
+          key: slang-${{ env.SLANG_VERSION }}-linux-x86_64
       - name: Install Slang shader compiler
+        if: steps.slang-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/slang"
-          # GitHub Releases иногда отвечает 5xx (504 — 2026-11-08): до 8 повторов с паузой 15 с.
-          # Сначала в файл, потом распаковка: повтор посреди потока сломал бы tar.
+          # До 8 повторов скачивания с паузой 15 с. Сначала в файл, потом
+          # распаковка: повтор посреди потока сломал бы tar.
           curl -sSfL --retry 8 --retry-all-errors --retry-delay 15 -o "$RUNNER_TEMP/slang.tar.gz" \
             "https://github.com/shader-slang/slang/releases/download/v$SLANG_VERSION/slang-$SLANG_VERSION-linux-x86_64.tar.gz"
           tar xzf "$RUNNER_TEMP/slang.tar.gz" -C "$RUNNER_TEMP/slang"
+      - name: Slang shader compiler on PATH
+        run: |
           echo "REYVEC_SLANGC=$RUNNER_TEMP/slang/bin/slangc" >> "$GITHUB_ENV"
           "$RUNNER_TEMP/slang/bin/slangc" -v
       # Включая проверку перезагрузки шейдеров: правка файла пересобирает шейдер,
@@ -178,9 +201,30 @@ jobs:
           xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 5
           REYVEC_NO_PRESENT_FENCES=1 xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 3
 
+  # Та же команда, что у EmbarkStudios/cargo-deny-action@v2, но без его
+  # Docker-образа: тот скачивает cargo-deny с GitHub Releases без повторов и
+  # кэша и падал вместе с ним (2026-11-08).
   deny:
     name: Licenses and advisories (cargo-deny)
     runs-on: ubuntu-latest
+    env:
+      DENY_VERSION: "0.20.2"
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo-deny
+        id: deny-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/cargo-deny
+          key: cargo-deny-${{ env.DENY_VERSION }}-linux-x86_64
+      - name: Install cargo-deny
+        if: steps.deny-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-deny"
+          curl -sSfL --retry 8 --retry-all-errors --retry-delay 15 -o "$RUNNER_TEMP/cargo-deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          tar xzf "$RUNNER_TEMP/cargo-deny.tar.gz" -C "$RUNNER_TEMP/cargo-deny" --strip-components=1
+      - name: cargo deny check
+        run: '"$RUNNER_TEMP/cargo-deny/cargo-deny" --log-level warn --manifest-path ./Cargo.toml --all-features check'
