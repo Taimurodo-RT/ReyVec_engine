@@ -646,7 +646,7 @@ impl WindowRenderer {
         self.demo.as_ref().map_or(0, Demo::space_objects)
     }
 
-    /// Включена ли сетка отсева сцены «3D».
+    /// Включена ли сетка отсева в последнем объёмном кадре (сцена «3D» или 2.5D-вид).
     pub fn space_culling(&self) -> bool {
         self.demo.as_ref().is_some_and(Demo::space_culling)
     }

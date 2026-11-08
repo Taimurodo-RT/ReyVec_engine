@@ -119,7 +119,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_file: Option<&'a str>,
     pub space_error: Option<String>,
     pub space_objects: usize,
-    /// Сетка отсева сцены «3D» включена (в файле `culling: false` выключает).
+    /// Была ли сетка отсева в последнем объёмном кадре: в сцене «3D» её выключает
+    /// `culling: false` в файле, у 2.5D-вида она есть всегда.
     pub space_culling: bool,
     /// Отсев по взгляду: объектов в кадре и всего (`None` — выключен).
     pub space_in_view: Option<(usize, usize)>,
