@@ -254,6 +254,9 @@ struct Baked {
     materials: Materials,
     plates: HashMap<u64, Rect2>,
     solids: HashMap<u64, Rect2>,
+    /// Плиты поля по порядку рисования: от него зависит, чей цвет там, где они
+    /// перекрываются.
+    order: Vec<u64>,
     bake_ms: f64,
     patched: Option<FieldPatched>,
 }
@@ -264,6 +267,9 @@ struct Pending {
     materials: Materials,
     plates: HashMap<u64, Rect2>,
     solids: HashMap<u64, Rect2>,
+    order: Vec<u64>,
+    /// Подпись набора, из которого печётся поле (для [`Level3d::field_failed`]).
+    signature: u64,
     cancel: Arc<AtomicBool>,
     reason: &'static str,
 }
@@ -282,6 +288,29 @@ struct StillShape {
     key: u64,
     placed: Placed2,
     rect: Rect2,
+}
+
+/// Перекрытия плит поля, поменявшихся местами в порядке рисования: `now` и `was` — одни и
+/// те же плиты по новому и прежнему порядку. Там цвет — другой плиты, эти прямоугольники
+/// надо перепечь. Перекрытие — без допуска [`LAYER_TOUCH`]: цвет меняется и на волоске.
+fn reordered(now: &[u64], was: &[u64], rects: &HashMap<u64, Rect2>) -> Vec<Rect2> {
+    let was_at: HashMap<u64, usize> = was.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let mut out = Vec::new();
+    for (i, a) in now.iter().enumerate() {
+        let (Some(&ra), Some(&ia)) = (rects.get(a), was_at.get(a)) else {
+            continue;
+        };
+        for b in &now[i + 1..] {
+            let (Some(&rb), Some(&ib)) = (rects.get(b), was_at.get(b)) else {
+                continue;
+            };
+            let (lo, hi) = (ra.0.max(rb.0), ra.1.min(rb.1));
+            if ia > ib && lo.x < hi.x && lo.y < hi.y {
+                out.push((lo, hi));
+            }
+        }
+    }
+    out
 }
 
 /// Пары таблицы по порядку ключей (чтобы порядок работы не зависел от хеша).
@@ -602,6 +631,7 @@ impl Level3d {
             materials: p.materials,
             plates: p.plates,
             solids: p.solids,
+            order: p.order,
             bake_ms: ms,
             patched: None,
         });
@@ -617,11 +647,7 @@ impl Level3d {
             && let Some(reason) = reason
         {
             tracing::warn!("Поле уровня не готово: {reason}");
-            let mut set = Signature::new();
-            for (k, _) in sorted(&p.plates).into_iter().chain(sorted(&p.solids)) {
-                set.add(k);
-            }
-            self.field.failed = Some((set.0, reason));
+            self.field.failed = Some((p.signature, reason));
         }
     }
 
@@ -656,6 +682,9 @@ impl Level3d {
         // идут.
         let mut bake_plates: Vec<StillShape> = Vec::new();
         let mut bake_solids: Vec<StillShape> = Vec::new();
+        // Неподвижные плиты «поверх» форм: в поле не идут, но кадры покоя считают (накрыты
+        // новой плитой — войдут в поле сразу за ней).
+        let mut covered: Vec<u64> = Vec::new();
         let s = LEVEL_SCALE;
 
         // Стена и земля.
@@ -789,10 +818,24 @@ impl Level3d {
                             }
                             let key = keys.key(base.0);
                             let over = front_rects.iter().any(|&r| overlaps(in_world, r));
-                            if over {
+                            // Неподвижная, которой нет в готовом поле (новая, сдвинутая), до
+                            // входа в поле рисуется формой на своём слое — плиты поля,
+                            // нарисованные поверх неё, тоже уходят в формы, иначе легли бы
+                            // под неё.
+                            let form = self
+                                .field
+                                .baked
+                                .as_ref()
+                                .is_some_and(|b| !b.plates.contains_key(&key));
+                            if over || form {
                                 front_rects.push(in_world.abs());
-                            } else if let Some(placed) =
-                                plate_placed(&flat, instance.transform, material)
+                            }
+                            if over {
+                                covered.push(key);
+                            }
+                            if !over
+                                && let Some(placed) =
+                                    plate_placed(&flat, instance.transform, material)
                             {
                                 let rect = placed.world_bounds();
                                 bake_plates.push(StillShape { key, placed, rect });
@@ -813,7 +856,7 @@ impl Level3d {
         }
 
         if field_mode {
-            let ready = self.field_frame(&materials, bake_plates, bake_solids, solid);
+            let ready = self.field_frame(&materials, bake_plates, bake_solids, &covered, solid);
             if let (Some(field), Some(baked)) = (ready, &self.field.baked) {
                 let mut forms = 0;
                 let mut kept: Vec<Shape3> = shapes
@@ -893,11 +936,14 @@ impl Level3d {
     /// входит, простояв [`FIELD_STABLE_FRAMES`] кадров, очередью не больше
     /// [`FIELD_ADD_POINTS`] точек за кадр, а до того рисуется формой. Полное запекание в
     /// фоне — только когда поля нет, кусок слишком велик или новое за краем сетки.
+    /// `covered` — неподвижные плиты «поверх» форм: в поле им нельзя, но кадры покоя у них
+    /// идут, чтобы стопка над новой плитой входила в поле сразу за ней.
     fn field_frame(
         &mut self,
         materials: &Materials,
         plates: Vec<StillShape>,
         solids: Vec<StillShape>,
+        covered: &[u64],
         solid: u32,
     ) -> Option<Shape3> {
         let f = &mut self.field;
@@ -916,14 +962,15 @@ impl Level3d {
             })
         };
         let mut fresh = HashMap::new();
-        for (s, plate) in plates
+        for (key, plate) in plates
             .iter()
-            .map(|s| (s, true))
-            .chain(solids.iter().map(|s| (s, false)))
+            .map(|s| (s.key, true))
+            .chain(covered.iter().map(|k| (*k, true)))
+            .chain(solids.iter().map(|s| (s.key, false)))
         {
-            if !in_field(&s.key, plate) {
-                let n = f.fresh.get(&s.key).copied().unwrap_or(0);
-                fresh.insert(s.key, n.saturating_add(1));
+            if !in_field(&key, plate) {
+                let n = f.fresh.get(&key).copied().unwrap_or(0);
+                fresh.insert(key, n.saturating_add(1));
             }
         }
         f.fresh = fresh;
@@ -984,8 +1031,29 @@ impl Level3d {
             .map(|k| b.plates[k])
             .chain(gone_solids.iter().map(|k| b.solids[k]))
             .map(|r| area_of(r).0)
-            .filter(|a| points(a) > 0)
             .collect();
+        // Плиты поля поменялись местами в порядке рисования (правка файла): там, где они
+        // перекрываются, цвет — другой плиты, этот кусок перепекается в новом порядке.
+        let gone_set: std::collections::HashSet<u64> = gone_plates.iter().copied().collect();
+        let now_order: Vec<u64> = plates
+            .iter()
+            .map(|s| s.key)
+            .filter(|k| b.plates.contains_key(k) && !gone_set.contains(k))
+            .collect();
+        let was_order: Vec<u64> = b
+            .order
+            .iter()
+            .copied()
+            .filter(|k| !gone_set.contains(k))
+            .collect();
+        if now_order != was_order {
+            areas.extend(
+                reordered(&now_order, &was_order, &b.plates)
+                    .into_iter()
+                    .map(|r| area_of(r).0),
+            );
+        }
+        areas.retain(|a| points(a) > 0);
         let removed: usize = areas.iter().map(points).sum();
         if removed > FIELD_REMOVE_POINTS {
             tracing::info!(
@@ -1039,12 +1107,51 @@ impl Level3d {
         }
 
         if !areas.is_empty() {
-            let Some(field) = Arc::get_mut(&mut b.field.0) else {
+            if Arc::get_mut(&mut b.field.0).is_none() {
                 // Поле ещё держит прошлый кадр: этот кадр — без поля, перепекание — в
                 // следующем (старое поле показывать нельзя).
                 f.status = LevelFieldStatus::Baking {
                     reason: "поле занято прошлым кадром",
                 };
+                return None;
+            }
+            // Состав поля после этого кадра: без ушедшего, с вошедшим.
+            let member_plate = |k: &u64| {
+                (b.plates.contains_key(k) && !gone_set.contains(k)) || added_plates.contains(k)
+            };
+            let member_solid = |k: &u64| {
+                (b.solids.contains_key(k) && !gone_solids.contains(k)) || added_solids.contains(k)
+            };
+            let bake = Self::bake_of(
+                plates
+                    .iter()
+                    .filter(|s| member_plate(&s.key))
+                    .map(|s| s.placed.clone())
+                    .collect(),
+                solids
+                    .iter()
+                    .filter(|s| member_solid(&s.key))
+                    .map(|s| s.placed.clone())
+                    .collect(),
+                solid,
+            );
+            let started = std::time::Instant::now();
+            // Сначала все куски, потом правка: не испёкся хоть один — поле разошлось бы с
+            // составом, поэтому оно выключается и печётся целиком.
+            let pieces: Option<Vec<_>> = areas
+                .iter()
+                .map(|area| bake.run_area(corner, cell, *area).map(|a| (*area, a)))
+                .collect();
+            let Some(pieces) = pieces else {
+                tracing::warn!("Поле уровня: кусок не перепёкся — запекание целиком");
+                f.baked = None;
+                f.patches.clear();
+                let reason = "кусок поля не перепёкся";
+                if f.pending.is_none() {
+                    Self::request_full(f, materials, &plates, &solids, solid, set.0, reason);
+                } else {
+                    f.status = LevelFieldStatus::Baking { reason };
+                }
                 return None;
             };
             for k in &gone_plates {
@@ -1063,31 +1170,16 @@ impl Level3d {
                     b.solids.insert(s.key, s.rect);
                 }
             }
-            let bake = Self::bake_of(
-                plates
-                    .iter()
-                    .filter(|s| b.plates.contains_key(&s.key))
-                    .map(|s| s.placed.clone())
-                    .collect(),
-                solids
-                    .iter()
-                    .filter(|s| b.solids.contains_key(&s.key))
-                    .map(|s| s.placed.clone())
-                    .collect(),
-                solid,
-            );
-            let started = std::time::Instant::now();
+            let field = Arc::get_mut(&mut b.field.0).expect("поле проверено выше");
             let mut done = FieldPatched::default();
-            for area in &areas {
-                let Some(baked) = bake.run_area(corner, cell, *area) else {
-                    continue;
-                };
-                field.patch(*area, &baked.texels, &baked.materials);
+            for (area, baked) in &pieces {
+                let area = *area;
+                field.patch(area, &baked.texels, &baked.materials);
                 done.pieces += 1;
                 done.points += baked.stats.points;
                 f.patches.push(FieldPatch {
                     ticket: b.ticket,
-                    area: *area,
+                    area,
                 });
             }
             done.ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1104,7 +1196,17 @@ impl Level3d {
             // Номера новых фигур — в таблице поля.
             b.materials = materials.clone();
         }
-        if outside && f.pending.is_none() {
+        if let Some(b) = f.baked.as_mut()
+            && (now_order != was_order || !areas.is_empty())
+        {
+            b.order = plates
+                .iter()
+                .map(|s| s.key)
+                .filter(|k| b.plates.contains_key(k))
+                .collect();
+        }
+        let gave_up = f.failed.is_some_and(|(failed, _)| failed == set.0);
+        if outside && f.pending.is_none() && !gave_up {
             let reason = "новое за краем поля";
             Self::request_full(f, materials, &plates, &solids, solid, set.0, reason);
         }
@@ -1183,8 +1285,10 @@ impl Level3d {
             None
         };
         if let Some(reason) = failed {
+            // Для этого набора поля не будет: кадр не просит его снова. Готовое поле (если
+            // есть) продолжает работать, новое за краем остаётся формой.
+            f.failed = Some((set, reason));
             if f.baked.is_none() {
-                f.failed = Some((set, reason));
                 f.status = LevelFieldStatus::Failed(reason);
             }
             return;
@@ -1202,6 +1306,8 @@ impl Level3d {
             materials: materials.clone(),
             plates: plates.iter().map(|s| (s.key, s.rect)).collect(),
             solids: solids.iter().map(|s| (s.key, s.rect)).collect(),
+            order: plates.iter().map(|s| s.key).collect(),
+            signature: set,
             cancel: bake.cancel.clone(),
             reason,
         });
@@ -2207,6 +2313,204 @@ mod tests {
             "ящики вписаны в поле"
         );
         assert!(level.take_field_request().is_none());
+    }
+
+    /// Три неподвижные плиты для проверок порядка: широкий пол, на нём «камень» и «трава»
+    /// поверх камня. `tint` — оттенок камня, `swap` — трава рисуется раньше камня.
+    fn stack_scene(
+        library: &mut ShapeLibrary,
+    ) -> impl Fn(Color, bool) -> reyvec_scene::Scene + use<> {
+        let rect = |w: f64, h: f64| kurbo::Shape::to_path(&kurbo::Rect::new(0.0, 0.0, w, h), 0.1);
+        let mut shape = |w: f64, h: f64, r: f32| {
+            library
+                .add(reyvec_vector::Shape::fill(
+                    rect(w, h),
+                    Paint::Solid(Color::linear(r, 0.4, 0.3, 1.0)),
+                ))
+                .unwrap()
+        };
+        let (floor, rock, grass) = (
+            shape(4.0, 0.2, 0.2),
+            shape(0.4, 0.4, 0.5),
+            shape(0.4, 0.4, 0.8),
+        );
+        move |tint: Color, swap: bool| {
+            let put = |id: ShapeId, x: f64, y: f64, tint: Color| {
+                let mut instance = reyvec_vector::Instance::new(id, Affine::translate((x, y)));
+                instance.tint = tint;
+                SceneItem::Shape(instance)
+            };
+            let white = Color::linear(1.0, 1.0, 1.0, 1.0);
+            let (a, b) = (put(rock, 1.0, 0.1, tint), put(grass, 1.2, 0.3, white));
+            let mut items = vec![put(floor, 0.0, 0.0, white)];
+            if swap {
+                items.extend([b, a]);
+            } else {
+                items.extend([a, b]);
+            }
+            reyvec_scene::Scene {
+                generation: 1,
+                items,
+                ..reyvec_scene::Scene::default()
+            }
+        }
+    }
+
+    /// Лицевые грани плит кадра (формы по порядку, поле — последним).
+    fn plate_fronts(shapes: &[Shape3]) -> Vec<f32> {
+        shapes
+            .iter()
+            .filter_map(|s| match s {
+                Shape3::Paint { shape, .. } => match **shape {
+                    Shape3::Move { at, .. } => Some(at[2] + PLATE * 0.5),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Готовое поле `level` — то же, что полное запекание сцены `scene` (байт в байт).
+    fn assert_field_is_full_bake(
+        level: &Level3d,
+        scene: &reyvec_scene::Scene,
+        library: &ShapeLibrary,
+    ) {
+        let mut fresh = Level3d::default();
+        drop(fresh.frame(scene, library, LevelRender::Field));
+        let (_, bake) = fresh.take_field_request().unwrap();
+        let (whole, _) = bake.run().unwrap();
+        let field = level.baked_field().unwrap();
+        assert_eq!(
+            (whole.corner(), whole.cell()),
+            (field.corner(), field.cell())
+        );
+        assert!(
+            whole.bytes() == field.bytes(),
+            "значения как у полного запекания"
+        );
+    }
+
+    fn bake_level_field(level: &mut Level3d) {
+        let (ticket, bake) = level.take_field_request().expect("запрос на запекание");
+        let (mut field, stats) = bake.run().expect("поле");
+        field.set_texture(1);
+        field.set_material_texture(2);
+        assert!(level.install_field(ticket, FieldRef(Arc::new(field)), stats, 1.0));
+    }
+
+    /// Неподвижная плита, которой нет в поле (камень перекрасили), рисуется формой на своём
+    /// слое — и трава, нарисованная поверх неё, уходит из поля в формы над ней, как в SDF,
+    /// а не остаётся в поле под камнем. Простояв, камень входит в поле, трава — сразу за ним.
+    #[test]
+    fn fresh_plate_keeps_later_overlapping_ones_as_forms() {
+        let mut library = ShapeLibrary::new(0.01);
+        let scene_with = stack_scene(&mut library);
+        let white = Color::linear(1.0, 1.0, 1.0, 1.0);
+        let mut level = Level3d::default();
+        let before = scene_with(white, false);
+        drop(level.frame(&before, &library, LevelRender::Field));
+        bake_level_field(&mut level);
+        let made = level.frame(&before, &library, LevelRender::Field);
+        assert_eq!(made.frame.shapes.len(), 2, "стена и поле");
+        drop(made);
+        let red = Color::linear(1.0, 0.3, 0.3, 1.0);
+        let after = scene_with(red, false);
+        let sdf = plate_fronts(&level.frame(&after, &library, LevelRender::Sdf).frame.shapes);
+        let made = level.frame(&after, &library, LevelRender::Field);
+        // Стена, камень и трава формами, поле.
+        assert_eq!(made.frame.shapes.len(), 4);
+        let got = plate_fronts(&made.frame.shapes);
+        assert_eq!(got[..2], sdf[1..3], "слои камня и травы — как в SDF");
+        assert!(
+            got[1] > got[0] && got[0] > got[2],
+            "трава над камнем, камень над полем"
+        );
+        drop(made);
+        assert_eq!(level.take_field_patches().len(), 2, "камень и трава вынуты");
+        assert!(level.take_field_request().is_none());
+        for _ in 2..FIELD_STABLE_FRAMES {
+            assert_eq!(
+                level
+                    .frame(&after, &library, LevelRender::Field)
+                    .frame
+                    .shapes
+                    .len(),
+                4
+            );
+        }
+        assert!(level.take_field_patches().is_empty());
+        // Камень входит в поле; трава ещё над формой камня — форма.
+        assert_eq!(
+            level
+                .frame(&after, &library, LevelRender::Field)
+                .frame
+                .shapes
+                .len(),
+            3
+        );
+        assert_eq!(level.take_field_patches().len(), 1);
+        // Трава простояла столько же и входит сразу за ним.
+        assert_eq!(
+            level
+                .frame(&after, &library, LevelRender::Field)
+                .frame
+                .shapes
+                .len(),
+            2
+        );
+        assert_eq!(level.take_field_patches().len(), 1);
+        assert!(level.take_field_request().is_none());
+        assert_field_is_full_bake(&level, &after, &library);
+    }
+
+    /// Плиты поля поменялись местами в порядке рисования (правка файла), ключи те же: в
+    /// перекрытии цвет теперь другой плиты — этот кусок перепекается в тот же кадр.
+    #[test]
+    fn reordered_plates_are_rebaked_in_place() {
+        let mut library = ShapeLibrary::new(0.01);
+        let scene_with = stack_scene(&mut library);
+        let white = Color::linear(1.0, 1.0, 1.0, 1.0);
+        let mut level = Level3d::default();
+        let before = scene_with(white, false);
+        drop(level.frame(&before, &library, LevelRender::Field));
+        bake_level_field(&mut level);
+        drop(level.frame(&before, &library, LevelRender::Field));
+        let swapped = scene_with(white, true);
+        let made = level.frame(&swapped, &library, LevelRender::Field);
+        assert_eq!(made.frame.shapes.len(), 2, "всё в поле");
+        let materials = made.materials.clone();
+        drop(made);
+        assert_eq!(level.take_field_patches().len(), 1, "кусок перекрытия");
+        assert!(level.take_field_request().is_none());
+        assert_field_is_full_bake(&level, &swapped, &library);
+        // Цвет в перекрытии — камня (теперь он сверху).
+        let field = level.baked_field().unwrap();
+        let p = Vec2::new(1.3, 0.4) * LEVEL_SCALE;
+        let id = field.material_at(p).expect("материал");
+        assert_eq!(materials[id as usize].color, [0.5, 0.4, 0.3]);
+        // Порядок запомнен: следующий кадр ничего не перепекает.
+        drop(level.frame(&swapped, &library, LevelRender::Field));
+        assert!(level.take_field_patches().is_empty());
+    }
+
+    /// Видеокарта не дала картинку поля: для этого набора поле больше не просится (и
+    /// строка на панели говорит почему), а не печётся заново каждый кадр.
+    #[test]
+    fn failed_field_is_not_baked_again() {
+        let mut library = ShapeLibrary::new(0.01);
+        let scene_with = stack_scene(&mut library);
+        let scene = scene_with(Color::linear(1.0, 1.0, 1.0, 1.0), false);
+        let mut level = Level3d::default();
+        drop(level.frame(&scene, &library, LevelRender::Field));
+        let (ticket, _) = level.take_field_request().expect("запрос на запекание");
+        level.field_failed(ticket, Some("видеокарта не дала картинку поля"));
+        drop(level.frame(&scene, &library, LevelRender::Field));
+        assert!(level.take_field_request().is_none());
+        assert_eq!(
+            level.field_status(),
+            LevelFieldStatus::Failed("видеокарта не дала картинку поля")
+        );
     }
 
     /// Перепекание на месте (7.18г): сдвинутая неподвижная фигура выходит из поля в тот же
