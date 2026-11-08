@@ -237,6 +237,10 @@ struct FieldState {
     next_ticket: u64,
     /// Неподвижное, которого нет в поле: сколько кадров подряд оно стоит на месте.
     fresh: HashMap<u64, u32>,
+    /// Сколько раз неподвижная плита выходила из поля, оказавшись над подвижным: каждый
+    /// раз ждать возврата вдвое дольше (подвижное, качающееся у края большой плиты, не
+    /// должно перепекать её по кругу).
+    bounces: HashMap<u64, u32>,
     /// Набор неподвижного (подпись), для которого поля не будет, и почему.
     failed: Option<(u64, &'static str)>,
     /// Куски, перепечённые в кадре и ещё не отданные видеокарте.
@@ -289,6 +293,8 @@ struct StillShape {
     key: u64,
     placed: Placed2,
     rect: Rect2,
+    /// Прямоугольник плиты в мире для правила слоёв (как у [`overlaps`]); у брусков пуст.
+    layer: kurbo::Rect,
 }
 
 /// Перекрытия плит поля, поменявшихся местами в порядке рисования: `now` и `was` — одни и
@@ -721,6 +727,8 @@ impl Level3d {
         // Неподвижные плиты, не накрывающие подвижное (с накрытыми новыми неподвижными
         // формами): их кадры покоя идут, и их берёт полное запекание.
         let mut full_plates: Vec<StillShape> = Vec::new();
+        // Неподвижные плиты над подвижным (для счёта выходов из поля).
+        let mut held: Vec<u64> = Vec::new();
         let s = LEVEL_SCALE;
 
         // Стена и земля.
@@ -780,7 +788,12 @@ impl Level3d {
                     }
                     let key = keys.key(base.0);
                     let rect = placed.world_bounds();
-                    bake_solids.push(StillShape { key, placed, rect });
+                    bake_solids.push(StillShape {
+                        key,
+                        placed,
+                        rect,
+                        layer: kurbo::Rect::ZERO,
+                    });
                     kind = Still::Solid(key);
                 }
                 for shape in solid_shapes(c) {
@@ -869,17 +882,28 @@ impl Level3d {
                             if over || form {
                                 front_rects.push(in_world.abs());
                             }
-                            if over_moving {
-                                moving_rects.push(in_world.abs());
-                            } else if let Some(placed) =
+                            let placed = if over_moving {
+                                held.push(key);
+                                None
+                            } else {
                                 plate_placed(&flat, instance.transform, material)
-                            {
+                            };
+                            if let Some(placed) = placed {
                                 let rect = placed.world_bounds();
-                                let shape = StillShape { key, placed, rect };
+                                let shape = StillShape {
+                                    key,
+                                    placed,
+                                    rect,
+                                    layer: in_world.abs(),
+                                };
                                 if !over {
                                     bake_plates.push(shape.clone());
                                 }
                                 full_plates.push(shape);
+                            } else {
+                                // Над подвижным или без формы для поля — форма всегда, как
+                                // подвижная.
+                                moving_rects.push(in_world.abs());
                             }
                             still.push(Still::Plate(key));
                         } else {
@@ -898,7 +922,14 @@ impl Level3d {
         }
 
         if field_mode {
-            let ready = self.field_frame(&materials, bake_plates, full_plates, bake_solids, solid);
+            let ready = self.field_frame(
+                &materials,
+                bake_plates,
+                full_plates,
+                bake_solids,
+                &held,
+                solid,
+            );
             if let (Some(field), Some(baked)) = (ready, &self.field.baked) {
                 let mut forms = 0;
                 let mut kept: Vec<Shape3> = shapes
@@ -987,9 +1018,24 @@ impl Level3d {
         plates: Vec<StillShape>,
         full: Vec<StillShape>,
         solids: Vec<StillShape>,
+        held: &[u64],
         solid: u32,
     ) -> Option<Shape3> {
         let f = &mut self.field;
+        // Выходы из поля помнятся, пока плита есть в кадре.
+        let present: std::collections::HashSet<u64> = full
+            .iter()
+            .map(|s| s.key)
+            .chain(held.iter().copied())
+            .collect();
+        f.bounces.retain(|k, _| present.contains(k));
+        let bounces = f.bounces.clone();
+        let need =
+            // Первый выход — обычное ожидание, каждый следующий — вдвое дольше.
+            move |k: &u64| {
+                let n = bounces.get(k).copied().unwrap_or(0);
+                FIELD_STABLE_FRAMES << n.saturating_sub(1).min(6)
+            };
         // Сколько кадров стоит неподвижное, которого нет в поле.
         let in_field = |key: &u64, plate: bool| {
             f.baked.as_ref().is_some_and(|b| {
@@ -1016,31 +1062,49 @@ impl Level3d {
         // печётся заново) — только простоявшее: в поле или [`FIELD_STABLE_FRAMES`] кадров
         // без изменений. Иначе фигура, меняющаяся каждый кадр без пометки «подвижное»,
         // уходила бы из каждого нового поля, и большая — снова запускала бы запекание.
-        let (full, solids_full): (Vec<StillShape>, Vec<StillShape>) = match &f.baked {
-            None => (full, solids.clone()),
-            Some(b) => {
+        // После отказа (поля не будет) — тоже: иначе меняющаяся фигура меняла бы подпись
+        // набора каждый кадр, и запекание просилось бы снова и снова. Плита, нарисованная
+        // поверх непростоявшей, после запекания окажется над её формой и тут же уйдёт из
+        // поля — её тоже не берём (цепочка — по тому же правилу слоёв, что в кадре).
+        let (full, solids_full): (Vec<StillShape>, Vec<StillShape>) =
+            if f.baked.is_none() && f.failed.is_none() {
+                (full, solids.clone())
+            } else {
+                let empty = HashMap::new();
+                let (plates_in, solids_in) = f
+                    .baked
+                    .as_ref()
+                    .map_or((&empty, &empty), |b| (&b.plates, &b.solids));
                 let stable = |s: &StillShape, members: &HashMap<u64, Rect2>| {
                     members.contains_key(&s.key)
-                        || f.fresh.get(&s.key).copied().unwrap_or(0) >= FIELD_STABLE_FRAMES
+                        || f.fresh.get(&s.key).copied().unwrap_or(0) >= need(&s.key)
                 };
-                (
-                    full.into_iter().filter(|s| stable(s, &b.plates)).collect(),
-                    solids
-                        .iter()
-                        .filter(|s| stable(s, &b.solids))
-                        .cloned()
-                        .collect(),
-                )
-            }
-        };
+                let mut front: Vec<kurbo::Rect> = Vec::new();
+                let mut kept = Vec::new();
+                for s in full {
+                    if stable(&s, plates_in) && !front.iter().any(|&r| overlaps(s.layer, r)) {
+                        kept.push(s);
+                    } else {
+                        front.push(s.layer);
+                    }
+                }
+                let solids_kept = solids
+                    .iter()
+                    .filter(|s| stable(s, solids_in))
+                    .cloned()
+                    .collect();
+                (kept, solids_kept)
+            };
         let mut set = Signature::new();
         for s in full.iter().chain(&solids_full) {
             set.add(s.key);
         }
 
         let Some(b) = f.baked.as_mut() else {
+            // Поля для этого набора не будет; после отказа набор — только простоявшее, и
+            // пока его нет, просить нечего.
             if let Some((failed, reason)) = f.failed
-                && failed == set.0
+                && (failed == set.0 || full.is_empty() && solids_full.is_empty())
             {
                 f.status = LevelFieldStatus::Failed(reason);
                 return None;
@@ -1089,6 +1153,12 @@ impl Level3d {
             .filter(|(k, _)| !now_solids.contains(k))
             .map(|(k, _)| k)
             .collect();
+        // Ушла, оказавшись над подвижным, — выход засчитан (возврат ждёт дольше).
+        for k in &gone_plates {
+            if held.contains(k) {
+                *f.bounces.entry(*k).or_default() += 1;
+            }
+        }
         let mut areas: Vec<[u32; 4]> = gone_plates
             .iter()
             .map(|k| b.plates[k])
@@ -1146,7 +1216,7 @@ impl Level3d {
         {
             let members = if plate { &b.plates } else { &b.solids };
             if members.contains_key(&s.key)
-                || f.fresh.get(&s.key).copied().unwrap_or(0) < FIELD_STABLE_FRAMES
+                || f.fresh.get(&s.key).copied().unwrap_or(0) < need(&s.key)
             {
                 continue;
             }
@@ -2645,6 +2715,147 @@ mod tests {
             level.field_status(),
             LevelFieldStatus::Ready { rebaking: true, .. }
         ));
+    }
+
+    /// Большая плита поверх плиты, перекрашиваемой каждый кадр без пометки «подвижное»:
+    /// после полного запекания она не входит в поле, чтобы тут же уйти, — запекания не
+    /// идут по кругу, поле работает.
+    #[test]
+    fn plate_over_changing_one_does_not_loop_full_bakes() {
+        let mut library = ShapeLibrary::new(0.01);
+        let rect = |w: f64, h: f64| kurbo::Shape::to_path(&kurbo::Rect::new(0.0, 0.0, w, h), 0.1);
+        let mut shape = |w: f64, h: f64| {
+            library
+                .add(reyvec_vector::Shape::fill(
+                    rect(w, h),
+                    Paint::Solid(Color::linear(0.5, 0.4, 0.3, 1.0)),
+                ))
+                .unwrap()
+        };
+        let (floor, pillar, small, big) = (
+            shape(4.0, 0.2),
+            shape(0.1, 3.0),
+            shape(0.3, 0.3),
+            shape(2.5, 2.5),
+        );
+        let scene_with = |tint: f32| {
+            let put = |id: ShapeId, x: f64, y: f64, tint: f32| {
+                let mut instance = reyvec_vector::Instance::new(id, Affine::translate((x, y)));
+                instance.tint = Color::linear(tint, 1.0, 1.0, 1.0);
+                SceneItem::Shape(instance)
+            };
+            reyvec_scene::Scene {
+                generation: 1,
+                items: vec![
+                    put(floor, 0.0, 0.0, 1.0),
+                    put(pillar, 3.8, 0.0, 1.0),
+                    put(small, 0.6, 0.4, tint),
+                    put(big, 0.5, 0.3, 1.0),
+                ],
+                ..reyvec_scene::Scene::default()
+            }
+        };
+        let mut level = Level3d::default();
+        let mut requests = 0;
+        for i in 0..3 * FIELD_STABLE_FRAMES {
+            let tint = 0.5 + 0.001 * i as f32;
+            drop(level.frame(&scene_with(tint), &library, LevelRender::Field));
+            if let Some((ticket, bake)) = level.take_field_request() {
+                requests += 1;
+                let (mut field, stats) = bake.run().expect("поле");
+                field.set_texture(1);
+                field.set_material_texture(2);
+                assert!(level.install_field(ticket, FieldRef(Arc::new(field)), stats, 1.0));
+            }
+        }
+        assert!(requests <= 2, "запеканий целиком: {requests}");
+        assert!(matches!(
+            level.field_status(),
+            LevelFieldStatus::Ready { .. }
+        ));
+    }
+
+    /// Отказ видеокарты при плите, меняющейся каждый кадр: после отказа запекание просится
+    /// не больше одного раза (по простоявшему набору), потом — никогда.
+    #[test]
+    fn failed_field_with_changing_plate_is_not_baked_again() {
+        let mut library = ShapeLibrary::new(0.01);
+        let scene_with = stack_scene(&mut library);
+        let mut level = Level3d::default();
+        let mut requests = 0;
+        for i in 0..4 * FIELD_STABLE_FRAMES {
+            let tint = Color::linear(0.5 + 0.001 * i as f32, 1.0, 1.0, 1.0);
+            drop(level.frame(&scene_with(tint, false), &library, LevelRender::Field));
+            if let Some((ticket, _)) = level.take_field_request() {
+                requests += 1;
+                level.field_failed(ticket, Some("видеокарта не дала картинку поля"));
+            }
+        }
+        assert_eq!(
+            requests, 2,
+            "первое запекание и одна попытка по простоявшему"
+        );
+        assert!(matches!(level.field_status(), LevelFieldStatus::Failed(_)));
+    }
+
+    /// Неподвижная плита над подвижной, которая то заезжает под неё, то уезжает: каждый
+    /// следующий возврат в поле ждёт вдвое дольше.
+    #[test]
+    fn bouncing_plate_waits_longer_each_time() {
+        let mut library = ShapeLibrary::new(0.01);
+        let square = kurbo::Shape::to_path(&kurbo::Rect::new(-0.5, -0.5, 0.5, 0.5), 0.1);
+        let ids: Vec<ShapeId> = (0..2)
+            .map(|i| {
+                library
+                    .add(reyvec_vector::Shape::fill(
+                        square.clone(),
+                        Paint::Solid(Color::linear(0.3 + 0.3 * i as f32, 0.5, 0.5, 1.0)),
+                    ))
+                    .unwrap()
+            })
+            .collect();
+        let scene_with = |m: f64| reyvec_scene::Scene {
+            generation: 1,
+            items: vec![
+                SceneItem::BeginDynamic,
+                SceneItem::Shape(reyvec_vector::Instance::new(
+                    ids[0],
+                    Affine::translate((m, 0.0)),
+                )),
+                SceneItem::EndDynamic,
+                SceneItem::Shape(reyvec_vector::Instance::new(ids[1], Affine::IDENTITY)),
+            ],
+            ..reyvec_scene::Scene::default()
+        };
+        let (far, under) = (scene_with(-10.0), scene_with(0.0));
+        let mut level = Level3d::default();
+        drop(level.frame(&far, &library, LevelRender::Field));
+        bake_level_field(&mut level);
+        drop(level.frame(&far, &library, LevelRender::Field));
+        let in_field = |level: &Level3d| {
+            matches!(
+                level.field_status(),
+                LevelFieldStatus::Ready { plates: 1, .. }
+            )
+        };
+        assert!(in_field(&level));
+        for wait in [
+            FIELD_STABLE_FRAMES,
+            2 * FIELD_STABLE_FRAMES,
+            4 * FIELD_STABLE_FRAMES,
+        ] {
+            drop(level.frame(&under, &library, LevelRender::Field));
+            assert!(!in_field(&level), "над подвижной — форма");
+            let mut frames = 0;
+            while !in_field(&level) {
+                drop(level.frame(&far, &library, LevelRender::Field));
+                frames += 1;
+                assert!(frames <= 4 * FIELD_STABLE_FRAMES);
+            }
+            assert_eq!(frames, wait);
+        }
+        level.take_field_patches();
+        assert!(level.take_field_request().is_none());
     }
 
     /// Видеокарта не дала картинку поля: для этого набора поле больше не просится (и
