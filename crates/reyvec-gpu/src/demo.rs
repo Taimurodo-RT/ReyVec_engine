@@ -538,6 +538,10 @@ pub(crate) struct Demo {
     /// Куски поля уровня, перепечённые в этом кадре (7.18г): буфер-источник (удаляется,
     /// когда видеокарта закончит кадр) и области копий в обе картинки поля.
     level_patch: Option<LevelPatch>,
+    /// Принят другой уровень, а кадры ещё рисуют прежний (поток логики берёт новый мир на
+    /// следующем шаге): поле сбрасывается на первом снимке нового мира, а не печёт прежний.
+    /// Здесь — номер прежнего мира.
+    level_clear_from: Option<u64>,
     /// Правка снимка мира перед 2.5D-видом (тесты перепекания поля 7.18г).
     #[cfg(test)]
     level_edit: Option<fn(&mut reyvec_scene::Scene)>,
@@ -846,6 +850,7 @@ impl Demo {
             },
             level_field_textures: Vec::new(),
             level_patch: None,
+            level_clear_from: None,
             #[cfg(test)]
             level_edit: None,
             space_shade_small: vk::Pipeline::null(),
@@ -1550,6 +1555,12 @@ impl Demo {
         ctx: &GpuContext,
         res: &mut GpuResources,
     ) -> (crate::level3d::LevelFrame, std::time::Duration) {
+        if let Some(old) = self.level_clear_from
+            && self.file_scene.generation != old
+        {
+            self.level_clear_from = None;
+            self.level.clear();
+        }
         for (ticket, result, took) in self.loading.take_level_fields() {
             self.install_level_field(ctx, res, ticket, result, took);
         }
@@ -1682,6 +1693,7 @@ impl Demo {
     pub fn set_level_view(&mut self, on: bool) {
         if on && !self.level_view {
             self.level.clear();
+            self.level_clear_from = None;
         }
         self.level_view = on;
     }
@@ -1730,8 +1742,12 @@ impl Demo {
         let mut world = world;
         let fresh = std::mem::take(&mut self.fresh_scene);
         if fresh {
-            // Другой уровень: поле прежнего не правится по кускам, а печётся заново.
-            self.level.clear();
+            // Другой уровень: поле прежнего не правится по кускам, а печётся заново — с
+            // первого снимка нового мира.
+            self.level_clear_from = Some(self.file_scene.generation);
+        } else {
+            // Правка файла: прежние выходы плит из поля — не мигание, счёт заново.
+            self.level.scene_edited();
         }
         if !fresh && let Some(body) = self.file_world.as_mut().and_then(|w| w.player_body()) {
             world.set_player_body(body);
