@@ -50,6 +50,40 @@ pub struct VectorCpu {
     pub drawn: usize,
 }
 
+/// Счётчики сцены «3D» и 2.5D-вида для панели (7.18б): до поля слоя ни одна цифра,
+/// определяющая цену кадра, не измерялась (перепроверка разбора 2026-11-07).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SpaceStats {
+    /// Процессор: собрать формы кадра (уровень из снимка мира и лампы или предметы файла
+    /// сцены «3D»), мс, сглажено по кадрам.
+    pub build_ms: f64,
+    /// Процессор: отсев по взгляду, программы форм, сетка отсева, запись в буфер (и
+    /// подготовка поля 7.10 в сцене «3D»), мс, сглажено по кадрам.
+    pub pack_ms: f64,
+    /// Объектов в списке сцены (предметы, заменители моделей, светящиеся шарики ламп).
+    pub objects: u32,
+    /// Слов сцены в буфере кадра (по 4 байта).
+    pub words: usize,
+    /// Объектов сверх предела шейдера ([`MAX_SCENE_OBJECTS`]): они не рисуются.
+    pub dropped: usize,
+    /// Сцена не поместилась в буфер ([`MAX_SCENE_WORDS`] слов): сколько было нужно;
+    /// рисуется пустая.
+    pub overflow: Option<usize>,
+    /// Пикселей края в прошлом кадре этой ячейки (счётчик прохода «края 3D: поиск»,
+    /// прочитан с видеокарты); `None` — сглаживание краёв выключено или список не создан.
+    pub edge_pixels: Option<u32>,
+    /// Пикселей в кадре 3D (с учётом «Разрешения 3D»): для доли краёв.
+    pub pixels: u32,
+}
+
+/// Больше объектов шейдер сцены «3D» не читает (`MAX_OBJECTS` в `include/space.slang`).
+pub const MAX_SCENE_OBJECTS: usize = reyvec_sdf::shape3d::MAX_OBJECTS;
+/// Больше слов в буфер сцены кадра не помещается.
+pub const MAX_SCENE_WORDS: usize = crate::space::MAX_WORDS;
+/// Больше пикселей края в список не входит (`MAX_EDGES` в `raymarch_edge_find.slang`);
+/// остальные рисуются одним лучом.
+pub const MAX_EDGE_PIXELS: u32 = 65535 * 16;
+
 /// Сколько времени кадра можно тратить на постройку недостающих уровней детализации, мс.
 const DETAIL_BUDGET_MS: f64 = 1.0;
 
@@ -403,9 +437,9 @@ pub(crate) struct FrameData {
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
-    /// Сглаживание краёв форм (7.6о): список пикселей краёв (адрес и сам буфер).
-    /// `None` — выключено.
-    space_edges: Option<(vk::DeviceAddress, vk::Buffer)>,
+    /// Сглаживание краёв форм (7.6о): список пикселей краёв (адрес и сам буфер) и буфер
+    /// для чтения его счётчика процессором (7.18б). `None` — выключено.
+    space_edges: Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)>,
     /// Запечённое поле расстояний (7.10б): что пересчитать в проходе «поле». `None` —
     /// поле выключено.
     space_field: Option<crate::field::FieldFrame>,
@@ -454,6 +488,9 @@ pub(crate) struct Demo {
     space_edges: vk::Pipeline,
     /// Список пикселей краёв, свой у каждого кадра в полёте (буфер и его размер).
     space_edge_lists: Vec<Option<(BufferId, u64)>>,
+    /// Начало списка краёв (16 байт, в том числе число пикселей), скопированное для
+    /// процессора; свой у каждого кадра в полёте (7.18б).
+    space_edge_counts: Vec<Option<BufferId>>,
     /// Включено ли сглаживание краёв (настройка, X).
     space_smooth: bool,
     /// Запечённое поле расстояний (7.10б) и его проход «поле» (`field_bake.slang`).
@@ -480,6 +517,11 @@ pub(crate) struct Demo {
     space_view: reyvec_sdf::view3d::ViewCullStats,
     /// Сетка отсева последнего кадра сцены «3D» (`None` — сетки не было).
     space_grid: Option<crate::space::GridStats>,
+    /// Был ли в последнем кадре сцены «3D» отсев по взгляду (у уровня — всегда).
+    space_view_culled: bool,
+    /// Счётчики последнего кадра сцены «3D» или 2.5D-вида (7.18б); `None` — кадр был
+    /// не объёмный.
+    space_stats: Option<SpaceStats>,
     /// Поле расстояний сцены «свет» (4.2): маска теней и проходы jump flooding.
     field: FieldPipelines,
     /// Линии фона сцены «свет» по полю из картинки (jump flooding), а не точному.
@@ -747,6 +789,7 @@ impl Demo {
             space_edge_find: vk::Pipeline::null(),
             space_edges: vk::Pipeline::null(),
             space_edge_lists: vec![None; frames_in_flight],
+            space_edge_counts: vec![None; frames_in_flight],
             space_smooth: true,
             space_field: crate::field::SpaceField::new(
                 frames_in_flight,
@@ -764,6 +807,8 @@ impl Demo {
             space_camera: reyvec_sdf::Camera3D::default(),
             space_view: Default::default(),
             space_grid: None,
+            space_view_culled: false,
+            space_stats: None,
             field: FieldPipelines::default(),
             light_field: false,
             file_scene: reyvec_scene::Scene::default(),
@@ -1089,15 +1134,16 @@ impl Demo {
     }
 
     /// Список пикселей краёв (7.6о) кадра `slot` для кадра размера `extent`: создаётся
-    /// при первой надобности и пересоздаётся, когда кадр стал больше. `None` — не вышло
-    /// (тогда края не сглаживаются).
+    /// при первой надобности и пересоздаётся, когда кадр стал больше. Вместе с ним —
+    /// буфер на 16 байт, куда проход «края 3D: поиск» копирует начало списка со счётчиком
+    /// пикселей для панели (7.18б). `None` — не вышло (тогда края не сглаживаются).
     fn edge_list(
         &mut self,
         ctx: &GpuContext,
         res: &mut GpuResources,
         slot: usize,
         extent: vk::Extent2D,
-    ) -> Option<(vk::DeviceAddress, vk::Buffer)> {
+    ) -> Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)> {
         let size = 16 + u64::from(extent.width) * u64::from(extent.height) * 4;
         let entry = self.space_edge_lists.get_mut(slot)?;
         if entry.is_some_and(|(_, have)| have < size)
@@ -1111,7 +1157,8 @@ impl Demo {
                 size,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST,
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::TRANSFER_SRC,
                 BufferMemory::GpuOnly,
                 &format!("края 3D, кадр {slot}"),
             ) {
@@ -1123,7 +1170,43 @@ impl Demo {
             }
         }
         let (id, _) = (*entry)?;
-        Some((res.buffer_address(id), res.buffer_raw(id)?))
+        let count = self.space_edge_counts.get_mut(slot)?;
+        if count.is_none() {
+            match res.create_buffer(
+                ctx,
+                16,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                BufferMemory::GpuToCpu,
+                &format!("число краёв 3D, кадр {slot}"),
+            ) {
+                Ok(id) => *count = Some(id),
+                Err(e) => {
+                    tracing::warn!("буфер числа краёв 3D: {e}");
+                    return None;
+                }
+            }
+        }
+        let count = (*count)?;
+        Some((
+            res.buffer_address(id),
+            res.buffer_raw(id)?,
+            res.buffer_raw(count)?,
+        ))
+    }
+
+    /// Число пикселей края в последнем законченном кадре ячейки `slot` (счётчик списка
+    /// краёв, скопированный проходом «края 3D: поиск»). Кадр ячейки должен быть закончен
+    /// (его забор дождались). `None` — списка краёв у ячейки нет.
+    pub fn edge_pixels(&self, res: &GpuResources, slot: usize) -> Option<u32> {
+        let id = (*self.space_edge_counts.get(slot)?)?;
+        let bytes = res.read_buffer(id, 16)?;
+        Some(u32::from_ne_bytes(bytes.get(12..16)?.try_into().ok()?))
+    }
+
+    /// Счётчики последнего кадра сцены «3D» или 2.5D-вида для панели (7.18б); `None` —
+    /// последний кадр был не объёмный.
+    pub fn space_stats(&self) -> Option<SpaceStats> {
+        self.space_stats
     }
 
     /// Запечённое поле расстояний сцены «3D» (7.10б): включено ли и умеет ли видеокарта.
@@ -1221,7 +1304,7 @@ impl Demo {
     /// Отсев по взгляду в последнем кадре сцены «3D»: сколько объектов осталось из
     /// скольких (`None` — выключен, `view_culling: false`).
     pub fn space_in_view(&self) -> Option<reyvec_sdf::view3d::ViewCullStats> {
-        (!self.space.view_culling_off).then_some(self.space_view)
+        self.space_view_culled.then_some(self.space_view)
     }
 
     /// Сетка отсева последнего кадра сцены «3D»: клетка, размеры, длины списков
@@ -2334,6 +2417,10 @@ impl Demo {
         let mut space_field = None;
         let mut space_camera = self.space_camera;
         if scene == DemoScene::Space {
+            // Счётчики для панели (7.18б): число краёв — из прошлого кадра этой ячейки
+            // (он закончен: его забор дождались перед подготовкой), времена — отсюда.
+            let edge_pixels = space_edges.and_then(|_| self.edge_pixels(res, slot));
+            let started = std::time::Instant::now();
             let (mut frame, level_materials) = if level {
                 let _zone = crate::cpu_zone!("уровень в объёме");
                 let center = [self.camera.center.x, self.camera.center.y];
@@ -2350,6 +2437,7 @@ impl Demo {
             } else {
                 (self.space.frame(time), None)
             };
+            let built = std::time::Instant::now();
             // Поле расстояний — только у сцены «3D»: у уровня почти всё движется вместе
             // с камерой и героем, пересчёт стоил бы дороже, чем экономит (7.12).
             if level {
@@ -2362,7 +2450,8 @@ impl Demo {
                     .prepare(ctx, res, slot, space_camera.eye, programs);
             }
             let view_proj = space_camera.view_proj(aspect);
-            if level || !self.space.view_culling_off {
+            self.space_view_culled = level || !self.space.view_culling_off;
+            if self.space_view_culled {
                 // У уровня солнца нет: его заслонки не держим, иначе в кадр комнаты
                 // тянулся бы коридор (разбор 2026-11-07).
                 self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj, !level);
@@ -2394,8 +2483,25 @@ impl Demo {
             }
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
+            let build_ms = (built - started).as_secs_f64() * 1000.0;
+            let pack_ms = built.elapsed().as_secs_f64() * 1000.0;
+            // Сглаживание, как у векторного кадра: числа на панели не прыгают.
+            let smooth = |old: Option<f64>, new: f64| old.map_or(new, |o| o * 0.9 + new * 0.1);
+            let prev = self.space_stats;
+            let space_extent = self.space_scale.apply(extent);
+            self.space_stats = Some(SpaceStats {
+                build_ms: smooth(prev.map(|p| p.build_ms), build_ms),
+                pack_ms: smooth(prev.map(|p| p.pack_ms), pack_ms),
+                objects: packed.objects,
+                words: packed.words.len(),
+                dropped: packed.dropped,
+                overflow: packed.overflow,
+                edge_pixels,
+                pixels: space_extent.width * space_extent.height,
+            });
         } else {
             self.space_field.skip();
+            self.space_stats = None;
         }
         FrameData {
             scene,
@@ -2871,7 +2977,7 @@ impl Demo {
             });
             // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
             // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
-            let edges = frame.space_edges.map(|(list, list_buffer)| {
+            let edges = frame.space_edges.map(|(list, list_buffer, count_buffer)| {
                 let pairs = if ext == frame.extent {
                     0
                 } else {
@@ -2903,15 +3009,18 @@ impl Demo {
                             .iter()
                             .flat_map(|w| w.to_ne_bytes())
                             .collect();
-                        // Список этого кадра в прошлый раз читал проход «края 3D».
+                        // Список этого кадра в прошлый раз читали проход «края 3D» и копия
+                        // счётчика для процессора.
                         let before_reset = [vk::MemoryBarrier2::default()
                             .src_stage_mask(
                                 vk::PipelineStageFlags2::COMPUTE_SHADER
-                                    | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                                    | vk::PipelineStageFlags2::DRAW_INDIRECT
+                                    | vk::PipelineStageFlags2::COPY,
                             )
                             .src_access_mask(
                                 vk::AccessFlags2::SHADER_STORAGE_READ
-                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ
+                                    | vk::AccessFlags2::TRANSFER_READ,
                             )
                             .dst_stage_mask(vk::PipelineStageFlags2::COPY)
                             .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
@@ -2928,12 +3037,26 @@ impl Demo {
                             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                             .dst_stage_mask(
                                 vk::PipelineStageFlags2::COMPUTE_SHADER
-                                    | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                                    | vk::PipelineStageFlags2::DRAW_INDIRECT
+                                    | vk::PipelineStageFlags2::COPY,
                             )
                             .dst_access_mask(
                                 vk::AccessFlags2::SHADER_STORAGE_READ
-                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ
+                                    | vk::AccessFlags2::TRANSFER_READ,
                             )];
+                        // Начало списка (со счётчиком пикселей) — процессору, для панели
+                        // (7.18б); читается, когда кадр закончен.
+                        let count_copy = [vk::BufferCopy::default().size(16)];
+                        let to_host = [vk::BufferMemoryBarrier2::default()
+                            .buffer(count_buffer)
+                            .size(vk::WHOLE_SIZE)
+                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                            .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
                         let (d, cmd) = (p.device, p.cmd);
                         // SAFETY: граф перевёл буфер геометрии в чтение, а картинку краёв в
                         // запись; список краёв и буфер сцены этого кадра живы, пока кадр
@@ -2960,6 +3083,11 @@ impl Demo {
                             d.cmd_pipeline_barrier2(
                                 cmd,
                                 &vk::DependencyInfo::default().memory_barriers(&after),
+                            );
+                            d.cmd_copy_buffer(cmd, list_buffer, count_buffer, &count_copy);
+                            d.cmd_pipeline_barrier2(
+                                cmd,
+                                &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
                             );
                         }
                     },

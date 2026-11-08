@@ -120,6 +120,9 @@ pub struct HeadlessImage {
     pub particles: crate::ParticleStats,
     /// Запечённое поле расстояний сцены «3D» после кадра (7.10б), если оно считалось.
     pub field: Option<FieldSnapshot>,
+    /// Счётчики сцены «3D» или 2.5D-вида этого кадра (7.18б): объекты и слова сцены,
+    /// время процессора, пиксели края (прочитаны после кадра). `None` — кадр плоский.
+    pub space_stats: Option<crate::SpaceStats>,
 }
 
 /// Запечённое поле расстояний, прочитанное с видеокарты: где стоят слои и числа.
@@ -268,6 +271,7 @@ pub fn render_headless_play(
         player: frame.player,
         particles: frame.particles,
         field: frame.field,
+        space_stats: frame.space_stats,
     })
 }
 
@@ -278,6 +282,7 @@ struct Rendered {
     player: Option<reyvec_scene::PlayerView>,
     particles: crate::ParticleStats,
     field: Option<FieldSnapshot>,
+    space_stats: Option<crate::SpaceStats>,
 }
 
 /// Читает буфер запечённого поля после законченного кадра.
@@ -580,6 +585,15 @@ fn render(
             }
             _ => None,
         };
+        // Счётчики кадра (7.18б): число краёв читается теперь, когда кадр закончен (в
+        // окне его читает подготовка следующего кадра той же ячейки).
+        let space_stats = match (r.gpu.as_ref(), r.demo.as_ref()) {
+            (Some(gpu), Some(demo)) => demo.space_stats().map(|mut s| {
+                s.edge_pixels = demo.edge_pixels(gpu, 0);
+                s
+            }),
+            _ => None,
+        };
         Ok(Rendered {
             rgba: pixels,
             timings,
@@ -587,6 +601,7 @@ fn render(
             player,
             particles,
             field,
+            space_stats,
         })
     }
 }
@@ -861,6 +876,23 @@ mod tests {
             let volume = volume.expect("объёмный кадр");
             let triangles = triangles.expect("объёмный кадр треугольниками");
             assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            // Счётчики панели (7.18б): плоский кадр их не имеет, объёмный — имеет, с
+            // объектами, без переполнения и с прочитанным с видеокарты числом краёв.
+            assert!(
+                flat.space_stats.is_none(),
+                "{name}: у плоского кадра нет счётчиков 3D"
+            );
+            let stats = volume.space_stats.expect("счётчики объёмного кадра");
+            eprintln!("{name}: счётчики {stats:?}");
+            assert!(stats.objects > 0 && stats.words > 0, "{name}: {stats:?}");
+            assert_eq!(stats.dropped, 0, "{name}: {stats:?}");
+            assert_eq!(stats.overflow, None, "{name}: {stats:?}");
+            assert!(
+                stats.edge_pixels.is_some_and(|n| n > 0 && n < stats.pixels),
+                "{name}: пиксели края {:?} из {}",
+                stats.edge_pixels,
+                stats.pixels
+            );
             // Треугольники рисуют тот же уровень: картинка близка к формам SDF (отличия —
             // тени и углы, у краёв фигур).
             let (_, _, mean) = image_diff(&volume.image, &triangles.image);

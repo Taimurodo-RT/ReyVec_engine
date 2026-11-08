@@ -600,6 +600,7 @@ impl App {
                 space_culling: renderer.space_culling(),
                 space_in_view: renderer.space_in_view(),
                 space_grid: renderer.space_grid(),
+                space_stats: renderer.space_stats(),
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
                 space_scale: renderer.space_scale(),

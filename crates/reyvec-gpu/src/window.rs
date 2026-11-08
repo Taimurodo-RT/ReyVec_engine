@@ -765,6 +765,12 @@ impl WindowRenderer {
         self.demo.as_ref().and_then(Demo::space_grid)
     }
 
+    /// Счётчики последнего кадра сцены «3D» или 2.5D-вида (7.18б): время процессора,
+    /// объекты и слова сцены, пиксели края (`None` — кадр был не объёмный).
+    pub fn space_stats(&self) -> Option<crate::SpaceStats> {
+        self.demo.as_ref().and_then(Demo::space_stats)
+    }
+
     /// Текст ошибки шейдера, если сохранённый шейдер не собрался (работает прошлая версия).
     pub fn shader_error(&self) -> Option<String> {
         self.shaders.error()

@@ -3,11 +3,29 @@
 //! и едут в буфер кадра одним списком слов (`reyvec_sdf::shape3d::pack_scene`) вместе с
 //! материалами и лампами (7.4).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use reyvec_sdf::SpaceFrame;
-use reyvec_sdf::shape3d::{Material3, Program, Shape3, compile, pack_scene};
+use reyvec_sdf::shape3d::{MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene};
 
 /// Сколько слов помещается в буфер сцены кадра (4 МБ: треугольники 2.5D-вида, 7.9б).
 pub(crate) const MAX_WORDS: usize = 1024 * 1024;
+
+/// Предупреждения о пределах уже записаны в журнал (пишутся один раз, пока предел
+/// нарушен; панель показывает их каждый кадр, 7.18б).
+static WARNED_OBJECTS: AtomicBool = AtomicBool::new(false);
+static WARNED_WORDS: AtomicBool = AtomicBool::new(false);
+
+/// Пишет предупреждение один раз на нарушение предела: `over` — предел нарушен сейчас.
+fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
+    if over {
+        if !flag.swap(true, Ordering::Relaxed) {
+            tracing::warn!("{}", message());
+        }
+    } else {
+        flag.store(false, Ordering::Relaxed);
+    }
+}
 
 /// Слов в заголовке раздела моделей: число вершин, число карт теней ламп, 2 запасных,
 /// матрица «мир → экран» (16 чисел, столбцами; пишет [`set_view_proj`]) и матрицы двух
@@ -30,6 +48,12 @@ pub(crate) struct Packed {
     pub vertices: u32,
     /// Сетка отсева кадра (`None` — её нет).
     pub grid: Option<GridStats>,
+    /// Объектов в списке (слово 0 заголовка; после обрезки до [`MAX_OBJECTS`]).
+    pub objects: u32,
+    /// Сколько объектов не вошло в список: шейдер дальше [`MAX_OBJECTS`] не читает.
+    pub dropped: usize,
+    /// Сцена не поместилась в буфер: сколько слов ей было нужно (рисуется пустая).
+    pub overflow: Option<usize>,
 }
 
 /// Сетка отсева кадра для панели: размер клетки, число клеток по осям и длины списков
@@ -76,20 +100,33 @@ pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
 /// моделей, 7.6ж), материалы, лампы, сетка отсева (`culling: false` — шейдер её не
 /// читает и перебирает все объекты) и треугольники моделей (слово 7 заголовка — где они).
 pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -> Packed {
-    let programs = programs(frame);
+    let mut programs = programs(frame);
+    // Шейдер читает не больше MAX_OBJECTS объектов и молча пропускает остальные:
+    // обрезаем список здесь, чтобы зеркало на процессоре (сетка отсева) видело то же.
+    let dropped = programs.len().saturating_sub(MAX_OBJECTS);
+    warn_once(&WARNED_OBJECTS, dropped > 0, || {
+        format!(
+            "объектов сцены 3D больше предела: {} из {MAX_OBJECTS}, {dropped} не рисуются",
+            programs.len()
+        )
+    });
+    programs.truncate(MAX_OBJECTS);
     let mut words = pack_scene(&programs, materials, &frame.lamps);
     let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
     let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;
-    if words.len() + mesh_words > MAX_WORDS {
-        tracing::warn!(
-            "сцена 3D не помещается в буфер ({} слов из {MAX_WORDS}), рисую пустую",
-            words.len() + mesh_words
-        );
+    let needed = words.len() + mesh_words;
+    warn_once(&WARNED_WORDS, needed > MAX_WORDS, || {
+        format!("сцена 3D не помещается в буфер ({needed} слов из {MAX_WORDS}), рисую пустую")
+    });
+    if needed > MAX_WORDS {
         let words = pack_scene(&[], materials, &frame.lamps);
         return Packed {
             words,
             vertices: 0,
             grid: None,
+            objects: 0,
+            dropped,
+            overflow: Some(needed),
         };
     }
     if !culling {
@@ -108,9 +145,12 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
         }
     }
     Packed {
+        objects: words[0],
         words,
         vertices: (triangles * 3) as u32,
         grid,
+        dropped,
+        overflow: None,
     }
 }
 
@@ -257,9 +297,51 @@ mod tests {
         let scene = reyvec_sdf::SpaceScene::parse(text).unwrap();
         assert_eq!(scene.object_count(), 200);
         let frame = scene.frame(1.0);
-        let words = pack(&frame, &scene.materials, true).words;
-        assert_eq!(words[0] as usize, frame.shapes.len());
-        assert!(words.len() < MAX_WORDS);
+        let packed = pack(&frame, &scene.materials, true);
+        assert_eq!(packed.words[0] as usize, frame.shapes.len());
+        assert!(packed.words.len() < MAX_WORDS);
+        // Счётчики для панели (7.18б): объекты — предметы и шарики ламп.
+        assert_eq!(packed.objects as usize, frame.shapes.len());
+        assert_eq!(packed.dropped, 0);
+        assert_eq!(packed.overflow, None);
+    }
+
+    /// Объектов больше предела шейдера: список обрезается до 1024 на процессоре, и панель
+    /// узнаёт, сколько не рисуется (7.18б). Раньше шейдер резал список молча.
+    #[test]
+    fn too_many_objects_are_dropped_with_a_count() {
+        let scene = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE).unwrap();
+        let mut frame = scene.frame(1.0);
+        frame.shapes.clear();
+        for i in 0..(MAX_OBJECTS + 5) {
+            frame
+                .shapes
+                .push(Shape3::Sphere { radius: 0.1 }.placed([i as f32 * 0.3, 0.0, 0.0], [0.0; 3]));
+        }
+        let packed = pack(&frame, &scene.materials, true);
+        assert_eq!(packed.objects as usize, MAX_OBJECTS);
+        assert_eq!(packed.words[0] as usize, MAX_OBJECTS);
+        assert_eq!(packed.dropped, 5);
+        assert_eq!(packed.overflow, None);
+    }
+
+    /// Сцена не влезает в буфер: панель узнаёт, сколько слов было нужно; раньше об этом
+    /// говорила только строка в журнале.
+    #[test]
+    fn overflow_is_reported() {
+        let scene = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE).unwrap();
+        let mut frame = scene.frame(1.0);
+        // Один треугольник — 12 слов; столько треугольников точно не поместится.
+        let triangles = MAX_WORDS / (3 * VERTEX_WORDS) + 1;
+        let t = [glam::Vec3::ZERO, glam::Vec3::X, glam::Vec3::Y];
+        frame.meshes.push(reyvec_sdf::space_file::MeshFrame {
+            triangles: vec![t; triangles],
+            material: 0,
+        });
+        let packed = pack(&frame, &scene.materials, true);
+        assert!(packed.overflow.is_some_and(|w| w > MAX_WORDS));
+        assert_eq!(packed.objects, 0);
+        assert_eq!(packed.vertices, 0);
     }
 
     #[test]
