@@ -31,6 +31,12 @@ float4 fs_main(VertexOut input) : SV_Target
     // программный lavapipe на таком падал при сборке.
     float shadow[4] = { 1.0, 1.0, 1.0, 1.0 };
     for (uint k = 0; k < 4; k++)
+    {
         shadow[k] = shadow_part(surface, s.normal, s.t, k);
+#ifdef SPACE_COUNTERS
+        // Счётчики (7.18д2): затенение в углах — своей строкой.
+        counters_flush_fragment(k == 1 ? PASS_AO : PASS_SHADOWS, px);
+#endif
+    }
     return float4(shadow[0], shadow[1], shadow[2], shadow[3]);
 }

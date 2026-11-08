@@ -112,6 +112,11 @@ impl ShaderLibrary {
                     changed.extend(self.shaders.keys().cloned());
                 }
             } else if let Some(name) = shader_name(&path) {
+                // Вариант со счётчиками лучей (7.18д2) подключает этот файл целиком.
+                let counted = format!("{name}_counted");
+                if self.shaders.contains_key(&counted) {
+                    changed.insert(counted);
+                }
                 changed.insert(name);
             }
         }

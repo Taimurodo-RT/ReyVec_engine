@@ -87,6 +87,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         if (pairs)
             part.y = shadow_part(surface, n0, g0.x, sub + 2);
     }
+    counters_flush(PASS_EDGE_SHADOWS, id.x >> 6);
     parts[lane][0] = part.x;
     parts[lane][1] = part.y;
     GroupMemoryBarrierWithGroupSync();
@@ -115,6 +116,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
             color = shade_lit(screen, g, shadows);
         }
     }
+    counters_flush(PASS_EDGES, id.x >> 6);
     // Складывает первый поток пикселя.
     colors[lane] = color;
     GroupMemoryBarrierWithGroupSync();

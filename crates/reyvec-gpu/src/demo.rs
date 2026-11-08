@@ -75,6 +75,103 @@ pub struct SpaceStats {
     pub edge_pixels: Option<u32>,
     /// Пикселей в кадре 3D (с учётом «Разрешения 3D»): для доли краёв.
     pub pixels: u32,
+    /// Счётчики лучей по проходам (7.18д2) последнего законченного кадра этой ячейки, если
+    /// он считал (флажок «Счётчики лучей 3D»); `None` — не считал.
+    pub rays: Option<[crate::counters::RayCounts; crate::counters::RAY_PASSES]>,
+}
+
+/// Конвейеры проходов лучей 3D со счётчиками (7.18д2, шейдеры `*_counted.slang`).
+/// Собираются, когда счётчики включают впервые. Вычислительные — null, если видеокарта
+/// не умеет писать в картинки через общий список.
+#[derive(Clone, Copy, Debug)]
+struct CountedPipelines {
+    cone: vk::Pipeline,
+    march: vk::Pipeline,
+    march_compute: vk::Pipeline,
+    shadow: vk::Pipeline,
+    edges: vk::Pipeline,
+}
+
+impl CountedPipelines {
+    fn build(
+        ctx: &GpuContext,
+        res: &GpuResources,
+        shaders: &ShaderLibrary,
+    ) -> Result<Self, GpuError> {
+        let mut made = Self {
+            cone: vk::Pipeline::null(),
+            march: vk::Pipeline::null(),
+            march_compute: vk::Pipeline::null(),
+            shadow: vk::Pipeline::null(),
+            edges: vk::Pipeline::null(),
+        };
+        let result = (|| {
+            made.cone = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_cone_counted",
+                CONE_FORMAT,
+                Msaa::Off,
+                None,
+            )?;
+            made.march = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_counted",
+                GBUFFER_FORMAT,
+                Msaa::Off,
+                None,
+            )?;
+            made.shadow = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_shadow_counted",
+                SHADOW3D_FORMAT,
+                Msaa::Off,
+                None,
+            )?;
+            if res.bindless.storage_images {
+                let layout = res.bindless.pipeline_layout;
+                made.march_compute = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_counted"),
+                )?;
+                made.edges = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_edges_counted"),
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(made),
+            Err(e) => {
+                made.destroy(ctx);
+                Err(e)
+            }
+        }
+    }
+
+    fn destroy(&self, ctx: &GpuContext) {
+        // SAFETY: конвейеры этого набора больше не записываются в кадры (их дождались);
+        // уничтожение null ничего не делает.
+        unsafe {
+            for p in [
+                self.cone,
+                self.march,
+                self.march_compute,
+                self.shadow,
+                self.edges,
+            ] {
+                ctx.device.destroy_pipeline(p, None);
+            }
+        }
+    }
 }
 
 /// Больше объектов шейдер сцены «3D» не читает (`MAX_OBJECTS` в `include/space.slang`).
@@ -445,6 +542,9 @@ pub(crate) struct FrameData {
     /// Сглаживание краёв форм (7.6о): список пикселей краёв (адрес и сам буфер) и буфер
     /// для чтения его счётчика процессором (7.18б). `None` — выключено.
     space_edges: Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)>,
+    /// Счётчики лучей (7.18д2): конвейеры со счётчиками, буфер, куда они складывают, и
+    /// буфер для процессора. `None` — кадр не считает.
+    space_counters: Option<(CountedPipelines, vk::Buffer, vk::Buffer)>,
     /// Запечённое поле расстояний (7.10б): что пересчитать в проходе «поле». `None` —
     /// поле выключено.
     space_field: Option<crate::field::FieldFrame>,
@@ -505,6 +605,14 @@ pub(crate) struct Demo {
     space_edge_counts: Vec<Option<BufferId>>,
     /// Включено ли сглаживание краёв (настройка, X).
     space_smooth: bool,
+    /// Счётчики лучей 3D включены (флажок на панели, 7.18д2).
+    space_counters_on: bool,
+    /// Конвейеры со счётчиками; `None` — ещё не собраны.
+    space_counted: Option<CountedPipelines>,
+    /// Буфер счётчиков и его копия для процессора, свои у каждого кадра в полёте.
+    space_counter_buffers: Vec<Option<(BufferId, BufferId)>>,
+    /// Считал ли последний кадр ячейки (иначе в её копии — старые числа).
+    space_counted_slots: Vec<bool>,
     /// Выдавливание через поле слоя (опыт 7.18б): подменять ли в сцене «3D» выдавленные
     /// фигуры верхнего уровня примитивом «поле слоя».
     space_extrude_field: bool,
@@ -829,6 +937,10 @@ impl Demo {
             space_edge_lists: vec![None; frames_in_flight],
             space_edge_counts: vec![None; frames_in_flight],
             space_smooth: true,
+            space_counters_on: false,
+            space_counted: None,
+            space_counter_buffers: vec![None; frames_in_flight],
+            space_counted_slots: vec![false; frames_in_flight],
             space_extrude_field: false,
             field_textures: std::collections::HashMap::new(),
             field_textures_stale: false,
@@ -1440,6 +1552,93 @@ impl Demo {
     /// Включает или выключает сглаживание краёв форм сцены «3D».
     pub fn set_space_smooth(&mut self, on: bool) {
         self.space_smooth = on;
+    }
+
+    /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
+    pub fn space_counters(&self, ctx: &GpuContext) -> (bool, bool) {
+        (self.space_counters_on, ctx.ray_counters)
+    }
+
+    /// Включает или выключает счётчики лучей 3D со следующего кадра. Конвейеры со
+    /// счётчиками собираются при первом включении (короткая пауза); если не собрались,
+    /// счётчики остаются выключенными.
+    pub fn set_space_counters(
+        &mut self,
+        ctx: &GpuContext,
+        res: &GpuResources,
+        shaders: &ShaderLibrary,
+        on: bool,
+    ) -> Result<(), GpuError> {
+        if on && ctx.ray_counters && self.space_counted.is_none() {
+            self.space_counted = Some(CountedPipelines::build(ctx, res, shaders)?);
+        }
+        self.space_counters_on = on && ctx.ray_counters;
+        Ok(())
+    }
+
+    /// Буфер счётчиков лучей кадра `slot` и его копия для процессора: создаются при
+    /// первой надобности. `None` — не вышло (кадр тогда не считает).
+    fn counter_buffers(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        slot: usize,
+    ) -> Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)> {
+        let entry = self.space_counter_buffers.get_mut(slot)?;
+        if entry.is_none() {
+            let size = crate::counters::COUNTER_BYTES;
+            let gpu = res.create_buffer(
+                ctx,
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::TRANSFER_SRC,
+                BufferMemory::GpuOnly,
+                &format!("счётчики лучей 3D, кадр {slot}"),
+            );
+            let gpu = match gpu {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!("буфер счётчиков лучей 3D: {e}");
+                    return None;
+                }
+            };
+            match res.create_buffer(
+                ctx,
+                size,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                BufferMemory::GpuToCpu,
+                &format!("счётчики лучей 3D для процессора, кадр {slot}"),
+            ) {
+                Ok(host) => *entry = Some((gpu, host)),
+                Err(e) => {
+                    res.destroy_buffer(gpu);
+                    tracing::warn!("буфер счётчиков лучей 3D для процессора: {e}");
+                    return None;
+                }
+            }
+        }
+        let (gpu, host) = (*entry)?;
+        Some((
+            res.buffer_address(gpu),
+            res.buffer_raw(gpu)?,
+            res.buffer_raw(host)?,
+        ))
+    }
+
+    /// Счётчики лучей последнего законченного кадра ячейки `slot` (его забор дождались);
+    /// `None` — тот кадр не считал.
+    pub(crate) fn ray_counts(
+        &self,
+        res: &GpuResources,
+        slot: usize,
+    ) -> Option<[crate::counters::RayCounts; crate::counters::RAY_PASSES]> {
+        if !self.space_counted_slots.get(slot).copied().unwrap_or(false) {
+            return None;
+        }
+        let (_, host) = (*self.space_counter_buffers.get(slot)?)?;
+        let bytes = res.read_buffer(host, crate::counters::COUNTER_BYTES as usize)?;
+        Some(crate::counters::sum_bytes(&bytes))
     }
 
     /// 2.5D-вид уровня из файла (7.9): включён ли.
@@ -2419,6 +2618,18 @@ impl Demo {
         names: &[String],
     ) {
         self.vector.reload(ctx, res, shaders, names);
+        // Счётчики лучей (7.18д2): собранный набор — заново целиком.
+        if let Some(old) = self.space_counted
+            && names.iter().any(|n| n.ends_with("_counted"))
+        {
+            match CountedPipelines::build(ctx, res, shaders) {
+                Ok(new) => {
+                    old.destroy(ctx);
+                    self.space_counted = Some(new);
+                }
+                Err(e) => shaders.set_error("raymarch_counted", e.to_string()),
+            }
+        }
         for name in names {
             let stencil = Some(self.stencil_format);
             let (slot, format, msaa, stencil) = match name.as_str() {
@@ -2818,6 +3029,7 @@ impl Demo {
         let space_buffer = self.space_buffers[slot];
         let mut space_vertices = 0;
         let mut space_shadow_maps = 0;
+        let mut space_counters = None;
         let space_compute =
             (level || self.space.compute) && self.space_march_compute != vk::Pipeline::null();
         if scene == DemoScene::Space {
@@ -2837,6 +3049,7 @@ impl Demo {
             // Счётчики для панели (7.18б): число краёв — из прошлого кадра этой ячейки
             // (он закончен: его забор дождались перед подготовкой), времена — отсюда.
             let edge_pixels = space_edges.and_then(|_| self.edge_pixels(res, slot));
+            let rays = self.ray_counts(res, slot);
             let started = std::time::Instant::now();
             let mut baked_inline = std::time::Duration::ZERO;
             let (mut frame, level_materials) = if level {
@@ -2906,6 +3119,15 @@ impl Demo {
                     space_shadow_maps = maps.len() as u32;
                 }
             }
+            // Счётчики лучей (7.18д2): адрес их буфера — в слова сцены, иначе 0 (не считать).
+            space_counters = match self.space_counted {
+                Some(pipelines) if self.space_counters_on => self
+                    .counter_buffers(ctx, res, slot)
+                    .map(|(address, gpu, host)| (pipelines, address, gpu, host)),
+                _ => None,
+            }
+            .filter(|&(_, address, _, _)| crate::space::set_counters(&mut packed.words, address))
+            .map(|(pipelines, _, gpu, host)| (pipelines, gpu, host));
             let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
             res.write_buffer(space_buffer, 0, &bytes);
             // Запекание поля уровня прямо в кадре (снимки, тесты) — не сборка кадра.
@@ -2924,10 +3146,14 @@ impl Demo {
                 overflow: packed.overflow,
                 edge_pixels,
                 pixels: space_extent.width * space_extent.height,
+                rays,
             });
         } else {
             self.space_field.skip();
             self.space_stats = None;
+        }
+        if let Some(counted) = self.space_counted_slots.get_mut(slot) {
+            *counted = space_counters.is_some();
         }
         FrameData {
             scene,
@@ -2941,6 +3167,7 @@ impl Demo {
             space_shadow_maps,
             space_compute,
             space_edges,
+            space_counters,
             space_field,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
@@ -3186,11 +3413,16 @@ impl Demo {
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл картинку конусов в цель рисования; буфер сцены
-                    // этого кадра жив, пока кадр рисуется.
+                    // и буфер счётчиков этого кадра живы, пока кадр рисуется.
                     unsafe {
+                        // Первый проход лучей кадра: счётчики (7.18д2) — с нуля.
+                        if let Some((_, buffer, _)) = frame.space_counters {
+                            crate::counters::record_reset(d, cmd, buffer);
+                        }
                         begin_color_pass(d, cmd, p.view(cone), tiles);
                         bindless.bind(d, cmd);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_cone);
+                        let pipeline = frame.space_counters.map_or(self.space_cone, |c| c.0.cone);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                         d.cmd_draw(cmd, 3, 1, 0, 0);
                         d.cmd_end_rendering(cmd);
@@ -3274,11 +3506,10 @@ impl Demo {
                     // запись; буфер сцены этого кадра жив, пока кадр рисуется.
                     unsafe {
                         bindless.bind_compute(d, cmd);
-                        d.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::COMPUTE,
-                            self.space_march_compute,
-                        );
+                        let pipeline = frame
+                            .space_counters
+                            .map_or(self.space_march_compute, |c| c.0.march_compute);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                         d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
                     }
@@ -3308,7 +3539,8 @@ impl Demo {
                     unsafe {
                         begin_color_pass(d, cmd, p.view(gbuffer), ext);
                         bindless.bind(d, cmd);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_march);
+                        let pipeline = frame.space_counters.map_or(self.space_march, |c| c.0.march);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                         d.cmd_draw(cmd, 3, 1, 0, 0);
                         d.cmd_end_rendering(cmd);
@@ -3410,7 +3642,10 @@ impl Demo {
                 unsafe {
                     begin_color_pass(d, cmd, p.view(shadows), half);
                     bindless.bind(d, cmd);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_shadow);
+                    let pipeline = frame
+                        .space_counters
+                        .map_or(self.space_shadow, |c| c.0.shadow);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                     d.cmd_end_rendering(cmd);
@@ -3566,13 +3801,22 @@ impl Demo {
                     // список краёв записан (барьер в прошлом проходе) и жив весь кадр.
                     unsafe {
                         bindless.bind_compute(d, cmd);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.space_edges);
+                        let pipeline = frame.space_counters.map_or(self.space_edges, |c| c.0.edges);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                         d.cmd_dispatch_indirect(cmd, list_buffer, 0);
                     }
                 });
                 edges
             });
+            // Счётчики лучей (7.18д2) — процессору, после последнего прохода лучей.
+            if let Some((_, gpu, host)) = frame.space_counters {
+                graph.add_pass("счётчики 3D", &[], move |p| {
+                    // SAFETY: проход вне рисования; оба буфера этого кадра живы, пока он
+                    // рисуется, и созданы с нужными флагами (counter_buffers).
+                    unsafe { crate::counters::record_copy(p.device, p.cmd, gpu, host) };
+                });
+            }
             // Уменьшенное разрешение (7.14): освещение здесь же, в своей картинке того же
             // размера; «сцена» растянет её на весь кадр.
             let color = (ext != frame.extent).then(|| {
@@ -4242,6 +4486,9 @@ impl Demo {
             for name in FIELD_SHADERS {
                 ctx.device.destroy_pipeline(*self.field.slot(name), None);
             }
+        }
+        if let Some(counted) = self.space_counted.take() {
+            counted.destroy(ctx);
         }
         self.triangle = vk::Pipeline::null();
         self.sdf = vk::Pipeline::null();

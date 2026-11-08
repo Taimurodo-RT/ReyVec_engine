@@ -349,6 +349,10 @@ pub(crate) struct GpuContext {
     /// Можно писать в картинки из шейдеров через общий список (binding 2 в bindless):
     /// так «реймарчинг» вычислительным шейдером пишет буфер геометрии (7.6м).
     pub storage_images: bool,
+    /// Шейдеры могут складывать счётчики лучей в буфер (7.18д2): сложение по волне в
+    /// пиксельном и вычислительном шейдере, запись в память из пиксельного, проверка
+    /// вспомогательных потоков. Без этого флажок «Счётчики лучей 3D» неактивен.
+    pub ray_counters: bool,
     // Последним: уничтожается после устройства.
     pub core: Core,
 }
@@ -372,6 +376,7 @@ impl GpuContext {
                 adapter,
                 present_fences,
                 storage_images,
+                ray_counters,
             )) => {
                 let allocator = gpu_allocator::vulkan::Allocator::new(
                     &gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -400,6 +405,7 @@ impl GpuContext {
                     adapter,
                     present_fences,
                     storage_images,
+                    ray_counters,
                     core,
                 })
             }
@@ -421,6 +427,7 @@ impl GpuContext {
             AdapterInfo,
             bool,
             bool,
+            bool,
         ),
         GpuError,
     > {
@@ -439,6 +446,7 @@ impl GpuContext {
             .queue_family_index(queue_family)
             .queue_priorities(&priorities)];
         let storage_images = Self::storage_images(&core.instance, physical);
+        let ray_counters = Self::ray_counters(&core.instance, physical);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .descriptor_binding_storage_image_update_after_bind(storage_images)
             .descriptor_indexing(true)
@@ -450,7 +458,8 @@ impl GpuContext {
             .buffer_device_address(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
-            .synchronization2(true);
+            .synchronization2(true)
+            .shader_demote_to_helper_invocation(ray_counters);
         let mut extensions: Vec<*const c_char> = Vec::new();
         let mut present_fences = false;
         if surface.is_some() {
@@ -488,7 +497,8 @@ impl GpuContext {
         let base_features = vk::PhysicalDeviceFeatures::default()
             .multi_draw_indirect(true)
             .draw_indirect_first_instance(true)
-            .shader_storage_image_array_dynamic_indexing(storage_images);
+            .shader_storage_image_array_dynamic_indexing(storage_images)
+            .fragment_stores_and_atomics(ray_counters);
         let mut create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_info)
             .enabled_features(&base_features)
@@ -512,7 +522,36 @@ impl GpuContext {
             adapter,
             present_fences,
             storage_images,
+            ray_counters,
         ))
+    }
+
+    /// Умеет ли видеокарта то, что нужно шейдерам со счётчиками лучей (7.18д2): писать в
+    /// память из пиксельного шейдера, узнавать вспомогательные потоки и складывать числа
+    /// по волне в пиксельном и вычислительном шейдере.
+    fn ray_counters(instance: &ash::Instance, physical: vk::PhysicalDevice) -> bool {
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f13);
+        let mut p11 = vk::PhysicalDeviceVulkan11Properties::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p11);
+        // SAFETY: physical получен из этого экземпляра, структуры живут до конца вызовов.
+        unsafe {
+            instance.get_physical_device_features2(physical, &mut f2);
+            instance.get_physical_device_properties2(physical, &mut p2);
+        }
+        let stages = vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE;
+        let operations = vk::SubgroupFeatureFlags::BASIC | vk::SubgroupFeatureFlags::ARITHMETIC;
+        let ok = f2.features.fragment_stores_and_atomics == vk::TRUE
+            && f13.shader_demote_to_helper_invocation == vk::TRUE
+            && p11.subgroup_supported_stages.contains(stages)
+            && p11.subgroup_supported_operations.contains(operations);
+        if !ok {
+            tracing::warn!(
+                "счётчики лучей недоступны: видеокарта не умеет писать в память из \
+                 пиксельного шейдера или складывать числа по волне"
+            );
+        }
+        ok
     }
 
     /// Умеет ли видеокарта то, что нужно для записи в картинки через общий список:

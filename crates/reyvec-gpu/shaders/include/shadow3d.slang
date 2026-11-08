@@ -13,11 +13,13 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
     // заслонят (7.6и): шагаем без них, иначе у пола шаг не длиннее высоты над полом.
     // Их полутень теряется, только когда свет почти вдоль плоскости (под углом меньше
     // 1/k, около 5°).
+    count_ray();
     bool planes = !away_from_planes(from, dir);
     for (int i = 0; i < 64; i++)
     {
         if (t >= far)
             break;
+        count_step();
         float3 q = from + dir * t;
         // Запечённое поле (7.10в). Если уже по его нижней оценке полутени здесь нет
         // (k · h больше 2t), формы не считаем. Шаг — на само число поля, а не на оценку:
@@ -107,6 +109,7 @@ float ambient_occlusion(float3 p, float3 n)
     float b = n.x * n.y * a;
     float3 t1 = float3(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
     float3 t2 = float3(b, s + n.y * n.y * a, -n.y);
+    count_ray();
     float visible = 0.0;
     float blocked = 0.0;
     // Проба: 0..2 — вдоль нормали (близко, средне, далеко), 3..10 — по наклонным
@@ -124,6 +127,7 @@ float ambient_occlusion(float3 p, float3 n)
             dir = normalize(n + ((k & 2) == 0 ? 0.9 : -0.9) * side);
             h = ((i - 3) & 1) == 1 ? 0.4 : 0.16;
         }
+        count_step();
         float plane = h * dot(dir, n);
         float3 q = p + dir * h;
         float estimate;
