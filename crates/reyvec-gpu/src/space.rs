@@ -6,7 +6,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reyvec_sdf::SpaceFrame;
-use reyvec_sdf::shape3d::{MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene};
+use reyvec_sdf::shape3d::{
+    MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_with,
+};
 
 /// Сколько слов помещается в буфер сцены кадра (4 МБ: треугольники 2.5D-вида, 7.9б).
 pub(crate) const MAX_WORDS: usize = 1024 * 1024;
@@ -99,7 +101,19 @@ pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
 /// Список слов сцены для видеокарты: программы объектов (и невидимых заменителей
 /// моделей, 7.6ж), материалы, лампы, сетка отсева (`culling: false` — шейдер её не
 /// читает и перебирает все объекты) и треугольники моделей (слово 7 заголовка — где они).
+#[cfg(test)]
 pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -> Packed {
+    pack_with(frame, materials, culling, true)
+}
+
+/// То же; `level_field: false` — поле уровня считается в общем переборе объектов, как до
+/// 7.18д3 (для сравнения в тестах).
+pub(crate) fn pack_with(
+    frame: &SpaceFrame,
+    materials: &[Material3],
+    culling: bool,
+    level_field: bool,
+) -> Packed {
     let mut programs = programs(frame);
     // Шейдер читает не больше MAX_OBJECTS объектов и молча пропускает остальные:
     // обрезаем список здесь, чтобы зеркало на процессоре (сетка отсева) видело то же.
@@ -111,7 +125,7 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
         )
     });
     programs.truncate(MAX_OBJECTS);
-    let mut words = pack_scene(&programs, materials, &frame.lamps);
+    let mut words = pack_scene_with(&programs, materials, &frame.lamps, level_field);
     let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
     let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;
     let needed = words.len() + mesh_words;

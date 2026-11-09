@@ -101,6 +101,24 @@ float sd2_field(uint* code, uint at, float2 p)
     return v;
 }
 
+// Точка `p` на сетке поля слоя (угол `corner`, клетка `cell`, nx × ny точек): где брать в
+// картинке (uv, края прижаты) и `e` — насколько точка за краем сетки (0 — внутри).
+float2 layer_uv(float2 p, float2 corner, float cell, uint nx, uint ny, out float e)
+{
+    float2 g = (p - corner) / cell - 0.5;
+    float2 top = float2(float(nx) - 1.0, float(ny) - 1.0);
+    float2 gc = clamp(g, float2(0.0, 0.0), top);
+    e = length(g - gc) * cell;
+    return (gc + 0.5) / float2(float(nx), float(ny));
+}
+
+// Ближайшая к `p` точка сетки поля слоя (для картинки номеров материалов).
+int2 layer_cell(float2 p, float2 corner, float cell, uint nx, uint ny)
+{
+    int2 ij = int2(floor(max((p - corner) / cell, 0.0)));
+    return min(ij, int2(int(nx) - 1, int(ny) - 1));
+}
+
 // Расстояние до фигур обоих слоёв поля слоя (7.18б, 7.18в) по заголовку с слова `at` и
 // картинке из общего списка (зеркало LayerField::distance2 в layer_field.rs): x — первый
 // слой, y — второй. Внутри сетки — линейная смесь четырёх точек картинки (samplers[0]:
@@ -113,13 +131,9 @@ float2 sd2_layer(uint* code, uint at, float2 p, float band, out bool2 estimate)
     uint slot = code[at];
     float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
     float cell = asfloat(code[at + 4]);
-    uint nx = code[at + 5] & 0xffff;
-    uint ny = code[at + 5] >> 16;
-    float2 g = (p - corner) / cell - 0.5;
-    float2 top = float2(float(nx) - 1.0, float(ny) - 1.0);
-    float2 gc = clamp(g, float2(0.0, 0.0), top);
-    float e = length(g - gc) * cell;
-    float2 uv = (gc + 0.5) / float2(float(nx), float(ny));
+    uint size = code[at + 5];
+    float e;
+    float2 uv = layer_uv(p, corner, cell, size & 0xffff, size >> 16, e);
     float2 v = textures[NonUniformResourceIndex(slot)].SampleLevel(samplers[0], uv, 0.0).xy;
     estimate = v >= band - cell;
     if (e > 0.0)
@@ -148,10 +162,8 @@ float layer_material(uint* code, uint at, uint mslot, float2 p)
     count_material();
     float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
     float cell = asfloat(code[at + 4]);
-    int nx = int(code[at + 5] & 0xffff);
-    int ny = int(code[at + 5] >> 16);
-    int2 ij = int2(floor(max((p - corner) / cell, 0.0)));
-    ij = min(ij, int2(nx - 1, ny - 1));
+    uint size = code[at + 5];
+    int2 ij = layer_cell(p, corner, cell, size & 0xffff, size >> 16);
     float id = textures[NonUniformResourceIndex(mslot - 1)].Load(int3(ij, 0)).x;
     return floor(id * 65535.0 + 0.5);
 }
@@ -239,6 +251,74 @@ float2 sdf_primitive(uint* code, uint i, float3 p)
     else
         d = sd3_plane(q, a.xyz, a.w);
     return float2(d * scale, material);
+}
+
+// Поле уровня (7.18д3): объект, чья программа — один примитив «поле слоя» без поворота,
+// масштаба и прямоугольника фигуры (отбор — shape3d::Program::level_field). Начало его
+// программы — слово 13 заголовка сцены, одно у всех потоков: слова читаются без цепочки
+// «список → объект → программа», без матрицы и лестницы видов, картинка — без
+// NonUniformResourceIndex. Расчёт тот же, что у ветки PRIM_FIELD в sdf_primitive (тот же
+// ответ до бита), кроме материала первого слоя вблизи формы: вместо чтения картинки
+// номеров — LAYER_MATERIAL_LOOKUP (номер читает вызывающий в точке попадания,
+// level_field_material). Он не меньше нуля: тени видят настоящую форму, как раньше.
+static const float LAYER_MATERIAL_LOOKUP = 65536.0;
+
+float2 level_field_near(uint* code, uint i, float3 p)
+{
+    count_field();
+    float material = float(code[i + 1]);
+    float3 q = p + float3(asfloat(code[i + 5]), asfloat(code[i + 9]), asfloat(code[i + 13]));
+    float4 a = float4(asfloat(code[i + 15]), asfloat(code[i + 16]), asfloat(code[i + 17]), asfloat(code[i + 18]));
+    uint at = i + PRIM_WORDS;
+    uint slot = code[at];
+    float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
+    float cell = asfloat(code[at + 4]);
+    uint size = code[at + 5];
+    float e;
+    float2 uv = layer_uv(q.xy, corner, cell, size & 0xffff, size >> 16, e);
+    float2 v = textures[slot].SampleLevel(samplers[0], uv, 0.0).xy;
+    bool2 estimate = v >= a.w - cell;
+    float2 d2 = v;
+    if (e > 0.0)
+    {
+        float2 vp = max(v, 0.0);
+        d2 = sqrt(e * e + vp * vp);
+    }
+    float d = sd3_extrude(q, d2.x, a.x, a.y);
+    bool est = estimate.x;
+    bool first = true;
+    if (a.z > 0.0)
+    {
+        float3 qs = float3(q.xy, q.z - asfloat(code[at + 10]));
+        float ds = sd3_extrude(qs, d2.y, a.z, a.y);
+        if (ds < d)
+        {
+            d = ds;
+            est = estimate.y;
+            first = false;
+            material = float(code[at + 11]);
+        }
+    }
+    if (est)
+        material = -1.0;
+    else if (first && code[at + 1] != 0 && d < LAYER_MATERIAL_NEAR)
+        material = LAYER_MATERIAL_LOOKUP;
+    return float2(d, material);
+}
+
+// Номер материала первого слоя поля уровня в точке `p` мира (вместо LAYER_MATERIAL_LOOKUP,
+// который вернул level_field_near в этой точке): то же, что layer_material.
+float level_field_material(uint* code, uint i, float3 p)
+{
+    count_material();
+    uint at = i + PRIM_WORDS;
+    float2 q = p.xy + float2(asfloat(code[i + 5]), asfloat(code[i + 9]));
+    float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
+    float cell = asfloat(code[at + 4]);
+    uint size = code[at + 5];
+    int2 ij = layer_cell(q, corner, cell, size & 0xffff, size >> 16);
+    float id = textures[code[at + 1] - 1].Load(int3(ij, 0)).x;
+    return floor(id * 65535.0 + 0.5);
 }
 
 // Расстояние до формы (x) и материал ближайшей части (y, номер как float) по программе

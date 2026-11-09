@@ -607,6 +607,9 @@ pub(crate) struct Demo {
     space_smooth: bool,
     /// Счётчики лучей 3D включены (флажок на панели, 7.18д2).
     space_counters_on: bool,
+    /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
+    /// переборе (только для сравнения в тестах).
+    level_field_apart: bool,
     /// Конвейеры со счётчиками; `None` — ещё не собраны.
     space_counted: Option<CountedPipelines>,
     /// Буфер счётчиков и его копия для процессора, свои у каждого кадра в полёте.
@@ -938,6 +941,7 @@ impl Demo {
             space_edge_counts: vec![None; frames_in_flight],
             space_smooth: true,
             space_counters_on: false,
+            level_field_apart: true,
             space_counted: None,
             space_counter_buffers: vec![None; frames_in_flight],
             space_counted_slots: vec![false; frames_in_flight],
@@ -1552,6 +1556,12 @@ impl Demo {
     /// Включает или выключает сглаживание краёв форм сцены «3D».
     pub fn set_space_smooth(&mut self, on: bool) {
         self.space_smooth = on;
+    }
+
+    /// Поле уровня до перебора объектов (7.18д3) или, для сравнения, в общем переборе.
+    #[cfg(test)]
+    pub(crate) fn set_level_field_apart(&mut self, on: bool) {
+        self.level_field_apart = on;
     }
 
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
@@ -3096,7 +3106,8 @@ impl Demo {
             let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             let culling = level || !self.space.culling_off;
             self.space_culled = culling;
-            let mut packed = crate::space::pack(&frame, materials, culling);
+            let mut packed =
+                crate::space::pack_with(&frame, materials, culling, self.level_field_apart);
             self.space_grid = packed.grid;
             crate::space::set_view_proj(&mut packed.words, view_proj);
             crate::space::set_field(
