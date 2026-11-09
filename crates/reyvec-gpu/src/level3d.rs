@@ -97,9 +97,13 @@ enum Flat {
 }
 
 /// Как рисуется 2.5D-вид уровня (7.9б).
+///
+/// `Default` — SDF: эталон для снимков и тестов. В окне способ выбирается по видеокарте
+/// ([`LevelRender::for_adapter`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LevelRender {
-    /// Всё формами SDF: точные мягкие тени и затенение в углах.
+    /// Всё формами SDF: точные мягкие тени и затенение в углах. С 7.18д — только для
+    /// сравнения.
     #[default]
     Sdf,
     /// Плитки и бруски — треугольники с картами теней, SDF только у мягких предметов.
@@ -109,15 +113,15 @@ pub enum LevelRender {
 }
 
 impl LevelRender {
-    /// Все способы по порядку (для панели).
-    pub const ALL: [Self; 3] = [Self::Sdf, Self::Field, Self::Triangles];
+    /// Все способы по порядку (для панели): сначала основные, SDF — последним.
+    pub const ALL: [Self; 3] = [Self::Field, Self::Triangles, Self::Sdf];
 
     /// Название для панели и журнала.
     pub fn title(self) -> &'static str {
         match self {
-            Self::Sdf => "SDF",
-            Self::Triangles => "треугольники",
-            Self::Field => "поле",
+            Self::Sdf => "SDF (сравнение)",
+            Self::Triangles => "быстро (треугольники)",
+            Self::Field => "честные тени (поле)",
         }
     }
 
@@ -131,9 +135,11 @@ impl LevelRender {
         }
     }
 
-    /// По умолчанию для видеокарты: на встроенной — треугольники.
+    /// По умолчанию для видеокарты (7.18д): на отдельной — поле, на встроенной —
+    /// треугольники, на остальных (программная, виртуальная) — SDF, как в тестах.
     pub fn for_adapter(kind: crate::adapter::AdapterKind) -> Self {
         match kind {
+            crate::adapter::AdapterKind::Discrete => Self::Field,
             crate::adapter::AdapterKind::Integrated => Self::Triangles,
             _ => Self::Sdf,
         }
@@ -1980,6 +1986,31 @@ fn object_shape(o: &reyvec_scene::SceneObject, z: f32) -> Option<(Shape3, [f32; 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 7.18д: на отдельной видеокарте 2.5D-вид по умолчанию рисуется полем, на встроенной —
+    /// треугольниками, на программной — SDF (как в тестах); на панели SDF последний.
+    #[test]
+    fn level_render_for_adapter() {
+        use crate::adapter::AdapterKind;
+        assert_eq!(
+            LevelRender::for_adapter(AdapterKind::Discrete),
+            LevelRender::Field
+        );
+        assert_eq!(
+            LevelRender::for_adapter(AdapterKind::Integrated),
+            LevelRender::Triangles
+        );
+        assert_eq!(LevelRender::for_adapter(AdapterKind::Cpu), LevelRender::Sdf);
+        assert_eq!(LevelRender::default(), LevelRender::Sdf);
+        assert_eq!(LevelRender::ALL[0], LevelRender::Field);
+        assert_eq!(LevelRender::ALL[2], LevelRender::Sdf);
+        for render in LevelRender::ALL {
+            assert!(!render.title().is_empty());
+        }
+        for name in ["sdf", "field", "поле", "triangles"] {
+            assert!(LevelRender::from_name(name).is_some(), "{name}");
+        }
+    }
 
     /// Отражённая и повёрнутая фигура в объёме стоит там же, где на плоскости.
     #[test]
