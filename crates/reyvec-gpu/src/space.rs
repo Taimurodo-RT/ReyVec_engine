@@ -85,7 +85,7 @@ pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
     let count = dims.iter().map(|&d| d as usize).product::<usize>();
     let (mut sum, mut max) = (0u64, 0u32);
     for i in 0..count {
-        let n = *words.get(cells + i * reyvec_sdf::grid3d::CELL_WORDS + 1)?;
+        let n = *words.get(cells + i * reyvec_sdf::grid3d::CELL_WORDS + 1)? & 0xffff;
         sum += u64::from(n);
         max = max.max(n);
     }
@@ -106,16 +106,18 @@ pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
 /// читает и перебирает все объекты) и треугольники моделей (слово 7 заголовка — где они).
 #[cfg(test)]
 pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -> Packed {
-    pack_with(frame, materials, culling, true)
+    pack_with(frame, materials, culling, true, true)
 }
 
 /// То же; `level_field: false` — поле уровня считается в общем переборе объектов, как до
-/// 7.18д3 (для сравнения в тестах).
+/// 7.18д3 (для сравнения в тестах); `free: false` — шаг в пустоте не длиннее клетки
+/// сетки, как до 7.18д4 (для сравнения на панели).
 pub(crate) fn pack_with(
     frame: &SpaceFrame,
     materials: &[Material3],
     culling: bool,
     level_field: bool,
+    free: bool,
 ) -> Packed {
     let mut programs = programs(frame);
     // Шейдер читает не больше MAX_OBJECTS объектов и молча пропускает остальные:
@@ -128,7 +130,7 @@ pub(crate) fn pack_with(
         )
     });
     programs.truncate(MAX_OBJECTS);
-    let mut words = pack_scene_with(&programs, materials, &frame.lamps, level_field);
+    let mut words = pack_scene_with(&programs, materials, &frame.lamps, level_field, free);
     let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
     let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;
     let needed = words.len() + mesh_words;
@@ -173,7 +175,7 @@ pub(crate) fn pack_with(
 
 /// Программы форм кадра: предметы, потом невидимые заменители моделей (7.6ж). Форма,
 /// которую не вышло превратить в программу, пропускается с записью в журнал.
-fn programs(frame: &SpaceFrame) -> Vec<Program> {
+pub(crate) fn programs(frame: &SpaceFrame) -> Vec<Program> {
     let build = |shapes: &[Shape3], shadow_only: bool, no_shadow: bool| -> Vec<Program> {
         shapes
             .iter()

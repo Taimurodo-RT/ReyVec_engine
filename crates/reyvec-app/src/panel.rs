@@ -36,6 +36,8 @@ pub(crate) enum PanelAction {
     SpaceSmooth(bool),
     /// Счётчики лучей 3D (7.18д2).
     SpaceCounters(bool),
+    /// Длинный шаг в пустоте (7.18д4).
+    SpaceFree(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -138,6 +140,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_smooth: (bool, bool),
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
     pub space_counters: (bool, bool),
+    /// Длинный шаг в пустоте (7.18д4): включён ли.
+    pub space_free: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -763,6 +767,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             .changed()
         {
             actions.push(PanelAction::SpaceCounters(counters));
+        }
+        let mut free = info.space_free;
+        if ui
+            .checkbox(&mut free, "Длинный шаг в пустоте")
+            .on_hover_text(
+                "Луч в пустоте шагает сразу до ближайшего предмета (до 2 м), а не по \
+                 клетке сетки отсева: меньше шагов у теней и грубого прохода. Картинка \
+                 может чуть отличаться в полутенях и затенении углов — выключите, чтобы \
+                 сравнить картинку и время",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::SpaceFree(free));
         }
         ui.label("Разрешение 3D").on_hover_text(
             "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
@@ -1463,6 +1480,7 @@ mod tests {
             space_compute: (false, false),
             space_smooth: (true, true),
             space_counters: (true, true),
+            space_free: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

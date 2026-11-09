@@ -3301,4 +3301,65 @@ mod tests {
         let screen = turned.project(center, 16.0 / 9.0).unwrap();
         assert!(screen.truncate().length() < 1e-3, "{screen}");
     }
+
+    /// Длинный шаг в пустоте (7.18д4) в комнате из примера с готовым полем уровня:
+    /// начальная оценка клетки никогда не больше настоящего расстояния до сцены (поле,
+    /// плоскости и формы вместе), вблизи форм ответ точный, и шаг начинается дальше
+    /// клетки во многих местах, но не ближе, чем без свободного расстояния.
+    #[test]
+    fn room_free_step_never_overestimates() {
+        use reyvec_sdf::grid3d::Grid;
+        let file = reyvec_scene::SceneFile::parse_in(
+            reyvec_scene::EXAMPLE,
+            Some(std::path::Path::new(reyvec_scene::EXAMPLE_DIR)),
+        )
+        .unwrap();
+        let mut library = ShapeLibrary::new(0.001);
+        let scene = file
+            .build(&mut library, &mut reyvec_scene::ShapeCache::new())
+            .unwrap();
+        let mut level = Level3d::default();
+        level.frame(&scene, &library, LevelRender::Field);
+        let (ticket, bake) = level.take_field_request().expect("запрос на запекание");
+        let (mut field, stats) = bake.run().expect("поле");
+        field.set_texture(1);
+        field.set_material_texture(2);
+        assert!(level.install_field(ticket, FieldRef(Arc::new(field)), stats, 1.0));
+        let made = level.frame(&scene, &library, LevelRender::Field);
+        let objects = crate::space::programs(&made.frame);
+        let grid = Grid::build(&objects);
+        assert!(grid.field.is_some(), "поле уровня в сцене");
+        let mut old = grid.clone();
+        old.clear_free();
+        let longer = (0..grid.cells.len())
+            .filter(|&c| grid.start(c) > 3.0 * grid.margin)
+            .count();
+        assert!(
+            longer * 10 > grid.cells.len(),
+            "дальше трёх клеток шаг начинается в {longer} из {}",
+            grid.cells.len()
+        );
+        let mut seed = 4242u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let size = grid.cell * Vec3::from(grid.dims.map(|d| d as f32));
+        for _ in 0..4000 {
+            let p = grid.origin + Vec3::new(rnd(), rnd(), rnd()) * size;
+            let truth = objects
+                .iter()
+                .map(|o| o.distance(p).0)
+                .fold(f32::INFINITY, f32::min);
+            let (d, _) = grid.near(&objects, p, 1e9);
+            let (d0, _) = old.near(&objects, p, 1e9);
+            assert!(d <= truth + 1e-4, "{p}: сетка {d}, правда {truth}");
+            assert!(d >= d0, "{p}: {d} < {d0}");
+            if truth < grid.margin.min(0.2) {
+                assert!((d - truth).abs() < 1e-4, "{p}: сетка {d}, правда {truth}");
+            }
+        }
+    }
 }

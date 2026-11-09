@@ -610,6 +610,8 @@ pub(crate) struct Demo {
     /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
     /// переборе (только для сравнения в тестах).
     level_field_apart: bool,
+    /// Длинный шаг в пустоте (7.18д4, флажок на панели).
+    space_free: bool,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -945,6 +947,7 @@ impl Demo {
             space_smooth: true,
             space_counters_on: false,
             level_field_apart: true,
+            space_free: true,
             #[cfg(test)]
             full_normal: false,
             space_counted: None,
@@ -1567,6 +1570,17 @@ impl Demo {
     #[cfg(test)]
     pub(crate) fn set_level_field_apart(&mut self, on: bool) {
         self.level_field_apart = on;
+    }
+
+    /// Длинный шаг в пустоте (7.18д4): у клеток сетки отсева своё свободное расстояние.
+    pub fn space_free(&self) -> bool {
+        self.space_free
+    }
+
+    /// Включает или выключает длинный шаг в пустоте (выключенный — как до 7.18д4, для
+    /// сравнения картинки и времени).
+    pub fn set_space_free(&mut self, on: bool) {
+        self.space_free = on;
     }
 
     /// Нормаль всегда по всей сцене (7.18д5) — для сравнения с обычной.
@@ -3117,8 +3131,13 @@ impl Demo {
             let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             let culling = level || !self.space.culling_off;
             self.space_culled = culling;
-            let mut packed =
-                crate::space::pack_with(&frame, materials, culling, self.level_field_apart);
+            let mut packed = crate::space::pack_with(
+                &frame,
+                materials,
+                culling,
+                self.level_field_apart,
+                self.space_free,
+            );
             self.space_grid = packed.grid;
             crate::space::set_view_proj(&mut packed.words, view_proj);
             crate::space::set_field(
