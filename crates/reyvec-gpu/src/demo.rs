@@ -610,6 +610,9 @@ pub(crate) struct Demo {
     /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
     /// переборе (только для сравнения в тестах).
     level_field_apart: bool,
+    /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
+    #[cfg(test)]
+    full_normal: bool,
     /// Конвейеры со счётчиками; `None` — ещё не собраны.
     space_counted: Option<CountedPipelines>,
     /// Буфер счётчиков и его копия для процессора, свои у каждого кадра в полёте.
@@ -942,6 +945,8 @@ impl Demo {
             space_smooth: true,
             space_counters_on: false,
             level_field_apart: true,
+            #[cfg(test)]
+            full_normal: false,
             space_counted: None,
             space_counter_buffers: vec![None; frames_in_flight],
             space_counted_slots: vec![false; frames_in_flight],
@@ -1562,6 +1567,12 @@ impl Demo {
     #[cfg(test)]
     pub(crate) fn set_level_field_apart(&mut self, on: bool) {
         self.level_field_apart = on;
+    }
+
+    /// Нормаль всегда по всей сцене (7.18д5) — для сравнения с обычной.
+    #[cfg(test)]
+    pub(crate) fn set_full_normal(&mut self, on: bool) {
+        self.full_normal = on;
     }
 
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
@@ -3129,6 +3140,10 @@ impl Demo {
                     crate::space::set_shadow_maps(&mut packed.words, &maps);
                     space_shadow_maps = maps.len() as u32;
                 }
+            }
+            #[cfg(test)]
+            if self.full_normal {
+                crate::space::set_full_normal(&mut packed.words);
             }
             // Счётчики лучей (7.18д2): адрес их буфера — в слова сцены, иначе 0 (не считать).
             space_counters = match self.space_counted {

@@ -4,18 +4,37 @@
 
 #include "space.slang"
 
-float3 normal_at(float3 p)
+// Нормаль у точки попадания `p` (на расстоянии `t` по лучу). Ближе NORMAL_NEAR к точкам
+// тетраэдра настоящая форма всегда есть, поэтому объекты дальше отвечают шаром-границей —
+// ответ тот же до бита, что без этого. Если в первой точке ближайший объект впереди
+// остальных больше чем на NORMAL_GAP, в трёх других точках он ближайший заведомо
+// (расстояния меняются не быстрее чем в 4 раза быстрее точки, а точки тетраэдра — в
+// 2√2·e друг от друга), и считается он один (7.18д5; зеркало Grid::normal_samples).
+static const float NORMAL_NEAR = 0.02;
+static const float NORMAL_GAP = 0.024;
+// Бит 2 слова 11 заголовка: нормаль всегда по всей сцене (сравнение в тестах).
+static const uint SCENE_FULL_NORMAL = 4;
+
+float3 normal_at(float3 p, float t)
 {
     // Наклон поля по четырём точкам тетраэдра: дешевле шести и без перекоса. Точки
     // перебираются циклом, а не четырьмя вызовами подряд: так scene() встраивается в
     // шейдер один раз, и драйверы (особенно программный lavapipe) собирают его быстро.
     const float e = 0.001;
+    float near = 0.0005 * max(t, 1.0) + NORMAL_NEAR;
+    bool full = (pc.scene[11] & SCENE_FULL_NORMAL) != 0;
     float3 n = float3(0.0, 0.0, 0.0);
+    uint only = SCENE_ALL;
     for (uint k = 0; k < 4; k++)
     {
         float3 dir = float3(float(((k + 3) >> 1) & 1), float((k >> 1) & 1), float(k & 1)) * 2.0 - 1.0;
         count_normal();
-        n += dir * scene_near(p + dir * e, 1e9, false, true).x;
+        uint winner;
+        float second;
+        float d = scene_pick(p + dir * e, full || only != SCENE_ALL ? 1e9 : near, false, true, only, winner, second).x;
+        if (k == 0 && !full && winner != SCENE_ALL && second - d > NORMAL_GAP)
+            only = winner;
+        n += dir * d;
     }
     return normalize(n);
 }
@@ -105,7 +124,7 @@ float4 march_pixel(int2 px, float2 screen)
     // Материал первого слоя поля уровня — один раз, в точке попадания (7.18д3).
     if (hit.y == LAYER_MATERIAL_LOOKUP)
         hit.y = level_field_material(pc.scene, pc.scene[13], hit_at);
-    float3 n = normal_at(ray.origin + ray.dir * hit.x);
+    float3 n = normal_at(ray.origin + ray.dir * hit.x, hit.x);
     return float4(hit.x, hit.y, oct_encode(n));
 }
 

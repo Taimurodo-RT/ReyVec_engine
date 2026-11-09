@@ -129,9 +129,17 @@ static const uint SCENE_NO_SUN = 2;
 // Плоскости (7.6и, флаг OBJECT_PLANE: пол, стены) видны только при `planes`. Луч глаза
 // находит их точку формулой (plane_hit) и шагает без них: иначе у пола каждый шаг
 // короче высоты над полом, и луч, скользящий вдоль пола, тратит на это десятки шагов.
-float2 scene_near(float3 p, float near, bool proxies, bool planes)
+//
+// scene_walk<1> (scene_pick, 7.18д5) ещё говорит, чей ответ (`winner`, SCENE_ALL — оценка)
+// и сколько не меньше расстояние до всех остальных (`second`), а с `only` считает один этот
+// объект — так нормаль считает три точки из четырёх (normal_at).
+static const uint SCENE_ALL = 0xffffffffu;
+
+float2 scene_walk<let PICK : int>(float3 p, float near, bool proxies, bool planes, uint only, out uint winner, out float second)
 {
     count_scene();
+    winner = SCENE_ALL;
+    second = 1e9;
     // Числа из буфера ограничены сверху: испорченный буфер не должен вешать видеокарту.
     uint count = min(pc.scene[0], MAX_OBJECTS);
     uint objects = pc.scene[1];
@@ -141,10 +149,18 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
     // все объекты по порядку (номер — сам индекс).
     uint first = 0;
     uint first_count = count;
-    uint second = 0;
+    uint second_list = 0;
     uint second_count = 0;
     bool direct = g == 0;
-    if (!direct)
+    uint level = pc.scene[12];
+    bool single = PICK != 0 && only != SCENE_ALL;
+    if (single)
+    {
+        // Один объект: поле уровня считается ниже, остальные — циклом из одного шага.
+        first_count = only + 1 == level ? 0 : 1;
+        direct = true;
+    }
+    else if (!direct)
     {
         first = pc.scene[g + 16];
         // Плоскости — в конце списка бесконечных форм: без них список короче.
@@ -156,7 +172,7 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
         if (all(q >= 0) && all(q < dims))
         {
             uint c = pc.scene[g + 14] + uint((q.z * dims.y + q.y) * dims.x + q.x) * 2;
-            second = pc.scene[c];
+            second_list = pc.scene[c];
             second_count = min(pc.scene[c + 1], MAX_OBJECTS);
             best = float2(asfloat(pc.scene[g + 7]), -1.0);
         }
@@ -169,17 +185,26 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
     }
     // Поле уровня (7.18д3, слова 12 и 13 заголовка: номер объекта + 1 и начало его
     // программы) — до перебора: в списках сетки его нет, без сетки он пропускается ниже.
-    uint level = pc.scene[12];
-    if (level != 0)
+    if (level != 0 && (!single || only + 1 == level))
     {
         float2 s = level_field_near(pc.scene, pc.scene[13], p);
+        if (PICK != 0)
+        {
+            if (s.x < best.x)
+            {
+                second = min(second, best.x);
+                winner = level - 1;
+            }
+            else
+                second = min(second, s.x);
+        }
         if (s.x < best.x)
             best = s;
     }
     uint total = first_count + second_count;
     for (uint k = 0; k < total; k++)
     {
-        uint o = direct ? k : (k < first_count ? pc.scene[first + k] : pc.scene[second + k - first_count]);
+        uint o = single ? only : (direct ? k : (k < first_count ? pc.scene[first + k] : pc.scene[second_list + k - first_count]));
         if (o >= count || o + 1 == level)
             continue;
         uint w = objects + o * OBJECT_WORDS;
@@ -198,9 +223,18 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
             float3 center = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
             float outside = length(p - center) - radius;
             if (outside >= best.x)
+            {
+                if (PICK != 0)
+                    second = min(second, outside);
                 continue;
+            }
             if (outside > near)
             {
+                if (PICK != 0)
+                {
+                    second = min(second, best.x);
+                    winner = SCENE_ALL;
+                }
                 best = float2(outside, -1.0);
                 continue;
             }
@@ -218,10 +252,32 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
             s = sdf_chain(pc.scene, start, len, p);
         else
             s = sdf_program(pc.scene, start, len, p);
+        if (PICK != 0)
+        {
+            if (s.x < best.x)
+            {
+                second = min(second, best.x);
+                winner = o;
+            }
+            else
+                second = min(second, s.x);
+        }
         if (s.x < best.x)
             best = s;
     }
     return best;
+}
+
+float2 scene_near(float3 p, float near, bool proxies, bool planes)
+{
+    uint winner;
+    float second;
+    return scene_walk<0>(p, near, proxies, planes, SCENE_ALL, winner, second);
+}
+
+float2 scene_pick(float3 p, float near, bool proxies, bool planes, uint only, out uint winner, out float second)
+{
+    return scene_walk<1>(p, near, proxies, planes, only, winner, second);
 }
 
 // Ближайшая точка плоскостей сцены на луче (7.6и): x — длина вдоль луча (1e30 — ни
