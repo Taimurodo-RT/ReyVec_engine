@@ -462,6 +462,9 @@ fn render(
                 demo.set_level_view(true);
                 demo.set_level_render(render);
             }
+            // Поле уровня в общем переборе, как до 7.18д3 (для сравнения).
+            #[cfg(test)]
+            demo.set_level_field_apart(!tests::LEVEL_FIELD_IN_LOOP.get());
             // Счётчики лучей (7.18д2).
             #[cfg(test)]
             demo.set_space_counters(
@@ -736,6 +739,8 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(None) };
         /// …и кадр до неё, чтобы поле испеклось без правки и перепеклось кусками.
         pub(super) static LEVEL_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Поле уровня в общем переборе объектов, как до 7.18д3.
+        pub(super) static LEVEL_FIELD_IN_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Кадр со счётчиками лучей (7.18д2).
         pub(super) static SPACE_COUNTERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
@@ -1379,6 +1384,86 @@ pub(crate) mod tests {
         }
         let rays = field.space_stats.and_then(|s| s.rays).expect("лучи");
         assert!(rays[PASS_MARCH].field > 0, "поле читается");
+    }
+
+    /// Поле уровня до перебора объектов (7.18д3): та же картинка до байта и те же шаги и
+    /// вычисления сцены, что у поля в общем переборе; объектов и форм меньше ровно на
+    /// чтения поля, материал первого слоя читается только в точках попадания.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_field_apart_same_picture() {
+        use crate::counters::{PASS_EDGES, PASS_MARCH, RAY_PASS_NAMES};
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        // Комната (точка теста уровня), у стола и у полки.
+        for start in [[-0.6, -0.5], [0.0, -0.6], [0.4, -0.5]] {
+            let play = HeadlessPlay {
+                start: Some(start),
+                ..Default::default()
+            };
+            LEVEL_VIEW.set(true);
+            LEVEL_RENDER.set(crate::LevelRender::Field);
+            let mut frames = Vec::new();
+            for (in_loop, counted) in [(true, false), (false, false), (true, true), (false, true)] {
+                LEVEL_FIELD_IN_LOOP.set(in_loop);
+                SPACE_COUNTERS.set(counted);
+                frames.push(render_headless_play(&options, &scene, Some(&play)));
+            }
+            LEVEL_FIELD_IN_LOOP.set(false);
+            SPACE_COUNTERS.set(false);
+            LEVEL_RENDER.set(crate::LevelRender::Sdf);
+            LEVEL_VIEW.set(false);
+            let frames: Vec<HeadlessImage> = frames.into_iter().map(|f| f.expect("кадр")).collect();
+            assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            for (k, what) in [(0, "в переборе"), (1, "до перебора")] {
+                if let Some(t) = &frames[k].gpu_timings {
+                    eprintln!("{start:?}, поле {what}: {}", t.describe());
+                }
+            }
+            for (a, b, what) in [(0, 1, "без счётчиков"), (2, 3, "со счётчиками")]
+            {
+                assert!(
+                    frames[a].image.rgba == frames[b].image.rgba,
+                    "{start:?} {what}: картинка та же до байта"
+                );
+            }
+            let old = frames[2].space_stats.and_then(|s| s.rays).expect("лучи");
+            let new = frames[3].space_stats.and_then(|s| s.rays).expect("лучи");
+            for (pass, name) in RAY_PASS_NAMES.iter().enumerate() {
+                let (o, n) = (old[pass], new[pass]);
+                eprintln!("{start:?} {name}: было {o:?}");
+                eprintln!("{start:?} {name}: стало {n:?}");
+                assert_eq!(
+                    (o.rays, o.steps, o.scene, o.normal, o.field),
+                    (n.rays, n.steps, n.scene, n.normal, n.field),
+                    "{name}"
+                );
+                assert!(o.field > 0, "{name}: поле читается");
+                assert_eq!(n.objects, o.objects - o.field, "{name}");
+                assert_eq!(n.forms, o.forms - o.field, "{name}");
+                if pass == PASS_MARCH || pass == PASS_EDGES {
+                    // Не больше одного чтения на попадание (нормаль — 4 вычисления).
+                    assert!(n.material <= n.normal / 4, "{name}: {n:?}");
+                } else {
+                    assert_eq!(n.material, 0, "{name}: материал только в попадании");
+                }
+            }
+        }
     }
 
     /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и

@@ -53,12 +53,14 @@ float4 march_pixel(int2 px, float2 screen)
     float omega = 1.6;
     float step = 0.0;
     float previous = 0.0;
+    float3 hit_at = ray.origin;
     for (int i = 0; i < 160; i++)
     {
         count_step();
         // Дальше 25 см (и ещё миллиметр на метр пути) от границы объекта его форма не
         // считается: это всегда больше точности попадания ниже.
-        float2 s = scene_near(ray.origin + ray.dir * t, 0.25 + 0.001 * t, false, false);
+        float3 at = ray.origin + ray.dir * t;
+        float2 s = scene_near(at, 0.25 + 0.001 * t, false, false);
         float radius = abs(s.x);
         if (omega > 1.0 && radius + previous < step)
         {
@@ -73,6 +75,7 @@ float4 march_pixel(int2 px, float2 screen)
         if (s.x < 0.0005 * max(t, 1.0))
         {
             hit = float2(t, s.y);
+            hit_at = at;
             break;
         }
         step = s.x * omega;
@@ -99,6 +102,9 @@ float4 march_pixel(int2 px, float2 screen)
             return float4(plane.x, plane.y, oct_encode(plane_normal));
         return mesh;
     }
+    // Материал первого слоя поля уровня — один раз, в точке попадания (7.18д3).
+    if (hit.y == LAYER_MATERIAL_LOOKUP)
+        hit.y = level_field_material(pc.scene, pc.scene[13], hit_at);
     float3 n = normal_at(ray.origin + ray.dir * hit.x);
     return float4(hit.x, hit.y, oct_encode(n));
 }

@@ -54,20 +54,32 @@ pub struct Grid {
     pub unbounded: Vec<u32>,
     /// Сколько первых из `unbounded` — не плоскости.
     pub unbounded_solid: usize,
+    /// Поле уровня (7.18д3, [`crate::shape3d::level_field_object`]): считается в каждой
+    /// точке первым, до `unbounded`; в `unbounded` его нет.
+    pub field: Option<u32>,
 }
 
 impl Grid {
-    /// Сетка для объектов `objects` (номера в списках — их индексы).
+    /// Сетка для объектов `objects` (номера в списках — их индексы); поле уровня
+    /// ([`crate::shape3d::level_field_object`]) — отдельно от списков.
     pub fn build(objects: &[Program]) -> Self {
+        let field = crate::shape3d::level_field_object(objects).map(|i| i as u32);
+        Self::build_with(objects, field)
+    }
+
+    /// То же с полем уровня `field` (номер объекта; `None` — все бесконечные формы в
+    /// списке, как до 7.18д3).
+    pub fn build_with(objects: &[Program], field: Option<u32>) -> Self {
         let planes = crate::shape3d::plane_objects(objects);
         let (mut unbounded, flat): (Vec<u32>, Vec<u32>) = (0..objects.len() as u32)
-            .filter(|&i| objects[i as usize].bounds.is_none())
+            .filter(|&i| objects[i as usize].bounds.is_none() && Some(i) != field)
             .partition(|i| !planes.contains(i));
         let unbounded_solid = unbounded.len();
         unbounded.extend(flat);
         let mut grid = Grid {
             unbounded,
             unbounded_solid,
+            field,
             ..Grid::default()
         };
         let finite: Vec<(u32, Vec3, f32)> = objects
@@ -229,6 +241,13 @@ impl Grid {
                 }
             }
         }
+        // Поле уровня — до перебора, как `level_field_near` в шейдере.
+        if let Some(f) = self.field {
+            let (d, m) = objects[f as usize].distance(p);
+            if d < best.0 {
+                best = (d, (m != ESTIMATE_MATERIAL).then_some(m));
+            }
+        }
         for &i in self.unbounded.iter().chain(list) {
             let o = &objects[i as usize];
             if let Some((c, r)) = o.bounds {
@@ -357,12 +376,9 @@ mod tests {
         ));
         let grid = Grid::build(&objects);
         let last = (objects.len() - 1) as u32;
-        assert_eq!(
-            grid.unbounded,
-            vec![last, 0],
-            "поле слоя — перед плоскостями"
-        );
-        assert_eq!(grid.unbounded_solid, 1);
+        assert_eq!(grid.unbounded, vec![0], "поле уровня — не в списке");
+        assert_eq!(grid.field, Some(last), "поле уровня считается первым");
+        assert_eq!(grid.unbounded_solid, 0);
         assert_eq!(
             grid.dims,
             Grid::build(&plain).dims,
@@ -407,11 +423,38 @@ mod tests {
     }
 
     /// Раскладка слов читается так же, как в шейдере (`scene_near` в
-    /// `include/space.slang`), и даёт тот же ответ, что [`Grid::near`].
+    /// `include/space.slang`), и даёт тот же ответ, что [`Grid::near`] — и с полем уровня
+    /// (7.18д3), которое считается до перебора и в списки не входит.
     #[test]
     fn packed_words_match_the_mirror() {
-        let objects = programs(include_str!("../../../scenes/3d/stress.ron"));
-        let grid = Grid::build(&objects);
+        use crate::layer_field::LayerField;
+        use crate::profile2d::Profile;
+        use crate::shape3d::FieldRef;
+        let plain = programs(include_str!("../../../scenes/3d/stress.ron"));
+        let profile = Profile::new("M -3 -1 L 3 -1 L 3 1 L -3 1 Z").unwrap();
+        let mut with_field = plain.clone();
+        with_field.push(
+            compile(
+                &Shape3::Field {
+                    field: FieldRef(std::sync::Arc::new(
+                        LayerField::from_profile(&profile, 1.0).without_rect(),
+                    )),
+                    depth: 0.3,
+                    round: 0.02,
+                }
+                .at([0.0, 0.5, 0.0])
+                .paint(1),
+            )
+            .unwrap(),
+        );
+        assert!(Grid::build(&with_field).field.is_some());
+        for objects in [plain, with_field] {
+            words_match_the_mirror(&objects);
+        }
+    }
+
+    fn words_match_the_mirror(objects: &[Program]) {
+        let grid = Grid::build(objects);
         let mut w = vec![0u32; 100];
         grid.write(100, &mut w);
         assert_eq!(w.len(), 100 + grid.words());
@@ -446,10 +489,14 @@ mod tests {
                     * (grid.cell * Vec3::from(grid.dims.map(|d| d as f32)) + 4.0);
             let (start, list) = from_words(p);
             let mut best = start;
+            if let Some(f) = grid.field {
+                assert!(!list.contains(&f), "поле уровня не в списках");
+                best = best.min(objects[f as usize].distance(p).0);
+            }
             for &i in &list {
                 best = best.min(objects[i as usize].distance(p).0);
             }
-            let mirror = grid.near(&objects, p, 1e9).0;
+            let mirror = grid.near(objects, p, 1e9).0;
             assert!(
                 (best - mirror).abs() < 1e-5,
                 "{p}: слова {best}, зеркало {mirror}"

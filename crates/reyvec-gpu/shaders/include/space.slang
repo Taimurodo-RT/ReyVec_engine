@@ -167,11 +167,20 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
             best = float2(length(p - clamp(p, lo, hi)), -1.0);
         }
     }
+    // Поле уровня (7.18д3, слова 12 и 13 заголовка: номер объекта + 1 и начало его
+    // программы) — до перебора: в списках сетки его нет, без сетки он пропускается ниже.
+    uint level = pc.scene[12];
+    if (level != 0)
+    {
+        float2 s = level_field_near(pc.scene, pc.scene[13], p);
+        if (s.x < best.x)
+            best = s;
+    }
     uint total = first_count + second_count;
     for (uint k = 0; k < total; k++)
     {
         uint o = direct ? k : (k < first_count ? pc.scene[first + k] : pc.scene[second + k - first_count]);
-        if (o >= count)
+        if (o >= count || o + 1 == level)
             continue;
         uint w = objects + o * OBJECT_WORDS;
         uint flags = pc.scene[w + 2];

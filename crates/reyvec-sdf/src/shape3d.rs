@@ -749,6 +749,28 @@ fn chain(
 }
 
 impl Program {
+    /// Поле уровня (7.18д3): вся программа — один примитив «поле слоя» без прямоугольника
+    /// фигуры (бесконечный), без поворота и масштаба (только сдвиг), обычный объект (не
+    /// заменитель и не светящийся). Такой объект шейдер считает до перебора объектов
+    /// (`level_field_near` в `include/sdf3d.slang`), без матрицы и лестницы видов.
+    pub fn level_field(&self) -> bool {
+        let w = &self.words;
+        if self.bounds.is_some()
+            || self.shadow_only
+            || self.no_shadow
+            || self.fields.len() != 1
+            || w.len() != PRIM_WORDS + FIELD_PRIM_WORDS
+            || w[0] != op::PRIM | (prim::FIELD << 8) | ((FIELD_PRIM_WORDS as u32) << 16)
+        {
+            return false;
+        }
+        let f = |i: usize| f32::from_bits(w[i]);
+        let rot = [f(2), f(3), f(4), f(6), f(7), f(8), f(10), f(11), f(12)];
+        let at = PRIM_WORDS;
+        let rect = f(at + 6) <= f(at + 8) && f(at + 7) <= f(at + 9);
+        rot == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] && f(14) == 1.0 && !rect
+    }
+
     /// Если вся форма — одна плоскость: плоскость в мире `(n, c)`, расстояние до неё
     /// `dot(n, p) + c` (`n` единичная). Такую форму луч глаза находит формулой (7.6и).
     pub fn plane(&self) -> Option<(Vec3, f32)> {
@@ -940,7 +962,14 @@ pub const MAX_PLANES: usize = 8;
 /// обрезается до него на процессоре заранее, с предупреждением (7.18б).
 pub const MAX_OBJECTS: usize = 1024;
 /// Слов в заголовке сцены.
-const HEADER_WORDS: usize = 12;
+const HEADER_WORDS: usize = 14;
+
+/// Поле уровня (7.18д3): первый объект, который шейдер считает отдельно, до перебора
+/// объектов ([`Program::level_field`]); у 2.5D-вида это поле уровня, но подойдёт и
+/// такое же поле в сцене «3D». В сетку отсева он не идёт.
+pub fn level_field_object(objects: &[Program]) -> Option<usize> {
+    objects.iter().position(Program::level_field)
+}
 
 /// Объекты-плоскости, которые луч глаза находит формулой ([`OBJECT_PLANE`]): первые
 /// [`MAX_PLANES`] видимых объектов из одной плоскости.
@@ -957,10 +986,12 @@ pub fn plane_objects(objects: &[Program]) -> Vec<u32> {
 /// Сцена для видеокарты: объекты (у каждого своя программа), материалы и лампы одним
 /// списком слов. Раскладка (читает `include/space.slang`):
 ///
-/// - заголовок, 12 слов: число объектов, где начинаются объекты, где материалы, сколько
+/// - заголовок, 14 слов: число объектов, где начинаются объекты, где материалы, сколько
 ///   их, где лампы, сколько их, где сетка отсева (0 — сетки нет), где полигоны (пишет
 ///   `reyvec-gpu`), где список плоскостей и сколько их ([`OBJECT_PLANE`]), где раздел
-///   запечённого поля (7.10, пишет `reyvec-gpu`; 0 — поля нет), 1 запасное;
+///   запечённого поля (7.10, пишет `reyvec-gpu`; 0 — поля нет), флаги кадра (пишет
+///   `reyvec-gpu`), номер объекта поля уровня + 1 (0 — его нет) и начало его программы
+///   (7.18д3, [`level_field_object`]);
 /// - объекты по 8 слов ([`OBJECT_WORDS`]): начало программы, её длина в словах, флаги
 ///   ([`OBJECT_SHADOW_ONLY`], [`OBJECT_PLANE`]), 1 запасное, шар-граница (середина и
 ///   радиус; радиус -1 — граница не нужна, форма бесконечна);
@@ -970,6 +1001,17 @@ pub fn plane_objects(objects: &[Program]) -> Vec<u32> {
 /// - список плоскостей: номера объектов (не больше [`MAX_PLANES`]);
 /// - сетка отсева ([`crate::grid3d::Grid::write`]).
 pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
+    pack_scene_with(objects, materials, lamps, true)
+}
+
+/// То же; `level_field: false` — поле уровня считается в общем переборе, как до 7.18д3
+/// (для сравнения в тестах).
+pub fn pack_scene_with(
+    objects: &[Program],
+    materials: &[Material3],
+    lamps: &[Lamp3],
+    level_field: bool,
+) -> Vec<u32> {
     let objects_at = HEADER_WORDS;
     let materials_at = objects_at + objects.len() * OBJECT_WORDS;
     let lamps_at = materials_at + materials.len() * MATERIAL_WORDS;
@@ -987,8 +1029,11 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
         0,
         0,
         0,
+        0,
+        0,
     ];
     let mut start = code_at;
+    let field = level_field.then(|| level_field_object(objects)).flatten();
     let planes = plane_objects(objects);
     for (i, p) in objects.iter().enumerate() {
         let mut flags = if p.shadow_only { OBJECT_SHADOW_ONLY } else { 0 };
@@ -1006,6 +1051,10 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
         out.extend([start as u32, p.words.len() as u32, flags, c.to_bits()]);
         let (center, r) = p.bounds.unwrap_or((n, -1.0));
         out.extend([center.x, center.y, center.z, r].map(f32::to_bits));
+        if field == Some(i) {
+            out[12] = i as u32 + 1;
+            out[13] = start as u32;
+        }
         start += p.words.len();
     }
     for m in materials {
@@ -1025,7 +1074,7 @@ pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3])
     out[8] = out.len() as u32;
     out[9] = planes.len() as u32;
     out.extend(&planes);
-    let grid = crate::grid3d::Grid::build(objects);
+    let grid = crate::grid3d::Grid::build_with(objects, field.map(|i| i as u32));
     if !grid.cells.is_empty() {
         out[6] = out.len() as u32;
         let at = out.len();
@@ -1298,7 +1347,8 @@ mod tests {
         .unwrap();
         let w = pack_scene(&[a.clone(), b.clone(), floor.clone()], &materials, &lamps);
         let o = |i: usize| HEADER_WORDS + 8 * i;
-        assert_eq!(&w[..6], &[3, 12, 36, 1, 44, 1]);
+        assert_eq!(&w[..6], &[3, 14, 38, 1, 46, 1]);
+        assert_eq!(&w[12..14], &[0, 0], "поля уровня нет");
         let (start_b, len_b) = (w[o(1)] as usize, w[o(1) + 1] as usize);
         assert_eq!(len_b, b.words.len());
         assert_eq!(&w[start_b..start_b + len_b], &b.words[..]);
@@ -1467,6 +1517,56 @@ mod tests {
         assert_eq!(f32::from_bits(w[HEADER_WORDS + 7]), -1.0);
         assert_eq!(w[HEADER_WORDS + 2] & (OBJECT_PLANE | OBJECT_CHAIN), 0);
         assert_eq!(w[9], 0, "плоскостей нет");
+    }
+
+    /// Поле уровня (7.18д3): бесконечное поле слоя со сдвигом — отдельный объект, слова 12 и
+    /// 13 заголовка указывают на него и начало его программы; с поворотом, масштабом,
+    /// прямоугольником, у заменителя или светящегося — обычный объект.
+    #[test]
+    fn level_field_is_found_and_packed() {
+        let profile = Profile::new(STAR).unwrap();
+        let field = |rect: bool| Shape3::Field {
+            field: FieldRef(Arc::new(if rect {
+                LayerField::from_profile(&profile, 1.0)
+            } else {
+                LayerField::from_profile(&profile, 1.0).without_rect()
+            })),
+            depth: 0.3,
+            round: 0.02,
+        };
+        let level = compile(&field(false).at([0.5, 1.0, -0.3]).paint(3)).unwrap();
+        assert!(level.level_field());
+        let mut refused = vec![
+            compile(&field(false).placed([0.5, 1.0, -0.3], [0.0, 0.0, 10.0])).unwrap(),
+            compile(&Shape3::Move {
+                at: [0.0; 3],
+                turn: [0.0; 3],
+                scale: 2.0,
+                shape: Box::new(field(false)),
+            })
+            .unwrap(),
+            compile(&field(true)).unwrap(),
+        ];
+        let mut shadow_only = level.clone();
+        shadow_only.shadow_only = true;
+        let mut no_shadow = level.clone();
+        no_shadow.no_shadow = true;
+        refused.extend([shadow_only, no_shadow]);
+        for (k, p) in refused.iter().enumerate() {
+            assert!(!p.level_field(), "{k}");
+        }
+        let sphere = compile(&Shape3::Sphere { radius: 1.0 }.at([3.0, 0.0, 0.0])).unwrap();
+        let objects = [sphere.clone(), level.clone()];
+        assert_eq!(level_field_object(&objects), Some(1));
+        let w = pack_scene(&objects, &[], &[]);
+        assert_eq!(w[12], 2, "номер объекта + 1");
+        let start = w[13] as usize;
+        assert_eq!(start, w[HEADER_WORDS + OBJECT_WORDS] as usize);
+        assert_eq!(&w[start..start + level.words.len()], &level.words[..]);
+        let w = pack_scene_with(&objects, &[], &[], false);
+        assert_eq!(&w[12..14], &[0, 0], "выключено — как до 7.18д3");
+        let w = pack_scene(&[sphere], &[], &[]);
+        assert_eq!(&w[12..14], &[0, 0], "поля нет");
     }
 
     /// Шар-граница поля фигуры держит тело: всё, что внутри, — в шаре, а снаружи шара
