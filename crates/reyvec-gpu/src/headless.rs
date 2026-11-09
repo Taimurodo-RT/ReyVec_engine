@@ -462,6 +462,14 @@ fn render(
                 demo.set_level_view(true);
                 demo.set_level_render(render);
             }
+            // Счётчики лучей (7.18д2).
+            #[cfg(test)]
+            demo.set_space_counters(
+                ctx,
+                gpu,
+                &ShaderLibrary::new(false),
+                tests::SPACE_COUNTERS.get(),
+            )?;
             demo.settle_details(ctx, gpu, extent, scene.time, scene.scene)?;
             // Перепекание поля на месте (7.18г): кадр до правки (поле печётся целиком),
             // потом правка снимка — и снимаемый кадр перепекает поле кусками.
@@ -614,6 +622,7 @@ fn render(
         let space_stats = match (r.gpu.as_ref(), r.demo.as_ref()) {
             (Some(gpu), Some(demo)) => demo.space_stats().map(|mut s| {
                 s.edge_pixels = demo.edge_pixels(gpu, 0);
+                s.rays = demo.ray_counts(gpu, 0);
                 s
             }),
             _ => None,
@@ -727,6 +736,8 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(None) };
         /// …и кадр до неё, чтобы поле испеклось без правки и перепеклось кусками.
         pub(super) static LEVEL_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Кадр со счётчиками лучей (7.18д2).
+        pub(super) static SPACE_COUNTERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Сцена «3D» для опыта 7.18б: пол, две лампы и две выдавленные фигуры верхнего
@@ -1258,6 +1269,116 @@ pub(crate) mod tests {
 
     fn stats_objects(f: &HeadlessImage) -> u32 {
         f.space_stats.map_or(0, |s| s.objects)
+    }
+
+    /// Счётчики лучей (7.18д2): в 2.5D-виде «комнаты» каждый проход считает столько лучей,
+    /// сколько пускает, шаги и вычисления сцены сходятся между собой, поле читается только
+    /// там, где оно есть, а картинка с ними та же, что без них.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_view_counts_rays() {
+        use crate::counters::{
+            PASS_AO, PASS_CONE, PASS_EDGE_SHADOWS, PASS_EDGES, PASS_MARCH, PASS_SHADOWS,
+            RAY_PASS_NAMES,
+        };
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        let play = HeadlessPlay {
+            start: Some([-0.6, -0.5]),
+            ..Default::default()
+        };
+        LEVEL_VIEW.set(true);
+        let plain = render_headless_play(&options, &scene, Some(&play));
+        SPACE_COUNTERS.set(true);
+        let counted = render_headless_play(&options, &scene, Some(&play));
+        LEVEL_RENDER.set(crate::LevelRender::Field);
+        let field = render_headless_play(&options, &scene, Some(&play));
+        LEVEL_RENDER.set(crate::LevelRender::Sdf);
+        SPACE_COUNTERS.set(false);
+        LEVEL_VIEW.set(false);
+        let plain = plain.expect("кадр без счётчиков");
+        let counted = counted.expect("кадр со счётчиками");
+        let field = field.expect("кадр с полем и счётчиками");
+        assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+        assert!(
+            plain.space_stats.expect("счётчики кадра").rays.is_none(),
+            "без флажка лучи не считаются"
+        );
+        let (changed, worst, _) = image_diff(&plain.image, &counted.image);
+        eprintln!("счётчики: отличается {changed} пикселей, наибольшая {worst}");
+        assert_eq!(changed, 0, "со счётчиками картинка та же");
+        for (name, image) in [("SDF", &counted), ("поле", &field)] {
+            let stats = image.space_stats.expect("счётчики кадра");
+            let rays = stats.rays.expect("лучи посчитаны");
+            for (pass, c) in rays.iter().enumerate() {
+                eprintln!("{name}, {}: {c:?}", RAY_PASS_NAMES[pass]);
+                assert!(
+                    c.forms <= c.objects,
+                    "{name}, {}: {c:?}",
+                    RAY_PASS_NAMES[pass]
+                );
+                assert!(
+                    c.normal <= c.scene,
+                    "{name}, {}: {c:?}",
+                    RAY_PASS_NAMES[pass]
+                );
+                assert!(
+                    c.objects <= c.scene * u64::from(stats.objects),
+                    "{name}, {}: {c:?}",
+                    RAY_PASS_NAMES[pass]
+                );
+                if name == "SDF" {
+                    assert_eq!((c.field, c.material), (0, 0), "{name}: поля нет");
+                }
+            }
+            let pixels = u64::from(stats.pixels);
+            let (w, h) = (u64::from(scene.width), u64::from(scene.height));
+            assert_eq!(rays[PASS_MARCH].rays, pixels, "{name}: луч на пиксель");
+            assert_eq!(
+                rays[PASS_CONE].rays,
+                w.div_ceil(8) * h.div_ceil(8),
+                "{name}: конус на квадрат 8×8"
+            );
+            let march = rays[PASS_MARCH];
+            assert!(march.steps >= march.rays, "{name}: {march:?}");
+            assert_eq!(march.normal % 4, 0, "{name}: нормаль — 4 вычисления");
+            assert!(march.normal <= 4 * march.rays, "{name}: {march:?}");
+            let ao = rays[PASS_AO];
+            assert!(ao.rays > 0 && ao.rays <= w * h / 4, "{name}: {ao:?}");
+            assert_eq!(ao.steps, 11 * ao.rays, "{name}: 11 проб на точку");
+            let shadows = rays[PASS_SHADOWS];
+            assert!(
+                shadows.rays > 0 && shadows.rays <= 2 * w * h / 4,
+                "{name}: {shadows:?}"
+            );
+            let edge_pixels = u64::from(stats.edge_pixels.expect("края посчитаны"));
+            assert_eq!(
+                rays[PASS_EDGES].rays,
+                4 * edge_pixels,
+                "{name}: 4 луча на край"
+            );
+            assert!(rays[PASS_EDGE_SHADOWS].rays > 0, "{name}");
+            if let Some(t) = &image.gpu_timings {
+                eprintln!("{name} со счётчиками: {}", t.describe());
+            }
+        }
+        let rays = field.space_stats.and_then(|s| s.rays).expect("лучи");
+        assert!(rays[PASS_MARCH].field > 0, "поле читается");
     }
 
     /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и

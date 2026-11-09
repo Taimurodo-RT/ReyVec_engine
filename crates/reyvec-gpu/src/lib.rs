@@ -32,6 +32,7 @@ mod adapter;
 mod bindless;
 mod blobs;
 mod context;
+mod counters;
 mod cull;
 mod demo;
 mod demo_load;
@@ -56,6 +57,7 @@ mod window;
 pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
 pub use bindless::{MAX_TEXTURES, SamplerKind};
 pub use context::{GpuOptions, list_adapters, validation_error_count};
+pub use counters::{RAY_PASS_NAMES, RAY_PASSES, RayCounts};
 pub use cull::CullStats;
 pub use demo::{
     DemoScene, MAX_EDGE_PIXELS, MAX_SCENE_OBJECTS, MAX_SCENE_WORDS, Msaa, PlayerStats, SpaceScale,

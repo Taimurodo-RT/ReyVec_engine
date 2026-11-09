@@ -14,6 +14,7 @@ float3 normal_at(float3 p)
     for (uint k = 0; k < 4; k++)
     {
         float3 dir = float3(float(((k + 3) >> 1) & 1), float((k >> 1) & 1), float(k & 1)) * 2.0 - 1.0;
+        count_normal();
         n += dir * scene_near(p + dir * e, 1e9, false, true).x;
     }
     return normalize(n);
@@ -23,6 +24,7 @@ float3 normal_at(float3 p)
 // пиксельного шейдера и вычислительного (опыт 7.6м).
 float4 march_pixel(int2 px, float2 screen)
 {
+    count_ray();
     Ray ray = screen_ray(screen);
 
     // Шагаем по лучу: каждый шаг — на расстояние до ближайшей формы, ближе неё ничего нет.
@@ -53,6 +55,7 @@ float4 march_pixel(int2 px, float2 screen)
     float previous = 0.0;
     for (int i = 0; i < 160; i++)
     {
+        count_step();
         // Дальше 25 см (и ещё миллиметр на метр пути) от границы объекта его форма не
         // считается: это всегда больше точности попадания ниже.
         float2 s = scene_near(ray.origin + ray.dir * t, 0.25 + 0.001 * t, false, false);

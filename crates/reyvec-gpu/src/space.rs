@@ -27,8 +27,8 @@ fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
     }
 }
 
-/// Слов в заголовке раздела моделей: число вершин, число карт теней ламп, 2 запасных,
-/// матрица «мир → экран» (16 чисел, столбцами; пишет [`set_view_proj`]) и матрицы двух
+/// Слов в заголовке раздела моделей: число вершин, число карт теней ламп, адрес буфера
+/// счётчиков лучей (2 слова, пишет [`set_counters`]; 0 — не считать), матрица «мир → экран» (16 чисел, столбцами; пишет [`set_view_proj`]) и матрицы двух
 /// ламп для карт теней (пишет [`set_shadow_maps`]), как в `include/space.slang`.
 const MESH_HEADER_WORDS: usize = 52;
 /// Где в разделе моделей матрица камеры и матрицы ламп.
@@ -223,14 +223,39 @@ pub(crate) fn set_field(
     }
 }
 
+/// Где раздел моделей; `None` — его нет (сцена не поместилась и рисуется пустой, слово 7
+/// заголовка — 0): писать в «раздел» тогда значит портить заголовок сцены.
+fn mesh_section(words: &[u32]) -> Option<usize> {
+    let at = *words.get(7)? as usize;
+    (at != 0).then_some(at)
+}
+
 /// Матрица камеры «мир → экран» в раздел моделей (вершинный шейдер «полигонов 3D»).
 pub(crate) fn set_view_proj(words: &mut [u32], view_proj: glam::Mat4) {
-    write_matrix(words, words[7] as usize + MESH_VIEW_PROJ, view_proj);
+    if let Some(at) = mesh_section(words) {
+        write_matrix(words, at + MESH_VIEW_PROJ, view_proj);
+    }
+}
+
+/// Адрес буфера счётчиков лучей (7.18д2) в слова 2 и 3 раздела моделей: туда шейдеры
+/// `*_counted` складывают счётчики (`counters_flush` в `include/space.slang`). `false` —
+/// раздела нет (сцена не поместилась), шейдеры считать не будут.
+pub(crate) fn set_counters(words: &mut [u32], address: u64) -> bool {
+    if let Some(at) = mesh_section(words)
+        && let Some(slot) = words.get_mut(at + 2..at + 4)
+    {
+        slot[0] = address as u32;
+        slot[1] = (address >> 32) as u32;
+        return true;
+    }
+    false
 }
 
 /// Матрицы ламп для карт теней (7.9б) в раздел моделей; их число — слово 1 раздела.
 pub(crate) fn set_shadow_maps(words: &mut [u32], maps: &[glam::Mat4]) {
-    let at = words[7] as usize;
+    let Some(at) = mesh_section(words) else {
+        return;
+    };
     let count = maps.len().min(MAX_SHADOW_MAPS);
     if let Some(w) = words.get_mut(at + 1) {
         *w = count as u32;
@@ -256,6 +281,31 @@ fn write_matrix(words: &mut [u32], at: usize, m: glam::Mat4) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Адрес счётчиков ложится в слова 2 и 3 раздела моделей и больше ничего не трогает; у
+    /// сцены, которая не поместилась (раздела нет), не пишется ничего — ни он, ни матрицы.
+    #[test]
+    fn counters_address_goes_to_mesh_header() {
+        let scene = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE).unwrap();
+        let words = pack(&scene.frame(1.0), &scene.materials, true).words;
+        let at = words[7] as usize;
+        assert!(at > 0);
+        let mut set = words.clone();
+        assert!(set_counters(&mut set, 0x1234_5678_9abc_def0));
+        assert_eq!(set[at + 2], 0x9abc_def0);
+        assert_eq!(set[at + 3], 0x1234_5678);
+        set[at + 2] = words[at + 2];
+        set[at + 3] = words[at + 3];
+        assert_eq!(set, words, "другие слова те же");
+
+        let empty = pack_scene(&[], &scene.materials, &[]);
+        assert_eq!(empty[7], 0);
+        let mut set = empty.clone();
+        assert!(!set_counters(&mut set, 0x1234_5678_9abc_def0));
+        set_view_proj(&mut set, glam::Mat4::IDENTITY);
+        set_shadow_maps(&mut set, &[glam::Mat4::IDENTITY]);
+        assert_eq!(set, empty, "без раздела моделей заголовок цел");
+    }
 
     #[test]
     fn example_scene_compiles_and_fits() {

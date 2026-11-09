@@ -691,6 +691,24 @@ impl WindowRenderer {
         }
     }
 
+    /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
+    pub fn space_counters(&self) -> (bool, bool) {
+        self.demo
+            .as_ref()
+            .map_or((false, false), |d| d.space_counters(&self.ctx))
+    }
+
+    /// Включает или выключает счётчики лучей 3D со следующего кадра (при первом включении
+    /// собираются шейдеры со счётчиками). Ошибка пишется в журнал, счётчики остаются
+    /// выключенными.
+    pub fn set_space_counters(&mut self, on: bool) {
+        if let (Some(demo), Some(res)) = (self.demo.as_mut(), self.resources.as_ref())
+            && let Err(e) = demo.set_space_counters(&self.ctx, res, &self.shaders, on)
+        {
+            tracing::error!("счётчики лучей 3D не включились: {e}");
+        }
+    }
+
     /// Выдавливание через поле слоя в сцене «3D» (опыт 7.18б): включено ли и есть ли в
     /// кадре фигуры, которые подменяются.
     pub fn space_extrude_field(&self) -> (bool, bool) {

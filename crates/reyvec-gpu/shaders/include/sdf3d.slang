@@ -14,6 +14,7 @@
 // полосой, расстояние там не больше настоящего, материала нет (тени не пишут полутень).
 
 #include "textures.slang"
+#include "counters.slang"
 
 static const uint OP_PRIM = 1;
 static const uint OP_UNION = 2;
@@ -108,6 +109,7 @@ float sd2_field(uint* code, uint at, float2 p)
 // band − клетка, это только оценка (`estimate`), настоящая поверхность может быть дальше.
 float2 sd2_layer(uint* code, uint at, float2 p, float band, out bool2 estimate)
 {
+    count_field();
     uint slot = code[at];
     float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
     float cell = asfloat(code[at + 4]);
@@ -143,6 +145,7 @@ static const float LAYER_MATERIAL_NEAR = 0.05;
 // `mslot` — слово заголовка: ячейка картинки + 1, 0 — картинки нет.
 float layer_material(uint* code, uint at, uint mslot, float2 p)
 {
+    count_material();
     float2 corner = float2(asfloat(code[at + 2]), asfloat(code[at + 3]));
     float cell = asfloat(code[at + 4]);
     int nx = int(code[at + 5] & 0xffff);

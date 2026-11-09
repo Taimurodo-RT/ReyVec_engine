@@ -34,9 +34,11 @@ float fs_main(VertexOut input) : SV_Target
     // точку плоскости. Дальше точки плоскости на оси идти незачем — там пол.
     float3 plane_normal;
     float limit = min(axis.limit, plane_hit(axis.origin, axis.dir, plane_normal).x);
+    count_ray();
     float t = 0.0;
     for (int i = 0; i < 96; i++)
     {
+        count_step();
         float cone = length(offset + drift * t);
         float d = scene_near(axis.origin + axis.dir * t, max(0.25, 2.0 * cone), false, false).x;
         // Пустота должна быть шире конуса с запасом: иначе дальше идут тонкие лучи.
@@ -48,5 +50,6 @@ float fs_main(VertexOut input) : SV_Target
         if (t > limit)
             break;
     }
+    counters_flush_fragment(PASS_CONE, int2(input.position.xy));
     return min(t, limit);
 }

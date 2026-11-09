@@ -131,6 +131,7 @@ static const uint SCENE_NO_SUN = 2;
 // короче высоты над полом, и луч, скользящий вдоль пола, тратит на это десятки шагов.
 float2 scene_near(float3 p, float near, bool proxies, bool planes)
 {
+    count_scene();
     // Числа из буфера ограничены сверху: испорченный буфер не должен вешать видеокарту.
     uint count = min(pc.scene[0], MAX_OBJECTS);
     uint objects = pc.scene[1];
@@ -181,6 +182,7 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
             continue;
         if (!planes && (flags & OBJECT_PLANE) != 0)
             continue;
+        count_object();
         float radius = asfloat(pc.scene[w + 7]);
         if (radius >= 0.0)
         {
@@ -194,6 +196,7 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
                 continue;
             }
         }
+        count_form();
         uint start = pc.scene[w];
         uint len = min(pc.scene[w + 1], MAX_PROGRAM_WORDS);
         // Объект из одного примитива (шар, коробка, пол — их большинство) считается
@@ -271,6 +274,75 @@ float planes_distance(float3 p)
     }
     return best;
 }
+
+// Какую копию счётчиков берёт волна пикселя `px`: соседние квадраты 8×8 — разные.
+uint counter_spread(int2 px)
+{
+    return uint((px.x >> 3) + (px.y >> 3) * 5);
+}
+
+#ifdef SPACE_COUNTERS
+// Добавить счётчики потоков волны к проходу `pass` (номера PASS_* в counters.slang) и
+// обнулить их. Одно сложение на волну и счётчик: сумма по волне (WaveActiveSum), пишет
+// первый настоящий поток (у вспомогательных потоков пиксельного шейдера запись в память
+// не действует, и их работу не считаем). `spread` выбирает одну из COUNTER_SPREAD копий
+// счётчика: иначе все волны кадра складывали бы в одно слово по очереди. Число — 64 бита
+// парой слов: перенос в старшее слово делает тот, чьё сложение переполнило младшее.
+void counter_add(uint* out, uint pass, uint c, uint spread, uint v, bool helper, bool writer)
+{
+    uint sum = WaveActiveSum(helper ? 0u : v);
+    if (!writer || sum == 0)
+        return;
+    uint at = ((pass * COUNTERS + c) * COUNTER_SPREAD + spread) * 2;
+    uint old;
+    InterlockedAdd(out[at], sum, old);
+    if (old + sum < old)
+        InterlockedAdd(out[at + 1], 1u);
+}
+
+// `key` — своё у каждого потока волны число: пишет поток с наименьшим среди настоящих.
+void counters_flush_key(uint pass, bool helper, uint spread, uint key)
+{
+    // Адрес буфера счётчиков — слова 2 и 3 раздела моделей (space::set_counters);
+    // 0 — счётчики этому кадру не нужны.
+    uint m = pc.scene[7];
+    uint2 a = m == 0 ? uint2(0, 0) : uint2(pc.scene[m + 2], pc.scene[m + 3]);
+    if (all(a == 0))
+        return;
+    uint* out = bit_cast<uint*>(a);
+    uint first = WaveActiveMin(helper ? 0xffffffffu : key);
+    bool writer = !helper && key == first;
+    uint s = spread % COUNTER_SPREAD;
+    counter_add(out, pass, 0, s, counted_rays, helper, writer);
+    counter_add(out, pass, 1, s, counted_steps, helper, writer);
+    counter_add(out, pass, 2, s, counted_scene, helper, writer);
+    counter_add(out, pass, 3, s, counted_normal, helper, writer);
+    counter_add(out, pass, 4, s, counted_objects, helper, writer);
+    counter_add(out, pass, 5, s, counted_forms, helper, writer);
+    counter_add(out, pass, 6, s, counted_field, helper, writer);
+    counter_add(out, pass, 7, s, counted_material, helper, writer);
+    counters_reset();
+}
+
+// Из вычислительного шейдера: все потоки настоящие, ключ — номер в волне.
+void counters_flush(uint pass, uint spread)
+{
+    counters_flush_key(pass, false, spread, WaveGetLaneIndex());
+}
+
+// Из пиксельного шейдера: его вспомогательные потоки не считаются. Ключ — пиксель `px`
+// (номер потока в волне здесь не берём: Slang объявляет его входом без Flat, и проверка
+// SPIR-V его не пропускает). Только для пиксельных точек входа (IsHelperLane в
+// вычислительном шейдере не собирается).
+void counters_flush_fragment(uint pass, int2 px)
+{
+    counters_flush_key(pass, IsHelperLane(), counter_spread(px), (uint(px.y) << 16) | uint(px.x));
+}
+#else
+void counters_flush(uint pass, uint spread) {}
+void counters_flush_fragment(uint pass, int2 px) {}
+#endif
+
 
 #include "field3d.slang"
 

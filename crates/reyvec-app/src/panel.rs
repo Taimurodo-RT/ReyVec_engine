@@ -34,6 +34,8 @@ pub(crate) enum PanelAction {
     Dither(bool),
     /// Сглаживание краёв форм сцены «3D» (7.6о).
     SpaceSmooth(bool),
+    /// Счётчики лучей 3D (7.18д2).
+    SpaceCounters(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -134,6 +136,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_compute: (bool, bool),
     /// Сглаживание краёв форм «3D» (7.6о): включено ли и умеет ли видеокарта.
     pub space_smooth: (bool, bool),
+    /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
+    pub space_counters: (bool, bool),
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -352,6 +356,15 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                     .color(budget_color(ms, RAYMARCH_BUDGET_MS)),
                 );
             }
+            if info.space_counters.0 {
+                ui.label(
+                    mono(
+                        "Счётчики лучей включены: время выше обычного — для замера выключите"
+                            .to_string(),
+                    )
+                    .color(Color32::from_rgb(240, 200, 80)),
+                );
+            }
             gpu_chart(ui, history);
         }
         None => {
@@ -426,7 +439,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
             }
         }
         if let Some(stats) = &info.space_stats {
-            space_stats_lines(ui, stats);
+            space_stats_lines(ui, stats, info.space_counters.0);
         }
     }
     if info.scene_id == DemoScene::File {
@@ -461,7 +474,7 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 ui.label(mono(text));
             }
             if let Some(stats) = &info.space_stats {
-                space_stats_lines(ui, stats);
+                space_stats_lines(ui, stats, info.space_counters.0);
             }
         }
         if let Some(p) = &info.physics {
@@ -734,6 +747,22 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             .changed()
         {
             actions.push(PanelAction::SpaceSmooth(smooth));
+        }
+        let (mut counters, can) = info.space_counters;
+        if ui
+            .add_enabled(can, egui::Checkbox::new(&mut counters, "Счётчики лучей 3D"))
+            .on_hover_text(
+                "Сколько лучей пускает каждый проход, сколько шагов делает луч и сколько \
+                 раз считается сцена — по ним видно, что дала очередная правка. Пока \
+                 включено, шейдеры считают, и время кадра чуть больше: время замеряйте с \
+                 выключенными",
+            )
+            .on_disabled_hover_text(
+                "Видеокарта не умеет складывать счётчики в пиксельном шейдере (см. журнал)",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::SpaceCounters(counters));
         }
         ui.label("Разрешение 3D").on_hover_text(
             "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
@@ -1092,8 +1121,26 @@ fn level_field_text(status: LevelFieldStatus) -> Option<String> {
 
 /// Счётчики объёмного кадра (7.18б): пиксели края, время процессора, размер данных сцены;
 /// у пределов — жёлтым с 75 %, красным при нарушении (раньше о нём писал только журнал).
-fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
+fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats, counting: bool) {
     let mono = |text: String| RichText::new(text).family(FontFamily::Monospace);
+    match &s.rays {
+        Some(rays) => {
+            let lines = ray_count_lines(rays);
+            let response = ui.label(mono(lines.join("\n")));
+            response.on_hover_text(
+                "Лучей — сколько лучей пустил проход за кадр (у «грубо» — квадратов 8×8, у \
+                 «углов» — точек). Шаг/луч — шагов на луч (у «углов» — проб на точку). \
+                 Сцена/луч — вычислений сцены на луч, в скобках из них для нормали. \
+                 Объект, форма, поле — на одно вычисление сцены: сколько объектов проверено \
+                 по шару-границе, у скольких посчитана сама форма и сколько раз прочитано \
+                 поле слоя. «Края: тени» — тени и затенение в углах пикселей края вместе",
+            );
+        }
+        None if counting => {
+            ui.label(mono("Лучи 3D: счётчики ждут кадра".to_string()));
+        }
+        None => {}
+    }
     let red = Color32::from_rgb(255, 90, 80);
     let edges = match s.edge_pixels {
         Some(n) => {
@@ -1147,6 +1194,66 @@ fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
             .color(red),
         );
     }
+}
+
+/// Число для таблицы счётчиков: «930», «32.4 тыс.», «2.07 млн».
+fn amount(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    // Три значащие цифры; единица — по уже округлённому числу (999 600 — «1.00 млн»).
+    let mut v = n as f64 / 1e3;
+    for unit in ["тыс.", "млн", "млрд"] {
+        let digits = if v >= 99.95 {
+            0
+        } else if v >= 9.995 {
+            1
+        } else {
+            2
+        };
+        let rounded = format!("{v:.digits$}");
+        if unit == "млрд" || rounded.parse::<f64>().unwrap_or(v) < 1000.0 {
+            return format!("{rounded} {unit}");
+        }
+        v /= 1e3;
+    }
+    unreachable!("последняя единица возвращается всегда")
+}
+
+/// Таблица счётчиков лучей 3D по проходам (7.18д2).
+fn ray_count_lines(rays: &[reyvec_gpu::RayCounts; reyvec_gpu::RAY_PASSES]) -> Vec<String> {
+    let per = |a: u64, b: u64| if b == 0 { 0.0 } else { a as f64 / b as f64 };
+    let mut lines = vec![
+        "Лучи 3D за кадр (счётчики)".to_string(),
+        format!(
+            "  {:<11}{:>11}{:>8}{:>15}{:>7}{:>6}{:>6}",
+            "проход", "лучей", "шаг/луч", "сцена/луч", "объект", "форма", "поле"
+        ),
+    ];
+    for (name, c) in reyvec_gpu::RAY_PASS_NAMES.iter().zip(rays) {
+        let scene = if c.normal > 0 {
+            format!("{:.1} ({:.1})", per(c.scene, c.rays), per(c.normal, c.rays))
+        } else {
+            format!("{:.1}", per(c.scene, c.rays))
+        };
+        lines.push(format!(
+            "  {name:<11}{:>11}{:>8.1}{scene:>15}{:>7.1}{:>6.1}{:>6.2}",
+            amount(c.rays),
+            per(c.steps, c.rays),
+            per(c.objects, c.scene),
+            per(c.forms, c.scene),
+            per(c.field, c.scene),
+        ));
+    }
+    let total = |f: fn(&reyvec_gpu::RayCounts) -> u64| rays.iter().map(f).sum::<u64>();
+    lines.push(format!(
+        "  всего: сцена {}, форм {}, поле {}, материал {}",
+        amount(total(|c| c.scene)),
+        amount(total(|c| c.forms)),
+        amount(total(|c| c.field)),
+        amount(total(|c| c.material)),
+    ));
+    lines
 }
 
 /// Зелёный, пока время укладывается в бюджет с запасом, жёлтый у края, красный сверх.
@@ -1226,6 +1333,53 @@ pub(crate) fn fonts() -> FontDefinitions {
 mod tests {
     use super::*;
 
+    /// Таблица счётчиков лучей (7.18д2): числа коротко, деления без нуля в знаменателе,
+    /// столбцы ровные, строка на проход.
+    #[test]
+    fn ray_count_table() {
+        assert_eq!(amount(930), "930");
+        assert_eq!(amount(32_400), "32.4 тыс.");
+        assert_eq!(amount(2_073_600), "2.07 млн");
+        assert_eq!(amount(461_000_000), "461 млн");
+        assert_eq!(amount(999_600), "1.00 млн");
+        assert_eq!(amount(9_996), "10.0 тыс.");
+        assert_eq!(amount(99_960), "100 тыс.");
+        let mut rays = [reyvec_gpu::RayCounts::default(); reyvec_gpu::RAY_PASSES];
+        rays[1] = reyvec_gpu::RayCounts {
+            rays: 2_073_600,
+            steps: 8_294_400,
+            scene: 12_441_600,
+            normal: 4_147_200,
+            objects: 37_324_800,
+            forms: 12_441_600,
+            field: 12_441_600,
+            material: 2_073_600,
+        };
+        let lines = ray_count_lines(&rays);
+        assert_eq!(lines.len(), 2 + reyvec_gpu::RAY_PASSES + 1);
+        let march = &lines[3];
+        assert!(
+            march.contains("реймарчинг") && march.contains("2.07 млн"),
+            "{march}"
+        );
+        assert!(
+            march.contains("4.0") && march.contains("6.0 (2.0)"),
+            "{march}"
+        );
+        assert!(march.contains("3.0") && march.contains("1.00"), "{march}");
+        assert!(
+            lines[2].contains("грубо") && lines[2].contains(" 0.0"),
+            "{}",
+            lines[2]
+        );
+        let width = |l: &String| l.chars().count();
+        assert!(
+            lines[2..8].iter().all(|l| width(l) == width(&lines[1])),
+            "{lines:#?}"
+        );
+        assert!(lines[8].contains("сцена 12.4 млн"), "{}", lines[8]);
+    }
+
     #[test]
     fn budget_colors() {
         assert_eq!(
@@ -1293,9 +1447,22 @@ mod tests {
                 overflow: None,
                 edge_pixels: Some(61_200),
                 pixels: 1280 * 720,
+                rays: Some(
+                    [reyvec_gpu::RayCounts {
+                        rays: 2_073_600,
+                        steps: 8_300_000,
+                        scene: 11_600_000,
+                        normal: 3_260_000,
+                        objects: 40_000_000,
+                        forms: 15_000_000,
+                        field: 11_600_000,
+                        material: 900_000,
+                    }; reyvec_gpu::RAY_PASSES],
+                ),
             }),
             space_compute: (false, false),
             space_smooth: (true, true),
+            space_counters: (true, true),
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,
