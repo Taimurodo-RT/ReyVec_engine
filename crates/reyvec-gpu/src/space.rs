@@ -40,6 +40,9 @@ const MESH_SHADOW_PROJ: usize = 20;
 pub(crate) const MAX_SHADOW_MAPS: usize = 2;
 /// Слово 11 заголовка сцены, бит 1: солнца нет (как SCENE_NO_SUN в `space.slang`).
 const SCENE_NO_SUN: u32 = 2;
+/// Бит 2 слова 11: нормаль по всей сцене (как SCENE_FULL_NORMAL в `include/march.slang`).
+#[cfg(test)]
+const SCENE_FULL_NORMAL: u32 = 4;
 /// Слов на вершину: место (3 числа) и номер материала.
 const VERTEX_WORDS: usize = 4;
 
@@ -282,6 +285,13 @@ pub(crate) fn set_shadow_maps(words: &mut [u32], maps: &[glam::Mat4]) {
 /// Солнца нет (2.5D-вид: уровень в помещении).
 pub(crate) fn set_no_sun(words: &mut [u32]) {
     words[11] |= SCENE_NO_SUN;
+}
+
+/// Нормаль всегда по всей сцене, без счёта одного ближайшего объекта (7.18д5; только для
+/// сравнения в тестах).
+#[cfg(test)]
+pub(crate) fn set_full_normal(words: &mut [u32]) {
+    words[11] |= SCENE_FULL_NORMAL;
 }
 
 fn write_matrix(words: &mut [u32], at: usize, m: glam::Mat4) {

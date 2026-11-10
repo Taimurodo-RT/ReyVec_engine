@@ -225,48 +225,139 @@ impl Grid {
     /// Ответ-оценка (по шару-границе, по размеру клетки или по коробке) помечен материалом
     /// `None`: настоящее расстояние не меньше.
     pub fn near(&self, objects: &[Program], p: Vec3, near: f32) -> (f32, Option<u32>) {
+        let pick = self.pick(objects, p, near, None);
+        (pick.distance, pick.material)
+    }
+
+    /// То же и чей ответ (зеркало `scene_walk<1>` шейдера, 7.18д5): `winner` — номер
+    /// объекта (`None` — ответ-оценка), `second` — не больше расстояния до любого другого
+    /// объекта. С `only` считается один этот объект (без сетки и оценок).
+    pub fn pick(&self, objects: &[Program], p: Vec3, near: f32, only: Option<u32>) -> Pick {
         // Как в шейдере: сначала оценка по клетке (или по коробке снаружи сетки), потом
-        // бесконечные объекты и список клетки одним проходом.
-        let mut best = (1e9f32, None);
+        // поле уровня, бесконечные объекты и список клетки одним проходом.
+        let mut pick = Pick {
+            distance: 1e9,
+            material: None,
+            winner: None,
+            second: 1e9,
+        };
         let mut list: &[u32] = &[];
-        if !self.cells.is_empty() {
+        let mut unbounded: &[u32] = &self.unbounded;
+        let single = only.map(|o| [o]);
+        if let Some(one) = &single {
+            unbounded = &[];
+            if Some(one[0]) != self.field {
+                list = one;
+            }
+        } else if !self.cells.is_empty() {
             match self.cell_at(p) {
                 Some(c) => {
                     let cell = self.cells[c];
                     list = &self.items[cell.start as usize..(cell.start + cell.count) as usize];
-                    best = (self.margin, None);
+                    pick.distance = self.margin;
                 }
                 None => {
-                    best = ((p - p.clamp(self.inner_lo, self.inner_hi)).length(), None);
+                    pick.distance = (p - p.clamp(self.inner_lo, self.inner_hi)).length();
                 }
             }
         }
         // Поле уровня — до перебора, как `level_field_near` в шейдере.
-        if let Some(f) = self.field {
+        if let Some(f) = self.field
+            && only.is_none_or(|o| o == f)
+        {
             let (d, m) = objects[f as usize].distance(p);
-            if d < best.0 {
-                best = (d, (m != ESTIMATE_MATERIAL).then_some(m));
-            }
+            pick.real(d, m, f);
         }
-        for &i in self.unbounded.iter().chain(list) {
+        for &i in unbounded.iter().chain(list) {
             let o = &objects[i as usize];
             if let Some((c, r)) = o.bounds {
                 let outside = (p - c).length() - r;
-                if outside >= best.0 {
+                if outside >= pick.distance {
+                    pick.second = pick.second.min(outside);
                     continue;
                 }
                 if outside > near {
-                    best = (outside, None);
+                    pick.second = pick.second.min(pick.distance);
+                    pick.distance = outside;
+                    pick.material = None;
+                    pick.winner = None;
                     continue;
                 }
             }
             let (d, m) = o.distance(p);
-            if d < best.0 {
-                // У поля слоя за полосой материал не известен: только оценка (7.18б).
-                best = (d, (m != ESTIMATE_MATERIAL).then_some(m));
+            pick.real(d, m, i);
+        }
+        pick
+    }
+
+    /// Четыре расстояния для нормали в точке попадания `p` на расстоянии `t` по лучу —
+    /// зеркало `normal_at` шейдера (7.18д5): по всей сцене с `near` NORMAL_NEAR, а если в
+    /// первой точке ближайший объект впереди остальных больше чем на NORMAL_GAP — в трёх
+    /// других точках только он. Второе — взят ли один объект.
+    pub fn normal_samples(&self, objects: &[Program], p: Vec3, t: f32) -> ([f32; 4], bool) {
+        let e = 0.001;
+        let near = 0.0005 * t.max(1.0) + NORMAL_NEAR;
+        let mut only = None;
+        let mut out = [0.0; 4];
+        for (k, d) in out.iter_mut().enumerate() {
+            let k = k as u32;
+            let dir = Vec3::new(
+                (((k + 3) >> 1) & 1) as f32,
+                ((k >> 1) & 1) as f32,
+                (k & 1) as f32,
+            ) * 2.0
+                - 1.0;
+            let pick = self.pick(
+                objects,
+                p + dir * e,
+                if only.is_some() { 1e9 } else { near },
+                only,
+            );
+            *d = pick.distance;
+            if k == 0
+                && let Some(w) = pick.winner
+                && pick.second - pick.distance > NORMAL_GAP
+            {
+                only = Some(w);
             }
         }
-        best
+        (out, only.is_some())
+    }
+}
+
+/// Ближе этого к точкам нормали настоящая форма есть всегда (с запасом на точность
+/// попадания и наклон расстояний): дальше объекты отвечают шаром-границей (как
+/// NORMAL_NEAR в `include/march.slang`).
+pub const NORMAL_NEAR: f32 = 0.02;
+/// Насколько ближайший объект должен быть впереди остальных, чтобы нормаль считала его
+/// одного: 4√2·L·e при L = 4 и e = 1 мм с запасом (как NORMAL_GAP в `include/march.slang`).
+pub const NORMAL_GAP: f32 = 0.024;
+
+/// Ответ [`Grid::pick`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pick {
+    /// Расстояние (или оценка снизу).
+    pub distance: f32,
+    /// Материал; `None` — ответ-оценка.
+    pub material: Option<u32>,
+    /// Чей ответ; `None` — оценка.
+    pub winner: Option<u32>,
+    /// Не больше расстояния до любого объекта, кроме `winner`.
+    pub second: f32,
+}
+
+impl Pick {
+    /// Настоящее расстояние `d` с материалом `m` объекта `i`.
+    fn real(&mut self, d: f32, m: u32, i: u32) {
+        if d < self.distance {
+            self.second = self.second.min(self.distance);
+            self.distance = d;
+            // У поля слоя за полосой материал не известен: только оценка (7.18б).
+            self.material = (m != ESTIMATE_MATERIAL).then_some(m);
+            self.winner = Some(i);
+        } else {
+            self.second = self.second.min(d);
+        }
     }
 }
 
@@ -451,6 +542,115 @@ mod tests {
         for objects in [plain, with_field] {
             words_match_the_mirror(&objects);
         }
+    }
+
+    /// Нормаль одним объектом (7.18д5) даёт до бита те же четыре расстояния, что и полный
+    /// перебор сцены без оценок, как было до 7.18д5: в точках попадания лучей по сценам
+    /// «3D», «нагрузка», по коробкам вплотную и по полю уровня, на котором стоит коробка.
+    /// Встречаются оба случая: и один объект, и вся сцена.
+    #[test]
+    fn normal_shortcut_matches_full_scene() {
+        use crate::layer_field::LayerField;
+        use crate::profile2d::Profile;
+        use crate::shape3d::FieldRef;
+        let boxed = |size: [f32; 3], at: [f32; 3], m: u32| {
+            compile(&Shape3::Box { size, round: 0.0 }.at(at).paint(m)).unwrap()
+        };
+        let floor = compile(&Shape3::Plane {
+            normal: [0.0, 1.0, 0.0],
+            offset: 0.0,
+        })
+        .unwrap();
+        // Коробки вплотную: на стыке ближайших двое, нормаль считает вся сцена.
+        let touching = vec![
+            floor.clone(),
+            boxed([1.0, 1.0, 1.0], [-0.5, 0.5, 0.0], 1),
+            boxed([1.0, 1.0, 1.0], [0.5, 0.5, 0.0], 2),
+            boxed([1.0, 0.5, 1.0], [0.0, 1.25, 0.0], 3),
+        ];
+        // Плита поля уровня и коробка, стоящая на ней.
+        let profile = Profile::new("M -3 -2 L 3 -2 L 3 2 L -3 2 Z").unwrap();
+        let mut on_field = vec![
+            compile(
+                &Shape3::Field {
+                    field: FieldRef(std::sync::Arc::new(
+                        LayerField::from_profile(&profile, 1.0).without_rect(),
+                    )),
+                    depth: 0.3,
+                    round: 0.02,
+                }
+                .paint(1),
+            )
+            .unwrap(),
+            boxed([0.6, 0.6, 0.6], [0.0, 0.0, 0.45], 2),
+        ];
+        on_field.push(boxed([0.4, 0.4, 0.4], [1.5, 0.5, 0.35], 3));
+        assert!(Grid::build(&on_field).field.is_some());
+        let scenes = [
+            programs(crate::space_file::EXAMPLE),
+            programs(include_str!("../../../scenes/3d/stress.ron")),
+            touching,
+            on_field,
+        ];
+        let (mut single, mut whole) = (0, 0);
+        for objects in &scenes {
+            let grid = Grid::build(objects);
+            let mut seed = 777u32;
+            let mut rnd = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as f32 / u32::MAX as f32
+            };
+            let lo = grid.origin - 1.0;
+            let size = grid.cell * Vec3::from(grid.dims.map(|d| d as f32)) + 2.0;
+            for _ in 0..4000 {
+                let origin = lo + Vec3::new(rnd(), rnd(), rnd()) * size;
+                let dir = (Vec3::new(rnd(), rnd(), rnd()) * 2.0 - 1.0).normalize_or_zero();
+                if dir == Vec3::ZERO {
+                    continue;
+                }
+                // Шаги по лучу до попадания с той же точностью, что в шейдере.
+                let mut t = 0.0;
+                let mut hit = None;
+                for _ in 0..200 {
+                    let at = origin + dir * t;
+                    let (d, _) = grid.near(objects, at, 1e9);
+                    if d < 0.0005 * t.max(1.0) {
+                        hit = Some(at);
+                        break;
+                    }
+                    t += d;
+                    if t > 40.0 {
+                        break;
+                    }
+                }
+                let Some(p) = hit else { continue };
+                let (fast, one) = grid.normal_samples(objects, p, t);
+                let full: [f32; 4] = std::array::from_fn(|k| {
+                    let k = k as u32;
+                    let dir = Vec3::new(
+                        (((k + 3) >> 1) & 1) as f32,
+                        ((k >> 1) & 1) as f32,
+                        (k & 1) as f32,
+                    ) * 2.0
+                        - 1.0;
+                    grid.near(objects, p + dir * 0.001, 1e9).0
+                });
+                assert_eq!(
+                    fast.map(f32::to_bits),
+                    full.map(f32::to_bits),
+                    "{p} (один объект: {one}): {fast:?} против {full:?}"
+                );
+                if one {
+                    single += 1;
+                } else {
+                    whole += 1;
+                }
+            }
+        }
+        assert!(single > 1000, "одним объектом: {single}");
+        assert!(whole > 20, "всей сценой: {whole}");
     }
 
     fn words_match_the_mirror(objects: &[Program]) {

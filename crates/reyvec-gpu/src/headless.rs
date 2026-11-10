@@ -462,6 +462,9 @@ fn render(
                 demo.set_level_view(true);
                 demo.set_level_render(render);
             }
+            // Нормаль по всей сцене, как до 7.18д5 (для сравнения).
+            #[cfg(test)]
+            demo.set_full_normal(tests::FULL_NORMAL.get());
             // Поле уровня в общем переборе, как до 7.18д3 (для сравнения).
             #[cfg(test)]
             demo.set_level_field_apart(!tests::LEVEL_FIELD_IN_LOOP.get());
@@ -739,6 +742,8 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(None) };
         /// …и кадр до неё, чтобы поле испеклось без правки и перепеклось кусками.
         pub(super) static LEVEL_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Нормаль по всей сцене, как до 7.18д5.
+        pub(super) static FULL_NORMAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Поле уровня в общем переборе объектов, как до 7.18д3.
         pub(super) static LEVEL_FIELD_IN_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Кадр со счётчиками лучей (7.18д2).
@@ -1461,6 +1466,93 @@ pub(crate) mod tests {
                     assert!(n.material <= n.normal / 4, "{name}: {n:?}");
                 } else {
                     assert_eq!(n.material, 0, "{name}: материал только в попадании");
+                }
+            }
+        }
+    }
+
+    /// Нормаль одним ближайшим объектом (7.18д5): та же картинка до байта, те же края, лучи,
+    /// шаги и вычисления сцены, что у нормали по всей сцене; объектов и форм в
+    /// реймарчинге и краях меньше — и у SDF, и у поля.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_view_normal_shortcut_is_exact() {
+        use crate::counters::{PASS_EDGES, PASS_MARCH, RAY_PASS_NAMES};
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        let starts = [[-0.6, -0.5], [0.4, -0.5]];
+        for render in [crate::LevelRender::Sdf, crate::LevelRender::Field] {
+            for start in starts {
+                let play = HeadlessPlay {
+                    start: Some(start),
+                    ..Default::default()
+                };
+                LEVEL_VIEW.set(true);
+                LEVEL_RENDER.set(render);
+                let mut frames = Vec::new();
+                for (full, counted) in [(true, false), (false, false), (true, true), (false, true)]
+                {
+                    FULL_NORMAL.set(full);
+                    SPACE_COUNTERS.set(counted);
+                    frames.push(render_headless_play(&options, &scene, Some(&play)));
+                }
+                FULL_NORMAL.set(false);
+                SPACE_COUNTERS.set(false);
+                LEVEL_RENDER.set(crate::LevelRender::Sdf);
+                LEVEL_VIEW.set(false);
+                let frames: Vec<HeadlessImage> =
+                    frames.into_iter().map(|f| f.expect("кадр")).collect();
+                assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+                let what = format!("{render:?} {start:?}");
+                for (k, how) in [(0, "по всей сцене"), (1, "одним объектом")]
+                {
+                    if let Some(t) = &frames[k].gpu_timings {
+                        eprintln!("{what}, нормаль {how}: {}", t.describe());
+                    }
+                }
+                for (a, b) in [(0, 1), (2, 3)] {
+                    assert!(
+                        frames[a].image.rgba == frames[b].image.rgba,
+                        "{what}: картинка та же до байта"
+                    );
+                    let edges = |f: &HeadlessImage| f.space_stats.and_then(|s| s.edge_pixels);
+                    assert_eq!(edges(&frames[a]), edges(&frames[b]), "{what}: те же края");
+                }
+                let old = frames[2].space_stats.and_then(|s| s.rays).expect("лучи");
+                let new = frames[3].space_stats.and_then(|s| s.rays).expect("лучи");
+                for (pass, name) in RAY_PASS_NAMES.iter().enumerate() {
+                    let (o, n) = (old[pass], new[pass]);
+                    assert_eq!(
+                        (o.rays, o.steps, o.scene, o.normal),
+                        (n.rays, n.steps, n.scene, n.normal),
+                        "{what} {name}"
+                    );
+                    if pass == PASS_MARCH || pass == PASS_EDGES {
+                        eprintln!("{what} {name}: было {o:?}");
+                        eprintln!("{what} {name}: стало {n:?}");
+                        assert!(
+                            n.objects * 100 <= o.objects * 90,
+                            "{what} {name}: {o:?} → {n:?}"
+                        );
+                        assert!(n.forms < o.forms, "{what} {name}: {o:?} → {n:?}");
+                    } else {
+                        assert_eq!(o, n, "{what} {name}: нормали там нет");
+                    }
                 }
             }
         }
