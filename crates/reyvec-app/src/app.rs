@@ -389,6 +389,10 @@ impl App {
                 r.set_space_smooth(on);
                 tracing::info!("Сглаживание 3D: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::SpaceFree(on) => {
+                r.set_space_free(on);
+                tracing::info!("Длинный шаг в пустоте: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::SpaceCounters(on) => {
                 r.set_space_counters(on);
                 tracing::info!(
@@ -622,6 +626,7 @@ impl App {
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
                 space_counters: renderer.space_counters(),
+                space_free: renderer.space_free(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
                 level_render: renderer.level_render(),

@@ -465,6 +465,9 @@ fn render(
             // Нормаль по всей сцене, как до 7.18д5 (для сравнения).
             #[cfg(test)]
             demo.set_full_normal(tests::FULL_NORMAL.get());
+            // Шаг в пустоте не длиннее клетки, как до 7.18д4 (для сравнения).
+            #[cfg(test)]
+            demo.set_space_free(!tests::FREE_OFF.get());
             // Поле уровня в общем переборе, как до 7.18д3 (для сравнения).
             #[cfg(test)]
             demo.set_level_field_apart(!tests::LEVEL_FIELD_IN_LOOP.get());
@@ -742,6 +745,8 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(None) };
         /// …и кадр до неё, чтобы поле испеклось без правки и перепеклось кусками.
         pub(super) static LEVEL_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Шаг в пустоте не длиннее клетки сетки, как до 7.18д4.
+        pub(super) static FREE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Нормаль по всей сцене, как до 7.18д5.
         pub(super) static FULL_NORMAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Поле уровня в общем переборе объектов, как до 7.18д3.
@@ -1554,6 +1559,93 @@ pub(crate) mod tests {
                         assert_eq!(o, n, "{what} {name}: нормали там нет");
                     }
                 }
+            }
+        }
+    }
+
+    /// Длинный шаг в пустоте (7.18д4): шагов у грубого прохода и теней меньше, лучей
+    /// столько же; картинка почти та же — сдвигаются точки мягких полутеней и затенения
+    /// углов (у поля углы чуть светлее: раньше дальняя проба упиралась в размер клетки).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_view_free_step() {
+        use crate::counters::{PASS_CONE, PASS_MARCH, PASS_SHADOWS, RAY_PASS_NAMES};
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        for render in [crate::LevelRender::Sdf, crate::LevelRender::Field] {
+            let play = HeadlessPlay {
+                start: Some([-0.6, -0.5]),
+                ..Default::default()
+            };
+            LEVEL_VIEW.set(true);
+            LEVEL_RENDER.set(render);
+            let mut frames = Vec::new();
+            for (off, counted) in [(true, false), (false, false), (true, true), (false, true)] {
+                FREE_OFF.set(off);
+                SPACE_COUNTERS.set(counted);
+                frames.push(render_headless_play(&options, &scene, Some(&play)));
+            }
+            FREE_OFF.set(false);
+            SPACE_COUNTERS.set(false);
+            LEVEL_RENDER.set(crate::LevelRender::Sdf);
+            LEVEL_VIEW.set(false);
+            let frames: Vec<HeadlessImage> = frames.into_iter().map(|f| f.expect("кадр")).collect();
+            assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            let what = format!("{render:?}");
+            for (k, how) in [(0, "шаг по клетке"), (1, "длинный шаг")] {
+                if let Some(t) = &frames[k].gpu_timings {
+                    eprintln!("{what}, {how}: {}", t.describe());
+                }
+            }
+            let (changed, worst, mean) = image_diff(&frames[0].image, &frames[1].image);
+            let pixels = frames[0].image.rgba.len() / 4;
+            let far = frames[0]
+                .image
+                .rgba
+                .chunks(4)
+                .zip(frames[1].image.rgba.chunks(4))
+                .filter(|(a, b)| a.iter().zip(*b).any(|(x, y)| x.abs_diff(*y) > 8))
+                .count();
+            eprintln!(
+                "{what}: больше 2 ступеней {changed}, больше 8 — {far} из {pixels}, \
+                 наибольшая {worst}, среднее {mean:.3}"
+            );
+            assert!(
+                far * 2000 <= pixels,
+                "{what}: {far} точек сильно отличаются"
+            );
+            let old = frames[2].space_stats.and_then(|s| s.rays).expect("лучи");
+            let new = frames[3].space_stats.and_then(|s| s.rays).expect("лучи");
+            for (pass, name) in RAY_PASS_NAMES.iter().enumerate() {
+                let (o, n) = (old[pass], new[pass]);
+                let per = |c: crate::RayCounts| c.steps as f64 / c.rays.max(1) as f64;
+                eprintln!("{what} {name}: шагов на луч {:.2} → {:.2}", per(o), per(n));
+                if pass == PASS_MARCH {
+                    assert_eq!(o.rays, n.rays, "{what} {name}: луч на пиксель");
+                }
+            }
+            let per = |c: crate::RayCounts| c.steps as f64 / c.rays.max(1) as f64;
+            let (oc, nc) = (old[PASS_CONE], new[PASS_CONE]);
+            assert!(per(nc) < per(oc) * 0.97, "{what}: грубо {oc:?} → {nc:?}");
+            let (os, ns) = (old[PASS_SHADOWS], new[PASS_SHADOWS]);
+            assert!(per(ns) <= per(os), "{what}: тени {os:?} → {ns:?}");
+            if render == crate::LevelRender::Field {
+                assert!(per(ns) < per(os) * 0.92, "{what}: тени {os:?} → {ns:?}");
             }
         }
     }

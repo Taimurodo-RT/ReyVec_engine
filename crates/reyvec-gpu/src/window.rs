@@ -698,6 +698,18 @@ impl WindowRenderer {
             .map_or((false, false), |d| d.space_counters(&self.ctx))
     }
 
+    /// Длинный шаг в пустоте (7.18д4): включён ли.
+    pub fn space_free(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.space_free())
+    }
+
+    /// Включает или выключает длинный шаг в пустоте со следующего кадра.
+    pub fn set_space_free(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_free(on);
+        }
+    }
+
     /// Включает или выключает счётчики лучей 3D со следующего кадра (при первом включении
     /// собираются шейдеры со счётчиками). Ошибка пишется в журнал, счётчики остаются
     /// выключенными.

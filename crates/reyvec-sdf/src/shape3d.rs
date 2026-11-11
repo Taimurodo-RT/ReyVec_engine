@@ -1001,16 +1001,18 @@ pub fn plane_objects(objects: &[Program]) -> Vec<u32> {
 /// - список плоскостей: номера объектов (не больше [`MAX_PLANES`]);
 /// - сетка отсева ([`crate::grid3d::Grid::write`]).
 pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
-    pack_scene_with(objects, materials, lamps, true)
+    pack_scene_with(objects, materials, lamps, true, true)
 }
 
 /// То же; `level_field: false` — поле уровня считается в общем переборе, как до 7.18д3
-/// (для сравнения в тестах).
+/// (для сравнения в тестах); `free: false` — у клеток сетки нет свободного расстояния,
+/// шаг в пустоте не длиннее клетки, как до 7.18д4 (для сравнения на панели).
 pub fn pack_scene_with(
     objects: &[Program],
     materials: &[Material3],
     lamps: &[Lamp3],
     level_field: bool,
+    free: bool,
 ) -> Vec<u32> {
     let objects_at = HEADER_WORDS;
     let materials_at = objects_at + objects.len() * OBJECT_WORDS;
@@ -1074,7 +1076,12 @@ pub fn pack_scene_with(
     out[8] = out.len() as u32;
     out[9] = planes.len() as u32;
     out.extend(&planes);
-    let grid = crate::grid3d::Grid::build_with(objects, field.map(|i| i as u32));
+    let field = field.map(|i| i as u32);
+    let grid = if free {
+        crate::grid3d::Grid::build_with(objects, field)
+    } else {
+        crate::grid3d::Grid::build_lists(objects, field)
+    };
     if !grid.cells.is_empty() {
         out[6] = out.len() as u32;
         let at = out.len();
@@ -1563,7 +1570,7 @@ mod tests {
         let start = w[13] as usize;
         assert_eq!(start, w[HEADER_WORDS + OBJECT_WORDS] as usize);
         assert_eq!(&w[start..start + level.words.len()], &level.words[..]);
-        let w = pack_scene_with(&objects, &[], &[], false);
+        let w = pack_scene_with(&objects, &[], &[], false, true);
         assert_eq!(&w[12..14], &[0, 0], "выключено — как до 7.18д3");
         let w = pack_scene(&[sphere], &[], &[]);
         assert_eq!(&w[12..14], &[0, 0], "поля нет");
