@@ -662,6 +662,9 @@ mod tests {
 
     #[test]
     fn draws_hud_numbers_and_both_menus_without_a_window() {
+        let _turn = crate::console::DRAWING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut g = ui();
         g.on_event(&GameEvent::Hurt {
             at: [0.1, 0.0],
