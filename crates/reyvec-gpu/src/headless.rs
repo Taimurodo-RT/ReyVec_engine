@@ -468,6 +468,11 @@ fn render(
             // Без карт теней ламп (7.18е): где они затеняют.
             #[cfg(test)]
             demo.set_no_shadow_maps(tests::NO_SHADOW_MAPS.get());
+            // Полигоны без образцов MSAA (7.18е2): края призм как до него.
+            #[cfg(test)]
+            demo.set_no_mesh_msaa(tests::NO_MESH_MSAA.get());
+            #[cfg(test)]
+            tests::MESH_COUNTS.set(demo.mesh_counts());
             // Шаг в пустоте не длиннее клетки, как до 7.18д4 (для сравнения).
             #[cfg(test)]
             demo.set_space_free(!tests::FREE_OFF.get());
@@ -746,6 +751,11 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(crate::SpaceScale::Full) };
         /// 2.5D-вид уровня из файла (7.9).
         pub(super) static LEVEL_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Полигоны без образцов MSAA (7.18е2).
+        pub(super) static NO_MESH_MSAA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Образцы полигонов, которые умеет видеокарта прошлого кадра (7.18е2).
+        pub(super) static MESH_COUNTS: std::cell::Cell<ash::vk::SampleCountFlags> =
+            const { std::cell::Cell::new(ash::vk::SampleCountFlags::empty()) };
         /// Треугольники без карт теней ламп (7.18е).
         pub(super) static NO_SHADOW_MAPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Как рисуется 2.5D-вид (7.9б).
@@ -1398,6 +1408,248 @@ pub(crate) mod tests {
             jumps * 1000 <= pairs * 5,
             "полутень карт ступенями: {jumps} скачков из {pairs} пар"
         );
+    }
+
+    /// Ровные края призм (7.18е2): в 2.5D-виде треугольниками лучи краёв берут свои образцы
+    /// MSAA картинки полигонов. Картинка меняется только у краёв (доля точек мала), и у
+    /// краёв она ближе к SDF (там края форм сглажены теми же лучами), чем без образцов —
+    /// и в полном разрешении 3D (четыре луча), и в половинном (два).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_view_triangle_edges() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        for scale in [crate::SpaceScale::Full, crate::SpaceScale::Half] {
+            SPACE_SCALE.set(scale);
+            let frame = |render, no_msaa: bool| {
+                NO_MESH_MSAA.set(no_msaa);
+                let play = HeadlessPlay {
+                    start: Some([-0.6, -0.5]),
+                    level: Some(render),
+                    ..Default::default()
+                };
+                let f = render_headless_play(&options, &scene, Some(&play));
+                NO_MESH_MSAA.set(false);
+                f.expect("кадр")
+            };
+            let sdf = frame(crate::LevelRender::Sdf, false);
+            let before = frame(crate::LevelRender::Triangles, true);
+            let after = frame(crate::LevelRender::Triangles, false);
+            SPACE_SCALE.set(crate::SpaceScale::Full);
+            assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            let counts = MESH_COUNTS.get();
+            assert!(
+                counts.intersects(
+                    ash::vk::SampleCountFlags::TYPE_2 | ash::vk::SampleCountFlags::TYPE_4
+                ),
+                "видеокарта теста не умеет образцы для полигонов: {counts:?}"
+            );
+            let (w, h) = (sdf.image.width as usize, sdf.image.height as usize);
+            let px = |f: &HeadlessImage, x: usize, y: usize| {
+                let i = (y * w + x) * 4;
+                [0, 1, 2].map(|c| i32::from(f.image.rgba[i + c]))
+            };
+            let differ =
+                |a: [i32; 3], b: [i32; 3]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<i32>();
+            // Края SDF-картинки: соседи заметно отличаются.
+            let (mut edges, mut far_before, mut far_after, mut changed) = (0, 0i64, 0i64, 0);
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let c = px(&sdf, x, y);
+                    let edge = [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+                        .iter()
+                        .any(|&(nx, ny)| differ(c, px(&sdf, nx, ny)) > 60);
+                    if differ(px(&before, x, y), px(&after, x, y)) > 6 {
+                        changed += 1;
+                    }
+                    if edge {
+                        edges += 1;
+                        far_before += i64::from(differ(c, px(&before, x, y)));
+                        far_after += i64::from(differ(c, px(&after, x, y)));
+                    }
+                }
+            }
+            let pixels = w * h;
+            eprintln!(
+                "{scale:?}: образцы {counts:?}; изменилось {changed} точек из {pixels}; \
+                 у {edges} точек краёв разница с SDF {far_before} → {far_after}"
+            );
+            if let Ok(dir) = std::env::var("PPM_DIR") {
+                for (kind, f) in [("sdf", &sdf), ("before", &before), ("after", &after)] {
+                    let mut out = format!("P6 {w} {h} 255\n").into_bytes();
+                    for p in f.image.rgba.chunks(4) {
+                        out.extend_from_slice(&p[..3]);
+                    }
+                    std::fs::write(format!("{dir}/edges-{scale:?}-{kind}.ppm"), out).expect("ppm");
+                }
+            }
+            assert!(
+                changed * 1000 >= pixels * 3 && changed * 10 <= pixels,
+                "{scale:?}: изменилось {changed} точек из {pixels} — не только края"
+            );
+            assert!(
+                far_after < far_before,
+                "{scale:?}: края призм не ближе к SDF: {far_before} → {far_after}"
+            );
+        }
+    }
+
+    /// Щель уже пикселя между полигональными коробками с общей передней гранью (7.18е2,
+    /// находка ревью): луч середины пикселя берёт ближайший накрытый образец и щель не
+    /// видит, соседи по буферу геометрии одинаковы. Поиск краёв ставит такие пиксели в
+    /// список по расхождению образцов (`mesh_mixed`), и лучи края показывают щель по
+    /// доле накрытия. Три щели шириной 0,4 пикселя с разным сдвигом внутри пикселя;
+    /// без образцов MSAA видна только та, что накрывает середину пикселя. Сравнение — с
+    /// кадром, где вместо четырёх коробок одна сплошная.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn mesh_slit_thinner_than_a_pixel_stays_visible() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        // Пиксель на передней грани (z 0,01, глаз на z 10, обзор 60°, высота 360). Коробки
+        // тонкие: их боковые грани в щелях видны сбоку меньше чем на 0,05 пикселя.
+        let p = 2.0 * 9.99 * (30f64).to_radians().tan() / 360.0;
+        let edge = |k: f64| (k - 320.0) * p;
+        let slits = [(300.0, 0.05), (320.0, 0.3), (340.0, 0.55)].map(|(k, phase)| {
+            let left = edge(k) + phase * p;
+            (left, left + 0.4 * p)
+        });
+        let block = |name: &str, from: f64, to: f64| {
+            format!(
+                "(name: \"{name}\", material: \"белый\", at: ({:.6}, 0.0, 0.0), \
+                 mesh: Block(size: ({:.6}, 3.0, 0.02))),",
+                (from + to) / 2.0,
+                to - from
+            )
+        };
+        let scene_text = |split: bool| {
+            let mut meshes = String::from(
+                "(name: \"фон\", material: \"чёрный\", at: (0.0, 0.0, -3.0), \
+                 mesh: Block(size: (30.0, 30.0, 0.2))),",
+            );
+            if split {
+                let mut from = -4.0;
+                for (i, (l, r)) in slits.iter().enumerate() {
+                    meshes += &block(&format!("коробка {i}"), from, *l);
+                    from = *r;
+                }
+                meshes += &block("коробка 3", from, 4.0);
+            } else {
+                meshes += &block("сплошная", -4.0, 4.0);
+            }
+            format!(
+                r#"(
+    format: "reyvec-space",
+    version: 1,
+    camera: Some((eye: (0.0, 0.0, 10.0), look_at: (0.0, 0.0, 0.0))),
+    materials: [
+        (name: "белый", color: (0.9, 0.9, 0.9)),
+        (name: "чёрный", color: (0.02, 0.02, 0.02)),
+    ],
+    lamps: [
+        (at: (0.0, 1.0, 6.0), color: (1.0, 1.0, 1.0), power: 30.0, range: 20.0, bulb: 0.05),
+    ],
+    objects: [],
+    meshes: [{meshes}],
+)"#
+            )
+        };
+        let frame = |split: bool, no_msaa: bool| {
+            NO_MESH_MSAA.set(no_msaa);
+            let scene = HeadlessScene {
+                width: 640,
+                height: 360,
+                time: 1.0,
+                shader_error: false,
+                scene: DemoScene::Space,
+                msaa: Msaa::X4,
+                perceptual_edges: false,
+                fill: crate::FillMode::default(),
+                zoom: false,
+                files: crate::UserFiles {
+                    space: Some(scene_text(split).into()),
+                    ..Default::default()
+                },
+                cascades: false,
+            };
+            let f = render_headless(&options, &scene);
+            NO_MESH_MSAA.set(false);
+            f.expect("кадр")
+        };
+        let errors = validation_error_count();
+        let whole = frame(false, false);
+        let split = frame(true, false);
+        let split_one = frame(true, true);
+        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+        // Сдвиги щелей подобраны под стандартные места 4 образцов.
+        let counts = MESH_COUNTS.get();
+        assert!(
+            counts.contains(ash::vk::SampleCountFlags::TYPE_4),
+            "видеокарта теста не умеет 4 образца для полигонов: {counts:?}"
+        );
+        // Насколько щели темнее сплошной коробки, по каждому столбцу у щелей.
+        let (w, h) = (whole.image.width as usize, whole.image.height as usize);
+        let darker = |f: &HeadlessImage, x: usize| -> i64 {
+            (h / 2 - 30..h / 2 + 30)
+                .map(|y| {
+                    let i = (y * w + x) * 4;
+                    (0..3)
+                        .map(|c| {
+                            i64::from(whole.image.rgba[i + c]) - i64::from(f.image.rgba[i + c])
+                        })
+                        .sum::<i64>()
+                        .max(0)
+                })
+                .sum()
+        };
+        let mut report = Vec::new();
+        for (k, _) in [(300usize, ()), (320, ()), (340, ())] {
+            let ms: i64 = (k - 2..k + 3).map(|x| darker(&split, x)).sum();
+            let one: i64 = (k - 2..k + 3).map(|x| darker(&split_one, x)).sum();
+            report.push((k, ms, one));
+        }
+        eprintln!("щели (столбец, с образцами, без): {report:?}");
+        if let Ok(dir) = std::env::var("PPM_DIR") {
+            for (kind, f) in [("whole", &whole), ("ms", &split), ("one", &split_one)] {
+                let mut out = format!("P6 {w} {h} 255\n").into_bytes();
+                for px in f.image.rgba.chunks(4) {
+                    out.extend_from_slice(&px[..3]);
+                }
+                std::fs::write(format!("{dir}/slit-{kind}.ppm"), out).expect("ppm");
+            }
+        }
+        // Полная разница одного столбца на 60 строк: сплошной белый против чёрного фона.
+        let full = darker(&split_one, 320).max(darker(&split, 320));
+        assert!(
+            full > 60 * 300,
+            "щель у середины пикселя не видна вовсе: {report:?}"
+        );
+        // Щель в 0,4 пикселя накрывает 1–2 образца из 4; после перевода в sRGB это около
+        // пятой части столбца (на lavapipe 7 500–8 100 против 39 000; без поиска краёв по
+        // образцам — меньше 120).
+        for (k, ms, _) in &report {
+            assert!(
+                *ms * 100 >= full * 8,
+                "щель у столбца {k} с образцами MSAA пропала: {report:?}"
+            );
+        }
     }
 
     /// Счётчики лучей (7.18д2): в 2.5D-виде «комнаты» каждый проход считает столько лучей,
