@@ -540,6 +540,11 @@ impl Console {
     }
 }
 
+/// `draw` забирает общий журнал логов: тесты, которые рисуют консоль (и здесь, и в
+/// `game_ui`), идут по очереди, иначе один заберёт строки, которых ждёт другой.
+#[cfg(test)]
+pub(crate) static DRAWING: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,8 +626,57 @@ mod tests {
         assert!(c.lines.is_empty());
     }
 
+    /// Ctrl+V: egui-winit читает буфер обмена системы (возможность `clipboard`) и отдаёт
+    /// текст событием вставки. Сам буфер Windows здесь не проверить (только на ПК); тест —
+    /// что строка консоли принимает такое событие и перевод строки в конце скопированного
+    /// текста команде не мешает.
+    #[test]
+    fn pasted_text_goes_into_the_command_line() {
+        let _turn = DRAWING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ctx = egui::Context::default();
+        let view = ConsoleView {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+            player: None,
+            solids: &[],
+        };
+        let mut c = Console::new();
+        c.toggle();
+        let frame = |c: &mut Console, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1280.0, 720.0))),
+                events,
+                ..Default::default()
+            };
+            // Картинки шрифтов здесь некуда отдавать.
+            ctx.run_ui(input, |ui| c.draw(ui.ctx(), &view))
+                .textures_delta
+                .clear();
+        };
+        frame(&mut c, Vec::new());
+        frame(&mut c, vec![egui::Event::Paste("телепорт 1 2\n".into())]);
+        assert_eq!(c.input.trim(), "телепорт 1 2");
+        let enter = egui::Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut c, vec![enter]);
+        assert_eq!(
+            c.take_orders(),
+            vec![Order::World(DebugCommand::Teleport([1.0, 2.0]))]
+        );
+    }
+
     #[test]
     fn program_logs_reach_the_console() {
+        let _turn = DRAWING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         use tracing_subscriber::layer::SubscriberExt;
         let subscriber = tracing_subscriber::registry().with(ConsoleLog);
         tracing::subscriber::with_default(subscriber, || {

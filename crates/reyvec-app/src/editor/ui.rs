@@ -519,7 +519,11 @@ impl EditorUi {
             });
             let copy = ev(i, |e| matches!(e, egui::Event::Copy));
             let cut = ev(i, |e| matches!(e, egui::Event::Cut));
-            let paste = ev(i, |e| matches!(e, egui::Event::Paste(_)));
+            // В буфере Windows картинка, а не текст: окно шлёт «вставить картинку» —
+            // вставляем предмет из своего буфера, как и при чужом тексте.
+            let paste = ev(i, |e| {
+                matches!(e, egui::Event::Paste(_) | egui::Event::PasteImage(_))
+            });
             let mut cmd = |key| i.consume_key(Modifiers::COMMAND, key);
             let (c, x, v, d) = (cmd(Key::C), cmd(Key::X), cmd(Key::V), cmd(Key::D));
             (
