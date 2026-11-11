@@ -172,13 +172,49 @@ float ambient_occlusion(float3 p, float3 n)
 static const float MAP_PENUMBRA = 0.1;
 // Полутень карт теней не шире стольких точек карты (столько же — округа поиска
 // заслоняющего).
-static const int MAP_SEARCH = 24;
+static const float MAP_SEARCH = 24.0;
 
-// Карта тени лампы `lamp` (7.9б): доля света точки `p` от треугольников. Сравнивает
-// расстояние до лампы с картой (mesh_shadow.slang) в точках вокруг: край тени мягкий.
-// Точка вне карты (вбок от лампы шире её угла) — без тени.
+// Расстояние от лампы до плоскости точки (через `rel` = точка − лампа, нормаль `n`) вдоль
+// направления, которое на карте лампы приходится на место `q` (в точках квадрата лампы).
+// С ним, а не с расстоянием до самой точки, сравниваются точки карты вокруг: плоская
+// поверхность сбоку от лампы сама себя не заслоняет, сколько бы шире ни была округа
+// (7.18е). Почти вдоль плоскости — расстояние до самой точки `flat`. Место за краем
+// квадрата — его край, как и у map_gather: точки карты и сравнение — одно направление.
+float map_reference(float2 q, float side, float f, float3 rel, float3 n, float flat)
+{
+    q = clamp(q, 0.5, side - 0.5 - 1.0 / 256.0);
+    float2 ndc = float2(q.x / side * 2.0 - 1.0, 1.0 - q.y / side * 2.0);
+    float3 dir = normalize(float3(ndc / f, -1.0));
+    float c = dot(dir, n);
+    if (c > -0.05)
+        return flat;
+    // Сверху — предел для плоскости почти вдоль луча; снизу не ограничиваем: меньшее
+    // расстояние только придумало бы заслоняющее.
+    return min(dot(rel, n) / c, 2.0 * flat);
+}
 
-float map_shadow(float3 p, uint lamp)
+// Четыре точки карты вокруг места `q` (в точках квадрата лампы `lo`) одним чтением.
+// Порядок Gather: w — (0, 0), z — (1, 0), x — (0, 1), y — (1, 1) от угла `corner`.
+float4 map_gather(Texture2D map, float2 q, float2 lo, float side, float2 inv, out float2 frac_)
+{
+    // Все четыре — в квадрате этой лампы, не у соседней.
+    q = clamp(q, 0.5, side - 0.5 - 1.0 / 256.0);
+    float2 b = q - 0.5;
+    float2 corner = floor(b);
+    frac_ = b - corner;
+    return map.GatherRed(samplers[1], (lo + corner + 1.0) * inv);
+}
+
+// Карта тени лампы `lamp` (7.9б): доля света точки `p` (нормаль `n`) от треугольников.
+// Сравнивает расстояние до лампы с картой (mesh_shadow.slang) в точках вокруг: край тени
+// мягкий. Точка вне карты (вбок от лампы шире её угла) — без тени.
+//
+// Без ступеней в полутени (7.18е): прежние 25 проб стояли квадратом вдоль осей карты, и
+// прямой край тени вдоль строки (столбца) карты переключал всю строку проб разом — скачки
+// по 1/5 (по 1/25 только у косого края). Теперь пробы стоят по повёрнутой решётке (у всех
+// разные x и y, поэтому и такой край проходит через них по одной), а каждая проба — четыре
+// точки карты одним Gather со смесью по положению между ними: доля света меняется плавно.
+float map_shadow(float3 p, float3 n, uint lamp)
 {
     uint at = pc.scene[7];
     if (lamp >= pc.scene[at + 1])
@@ -199,34 +235,49 @@ float map_shadow(float3 p, uint lamp)
     Texture2D map = textures[pc.flags >> 16];
     uint w, h;
     map.GetDimensions(w, h);
-    int side = int(h);
-    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * float(side);
-    float d = length(p - read_lamp(lamp).at);
+    float side = float(h);
+    float2 inv = 1.0 / float2(float(w), float(h));
+    float2 lo = float2(float(lamp) * side, 0.0);
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * side;
+    float3 rel = p - read_lamp(lamp).at;
+    float d = length(rel);
     float bias = 0.02 + 0.01 * d;
-    int2 lo = int2(int(lamp) * side, 0);
-    int2 hi = lo + side - 1;
-    int2 center = int2(floor(uv)) + lo;
+    // Камера лампы смотрит вдоль −Z без поворота (level3d.rs, lamp_view_proj): первый
+    // элемент матрицы — 1 / tan половины угла.
+    float f = asfloat(pc.scene[m]);
     // Полутень как у теней SDF с k = 10: лампа как диск радиуса d/k, полутень на точке
     // шире во столько раз, во сколько заслоняющее ближе к лампе, чем к точке. Сначала
-    // ближайший заслоняющий в округе (9 проб), потом 25 проб по квадрату такого размера.
-    float blocker = d;
+    // среднее расстояние заслоняющих в округе (9 проб, 36 точек карты), потом 25 проб в
+    // повёрнутом квадрате такого размера.
+    float blockers = 0.0;
+    float count = 0.0;
     for (int k = 0; k < 9; k++)
     {
-        int2 o = (int2(k % 3, k / 3) - 1) * MAP_SEARCH;
-        blocker = min(blocker, map.Load(int3(clamp(center + o, lo, hi), 0)).x);
+        float2 g = float2(float(k % 3), float(k / 3)) - 1.0;
+        float2 q = uv + float2(3.0 * g.x - g.y, g.x + 3.0 * g.y) * (MAP_SEARCH * 0.25);
+        float2 between;
+        float4 depth = map_gather(map, q, lo, side, inv, between);
+        float4 shut = 1.0 - step(map_reference(q, side, f, rel, n, d) - bias, depth);
+        blockers += dot(shut, depth);
+        count += dot(shut, float4(1.0, 1.0, 1.0, 1.0));
     }
-    if (blocker >= d - bias)
+    if (count <= 0.0)
         return 1.0;
+    float blocker = blockers / count;
     // Мир на карте у точки: 2·d·tan 70° на сторону.
-    float texel = 5.5 * d / float(side);
+    float texel = 5.5 * d / side;
     float world = (d - blocker) / max(blocker, 0.05) * d * MAP_PENUMBRA;
-    float radius = clamp(world / texel, 1.0, float(MAP_SEARCH));
+    float radius = clamp(world / texel, 1.0, MAP_SEARCH);
     float lit = 0.0;
     for (int k = 0; k < 25; k++)
     {
-        float2 o = (float2(k % 5, k / 5) - 2.0) * (radius * 0.5);
-        int2 q = clamp(int2(floor(uv + o)) + lo, lo, hi);
-        lit += d - bias <= map.Load(int3(q, 0)).x ? 1.0 : 0.0;
+        float2 g = float2(float(k % 5), float(k / 5)) - 2.0;
+        float2 q = uv + float2(5.0 * g.x - g.y, g.x + 5.0 * g.y) * (radius / 12.0);
+        float2 between;
+        float4 depth = map_gather(map, q, lo, side, inv, between);
+        float4 open = step(map_reference(q, side, f, rel, n, d) - bias, depth);
+        lit += lerp(lerp(open.w, open.z, between.x), lerp(open.x, open.y, between.x),
+                    between.y);
     }
     return lit / 25.0;
 }
@@ -273,7 +324,7 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
     float by_map = 1.0;
     if (part >= 2 && (pc.flags & SPACE_FLAG_SHADOW_MAP) != 0)
     {
-        by_map = map_shadow(p, part - 2);
+        by_map = map_shadow(p, n, part - 2);
         if (by_map <= 0.0)
             return 0.0;
     }

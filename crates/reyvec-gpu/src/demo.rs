@@ -615,6 +615,9 @@ pub(crate) struct Demo {
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
+    /// Без карт теней ламп в режиме треугольников (7.18е; только для тестов).
+    #[cfg(test)]
+    no_shadow_maps: bool,
     /// Конвейеры со счётчиками; `None` — ещё не собраны.
     space_counted: Option<CountedPipelines>,
     /// Буфер счётчиков и его копия для процессора, свои у каждого кадра в полёте.
@@ -950,6 +953,8 @@ impl Demo {
             space_free: true,
             #[cfg(test)]
             full_normal: false,
+            #[cfg(test)]
+            no_shadow_maps: false,
             space_counted: None,
             space_counter_buffers: vec![None; frames_in_flight],
             space_counted_slots: vec![false; frames_in_flight],
@@ -1587,6 +1592,12 @@ impl Demo {
     #[cfg(test)]
     pub(crate) fn set_full_normal(&mut self, on: bool) {
         self.full_normal = on;
+    }
+
+    /// Кадр треугольниками без карт теней ламп (7.18е) — где они дают тень.
+    #[cfg(test)]
+    pub(crate) fn set_no_shadow_maps(&mut self, on: bool) {
+        self.no_shadow_maps = on;
     }
 
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
@@ -3149,7 +3160,11 @@ impl Demo {
             if level {
                 crate::space::set_no_sun(&mut packed.words);
                 // Треугольники (7.9б): карты теней двух первых ламп, если есть чем рисовать.
-                if space_vertices > 0 && self.space_mesh_shadow != vk::Pipeline::null() {
+                #[cfg(not(test))]
+                let maps_on = true;
+                #[cfg(test)]
+                let maps_on = !self.no_shadow_maps;
+                if maps_on && space_vertices > 0 && self.space_mesh_shadow != vk::Pipeline::null() {
                     let maps: Vec<glam::Mat4> = frame
                         .lamps
                         .iter()

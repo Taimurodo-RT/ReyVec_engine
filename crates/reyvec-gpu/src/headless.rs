@@ -465,6 +465,9 @@ fn render(
             // Нормаль по всей сцене, как до 7.18д5 (для сравнения).
             #[cfg(test)]
             demo.set_full_normal(tests::FULL_NORMAL.get());
+            // Без карт теней ламп (7.18е): где они затеняют.
+            #[cfg(test)]
+            demo.set_no_shadow_maps(tests::NO_SHADOW_MAPS.get());
             // Шаг в пустоте не длиннее клетки, как до 7.18д4 (для сравнения).
             #[cfg(test)]
             demo.set_space_free(!tests::FREE_OFF.get());
@@ -733,6 +736,8 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(crate::SpaceScale::Full) };
         /// 2.5D-вид уровня из файла (7.9).
         pub(super) static LEVEL_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Треугольники без карт теней ламп (7.18е).
+        pub(super) static NO_SHADOW_MAPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Как рисуется 2.5D-вид (7.9б).
         pub(super) static LEVEL_RENDER: std::cell::Cell<crate::LevelRender> =
             const { std::cell::Cell::new(crate::LevelRender::Sdf) };
@@ -1284,6 +1289,105 @@ pub(crate) mod tests {
 
     fn stats_objects(f: &HeadlessImage) -> u32 {
         f.space_stats.map_or(0, |s| s.objects)
+    }
+
+    /// Тени от карт ламп (7.18е): в 2.5D-виде треугольниками карты дают тень, без ошибок
+    /// Vulkan, и там, где они затеняют гладкую без них картинку, нет грубых скачков между
+    /// соседними точками. Прежние ступени полутени этот тест НЕ отличает: при 640×360 они
+    /// мельче его порога, и прежний фильтр его тоже проходит. Их смотреть глазом на снимках
+    /// с картами и без (PPM_DIR=папка).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn level_view_map_shadows() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let mut jumps = 0usize;
+        let mut pairs = 0usize;
+        // Комната (висячая лампа и шар-светильник) в двух фазах качания лампы и у левой стены.
+        for (time, start) in [
+            (1.0, [-0.6, -0.5]),
+            (0.8, [-0.6, -0.5]),
+            (1.0, [-1.75, 0.0]),
+        ] {
+            let scene = HeadlessScene {
+                width: 640,
+                height: 360,
+                time,
+                shader_error: false,
+                scene: DemoScene::File,
+                msaa: Msaa::X4,
+                perceptual_edges: false,
+                fill: crate::FillMode::Triangles,
+                zoom: false,
+                files: crate::UserFiles::default(),
+                cascades: false,
+            };
+            let play = HeadlessPlay {
+                start: Some(start),
+                level: Some(crate::LevelRender::Triangles),
+                ..Default::default()
+            };
+            let maps = render_headless_play(&options, &scene, Some(&play)).expect("кадр");
+            NO_SHADOW_MAPS.set(true);
+            let bare = render_headless_play(&options, &scene, Some(&play));
+            NO_SHADOW_MAPS.set(false);
+            let bare = bare.expect("кадр без карт");
+            assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
+            let (w, h) = (maps.image.width as usize, maps.image.height as usize);
+            let at = |img: &HeadlessImage, x: usize, y: usize| {
+                let i = (y * w + x) * 4;
+                img.image.rgba[i..i + 3]
+                    .iter()
+                    .map(|&v| i32::from(v))
+                    .sum::<i32>()
+            };
+            // Точка тени карт: без карт ярче, и без карт вокруг гладко (не край формы).
+            let shaded = |x: usize, y: usize| {
+                let b = at(&bare, x, y);
+                b - at(&maps, x, y) > 12
+                    && (x + 1 >= w || (at(&bare, x + 1, y) - b).abs() <= 6)
+                    && (y + 1 >= h || (at(&bare, x, y + 1) - b).abs() <= 6)
+            };
+            let (mut j, mut n) = (0, 0);
+            for y in 0..h - 1 {
+                for x in 0..w - 1 {
+                    if !shaded(x, y) {
+                        continue;
+                    }
+                    for (nx, ny) in [(x + 1, y), (x, y + 1)] {
+                        if shaded(nx, ny) {
+                            n += 1;
+                            if (at(&maps, nx, ny) - at(&maps, x, y)).abs() >= 24 {
+                                j += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            eprintln!("время {time}, {start:?}: скачков {j} из {n} пар в тени карт");
+            if let Ok(dir) = std::env::var("PPM_DIR") {
+                for (kind, f) in [("maps", &maps), ("bare", &bare)] {
+                    let mut out = format!("P6 {w} {h} 255\n").into_bytes();
+                    for px in f.image.rgba.chunks(4) {
+                        out.extend_from_slice(&px[..3]);
+                    }
+                    std::fs::write(
+                        format!("{dir}/penumbra-{time}-{}-{kind}.ppm", start[0]),
+                        out,
+                    )
+                    .expect("ppm");
+                }
+            }
+            jumps += j;
+            pairs += n;
+        }
+        assert!(pairs > 2000, "тени карт почти нет: {pairs} пар");
+        assert!(
+            jumps * 1000 <= pairs * 5,
+            "полутень карт ступенями: {jumps} скачков из {pairs} пар"
+        );
     }
 
     /// Счётчики лучей (7.18д2): в 2.5D-виде «комнаты» каждый проход считает столько лучей,
