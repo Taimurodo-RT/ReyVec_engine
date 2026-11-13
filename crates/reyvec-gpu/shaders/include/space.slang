@@ -104,6 +104,9 @@ static const uint SPACE_FLAG_SHADOW_MAP = 8;
 static const uint SPACE_FLAG_MESH_MS = 16;
 static const uint SPACE_FLAG_MESH_X4 = 32;
 static const uint MESH_SAMPLE_SHIFT = 8;
+// Вывод «3D» прямо в окно (7.20а): шум против полос (дизеринг) — у растяжения в проходе
+// «вывод» (raymarch_upscale.slang) и у «освещения 3D» при 100 % (raymarch_shade.slang).
+static const uint SPACE_FLAG_DITHER = 64;
 // Раздел полигонов (слово 7 заголовка сцены): число вершин, число карт теней, 2 запасных,
 // матрица камеры, матрицы ламп для карт теней (по 16 чисел, столбцами), потом вершины.
 static const uint MESH_HEADER_WORDS = 52;

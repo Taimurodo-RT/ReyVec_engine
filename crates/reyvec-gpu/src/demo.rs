@@ -626,6 +626,9 @@ pub(crate) struct Demo {
     /// Картинка полигонов без образцов MSAA (7.18е2; только для тестов).
     #[cfg(test)]
     no_mesh_msaa: bool,
+    /// Без прямого вывода «3D» в окно (7.20а; только для тестов): через кадр сцены.
+    #[cfg(test)]
+    no_direct: bool,
     /// Конвейеры со счётчиками; `None` — ещё не собраны.
     space_counted: Option<CountedPipelines>,
     /// Буфер счётчиков и его копия для процессора, свои у каждого кадра в полёте.
@@ -674,6 +677,12 @@ pub(crate) struct Demo {
     level_edit: Option<fn(&mut reyvec_scene::Scene)>,
     space_shade_small: vk::Pipeline,
     space_upscale: vk::Pipeline,
+    /// Тот же шейдер растяжения, но прямо в окно (формат окна, без MSAA): кадр, где нет
+    /// ничего, кроме «3D» (7.20а, [`DemoRenderer::direct_space`]).
+    space_present: vk::Pipeline,
+    /// Освещение «3D» прямо в окно при разрешении 3D 100 % (7.20а): тот же шейдер, что у
+    /// `space_shade`, формат окна, без MSAA.
+    space_shade_present: vk::Pipeline,
     /// Камера сцены «3D».
     space_camera: reyvec_sdf::Camera3D,
     /// Отсев по взгляду в последнем кадре сцены «3D» (7.6к).
@@ -969,6 +978,8 @@ impl Demo {
             no_shadow_maps: false,
             #[cfg(test)]
             no_mesh_msaa: false,
+            #[cfg(test)]
+            no_direct: false,
             space_counted: None,
             space_counter_buffers: vec![None; frames_in_flight],
             space_counted_slots: vec![false; frames_in_flight],
@@ -998,6 +1009,8 @@ impl Demo {
             level_edit: None,
             space_shade_small: vk::Pipeline::null(),
             space_upscale: vk::Pipeline::null(),
+            space_present: vk::Pipeline::null(),
+            space_shade_present: vk::Pipeline::null(),
             space_camera: reyvec_sdf::Camera3D::default(),
             space_view: Default::default(),
             space_grid: None,
@@ -1631,6 +1644,12 @@ impl Demo {
     #[cfg(test)]
     pub(crate) fn set_no_mesh_msaa(&mut self, on: bool) {
         self.no_mesh_msaa = on;
+    }
+
+    /// Кадр «3D» через картинку сцены, как до 7.20а, — для сравнения.
+    #[cfg(test)]
+    pub(crate) fn set_no_direct(&mut self, on: bool) {
+        self.no_direct = on;
     }
 
     /// Образцы картинки полигонов, которые видеокарта умеет (7.18е2).
@@ -2672,22 +2691,31 @@ impl Demo {
         if format == self.format {
             return Ok(());
         }
-        let present = build(ctx, res, shaders, "present", format, Msaa::Off, None)?;
-        let glow = match build(ctx, res, shaders, "particles", format, Msaa::Off, None) {
-            Ok(p) => p,
-            Err(e) => {
-                // SAFETY: конвейер только что создан и нигде не используется.
-                unsafe { ctx.device.destroy_pipeline(present, None) };
-                return Err(e);
+        let mut made = Vec::with_capacity(4);
+        let result = (|| {
+            for name in ["present", "particles", "raymarch_upscale", "raymarch_shade"] {
+                made.push(build(ctx, res, shaders, name, format, Msaa::Off, None)?);
             }
-        };
+            Ok(())
+        })();
+        if let Err(e) = result {
+            // SAFETY: конвейеры только что созданы и нигде не используются.
+            for p in made {
+                unsafe { ctx.device.destroy_pipeline(p, None) };
+            }
+            return Err(e);
+        }
         // SAFETY: условие функции; null допустим.
         unsafe {
             ctx.device.destroy_pipeline(self.present, None);
             ctx.device.destroy_pipeline(self.particle_glow, None);
+            ctx.device.destroy_pipeline(self.space_present, None);
+            ctx.device.destroy_pipeline(self.space_shade_present, None);
         }
-        self.present = present;
-        self.particle_glow = glow;
+        self.present = made[0];
+        self.particle_glow = made[1];
+        self.space_present = made[2];
+        self.space_shade_present = made[3];
         self.format = format;
         Ok(())
     }
@@ -2724,22 +2752,37 @@ impl Demo {
                 "resolve" => (&mut self.resolve, self.scene_format, Msaa::Off, None),
                 "sdf_demo" => (&mut self.sdf, self.scene_format, self.msaa, stencil),
                 "raymarch_shade" => {
-                    match build(ctx, res, shaders, name, SPACE_COLOR_FORMAT, Msaa::Off, None) {
+                    for (slot, format) in [
+                        (&mut self.space_shade_small, SPACE_COLOR_FORMAT),
+                        (&mut self.space_shade_present, self.format),
+                    ] {
+                        match build(ctx, res, shaders, name, format, Msaa::Off, None) {
+                            Ok(new) => {
+                                let old = std::mem::replace(slot, new);
+                                // SAFETY: видеокарта простаивает (условие функции).
+                                unsafe { ctx.device.destroy_pipeline(old, None) };
+                            }
+                            Err(e) => shaders.set_error(name, e.to_string()),
+                        }
+                    }
+                    (&mut self.space_shade, self.scene_format, self.msaa, stencil)
+                }
+                "raymarch_upscale" => {
+                    match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
                         Ok(new) => {
-                            let old = std::mem::replace(&mut self.space_shade_small, new);
+                            let old = std::mem::replace(&mut self.space_present, new);
                             // SAFETY: видеокарта простаивает (условие функции).
                             unsafe { ctx.device.destroy_pipeline(old, None) };
                         }
                         Err(e) => shaders.set_error(name, e.to_string()),
                     }
-                    (&mut self.space_shade, self.scene_format, self.msaa, stencil)
+                    (
+                        &mut self.space_upscale,
+                        self.scene_format,
+                        self.msaa,
+                        stencil,
+                    )
                 }
-                "raymarch_upscale" => (
-                    &mut self.space_upscale,
-                    self.scene_format,
-                    self.msaa,
-                    stencil,
-                ),
                 "raymarch" => (&mut self.space_march, GBUFFER_FORMAT, Msaa::Off, None),
                 "raymarch_cone" => (&mut self.space_cone, CONE_FORMAT, Msaa::Off, None),
                 "mesh3d" => {
@@ -3323,8 +3366,11 @@ impl Demo {
         }
     }
 
-    /// Добавляет в граф проходы сцены: «сцена» рисует фон, треугольник и спрайты во
-    /// временную картинку, «вывод» копирует её в `target`.
+    /// Добавляет в граф проходы кадра. Обычно «сцена» рисует всё во временную картинку (с
+    /// MSAA и сведением), а «вывод» переносит её в `target` вместе со светом и свечением.
+    /// Если в кадре только «3D» ([`Self::direct_space`], 7.20а), временной картинки и прохода
+    /// «сцена» нет: при разрешении 3D 100 % «освещение 3D» красит прямо `target`, иначе
+    /// «вывод» растягивает в него картинку «цвет 3D» (raymarch_upscale.slang).
     pub fn add_passes<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -3340,6 +3386,14 @@ impl Demo {
                 // (старые удаляются отложенно).
                 unsafe { VectorRenderer::record_uploads(p.device, p.cmd, &self.uploads) };
             });
+        }
+        if self.direct_space(frame) {
+            // При разрешении 3D 100 % освещение красит прямо в окно, иначе «вывод» растягивает.
+            let (_, _, _, color) = self.add_space_passes(graph, bindless, frame, Some(target));
+            if let Some(color) = color {
+                self.add_direct_output(graph, bindless, frame, color, target);
+            }
+            return;
         }
         let scene = graph.create("кадр сцены", frame.extent, self.scene_format);
         // Со сглаживанием сцена рисуется в картинку с несколькими точками на пиксель. Точки
@@ -3489,552 +3543,8 @@ impl Demo {
 
         // Сцена «3D» (7.3): лучи шагают своим проходом в буфер геометрии (по точке на
         // пиксель и без MSAA: шагание — самое дорогое), а «сцена» его освещает.
-        let gbuffer = (frame.scene == DemoScene::Space).then(|| {
-            let camera = frame.space_camera;
-            let ext = frame.space_extent;
-            // Куски поля уровня, перепечённые в этом кадре (7.18г), — до всех лучей кадра.
-            if let Some(patch) = &self.level_patch {
-                graph.add_pass("правка поля уровня", &[], move |p| {
-                    // SAFETY: проход вне рисования; картинки поля живы, пока поле готово
-                    // (удаляются отложенно), буфер-источник — до конца кадра.
-                    unsafe {
-                        crate::resources::record_texture_patches(
-                            p.device,
-                            p.cmd,
-                            patch.src,
-                            &patch.images,
-                        );
-                    }
-                });
-            }
-            // Запечённое поле расстояний (7.10б): кубики у сдвинутых предметов и вошедшие
-            // в слои при полёте камеры — до всех лучей кадра.
-            if let Some(field) = frame.space_field {
-                let bake = self.space_field_bake;
-                let copies = self.space_field.copies.clone();
-                graph.add_pass("поле", &[], move |p| {
-                    // SAFETY: проход вне рисования; конвейер жив, пока жива сцена; буферы
-                    // поля и задания кадра живы, пока кадр выполняется.
-                    unsafe {
-                        crate::field::SpaceField::record(
-                            p.device, p.cmd, bindless, layout, bake, &field, &copies,
-                        );
-                    }
-                });
-            }
-            // Предварительное шагание конусами (7.8): точка на квадрат 8×8 пикселей.
-            let tiles = vk::Extent2D {
-                width: ext.width.div_ceil(CONE_TILE),
-                height: ext.height.div_ceil(CONE_TILE),
-            };
-            let cone = graph.create("конусы 3D", tiles, CONE_FORMAT);
-            graph.add_pass(
-                "лучи 3D грубо",
-                &[(cone, Access::ColorAttachment)],
-                move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots::default(),
-                        0,
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл картинку конусов в цель рисования; буфер сцены
-                    // и буфер счётчиков этого кадра живы, пока кадр рисуется.
-                    unsafe {
-                        // Первый проход лучей кадра: счётчики (7.18д2) — с нуля.
-                        if let Some((_, buffer, _)) = frame.space_counters {
-                            crate::counters::record_reset(d, cmd, buffer);
-                        }
-                        begin_color_pass(d, cmd, p.view(cone), tiles);
-                        bindless.bind(d, cmd);
-                        let pipeline = frame.space_counters.map_or(self.space_cone, |c| c.0.cone);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_draw(cmd, 3, 1, 0, 0);
-                        d.cmd_end_rendering(cmd);
-                    }
-                },
-            );
-            // Полигональные модели (7.6ж): растеризация с глубиной в свой буфер геометрии
-            // той же раскладки. «Реймарчинг» не шагает дальше них и берёт их точку, если
-            // луч ни во что не попал раньше.
-            //
-            // С образцами MSAA (7.18е2) по числу лучей краёв: каждый луч края берёт свой
-            // образец, и край призмы получает столько же ступеней, сколько край формы SDF.
-            let pairs = ext != frame.extent;
-            #[cfg(not(test))]
-            let mesh_counts = self.mesh_counts;
-            #[cfg(test)]
-            let mesh_counts = if self.no_mesh_msaa {
-                vk::SampleCountFlags::empty()
-            } else {
-                self.mesh_counts
-            };
-            let (mesh_msaa, mesh_flags) = if frame.space_edges.is_some() {
-                mesh_samples(mesh_counts, pairs)
-            } else {
-                (Msaa::Off, 0)
-            };
-            let mesh_pipeline = match mesh_msaa {
-                Msaa::X2 => self.space_mesh_ms[0],
-                Msaa::X4 => self.space_mesh_ms[1],
-                _ => self.space_mesh,
-            };
-            let (mesh_msaa, mesh_flags, mesh_pipeline) = if mesh_pipeline == vk::Pipeline::null() {
-                (Msaa::Off, 0, self.space_mesh)
-            } else {
-                (mesh_msaa, mesh_flags, mesh_pipeline)
-            };
-            let meshes = (frame.space_vertices > 0).then(|| {
-                let samples = mesh_msaa.samples();
-                let meshes = graph.create_multisampled("полигоны 3D", ext, MESH_FORMAT, samples);
-                let depth = graph.create_multisampled(
-                    "глубина полигонов 3D",
-                    ext,
-                    MESH_DEPTH_FORMAT,
-                    samples,
-                );
-                graph.add_pass(
-                    "полигоны 3D",
-                    &[
-                        (meshes, Access::ColorAttachment),
-                        (depth, Access::StencilAttachment),
-                    ],
-                    move |p| {
-                        let push = space_push(
-                            &camera,
-                            ext,
-                            frame.time,
-                            frame.space_address,
-                            SpaceSlots::default(),
-                            0,
-                        );
-                        let (d, cmd) = (p.device, p.cmd);
-                        // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
-                        // этого кадра жив, пока кадр рисуется.
-                        unsafe {
-                            // Нули: бит попадания упакованной точки — 0 (pack_mesh).
-                            begin_depth_pass(
-                                d,
-                                cmd,
-                                p.view(meshes),
-                                p.view(depth),
-                                ext,
-                                [0.0, 0.0, 0.0, 0.0],
-                            );
-                            bindless.bind(d, cmd);
-                            d.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                mesh_pipeline,
-                            );
-                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                            d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
-                            d.cmd_end_rendering(cmd);
-                        }
-                    },
-                );
-                meshes
-            });
-            // Флаги чтения полигонов для «реймарчинга» и «краёв 3D».
-            let mesh_bits = if meshes.is_some() {
-                SPACE_FLAG_MESHES | mesh_flags
-            } else {
-                0
-            };
-            let gbuffer = graph.create("буфер геометрии 3D", ext, GBUFFER_FORMAT);
-            if frame.space_compute {
-                // Опыт 7.6м: те же лучи вычислительным шейдером, прямо в картинку буфера
-                // геометрии (её читают тени и освещение как обычно).
-                let mut uses = vec![
-                    (cone, Access::ComputeSampled),
-                    (gbuffer, Access::ComputeWrite),
-                ];
-                if let Some(m) = meshes {
-                    uses.push((m, Access::ComputeSampled));
-                }
-                graph.add_pass("реймарчинг", &uses, move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots {
-                            target: p.storage(gbuffer),
-                            cone: p.texture(cone),
-                            meshes: meshes.map_or(0, |m| p.texture(m)),
-                            ..SpaceSlots::default()
-                        },
-                        mesh_bits,
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл конусы (и полигоны) в чтение, буфер геометрии в
-                    // запись; буфер сцены этого кадра жив, пока кадр рисуется.
-                    unsafe {
-                        bindless.bind_compute(d, cmd);
-                        let pipeline = frame
-                            .space_counters
-                            .map_or(self.space_march_compute, |c| c.0.march_compute);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
-                    }
-                });
-            } else {
-                let mut march_uses =
-                    vec![(cone, Access::Sampled), (gbuffer, Access::ColorAttachment)];
-                if let Some(m) = meshes {
-                    march_uses.push((m, Access::Sampled));
-                }
-                graph.add_pass("реймарчинг", &march_uses, move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots {
-                            cone: p.texture(cone),
-                            meshes: meshes.map_or(0, |m| p.texture(m)),
-                            ..SpaceSlots::default()
-                        },
-                        mesh_bits,
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
-                    // этого кадра жив, пока кадр рисуется.
-                    unsafe {
-                        begin_color_pass(d, cmd, p.view(gbuffer), ext);
-                        bindless.bind(d, cmd);
-                        let pipeline = frame.space_counters.map_or(self.space_march, |c| c.0.march);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_draw(cmd, 3, 1, 0, 0);
-                        d.cmd_end_rendering(cmd);
-                    }
-                });
-            }
-            // Тени и затенение в углах (7.4): мягкие, поэтому в половинном разрешении —
-            // точка на квадрат 2×2 пикселя, вчетверо меньше лучей (7.6б). «Сцена»
-            // растягивает их обратно с оглядкой на глубину и нормаль.
-            let half = vk::Extent2D {
-                width: ext.width.div_ceil(2),
-                height: ext.height.div_ceil(2),
-            };
-            // Карты теней ламп от треугольников (7.9б): квадраты рядом в одной картинке.
-            let shadow_maps = (frame.space_shadow_maps > 0).then(|| {
-                let count = frame.space_shadow_maps;
-                let size = vk::Extent2D {
-                    width: SHADOW_MAP_SIZE * count,
-                    height: SHADOW_MAP_SIZE,
-                };
-                let maps = graph.create("карты теней ламп", size, SHADOW_MAP_FORMAT);
-                let depth = graph.create("глубина карт теней", size, MESH_DEPTH_FORMAT);
-                graph.add_pass(
-                    "карты теней ламп",
-                    &[
-                        (maps, Access::ColorAttachment),
-                        (depth, Access::StencilAttachment),
-                    ],
-                    move |p| {
-                        let push = space_push(
-                            &camera,
-                            ext,
-                            frame.time,
-                            frame.space_address,
-                            SpaceSlots::default(),
-                            0,
-                        );
-                        let (d, cmd) = (p.device, p.cmd);
-                        // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
-                        // этого кадра жив, пока кадр рисуется.
-                        unsafe {
-                            begin_depth_pass(
-                                d,
-                                cmd,
-                                p.view(maps),
-                                p.view(depth),
-                                size,
-                                [1e9, 0.0, 0.0, 0.0],
-                            );
-                            bindless.bind(d, cmd);
-                            d.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::GRAPHICS,
-                                self.space_mesh_shadow,
-                            );
-                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                            for k in 0..count {
-                                let viewport = vk::Viewport::default()
-                                    .x((k * SHADOW_MAP_SIZE) as f32)
-                                    .width(SHADOW_MAP_SIZE as f32)
-                                    .height(SHADOW_MAP_SIZE as f32)
-                                    .max_depth(1.0);
-                                d.cmd_set_viewport(cmd, 0, &[viewport]);
-                                d.cmd_draw(cmd, frame.space_vertices, 1, 0, k);
-                            }
-                            d.cmd_end_rendering(cmd);
-                        }
-                    },
-                );
-                maps
-            });
-            // Флаг и номер картинки карт теней для «теней 3D» и «краёв 3D».
-            let map_flags = move |p: &PassContext| {
-                shadow_maps.map_or(0, |m| SPACE_FLAG_SHADOW_MAP | (p.texture(m) << 16))
-            };
-            let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
-            let mut uses = vec![
-                (gbuffer, Access::Sampled),
-                (shadows, Access::ColorAttachment),
-            ];
-            if let Some(m) = shadow_maps {
-                uses.push((m, Access::Sampled));
-            }
-            graph.add_pass("тени 3D", &uses, move |p| {
-                let push = space_push(
-                    &camera,
-                    ext,
-                    frame.time,
-                    frame.space_address,
-                    SpaceSlots {
-                        gbuffer: p.texture(gbuffer),
-                        ..SpaceSlots::default()
-                    },
-                    map_flags(p),
-                );
-                let (d, cmd) = (p.device, p.cmd);
-                // SAFETY: граф перевёл буфер геометрии в чтение, а тени в цель
-                // рисования; буфер сцены этого кадра жив, пока кадр рисуется.
-                unsafe {
-                    begin_color_pass(d, cmd, p.view(shadows), half);
-                    bindless.bind(d, cmd);
-                    let pipeline = frame
-                        .space_counters
-                        .map_or(self.space_shadow, |c| c.0.shadow);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                    d.cmd_draw(cmd, 3, 1, 0, 0);
-                    d.cmd_end_rendering(cmd);
-                }
-            });
-            // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
-            // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
-            let edges = frame.space_edges.map(|(list, list_buffer, count_buffer)| {
-                let pairs = if ext == frame.extent {
-                    0
-                } else {
-                    SPACE_FLAG_EDGE_PAIRS
-                };
-                let edges = graph.create("края 3D", ext, EDGE_FORMAT);
-                // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
-                // расходятся, — край, даже если буфер геометрии у соседей одинаков.
-                let mut find_uses = vec![
-                    (gbuffer, Access::ComputeSampled),
-                    (edges, Access::ComputeWrite),
-                ];
-                if let Some(m) = meshes {
-                    find_uses.push((m, Access::ComputeSampled));
-                }
-                graph.add_pass("края 3D: поиск", &find_uses, move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots {
-                            gbuffer: p.texture(gbuffer),
-                            target: p.storage(edges),
-                            meshes: meshes.map_or(0, |m| p.texture(m)),
-                            edges: list,
-                            ..SpaceSlots::default()
-                        },
-                        mesh_bits | pairs,
-                    );
-                    // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей.
-                    let start: Vec<u8> = [0u32, 1, 1, 0]
-                        .iter()
-                        .flat_map(|w| w.to_ne_bytes())
-                        .collect();
-                    // Список этого кадра в прошлый раз читали проход «края 3D» и копия
-                    // счётчика для процессора.
-                    let before_reset = [vk::MemoryBarrier2::default()
-                        .src_stage_mask(
-                            vk::PipelineStageFlags2::COMPUTE_SHADER
-                                | vk::PipelineStageFlags2::DRAW_INDIRECT
-                                | vk::PipelineStageFlags2::COPY,
-                        )
-                        .src_access_mask(
-                            vk::AccessFlags2::SHADER_STORAGE_READ
-                                | vk::AccessFlags2::INDIRECT_COMMAND_READ
-                                | vk::AccessFlags2::TRANSFER_READ,
-                        )
-                        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
-                    let after_reset = [vk::MemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .dst_access_mask(
-                            vk::AccessFlags2::SHADER_STORAGE_READ
-                                | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                        )];
-                    let after = [vk::MemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                        .dst_stage_mask(
-                            vk::PipelineStageFlags2::COMPUTE_SHADER
-                                | vk::PipelineStageFlags2::DRAW_INDIRECT
-                                | vk::PipelineStageFlags2::COPY,
-                        )
-                        .dst_access_mask(
-                            vk::AccessFlags2::SHADER_STORAGE_READ
-                                | vk::AccessFlags2::INDIRECT_COMMAND_READ
-                                | vk::AccessFlags2::TRANSFER_READ,
-                        )];
-                    // Начало списка (со счётчиком пикселей) — процессору, для панели
-                    // (7.18б); читается, когда кадр закончен.
-                    let count_copy = [vk::BufferCopy::default().size(16)];
-                    let to_host = [vk::BufferMemoryBarrier2::default()
-                        .buffer(count_buffer)
-                        .size(vk::WHOLE_SIZE)
-                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                        .dst_access_mask(vk::AccessFlags2::HOST_READ)
-                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл буфер геометрии (и полигоны) в чтение, а
-                    // картинку краёв в запись; список краёв и буфер сцены этого кадра
-                    // живы, пока кадр рисуется; барьеры выше упорядочивают список с
-                    // прошлым кадром и со следующим проходом.
-                    unsafe {
-                        d.cmd_pipeline_barrier2(
-                            cmd,
-                            &vk::DependencyInfo::default().memory_barriers(&before_reset),
-                        );
-                        d.cmd_update_buffer(cmd, list_buffer, 0, &start);
-                        d.cmd_pipeline_barrier2(
-                            cmd,
-                            &vk::DependencyInfo::default().memory_barriers(&after_reset),
-                        );
-                        bindless.bind_compute(d, cmd);
-                        d.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::COMPUTE,
-                            self.space_edge_find,
-                        );
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
-                        d.cmd_pipeline_barrier2(
-                            cmd,
-                            &vk::DependencyInfo::default().memory_barriers(&after),
-                        );
-                        d.cmd_copy_buffer(cmd, list_buffer, count_buffer, &count_copy);
-                        d.cmd_pipeline_barrier2(
-                            cmd,
-                            &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
-                        );
-                    }
-                });
-                let mut uses = vec![
-                    (cone, Access::ComputeSampled),
-                    (gbuffer, Access::ComputeSampled),
-                    (shadows, Access::ComputeSampled),
-                    (edges, Access::ComputeWrite),
-                ];
-                if let Some(m) = meshes {
-                    uses.push((m, Access::ComputeSampled));
-                }
-                if let Some(m) = shadow_maps {
-                    uses.push((m, Access::ComputeSampled));
-                }
-                graph.add_pass("края 3D", &uses, move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots {
-                            gbuffer: p.texture(gbuffer),
-                            shadows: p.texture(shadows),
-                            target: p.storage(edges),
-                            cone: p.texture(cone),
-                            meshes: meshes.map_or(0, |m| p.texture(m)),
-                            edges: list,
-                        },
-                        mesh_bits | pairs | map_flags(p),
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
-                    // список краёв записан (барьер в прошлом проходе) и жив весь кадр.
-                    unsafe {
-                        bindless.bind_compute(d, cmd);
-                        let pipeline = frame.space_counters.map_or(self.space_edges, |c| c.0.edges);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_dispatch_indirect(cmd, list_buffer, 0);
-                    }
-                });
-                edges
-            });
-            // Счётчики лучей (7.18д2) — процессору, после последнего прохода лучей.
-            if let Some((_, gpu, host)) = frame.space_counters {
-                graph.add_pass("счётчики 3D", &[], move |p| {
-                    // SAFETY: проход вне рисования; оба буфера этого кадра живы, пока он
-                    // рисуется, и созданы с нужными флагами (counter_buffers).
-                    unsafe { crate::counters::record_copy(p.device, p.cmd, gpu, host) };
-                });
-            }
-            // Уменьшенное разрешение (7.14): освещение здесь же, в своей картинке того же
-            // размера; «сцена» растянет её на весь кадр.
-            let color = (ext != frame.extent).then(|| {
-                let color = graph.create("цвет 3D", ext, SPACE_COLOR_FORMAT);
-                let mut uses = vec![
-                    (gbuffer, Access::Sampled),
-                    (shadows, Access::Sampled),
-                    (color, Access::ColorAttachment),
-                ];
-                if let Some(e) = edges {
-                    uses.push((e, Access::Sampled));
-                }
-                graph.add_pass("освещение 3D", &uses, move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots {
-                            gbuffer: p.texture(gbuffer),
-                            shadows: p.texture(shadows),
-                            target: edges.map_or(0, |e| p.texture(e)),
-                            ..SpaceSlots::default()
-                        },
-                        u32::from(edges.is_some()) * SPACE_FLAG_EDGES,
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл картинки 3D в чтение, а цвет в цель рисования;
-                    // буфер сцены этого кадра жив, пока кадр рисуется.
-                    unsafe {
-                        begin_color_pass(d, cmd, p.view(color), ext);
-                        bindless.bind(d, cmd);
-                        d.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::GRAPHICS,
-                            self.space_shade_small,
-                        );
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_draw(cmd, 3, 1, 0, 0);
-                        d.cmd_end_rendering(cmd);
-                    }
-                });
-                color
-            });
-            (gbuffer, shadows, edges, color)
-        });
+        let gbuffer = (frame.scene == DemoScene::Space)
+            .then(|| self.add_space_passes(graph, bindless, frame, None));
 
         let mut uses = vec![
             (target_image, Access::ColorAttachment),
@@ -4245,6 +3755,621 @@ impl Demo {
                 d.cmd_end_rendering(cmd);
             }
         });
+    }
+
+    /// Кадр, где нет ничего, кроме сцены «3D» (2.5D-вид уровня, 7.20а): ни векторов, ни
+    /// SDF-предметов, ни спрайтов, ни частиц. Тогда картинка сцены с MSAA, её сведение и
+    /// копирование в окно не нужны: при уменьшенном разрешении 3D «вывод» растягивает
+    /// освещённую картинку «3D» прямо в окно, при 100 % «освещение 3D» красит окно само.
+    /// Сглаживать MSAA в таком кадре нечего — один треугольник на весь экран.
+    fn direct_space(&self, frame: FrameData) -> bool {
+        #[cfg(test)]
+        if self.no_direct {
+            return false;
+        }
+        frame.scene == DemoScene::Space
+            && frame.vector.is_none()
+            && frame.object_count == 0
+            && frame.sprite_count == 0
+            && self.particle_steps.iter().all(|f| f.span.count == 0)
+            && self.space_present != vk::Pipeline::null()
+            && self.space_shade_present != vk::Pipeline::null()
+    }
+
+    /// Проход «вывод» прямого вывода «3D» (7.20а, только при уменьшенном разрешении 3D):
+    /// растяжение картинки «цвет 3D» с шумом против полос прямо в окно, одним треугольником.
+    fn add_direct_output<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        bindless: &'a Bindless,
+        frame: FrameData,
+        color: ImageHandle,
+        target: ImageHandle,
+    ) {
+        let layout = bindless.pipeline_layout;
+        let flags = u32::from(self.dither) * SPACE_FLAG_DITHER;
+        let uses = [(color, Access::Sampled), (target, Access::ColorAttachment)];
+        graph.add_pass("вывод", &uses, move |p| {
+            let push = space_push(
+                &frame.space_camera,
+                frame.extent,
+                frame.time,
+                frame.space_address,
+                SpaceSlots {
+                    target: p.texture(color),
+                    ..SpaceSlots::default()
+                },
+                flags,
+            );
+            let (d, cmd) = (p.device, p.cmd);
+            // SAFETY: граф перевёл картинку «цвет 3D» в чтение, а окно в цель рисования;
+            // конвейер и буфер сцены этого кадра живы, пока кадр рисуется.
+            unsafe {
+                begin_color_pass(d, cmd, p.view(target), p.extent(target));
+                bindless.bind(d, cmd);
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_present);
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+                d.cmd_end_rendering(cmd);
+            }
+        });
+    }
+
+    /// Проходы сцены «3D» до освещения: лучи, тени, края и (при уменьшенном разрешении или
+    /// прямом выводе в окно `direct`, 7.20а) освещение. Оно красит свою картинку «цвет 3D»,
+    /// а при прямом выводе и разрешении 100 % — сразу окно (с шумом против полос).
+    /// Возвращает буфер геометрии, тени, края и картинку «цвет 3D», если она есть.
+    fn add_space_passes<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        bindless: &'a Bindless,
+        frame: FrameData,
+        direct: Option<ImageHandle>,
+    ) -> (
+        ImageHandle,
+        ImageHandle,
+        Option<ImageHandle>,
+        Option<ImageHandle>,
+    ) {
+        let layout = bindless.pipeline_layout;
+        let camera = frame.space_camera;
+        let ext = frame.space_extent;
+        // Куски поля уровня, перепечённые в этом кадре (7.18г), — до всех лучей кадра.
+        if let Some(patch) = &self.level_patch {
+            graph.add_pass("правка поля уровня", &[], move |p| {
+                // SAFETY: проход вне рисования; картинки поля живы, пока поле готово
+                // (удаляются отложенно), буфер-источник — до конца кадра.
+                unsafe {
+                    crate::resources::record_texture_patches(
+                        p.device,
+                        p.cmd,
+                        patch.src,
+                        &patch.images,
+                    );
+                }
+            });
+        }
+        // Запечённое поле расстояний (7.10б): кубики у сдвинутых предметов и вошедшие
+        // в слои при полёте камеры — до всех лучей кадра.
+        if let Some(field) = frame.space_field {
+            let bake = self.space_field_bake;
+            let copies = self.space_field.copies.clone();
+            graph.add_pass("поле", &[], move |p| {
+                // SAFETY: проход вне рисования; конвейер жив, пока жива сцена; буферы
+                // поля и задания кадра живы, пока кадр выполняется.
+                unsafe {
+                    crate::field::SpaceField::record(
+                        p.device, p.cmd, bindless, layout, bake, &field, &copies,
+                    );
+                }
+            });
+        }
+        // Предварительное шагание конусами (7.8): точка на квадрат 8×8 пикселей.
+        let tiles = vk::Extent2D {
+            width: ext.width.div_ceil(CONE_TILE),
+            height: ext.height.div_ceil(CONE_TILE),
+        };
+        let cone = graph.create("конусы 3D", tiles, CONE_FORMAT);
+        graph.add_pass(
+            "лучи 3D грубо",
+            &[(cone, Access::ColorAttachment)],
+            move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots::default(),
+                    0,
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл картинку конусов в цель рисования; буфер сцены
+                // и буфер счётчиков этого кадра живы, пока кадр рисуется.
+                unsafe {
+                    // Первый проход лучей кадра: счётчики (7.18д2) — с нуля.
+                    if let Some((_, buffer, _)) = frame.space_counters {
+                        crate::counters::record_reset(d, cmd, buffer);
+                    }
+                    begin_color_pass(d, cmd, p.view(cone), tiles);
+                    bindless.bind(d, cmd);
+                    let pipeline = frame.space_counters.map_or(self.space_cone, |c| c.0.cone);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            },
+        );
+        // Полигональные модели (7.6ж): растеризация с глубиной в свой буфер геометрии
+        // той же раскладки. «Реймарчинг» не шагает дальше них и берёт их точку, если
+        // луч ни во что не попал раньше.
+        //
+        // С образцами MSAA (7.18е2) по числу лучей краёв: каждый луч края берёт свой
+        // образец, и край призмы получает столько же ступеней, сколько край формы SDF.
+        let pairs = ext != frame.extent;
+        #[cfg(not(test))]
+        let mesh_counts = self.mesh_counts;
+        #[cfg(test)]
+        let mesh_counts = if self.no_mesh_msaa {
+            vk::SampleCountFlags::empty()
+        } else {
+            self.mesh_counts
+        };
+        let (mesh_msaa, mesh_flags) = if frame.space_edges.is_some() {
+            mesh_samples(mesh_counts, pairs)
+        } else {
+            (Msaa::Off, 0)
+        };
+        let mesh_pipeline = match mesh_msaa {
+            Msaa::X2 => self.space_mesh_ms[0],
+            Msaa::X4 => self.space_mesh_ms[1],
+            _ => self.space_mesh,
+        };
+        let (mesh_msaa, mesh_flags, mesh_pipeline) = if mesh_pipeline == vk::Pipeline::null() {
+            (Msaa::Off, 0, self.space_mesh)
+        } else {
+            (mesh_msaa, mesh_flags, mesh_pipeline)
+        };
+        let meshes = (frame.space_vertices > 0).then(|| {
+            let samples = mesh_msaa.samples();
+            let meshes = graph.create_multisampled("полигоны 3D", ext, MESH_FORMAT, samples);
+            let depth =
+                graph.create_multisampled("глубина полигонов 3D", ext, MESH_DEPTH_FORMAT, samples);
+            graph.add_pass(
+                "полигоны 3D",
+                &[
+                    (meshes, Access::ColorAttachment),
+                    (depth, Access::StencilAttachment),
+                ],
+                move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots::default(),
+                        0,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
+                    // этого кадра жив, пока кадр рисуется.
+                    unsafe {
+                        // Нули: бит попадания упакованной точки — 0 (pack_mesh).
+                        begin_depth_pass(
+                            d,
+                            cmd,
+                            p.view(meshes),
+                            p.view(depth),
+                            ext,
+                            [0.0, 0.0, 0.0, 0.0],
+                        );
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, mesh_pipeline);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                },
+            );
+            meshes
+        });
+        // Флаги чтения полигонов для «реймарчинга» и «краёв 3D».
+        let mesh_bits = if meshes.is_some() {
+            SPACE_FLAG_MESHES | mesh_flags
+        } else {
+            0
+        };
+        let gbuffer = graph.create("буфер геометрии 3D", ext, GBUFFER_FORMAT);
+        if frame.space_compute {
+            // Опыт 7.6м: те же лучи вычислительным шейдером, прямо в картинку буфера
+            // геометрии (её читают тени и освещение как обычно).
+            let mut uses = vec![
+                (cone, Access::ComputeSampled),
+                (gbuffer, Access::ComputeWrite),
+            ];
+            if let Some(m) = meshes {
+                uses.push((m, Access::ComputeSampled));
+            }
+            graph.add_pass("реймарчинг", &uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        target: p.storage(gbuffer),
+                        cone: p.texture(cone),
+                        meshes: meshes.map_or(0, |m| p.texture(m)),
+                        ..SpaceSlots::default()
+                    },
+                    mesh_bits,
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл конусы (и полигоны) в чтение, буфер геометрии в
+                // запись; буфер сцены этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    bindless.bind_compute(d, cmd);
+                    let pipeline = frame
+                        .space_counters
+                        .map_or(self.space_march_compute, |c| c.0.march_compute);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                }
+            });
+        } else {
+            let mut march_uses = vec![(cone, Access::Sampled), (gbuffer, Access::ColorAttachment)];
+            if let Some(m) = meshes {
+                march_uses.push((m, Access::Sampled));
+            }
+            graph.add_pass("реймарчинг", &march_uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        cone: p.texture(cone),
+                        meshes: meshes.map_or(0, |m| p.texture(m)),
+                        ..SpaceSlots::default()
+                    },
+                    mesh_bits,
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
+                // этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(gbuffer), ext);
+                    bindless.bind(d, cmd);
+                    let pipeline = frame.space_counters.map_or(self.space_march, |c| c.0.march);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            });
+        }
+        // Тени и затенение в углах (7.4): мягкие, поэтому в половинном разрешении —
+        // точка на квадрат 2×2 пикселя, вчетверо меньше лучей (7.6б). «Сцена»
+        // растягивает их обратно с оглядкой на глубину и нормаль.
+        let half = vk::Extent2D {
+            width: ext.width.div_ceil(2),
+            height: ext.height.div_ceil(2),
+        };
+        // Карты теней ламп от треугольников (7.9б): квадраты рядом в одной картинке.
+        let shadow_maps = (frame.space_shadow_maps > 0).then(|| {
+            let count = frame.space_shadow_maps;
+            let size = vk::Extent2D {
+                width: SHADOW_MAP_SIZE * count,
+                height: SHADOW_MAP_SIZE,
+            };
+            let maps = graph.create("карты теней ламп", size, SHADOW_MAP_FORMAT);
+            let depth = graph.create("глубина карт теней", size, MESH_DEPTH_FORMAT);
+            graph.add_pass(
+                "карты теней ламп",
+                &[
+                    (maps, Access::ColorAttachment),
+                    (depth, Access::StencilAttachment),
+                ],
+                move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots::default(),
+                        0,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
+                    // этого кадра жив, пока кадр рисуется.
+                    unsafe {
+                        begin_depth_pass(
+                            d,
+                            cmd,
+                            p.view(maps),
+                            p.view(depth),
+                            size,
+                            [1e9, 0.0, 0.0, 0.0],
+                        );
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.space_mesh_shadow,
+                        );
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        for k in 0..count {
+                            let viewport = vk::Viewport::default()
+                                .x((k * SHADOW_MAP_SIZE) as f32)
+                                .width(SHADOW_MAP_SIZE as f32)
+                                .height(SHADOW_MAP_SIZE as f32)
+                                .max_depth(1.0);
+                            d.cmd_set_viewport(cmd, 0, &[viewport]);
+                            d.cmd_draw(cmd, frame.space_vertices, 1, 0, k);
+                        }
+                        d.cmd_end_rendering(cmd);
+                    }
+                },
+            );
+            maps
+        });
+        // Флаг и номер картинки карт теней для «теней 3D» и «краёв 3D».
+        let map_flags = move |p: &PassContext| {
+            shadow_maps.map_or(0, |m| SPACE_FLAG_SHADOW_MAP | (p.texture(m) << 16))
+        };
+        let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
+        let mut uses = vec![
+            (gbuffer, Access::Sampled),
+            (shadows, Access::ColorAttachment),
+        ];
+        if let Some(m) = shadow_maps {
+            uses.push((m, Access::Sampled));
+        }
+        graph.add_pass("тени 3D", &uses, move |p| {
+            let push = space_push(
+                &camera,
+                ext,
+                frame.time,
+                frame.space_address,
+                SpaceSlots {
+                    gbuffer: p.texture(gbuffer),
+                    ..SpaceSlots::default()
+                },
+                map_flags(p),
+            );
+            let (d, cmd) = (p.device, p.cmd);
+            // SAFETY: граф перевёл буфер геометрии в чтение, а тени в цель
+            // рисования; буфер сцены этого кадра жив, пока кадр рисуется.
+            unsafe {
+                begin_color_pass(d, cmd, p.view(shadows), half);
+                bindless.bind(d, cmd);
+                let pipeline = frame
+                    .space_counters
+                    .map_or(self.space_shadow, |c| c.0.shadow);
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                d.cmd_draw(cmd, 3, 1, 0, 0);
+                d.cmd_end_rendering(cmd);
+            }
+        });
+        // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
+        // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
+        let edges = frame.space_edges.map(|(list, list_buffer, count_buffer)| {
+            let pairs = if ext == frame.extent {
+                0
+            } else {
+                SPACE_FLAG_EDGE_PAIRS
+            };
+            let edges = graph.create("края 3D", ext, EDGE_FORMAT);
+            // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
+            // расходятся, — край, даже если буфер геометрии у соседей одинаков.
+            let mut find_uses = vec![
+                (gbuffer, Access::ComputeSampled),
+                (edges, Access::ComputeWrite),
+            ];
+            if let Some(m) = meshes {
+                find_uses.push((m, Access::ComputeSampled));
+            }
+            graph.add_pass("края 3D: поиск", &find_uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        gbuffer: p.texture(gbuffer),
+                        target: p.storage(edges),
+                        meshes: meshes.map_or(0, |m| p.texture(m)),
+                        edges: list,
+                        ..SpaceSlots::default()
+                    },
+                    mesh_bits | pairs,
+                );
+                // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей.
+                let start: Vec<u8> = [0u32, 1, 1, 0]
+                    .iter()
+                    .flat_map(|w| w.to_ne_bytes())
+                    .collect();
+                // Список этого кадра в прошлый раз читали проход «края 3D» и копия
+                // счётчика для процессора.
+                let before_reset = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                            | vk::PipelineStageFlags2::DRAW_INDIRECT
+                            | vk::PipelineStageFlags2::COPY,
+                    )
+                    .src_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::INDIRECT_COMMAND_READ
+                            | vk::AccessFlags2::TRANSFER_READ,
+                    )
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+                let after_reset = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )];
+                let after = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                            | vk::PipelineStageFlags2::DRAW_INDIRECT
+                            | vk::PipelineStageFlags2::COPY,
+                    )
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::INDIRECT_COMMAND_READ
+                            | vk::AccessFlags2::TRANSFER_READ,
+                    )];
+                // Начало списка (со счётчиком пикселей) — процессору, для панели
+                // (7.18б); читается, когда кадр закончен.
+                let count_copy = [vk::BufferCopy::default().size(16)];
+                let to_host = [vk::BufferMemoryBarrier2::default()
+                    .buffer(count_buffer)
+                    .size(vk::WHOLE_SIZE)
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл буфер геометрии (и полигоны) в чтение, а
+                // картинку краёв в запись; список краёв и буфер сцены этого кадра
+                // живы, пока кадр рисуется; барьеры выше упорядочивают список с
+                // прошлым кадром и со следующим проходом.
+                unsafe {
+                    d.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&before_reset),
+                    );
+                    d.cmd_update_buffer(cmd, list_buffer, 0, &start);
+                    d.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&after_reset),
+                    );
+                    bindless.bind_compute(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.space_edge_find);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                    d.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&after),
+                    );
+                    d.cmd_copy_buffer(cmd, list_buffer, count_buffer, &count_copy);
+                    d.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
+                    );
+                }
+            });
+            let mut uses = vec![
+                (cone, Access::ComputeSampled),
+                (gbuffer, Access::ComputeSampled),
+                (shadows, Access::ComputeSampled),
+                (edges, Access::ComputeWrite),
+            ];
+            if let Some(m) = meshes {
+                uses.push((m, Access::ComputeSampled));
+            }
+            if let Some(m) = shadow_maps {
+                uses.push((m, Access::ComputeSampled));
+            }
+            graph.add_pass("края 3D", &uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        gbuffer: p.texture(gbuffer),
+                        shadows: p.texture(shadows),
+                        target: p.storage(edges),
+                        cone: p.texture(cone),
+                        meshes: meshes.map_or(0, |m| p.texture(m)),
+                        edges: list,
+                    },
+                    mesh_bits | pairs | map_flags(p),
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
+                // список краёв записан (барьер в прошлом проходе) и жив весь кадр.
+                unsafe {
+                    bindless.bind_compute(d, cmd);
+                    let pipeline = frame.space_counters.map_or(self.space_edges, |c| c.0.edges);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_dispatch_indirect(cmd, list_buffer, 0);
+                }
+            });
+            edges
+        });
+        // Счётчики лучей (7.18д2) — процессору, после последнего прохода лучей.
+        if let Some((_, gpu, host)) = frame.space_counters {
+            graph.add_pass("счётчики 3D", &[], move |p| {
+                // SAFETY: проход вне рисования; оба буфера этого кадра живы, пока он
+                // рисуется, и созданы с нужными флагами (counter_buffers).
+                unsafe { crate::counters::record_copy(p.device, p.cmd, gpu, host) };
+            });
+        }
+        // Уменьшенное разрешение (7.14): освещение здесь же, в своей картинке того же
+        // размера; «сцена» растянет её на весь кадр. При прямом выводе (7.20а) — всегда:
+        // при разрешении 100 % освещение красит само окно, иначе «вывод» растянет картинку
+        // прямо в окно.
+        let window = direct.filter(|_| ext == frame.extent);
+        let lit = (direct.is_some() || ext != frame.extent).then(|| {
+            let color = window.unwrap_or_else(|| graph.create("цвет 3D", ext, SPACE_COLOR_FORMAT));
+            let mut uses = vec![
+                (gbuffer, Access::Sampled),
+                (shadows, Access::Sampled),
+                (color, Access::ColorAttachment),
+            ];
+            if let Some(e) = edges {
+                uses.push((e, Access::Sampled));
+            }
+            let (pipeline, dither) = match window {
+                Some(_) => (
+                    self.space_shade_present,
+                    u32::from(self.dither) * SPACE_FLAG_DITHER,
+                ),
+                None => (self.space_shade_small, 0),
+            };
+            graph.add_pass("освещение 3D", &uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        gbuffer: p.texture(gbuffer),
+                        shadows: p.texture(shadows),
+                        target: edges.map_or(0, |e| p.texture(e)),
+                        ..SpaceSlots::default()
+                    },
+                    (u32::from(edges.is_some()) * SPACE_FLAG_EDGES) | dither,
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл картинки 3D в чтение, а цвет (или окно) в цель
+                // рисования; буфер сцены этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    begin_color_pass(d, cmd, p.view(color), ext);
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, 3, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            });
+            color
+        });
+        let color = lit.filter(|_| window.is_none());
+        (gbuffer, shadows, edges, color)
     }
 
     /// Проходы поля расстояний сцены «свет» (4.2): «маска» рисует фигуры, отбрасывающие
@@ -4648,6 +4773,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.space_shade_small, None);
             ctx.device.destroy_pipeline(self.space_upscale, None);
+            ctx.device.destroy_pipeline(self.space_present, None);
+            ctx.device.destroy_pipeline(self.space_shade_present, None);
             ctx.device.destroy_pipeline(self.light, None);
             ctx.device.destroy_pipeline(self.object, None);
             ctx.device.destroy_pipeline(self.object_mask, None);
@@ -4680,6 +4807,8 @@ impl Demo {
         self.space_shade = vk::Pipeline::null();
         self.space_shade_small = vk::Pipeline::null();
         self.space_upscale = vk::Pipeline::null();
+        self.space_present = vk::Pipeline::null();
+        self.space_shade_present = vk::Pipeline::null();
         self.light = vk::Pipeline::null();
         self.object = vk::Pipeline::null();
         self.object_mask = vk::Pipeline::null();
@@ -4953,6 +5082,10 @@ const SPACE_FLAG_EDGE_PAIRS: u32 = 4;
 /// Флаг сцены «3D»: тени ламп от треугольников по картам теней (7.9б); номер картинки
 /// карт — в старших 16 битах флагов (как в space.slang).
 const SPACE_FLAG_SHADOW_MAP: u32 = 8;
+/// Флаг вывода «3D» прямо в окно (7.20а): шум против полос, как у обычного «вывода», — у
+/// растяжения в проходе «вывод» (raymarch_upscale.slang) и у «освещения 3D» при 100 %
+/// (raymarch_shade.slang).
+const SPACE_FLAG_DITHER: u32 = 64;
 /// Карта тени лампы (7.9б): расстояние от лампы до ближней поверхности.
 const SHADOW_MAP_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 /// Сторона карты тени лампы, точек.

@@ -27,6 +27,8 @@ struct Push
 [[vk::binding(0, 0)]] Texture2D textures[];
 [[vk::binding(1, 0)]] SamplerState samplers[2];
 
+#include "include/dither.slang"
+
 struct VertexOut
 {
     float4 position : SV_Position;
@@ -91,35 +93,6 @@ float3 tonemap(float3 c)
     float3 hue = c * (mapped / m);
     float white = saturate((m - 1.0) / 4.0);
     return lerp(hue, float3(mapped, mapped, mapped), white * 0.6);
-}
-
-float srgb_encode(float x)
-{
-    return x <= 0.0031308 ? x * 12.92 : 1.055 * pow(x, 1.0 / 2.4) - 0.055;
-}
-
-float srgb_decode(float x)
-{
-    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
-}
-
-// Шум для пикселя p в пределах ±1 ступени экрана (сумма двух равномерных — треугольное
-// распределение: так ступени исчезают, а шум почти не заметен). Не меняется от кадра к
-// кадру, чтобы не мерцать.
-float noise(float2 p)
-{
-    float a = frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
-    float b = frac(52.9829189 * frac(dot(p + float2(17.0, 59.0), float2(0.00583715, 0.06711056))));
-    return a + b - 1.0;
-}
-
-float3 dither(float3 c, float2 p)
-{
-    float n = noise(p) / 255.0;
-    float3 e = float3(srgb_encode(saturate(c.r)), srgb_encode(saturate(c.g)),
-                      srgb_encode(saturate(c.b)));
-    e = saturate(e + n);
-    return float3(srgb_decode(e.r), srgb_decode(e.g), srgb_decode(e.b));
 }
 
 [shader("fragment")]

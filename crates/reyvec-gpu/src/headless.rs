@@ -471,6 +471,9 @@ fn render(
             // Полигоны без образцов MSAA (7.18е2): края призм как до него.
             #[cfg(test)]
             demo.set_no_mesh_msaa(tests::NO_MESH_MSAA.get());
+            // Кадр «3D» через картинку сцены, как до 7.20а (для сравнения).
+            #[cfg(test)]
+            demo.set_no_direct(tests::NO_DIRECT.get());
             #[cfg(test)]
             tests::MESH_COUNTS.set(demo.mesh_counts());
             // Шаг в пустоте не длиннее клетки, как до 7.18д4 (для сравнения).
@@ -753,6 +756,8 @@ pub(crate) mod tests {
         pub(super) static LEVEL_VIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Полигоны без образцов MSAA (7.18е2).
         pub(super) static NO_MESH_MSAA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Кадр «3D» через картинку сцены, как до 7.20а.
+        pub(super) static NO_DIRECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Образцы полигонов, которые умеет видеокарта прошлого кадра (7.18е2).
         pub(super) static MESH_COUNTS: std::cell::Cell<ash::vk::SampleCountFlags> =
             const { std::cell::Cell::new(ash::vk::SampleCountFlags::empty()) };
@@ -1045,6 +1050,58 @@ pub(crate) mod tests {
             );
             assert!(mean < 3.0, "{}: средняя разница {mean:.2}", scale.title());
             assert!(share < 0.25, "{}: отличается {share:.3}", scale.title());
+        }
+    }
+
+    /// Прямой вывод «3D» в окно (7.20а): кадр без картинки сцены с MSAA и без прохода
+    /// «сцена» тот же, что через неё, — в полном разрешении 3D и в половинном, с MSAA и без.
+    /// Отличия только от округления цвета в кадре сцены (компактный формат B10G11R11):
+    /// почти у каждого пикселя на ступень, не больше чем на 3 из 255 (lavapipe). Прямой
+    /// вывод этого округления не делает.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn space_direct_output_matches_scene_pass() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let mut scene = hollow_side();
+        (scene.width, scene.height) = (641, 361);
+        for (scale, msaa) in [
+            (crate::SpaceScale::Full, Msaa::Off),
+            (crate::SpaceScale::Full, Msaa::X2),
+            (crate::SpaceScale::Half, Msaa::X2),
+        ] {
+            scene.msaa = msaa;
+            SPACE_SCALE.set(scale);
+            let errors = validation_error_count();
+            let direct = render_headless(&options, &scene);
+            NO_DIRECT.set(true);
+            let old = render_headless(&options, &scene);
+            NO_DIRECT.set(false);
+            SPACE_SCALE.set(crate::SpaceScale::Full);
+            let (direct, old) = (direct.expect("прямой вывод"), old.expect("через сцену"));
+            assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+            let (changed, worst, mean) = image_diff(&old.image, &direct.image);
+            eprintln!(
+                "{} {msaa:?}: отличается {changed} пикселей, наибольшая разница {worst}, \
+                 средняя {mean:.3}",
+                scale.title()
+            );
+            for (name, img) in [("прямой", &direct), ("через сцену", &old)] {
+                if let Some(t) = &img.gpu_timings {
+                    eprintln!("  {name}: {}", t.describe());
+                }
+            }
+            assert!(worst <= 4, "{}: наибольшая разница {worst}", scale.title());
+            assert!(mean < 1.5, "{}: средняя разница {mean:.3}", scale.title());
+            // Пути и правда разные: у прямого вывода нет прохода «сцена», у прежнего — есть.
+            for (img, want) in [(&direct, false), (&old, true)] {
+                if let Some(t) = &img.gpu_timings {
+                    let names: Vec<_> = t.passes.iter().map(|p| p.name).collect();
+                    assert_eq!(names.contains(&"сцена"), want, "проходы: {names:?}");
+                }
+            }
         }
     }
 
