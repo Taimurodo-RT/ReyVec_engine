@@ -28,10 +28,11 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
         // полю, у них выходят резкие края (пятна на стыке стенок полой коробки). Поэтому же
         // поле берём, только когда запас оценки (0.87 шага сетки) меньше трети расстояния:
         // так перешаг числа поля за настоящее расстояние мал.
+        // Плоскости (пол, стены) — формулой, один раз на шаг: и для оценки поля, и вместо
+        // их программ в переборе (7.19в).
+        float planes_d = planes ? planes_distance_shadow(q) : 1e9;
         float estimate;
-        float lower = field_lower(q, estimate);
-        if (planes)
-            lower = min(lower, planes_distance(q));
+        float lower = min(field_lower(q, estimate), planes_d);
         if (k * lower > 2.0 * t && lower > 2.0 * (estimate - lower))
         {
             t += estimate;
@@ -40,7 +41,7 @@ float soft_shadow(float3 from, float3 dir, float far, float k)
         }
         // Граница объекта вместо формы, только если она так далеко, что полутени не даёт:
         // k · h / t заметно больше 1 (см. scene_near).
-        float2 s = scene_near(q, max(0.15, 2.0 * t / k), true, planes);
+        float2 s = scene_near_shadow(q, max(0.15, 2.0 * t / k), planes_d);
         float h = s.x;
         // Уточнение по двум последним шагам: меньше полос в полутени.
         float y = h * h / (2.0 * last);
