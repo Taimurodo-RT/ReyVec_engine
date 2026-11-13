@@ -29,7 +29,7 @@ static const uint MAX_EDGES = 65535 * 16;
 
 bool is_edge(int2 px, int2 size)
 {
-    float4 g0 = textures[pc.gbuffer].Load(int3(px, 0));
+    float4 g0 = gbuffer_load(px);
     // Полигоны с образцами MSAA (7.18е2): пиксель, где образцы расходятся, — край, даже
     // если соседи по буферу геометрии одинаковы (щель уже пикселя).
     if (mesh_mixed(px, g0.x))
@@ -43,7 +43,7 @@ bool is_edge(int2 px, int2 size)
         int2 q = px + o;
         if (any(q < 0) || any(q >= size))
             continue;
-        float4 g1 = textures[pc.gbuffer].Load(int3(q, 0));
+        float4 g1 = gbuffer_load(q);
         if ((g0.x < 0.0) != (g1.x < 0.0))
             return true;
         if (g0.x < 0.0)
@@ -85,8 +85,8 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     if (lane == 0)
         group_count = 0;
     GroupMemoryBarrierWithGroupSync();
-    uint w, h;
-    textures[pc.gbuffer].GetDimensions(w, h);
+    int2 size = gbuffer_size();
+    uint w = uint(size.x), h = uint(size.y);
     int2 px = int2(id.xy);
     bool inside = id.x < w && id.y < h;
     bool edge = inside && is_edge(px, int2(w, h));

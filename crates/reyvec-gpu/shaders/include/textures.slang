@@ -11,6 +11,10 @@
 #define REYVEC_TEXTURES
 
 [[vk::binding(0, 0)]] Texture2D textures[];
+// Та же ячейка, но картинки из целых чисел: упакованные буфер геометрии (7.20б) и
+// «полигоны 3D» (7.18е2). slangc предупреждает о совпадении binding (E39001): так и
+// задумано, ячейка одна, вид чтения — по картинке.
+[[vk::binding(0, 0)]] Texture2D<uint4> textures_u[];
 [[vk::binding(1, 0)]] SamplerState samplers[2];
 
 #endif

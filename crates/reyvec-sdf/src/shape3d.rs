@@ -940,6 +940,10 @@ pub const SHADOW_LAMPS: usize = 2;
 
 /// Слов в записи материала и лампы.
 const MATERIAL_WORDS: usize = 8;
+/// Сколько материалов различает буфер геометрии сцены «3D» (7.20б: 12 бит номера,
+/// `GBUFFER_MATERIALS` в space.slang). Материалы с большими номерами рисуются последним;
+/// файл сцены с большим числом не загружается, сцена из уровня пишет предупреждение.
+pub const MAX_MATERIALS: usize = 4096;
 const LAMP_WORDS: usize = 8;
 /// Слов в записи объекта.
 pub const OBJECT_WORDS: usize = 8;

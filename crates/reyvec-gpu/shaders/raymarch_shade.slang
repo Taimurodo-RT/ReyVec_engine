@@ -18,7 +18,7 @@ float3 shade_pixel(VertexOut input)
         if (edge.a > 0.0)
             return edge.rgb;
     }
-    float4 g = textures[pc.gbuffer].Load(int3(px, 0));
+    float4 g = gbuffer_load(px);
     return shade_point(input.screen, g, px);
 }
 

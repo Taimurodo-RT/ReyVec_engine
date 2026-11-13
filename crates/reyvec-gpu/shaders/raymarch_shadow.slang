@@ -16,10 +16,10 @@
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
-    uint w, h;
-    textures[pc.gbuffer].GetDimensions(w, h);
-    int2 px = min(int2(input.position.xy) * 2, int2(w, h) - 1);
-    Surface s = read_surface(textures[pc.gbuffer].Load(int3(px, 0)));
+    int2 size = gbuffer_size();
+    uint w = uint(size.x), h = uint(size.y);
+    int2 px = min(int2(input.position.xy) * 2, size - 1);
+    Surface s = read_surface(gbuffer_load(px));
     if (s.t < 0.0)
         return float4(1.0, 1.0, 1.0, 1.0);
     // Луч того же пикселя кадра, что и точка буфера геометрии.

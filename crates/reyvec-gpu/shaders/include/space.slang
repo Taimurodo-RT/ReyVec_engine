@@ -454,13 +454,48 @@ uint2 pack_mesh(float t, uint material, float3 n)
     return uint2(asuint(t), 0x80000000u | (min(material, 2047u) << 20) | (e.x << 10) | e.y);
 }
 
-// Обратно в раскладку буфера геометрии (RGBA32F): без попадания — x = −1.
+// Обратно в раскладку буфера геометрии для шейдеров — float4(t, материал, нормаль), как у
+// unpack_gbuffer: без попадания — x = −1.
 float4 unpack_mesh(uint2 v)
 {
     if ((v.y & 0x80000000u) == 0)
         return float4(-1.0, 0.0, 0.0, 0.0);
     float2 e = float2(float((v.y >> 10) & 1023u), float(v.y & 1023u)) / 1022.0 * 2.0 - 1.0;
     return float4(asfloat(v.x), float((v.y >> 20) & 2047u), e);
+}
+
+// Буфер геометрии (7.20б, R32G32_UINT — 8 байт на точку вместо 16 у RGBA32F): x —
+// расстояние вдоль луча (биты float; меньше нуля — небо), y — 12 бит материала (старшие)
+// и по 10 бит на две половины нормали (oct_encode), как у pack_mesh. Множитель 1022
+// оставляет 0 и ±1 точными: нормали пола и граней вдоль осей не наклоняются. Сравнение
+// с прежним RGBA32F на lavapipe: пикселей краёв столько же, цвет — в пределах ступеней.
+// Раскладка для шейдеров та же, что была у RGBA32F: float4(t, материал, нормаль).
+static const uint GBUFFER_MATERIALS = 4096; // как shape3d::MAX_MATERIALS
+
+uint2 pack_gbuffer(float4 g)
+{
+    uint material = min(uint(max(g.y, 0.0) + 0.5), GBUFFER_MATERIALS - 1);
+    uint2 e = uint2(round(saturate(g.zw * 0.5 + 0.5) * 1022.0));
+    return uint2(asuint(g.x), (material << 20) | (e.x << 10) | e.y);
+}
+
+float4 unpack_gbuffer(uint2 v)
+{
+    float2 e = float2(float((v.y >> 10) & 1023u), float(v.y & 1023u)) / 1022.0 * 2.0 - 1.0;
+    return float4(asfloat(v.x), float(v.y >> 20), e);
+}
+
+// Точка буфера геометрии пикселя `px` (картинка pc.gbuffer).
+float4 gbuffer_load(int2 px)
+{
+    return unpack_gbuffer(textures_u[pc.gbuffer].Load(int3(px, 0)).xy);
+}
+
+int2 gbuffer_size()
+{
+    uint w, h;
+    textures_u[pc.gbuffer].GetDimensions(w, h);
+    return int2(w, h);
 }
 
 // Буфер геометрии одной точки экрана (см. raymarch.slang).
