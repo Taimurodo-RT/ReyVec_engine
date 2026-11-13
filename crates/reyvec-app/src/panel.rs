@@ -1174,7 +1174,10 @@ fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats, counting: bo
             } else {
                 String::new()
             };
-            format!("Края 3D: {n} пикселей ({share:.1} % кадра 3D){tail}")
+            let exact = s
+                .edge_unreliable
+                .map_or_else(String::new, |u| format!(", с точными тенями {u}"));
+            format!("Края 3D: {n} пикселей ({share:.1} % кадра 3D){exact}{tail}")
         }
         None => "Края 3D: число пикселей неизвестно (сглаживание выключено)".to_string(),
     };
@@ -1463,6 +1466,7 @@ mod tests {
                 dropped: 0,
                 overflow: None,
                 edge_pixels: Some(61_200),
+                edge_unreliable: Some(25_100),
                 pixels: 1280 * 720,
                 rays: Some(
                     [reyvec_gpu::RayCounts {

@@ -24,6 +24,43 @@ static const uint MATERIAL_GRID = 1;
 // не получал света вовсе и у пола выходил чёрной полосой.
 static const float3 GROUND = float3(0.12, 0.12, 0.13);
 
+// Вес точки теней `hp` (половинный размер) для пикселя с глубиной `t` и нормалью `n`:
+// `bilinear` — вес по расстоянию, дальше сходство по глубине и стороне. 0 — небо.
+// `gsize` — размер буфера геометрии.
+float shadow_weight(int2 hp, float bilinear, float t, float3 n, int2 gsize)
+{
+    float4 g = gbuffer_load(min(hp * 2, gsize - 1));
+    if (g.x < 0.0)
+        return 0.0;
+    float depth = saturate(1.0 - abs(g.x - t) / (0.02 * t + 0.05));
+    float facing = saturate(dot(oct_decode(g.zw), n));
+    facing *= facing;
+    facing *= facing;
+    return bilinear * depth * facing;
+}
+
+// Сколько веса набирают четыре ближайшие точки теней для пикселя `px` (то же `similar`,
+// что у upsampled_shadows_checked, но только по буферу геометрии: картинка теней не
+// нужна). `half_size` — размер картинки теней. По нему проход «края 3D: поиск» (7.19а)
+// заранее делит края на надёжные и ненадёжные.
+float shadow_similarity(int2 px, float t, float3 n, int2 half_size)
+{
+    int2 gsize = gbuffer_size();
+    int2 base = px >> 1;
+    float2 f = float2(px & 1) * 0.5;
+    float total = 0.0;
+    for (uint k = 0; k < 4; k++)
+    {
+        int2 o = int2(k & 1, k >> 1);
+        int2 hp = min(base + o, half_size - 1);
+        float bilinear = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
+        if (bilinear <= 0.0)
+            continue;
+        total += shadow_weight(hp, bilinear, t, n, gsize);
+    }
+    return total;
+}
+
 // Тени для пикселя `px` из половинного разрешения (7.6б). Точка теней h посчитана для
 // пикселя кадра 2h, поэтому пиксель кадра лежит между четырьмя ближайшими точками.
 // Каждая берётся с весом по расстоянию (как при обычном растяжении) и по сходству с
@@ -48,14 +85,10 @@ float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
         float bilinear = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
         if (bilinear <= 0.0)
             continue;
-        float4 g = gbuffer_load(min(hp * 2, gsize - 1));
-        if (g.x < 0.0)
+        // Как в shadow_similarity: по `similar` края заранее делятся на два списка.
+        float weight = shadow_weight(hp, bilinear, t, n, gsize);
+        if (weight <= 0.0)
             continue;
-        float depth = saturate(1.0 - abs(g.x - t) / (0.02 * t + 0.05));
-        float facing = saturate(dot(oct_decode(g.zw), n));
-        facing *= facing;
-        facing *= facing;
-        float weight = bilinear * depth * facing;
         sum += textures[pc.shadows].Load(int3(hp, 0)) * weight;
         total += weight;
     }

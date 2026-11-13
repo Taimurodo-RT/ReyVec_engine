@@ -73,6 +73,9 @@ pub struct SpaceStats {
     /// «края 3D: поиск», прочитан с видеокарты; в первом кадре ячейки — 0); `None` —
     /// сглаживание краёв выключено или список не создан.
     pub edge_pixels: Option<u32>,
+    /// Из них «ненадёжных» (7.19а): тени из половинного размера для них не подходят, и
+    /// проход «края 3D» считает им свои лучи тени. `None` — как у `edge_pixels`.
+    pub edge_unreliable: Option<u32>,
     /// Пикселей в кадре 3D (с учётом «Разрешения 3D»): для доли краёв.
     pub pixels: u32,
     /// Счётчики лучей по проходам (7.18д2) последнего законченного кадра этой ячейки, если
@@ -180,7 +183,7 @@ pub const MAX_SCENE_OBJECTS: usize = reyvec_sdf::shape3d::MAX_OBJECTS;
 pub const MAX_SCENE_WORDS: usize = crate::space::MAX_WORDS;
 /// Больше пикселей края в список не входит (`MAX_EDGES` в `raymarch_edge_find.slang`);
 /// остальные рисуются одним лучом.
-pub const MAX_EDGE_PIXELS: u32 = 65535 * 16;
+pub const MAX_EDGE_PIXELS: u32 = 65534 * 16;
 /// Полоса `B` поля слоя у выдавливания через поле (опыт 7.18б), м: как у поля уровня в
 /// `docs/decisions/0020-level-field.md`. На собственной сетке профиля значения до неё не
 /// доходят; в заголовке примитива она нужна порогу «только оценка».
@@ -1358,8 +1361,8 @@ impl Demo {
 
     /// Список пикселей краёв (7.6о) кадра `slot` для кадра размера `extent`: создаётся
     /// при первой надобности и пересоздаётся, когда кадр стал больше. Вместе с ним —
-    /// буфер на 16 байт, куда проход «края 3D: поиск» копирует начало списка со счётчиком
-    /// пикселей для панели (7.18б). `None` — не вышло (тогда края не сглаживаются).
+    /// буфер на 32 байта, куда проход «края 3D: поиск» копирует начало списка со счётчиками
+    /// пикселей для панели (7.18б, 7.19а). `None` — не вышло (тогда края не сглаживаются).
     fn edge_list(
         &mut self,
         ctx: &GpuContext,
@@ -1367,7 +1370,7 @@ impl Demo {
         slot: usize,
         extent: vk::Extent2D,
     ) -> Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)> {
-        let size = 16 + u64::from(extent.width) * u64::from(extent.height) * 4;
+        let size = 32 + u64::from(extent.width) * u64::from(extent.height) * 4;
         let entry = self.space_edge_lists.get_mut(slot)?;
         if entry.is_some_and(|(_, have)| have < size)
             && let Some((id, _)) = entry.take()
@@ -1397,7 +1400,7 @@ impl Demo {
         if count.is_none() {
             match res.create_buffer(
                 ctx,
-                16,
+                32,
                 vk::BufferUsageFlags::TRANSFER_DST,
                 BufferMemory::GpuToCpu,
                 &format!("число краёв 3D, кадр {slot}"),
@@ -1405,7 +1408,7 @@ impl Demo {
                 Ok(id) => {
                     // Панель читает буфер до первого кадра ячейки: пусть там будет 0, а не
                     // старая память (память видна процессору сразу, HOST_COHERENT).
-                    res.write_buffer(id, 0, &[0; 16]);
+                    res.write_buffer(id, 0, &[0; 32]);
                     *count = Some(id);
                 }
                 Err(e) => {
@@ -1426,9 +1429,22 @@ impl Demo {
     /// краёв, скопированный проходом «края 3D: поиск»). Кадр ячейки должен быть закончен
     /// (его забор дождались). `None` — списка краёв у ячейки нет.
     pub fn edge_pixels(&self, res: &GpuResources, slot: usize) -> Option<u32> {
+        self.edge_word(res, slot, 3)
+    }
+
+    /// Сколько из них «ненадёжных» (7.19а, проход «края 3D» считает им свои лучи тени);
+    /// условия — как у [`Self::edge_pixels`].
+    pub fn edge_unreliable(&self, res: &GpuResources, slot: usize) -> Option<u32> {
+        self.edge_word(res, slot, 4)
+    }
+
+    /// Слово `index` начала списка краёв, скопированного для процессора.
+    fn edge_word(&self, res: &GpuResources, slot: usize, index: usize) -> Option<u32> {
         let id = (*self.space_edge_counts.get(slot)?)?;
-        let bytes = res.read_buffer(id, 16)?;
-        Some(u32::from_ne_bytes(bytes.get(12..16)?.try_into().ok()?))
+        let bytes = res.read_buffer(id, 32)?;
+        Some(u32::from_ne_bytes(
+            bytes.get(index * 4..index * 4 + 4)?.try_into().ok()?,
+        ))
     }
 
     /// Счётчики последнего кадра сцены «3D» или 2.5D-вида для панели (7.18б); `None` —
@@ -3202,6 +3218,7 @@ impl Demo {
             // Счётчики для панели (7.18б): число краёв — из прошлого кадра этой ячейки
             // (он закончен: его забор дождались перед подготовкой), времена — отсюда.
             let edge_pixels = space_edges.and_then(|_| self.edge_pixels(res, slot));
+            let edge_unreliable = space_edges.and_then(|_| self.edge_unreliable(res, slot));
             let rays = self.ray_counts(res, slot);
             let started = std::time::Instant::now();
             let mut baked_inline = std::time::Duration::ZERO;
@@ -3317,6 +3334,7 @@ impl Demo {
                 dropped: packed.dropped,
                 overflow: packed.overflow,
                 edge_pixels,
+                edge_unreliable,
                 pixels: space_extent.width * space_extent.height,
                 rays,
             });
@@ -4186,8 +4204,9 @@ impl Demo {
                     },
                     mesh_bits | pairs,
                 );
-                // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей.
-                let start: Vec<u8> = [0u32, 1, 1, 0]
+                // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей всего, 0
+                // ненадёжных и 0 надёжных (7.19а), два слова не заняты.
+                let start: Vec<u8> = [0u32, 1, 1, 0, 0, 0, 0, 0]
                     .iter()
                     .flat_map(|w| w.to_ne_bytes())
                     .collect();
@@ -4227,9 +4246,9 @@ impl Demo {
                             | vk::AccessFlags2::INDIRECT_COMMAND_READ
                             | vk::AccessFlags2::TRANSFER_READ,
                     )];
-                // Начало списка (со счётчиком пикселей) — процессору, для панели
+                // Начало списка (со счётчиками пикселей) — процессору, для панели
                 // (7.18б); читается, когда кадр закончен.
-                let count_copy = [vk::BufferCopy::default().size(16)];
+                let count_copy = [vk::BufferCopy::default().size(32)];
                 let to_host = [vk::BufferMemoryBarrier2::default()
                     .buffer(count_buffer)
                     .size(vk::WHOLE_SIZE)

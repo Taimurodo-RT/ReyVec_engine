@@ -652,6 +652,7 @@ fn render(
         let space_stats = match (r.gpu.as_ref(), r.demo.as_ref()) {
             (Some(gpu), Some(demo)) => demo.space_stats().map(|mut s| {
                 s.edge_pixels = demo.edge_pixels(gpu, 0);
+                s.edge_unreliable = demo.edge_unreliable(gpu, 0);
                 s.rays = demo.ray_counts(gpu, 0);
                 s
             }),
@@ -1811,6 +1812,21 @@ pub(crate) mod tests {
                 "{name}: 4 луча на край"
             );
             assert!(rays[PASS_EDGE_SHADOWS].rays > 0, "{name}");
+            // Два списка краёв (7.19а): лучи тени — только у ненадёжных, не больше одного
+            // на долю света (солнце, углы, две лампы).
+            let unreliable = u64::from(stats.edge_unreliable.expect("края посчитаны"));
+            assert!(
+                unreliable > 0 && unreliable < edge_pixels,
+                "{name}: ненадёжных {unreliable} из {edge_pixels}"
+            );
+            // Угол (1 луч) у каждого ненадёжного пикселя точно, у остальных долей — если
+            // есть солнце и лампы.
+            assert!(
+                rays[PASS_EDGE_SHADOWS].rays >= unreliable
+                    && rays[PASS_EDGE_SHADOWS].rays <= 4 * unreliable,
+                "{name}: {:?}, ненадёжных {unreliable}",
+                rays[PASS_EDGE_SHADOWS]
+            );
             if let Some(t) = &image.gpu_timings {
                 eprintln!("{name} со счётчиками: {}", t.describe());
             }
