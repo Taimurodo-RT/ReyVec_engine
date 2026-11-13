@@ -540,6 +540,16 @@ fn render(
         let demo = &*demo;
         let camera = demo.camera_view();
         let player = demo.file_player();
+        // Сломанный или оборванный скрипт сцены меняет кадр (монетки замирают): тест
+        // должен упасть с понятной причиной, а не с разницей точек.
+        #[cfg(test)]
+        if let Some(info) = demo.script_info() {
+            assert!(
+                info.errors.is_empty(),
+                "ошибки скриптов сцены: {:?}",
+                info.errors
+            );
+        }
         let particles = demo.particle_stats();
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();

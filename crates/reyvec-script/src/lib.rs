@@ -15,8 +15,8 @@
 //!
 //! Защита: скрипты в песочнице Luau (нет доступа к файлам и системе, общие таблицы
 //! только для чтения), у каждого файла свои глобальные имена, на вызов — не больше
-//! [`CALL_BUDGET_MS`] миллисекунд (вечный цикл обрывается), на всё — не больше
-//! [`MEMORY_LIMIT`] байт.
+//! [`CALL_BUDGET_TICKS`] проверок Luau и не дольше [`CALL_BACKSTOP_MS`] по часам
+//! (вечный цикл обрывается), на всё — не больше [`MEMORY_LIMIT`] байт.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,8 +25,18 @@ use std::time::{Instant, SystemTime};
 
 use mlua::{Function, Lua, RegistryKey, Table, VmState};
 
-/// Сколько миллисекунд может думать один вызов скрипта.
-pub const CALL_BUDGET_MS: u64 = 5;
+/// Сколько раз один вызов скрипта может пройти проверку Luau (она стоит на каждом обороте
+/// цикла и вызове функции), прежде чем его оборвут. Счёт, а не часы: раньше предел был
+/// 5 мс по часам, и вызов, который система на миг остановила (загруженный процессор,
+/// рывок), обрывался, а скрипт выключался до правки файла — монетки замирали, и один и
+/// тот же шаг логики давал разное. Миллион проверок — десятки миллисекунд счёта: обычный
+/// скрипт тратит сотни, вечный цикл обрывается быстро и одинаково на любом компьютере.
+pub const CALL_BUDGET_TICKS: u64 = 1_000_000;
+/// Запасной предел вызова по часам. Проверка Luau не стоит внутри встроенных функций
+/// (`string.rep`, `table.concat`…): цикл из таких вызовов тратит проверку на оборот, а
+/// оборот — миллисекунды, и по счёту его не оборвать за разумное время. Секунда — далеко
+/// за любой остановкой потока системой, поэтому обычные вызовы по часам не обрываются.
+pub const CALL_BACKSTOP_MS: u64 = 1000;
 /// Память всех скриптов вместе.
 pub const MEMORY_LIMIT: usize = 64 << 20;
 
@@ -101,7 +111,9 @@ struct ScriptFile {
 pub struct Scripts {
     lua: Lua,
     files: Vec<ScriptFile>,
-    /// Когда оборвать текущий вызов: наносекунды от `epoch` (0 — не обрывать).
+    /// Сколько проверок Luau осталось текущему вызову (0 — вызова нет, не обрывать).
+    remaining: Arc<AtomicU64>,
+    /// Запасной предел текущего вызова: наносекунды от `epoch`.
     deadline: Arc<AtomicU64>,
     epoch: Instant,
     /// Сколько раз перечитаны файлы (для панели и тестов).
@@ -121,21 +133,27 @@ impl Scripts {
             tracing::warn!("песочница Luau: {e}");
         }
         let _ = lua.set_memory_limit(MEMORY_LIMIT);
+        let remaining = Arc::new(AtomicU64::new(0));
         let deadline = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
-        let d = Arc::clone(&deadline);
+        let (r, d) = (Arc::clone(&remaining), Arc::clone(&deadline));
         lua.set_interrupt(move |_| {
-            let limit = d.load(Ordering::Relaxed);
-            if limit != 0 && epoch.elapsed().as_nanos() as u64 > limit {
-                return Err(mlua::Error::runtime(format!(
-                    "скрипт думает дольше {CALL_BUDGET_MS} мс (вечный цикл?): вызов оборван"
-                )));
+            let left = r.load(Ordering::Relaxed);
+            if left == 0 {
+                return Ok(VmState::Continue);
             }
+            if left == 1 || epoch.elapsed().as_nanos() as u64 > d.load(Ordering::Relaxed) {
+                return Err(mlua::Error::runtime(
+                    "скрипт думает слишком долго (вечный цикл?): вызов оборван",
+                ));
+            }
+            r.store(left - 1, Ordering::Relaxed);
             Ok(VmState::Continue)
         });
         Self {
             lua,
             files: Vec::new(),
+            remaining,
             deadline,
             epoch,
             reloads: 0,
@@ -225,12 +243,13 @@ impl Scripts {
     }
 
     fn arm(&self) {
-        let limit = self.epoch.elapsed().as_nanos() as u64 + CALL_BUDGET_MS * 1_000_000;
+        let limit = self.epoch.elapsed().as_nanos() as u64 + CALL_BACKSTOP_MS * 1_000_000;
         self.deadline.store(limit, Ordering::Relaxed);
+        self.remaining.store(CALL_BUDGET_TICKS, Ordering::Relaxed);
     }
 
     fn disarm(&self) {
-        self.deadline.store(0, Ordering::Relaxed);
+        self.remaining.store(0, Ordering::Relaxed);
     }
 
     /// Перечитывает изменённые файлы. Возвращает, сколько перечитано.
@@ -460,7 +479,24 @@ mod tests {
         let a = s.actor(id).unwrap();
         let started = Instant::now();
         s.run(&a, &input(), &HeroIn::default(), 0.016);
-        assert!(started.elapsed().as_millis() < 500);
+        let took = started.elapsed();
+        eprintln!("вечный цикл оборван через {took:?}");
+        // Обрыв считается проверками, не часами: предел по времени — только от зависания.
+        assert!(took.as_secs() < 10, "{took:?}");
+        assert!(s.errors()[0].contains("оборван"), "{:?}", s.errors());
+        // Цикл из тяжёлых встроенных вызовов (проверка Luau — раз на оборот) обрывает
+        // запасной предел по часам.
+        let mut s = Scripts::new();
+        let id = s.load_text(
+            "rep.luau",
+            "function update(me) while true do local x = string.rep('x', 100000) end end",
+        );
+        let a = s.actor(id).unwrap();
+        let started = Instant::now();
+        s.run(&a, &input(), &HeroIn::default(), 0.016);
+        let took = started.elapsed();
+        eprintln!("цикл встроенных вызовов оборван через {took:?}");
+        assert!(took.as_secs() < 10, "{took:?}");
         assert!(s.errors()[0].contains("оборван"), "{:?}", s.errors());
         let mut s = Scripts::new();
         s.load_text(
@@ -478,6 +514,25 @@ mod tests {
         let (aa, bb) = (s.actor(a).unwrap(), s.actor(b).unwrap());
         assert_eq!(s.run(&aa, &input(), &HeroIn::default(), 0.0).move_x, 1.0);
         assert_eq!(s.run(&bb, &input(), &HeroIn::default(), 0.0).move_x, 0.5);
+    }
+
+    /// Предел вызова считается проверками Luau, а не часами (CI 2026-11-11: под нагрузкой
+    /// вызов монетки обрывался по 5 мс, скрипт выключался, и кадры одной сцены
+    /// расходились). Долгий, но конечный счёт не обрывается, сколько бы он ни шёл по
+    /// часам; ровно столько же оборотов — всегда одинаково.
+    #[test]
+    fn call_budget_counts_work_not_time() {
+        let mut s = Scripts::new();
+        let id = s.load_text(
+            "busy.luau",
+            "function update(me, hero, dt) local n = 0 for i = 1, 200000 do n = n + i end me.move = 1 end",
+        );
+        let a = s.actor(id).unwrap();
+        for _ in 0..3 {
+            let out = s.run(&a, &input(), &HeroIn::default(), 0.016);
+            assert_eq!(out.move_x, 1.0, "{:?}", s.errors());
+        }
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
     }
 
     #[test]
