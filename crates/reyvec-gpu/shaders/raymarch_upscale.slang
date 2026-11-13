@@ -8,8 +8,21 @@
 // даёт светлую или тёмную кайму, поэтому итог зажат между самым тёмным и самым светлым
 // из четырёх ближайших точек.
 // Картинка — pc.target, размер кадра — pc.height и pc.aspect (space_push в demo.rs).
+//
+// Прямой вывод (7.20а): если в кадре нет ничего, кроме «3D» (2.5D-вид уровня), этот же
+// шейдер рисует прямо в окно в проходе «вывод» — без картинки сцены с MSAA, её сведения
+// и ещё одного копирования. Тогда стоит SPACE_FLAG_DITHER (шум как в present.slang). При
+// разрешении 3D 100 % этот шейдер не нужен: окно красит raymarch_shade.slang.
 
 #include "include/space.slang"
+#include "include/dither.slang"
+
+float4 finish(float3 c, float2 position)
+{
+    if ((pc.flags & SPACE_FLAG_DITHER) != 0)
+        c = dither(c, position);
+    return float4(c, 1.0);
+}
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
@@ -52,5 +65,5 @@ float4 fs_main(VertexOut input) : SV_Target
         lo = min(lo, c);
         hi = max(hi, c);
     }
-    return float4(clamp(sum, lo, hi), 1.0);
+    return finish(clamp(sum, lo, hi), input.position.xy);
 }
