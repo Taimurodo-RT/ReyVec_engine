@@ -53,16 +53,24 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     bool pairs = (pc.flags & SPACE_FLAG_EDGE_PAIRS) != 0;
     uint shift = pairs ? 1 : 2;
     uint rays = 1u << shift;
-    uint count = min(pc.edges[3], 65535 * 16); // как MAX_EDGES в raymarch_edge_find.slang
-    uint i = id.x >> shift;
+    uint per = 64u >> shift;
     uint sub = id.x & (rays - 1);
-    int2 px = int2(0, 0);
     uint w, h;
     images[pc.target].GetDimensions(w, h);
+    // Два списка (raymarch_edge_find.slang, 7.19а): сначала группы ненадёжных пикселей,
+    // потом надёжных. Вид у всей группы один.
+    uint count_u = pc.edges[4];
+    uint count_r = pc.edges[5];
+    uint groups_u = (count_u + per - 1) / per;
+    uint group = id.x >> 6;
+    bool unreliable = group < groups_u;
+    uint j = ((unreliable ? group : group - groups_u) * per) + (lane >> shift);
+    bool valid = j < (unreliable ? count_u : count_r);
+    int2 px = int2(0, 0);
     float4 g0 = float4(-1.0, 0.0, 0.0, 0.0);
-    if (i < count)
+    if (valid)
     {
-        uint packed = pc.edges[4 + i];
+        uint packed = pc.edges[8 + (unreliable ? j : w * h - 1 - j)];
         px = int2(packed & 0xffff, packed >> 16);
         g0 = gbuffer_load(px);
     }
@@ -70,36 +78,38 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     // Точные доли света точки самого пикселя (солнце, углы, две лампы): потоки пикселя
     // делят их между собой (при двух лучах — по две). Только там, где тени из половинного
     // размера для неё ненадёжны (7.6с): у силуэта большой формы её сторона края и так
-    // покрыта похожими точками, и четыре луча тени на пиксель не нужны.
+    // покрыта похожими точками, и четыре луча тени на пиксель не нужны. Надёжна ли точка,
+    // уже решил «поиск» (тот же shadow_similarity, что внутри upsampled_shadows_checked).
     float3 n0 = oct_decode(g0.zw);
-    float similar = 0.0;
     float4 upsampled = float4(1.0, 1.0, 1.0, 1.0);
-    if (g0.x >= 0.0)
-        upsampled = upsampled_shadows_checked(px, g0.x, n0, similar);
-    bool reliable = similar >= 0.5;
     float2 part = float2(1.0, 1.0);
-    if (g0.x >= 0.0 && !reliable)
+    if (unreliable)
     {
-        float2 c = float2(px) + 0.5;
-        Ray r0 = screen_ray(float2(c.x / float(w) * 2.0 - 1.0, 1.0 - c.y / float(h) * 2.0));
-        float3 surface = r0.origin + r0.dir * g0.x;
-        part.x = shadow_part(surface, n0, g0.x, sub);
-        if (pairs)
-            part.y = shadow_part(surface, n0, g0.x, sub + 2);
+        if (g0.x >= 0.0)
+        {
+            float2 c = float2(px) + 0.5;
+            Ray r0 = screen_ray(float2(c.x / float(w) * 2.0 - 1.0, 1.0 - c.y / float(h) * 2.0));
+            float3 surface = r0.origin + r0.dir * g0.x;
+            part.x = shadow_part(surface, n0, g0.x, sub);
+            if (pairs)
+                part.y = shadow_part(surface, n0, g0.x, sub + 2);
+        }
     }
+    else if (g0.x >= 0.0)
+        upsampled = upsampled_shadows(px, g0.x, n0);
     counters_flush(PASS_EDGE_SHADOWS, id.x >> 6);
     parts[lane][0] = part.x;
     parts[lane][1] = part.y;
     GroupMemoryBarrierWithGroupSync();
     uint first = lane & ~(rays - 1);
     float4 exact = upsampled;
-    if (!reliable)
+    if (unreliable)
         exact = pairs
             ? float4(parts[first][0], parts[first + 1][0], parts[first][1], parts[first + 1][1])
             : float4(parts[first][0], parts[first + 1][0], parts[first + 2][0], parts[first + 3][0]);
 
     float3 color = float3(0.0, 0.0, 0.0);
-    if (i < count)
+    if (valid)
     {
         float2 at = float2(px) + 0.5 + (pairs ? SUBPIXEL_PAIR[sub] : SUBPIXEL[sub]);
         float2 screen = float2(at.x / float(w) * 2.0 - 1.0, 1.0 - at.y / float(h) * 2.0);
@@ -123,7 +133,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     // Складывает первый поток пикселя.
     colors[lane] = color;
     GroupMemoryBarrierWithGroupSync();
-    if (i < count && sub == 0)
+    if (valid && sub == 0)
     {
         float3 sum = colors[lane] + colors[lane + 1];
         if (!pairs)
