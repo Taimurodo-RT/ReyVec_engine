@@ -145,7 +145,7 @@ static const uint SCENE_NO_SUN = 2;
 // объект — так нормаль считает три точки из четырёх (normal_at).
 static const uint SCENE_ALL = 0xffffffffu;
 
-float2 scene_walk<let PICK : int>(float3 p, float near, bool proxies, bool planes, uint only, out uint winner, out float second)
+float2 scene_walk<let PICK : int>(float3 p, float near, bool proxies, bool planes, uint only, float bound, out uint winner, out float second)
 {
     count_scene();
     winner = SCENE_ALL;
@@ -196,6 +196,10 @@ float2 scene_walk<let PICK : int>(float3 p, float near, bool proxies, bool plane
             best = float2(length(p - clamp(p, lo, hi)), -1.0);
         }
     }
+    // Уже известное расстояние (7.19в: плоскости, посчитанные формулой): объекты дальше
+    // него не считаются, как если бы оно было первым объектом.
+    if (bound < best.x)
+        best = float2(bound, 0.0);
     // Поле уровня (7.18д3, слова 12 и 13 заголовка: номер объекта + 1 и начало его
     // программы) — до перебора: в списках сетки его нет, без сетки он пропускается ниже.
     if (level != 0 && (!single || only + 1 == level))
@@ -285,12 +289,24 @@ float2 scene_near(float3 p, float near, bool proxies, bool planes)
 {
     uint winner;
     float second;
-    return scene_walk<0>(p, near, proxies, planes, SCENE_ALL, winner, second);
+    return scene_walk<0>(p, near, proxies, planes, SCENE_ALL, 1e9, winner, second);
+}
+
+// Для теней (7.19в): как scene_near(p, near, true, false), но плоскости, которые
+// пропускаются, уже посчитаны формулой — их расстояние `planes_d` (planes_distance_shadow).
+// Ответ тот же, что у scene_near(p, near, true, true), до округления формулы плоскости:
+// плоскость в переборе стояла раньше объектов клетки и так же отсекала их по
+// шару-границе. Материал плоскости здесь 0: тени нужен только знак.
+float2 scene_near_shadow(float3 p, float near, float planes_d)
+{
+    uint winner;
+    float second;
+    return scene_walk<0>(p, near, true, false, SCENE_ALL, planes_d, winner, second);
 }
 
 float2 scene_pick(float3 p, float near, bool proxies, bool planes, uint only, out uint winner, out float second)
 {
-    return scene_walk<1>(p, near, proxies, planes, only, winner, second);
+    return scene_walk<1>(p, near, proxies, planes, only, 1e9, winner, second);
 }
 
 // Ближайшая точка плоскостей сцены на луче (7.6и): x — длина вдоль луча (1e30 — ни
@@ -347,6 +363,25 @@ float planes_distance(float3 p)
     for (uint k = 0; k < count; k++)
     {
         uint w = objects + min(pc.scene[list + k], MAX_OBJECTS - 1) * OBJECT_WORDS;
+        float3 n = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
+        best = min(best, dot(n, p) + asfloat(pc.scene[w + 3]));
+    }
+    return best;
+}
+
+// То же для лучей тени (7.19в): без плоскостей «без тени» (OBJECT_NO_SHADOW), как их
+// пропускает перебор при `proxies` (scene_walk).
+float planes_distance_shadow(float3 p)
+{
+    uint list = pc.scene[8];
+    uint count = min(pc.scene[9], MAX_PLANES);
+    uint objects = pc.scene[1];
+    float best = 1e9;
+    for (uint k = 0; k < count; k++)
+    {
+        uint w = objects + min(pc.scene[list + k], MAX_OBJECTS - 1) * OBJECT_WORDS;
+        if ((pc.scene[w + 2] & OBJECT_NO_SHADOW) != 0)
+            continue;
         float3 n = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
         best = min(best, dot(n, p) + asfloat(pc.scene[w + 3]));
     }
