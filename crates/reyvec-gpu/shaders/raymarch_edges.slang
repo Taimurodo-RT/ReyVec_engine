@@ -64,7 +64,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     {
         uint packed = pc.edges[4 + i];
         px = int2(packed & 0xffff, packed >> 16);
-        g0 = textures[pc.gbuffer].Load(int3(px, 0));
+        g0 = gbuffer_load(px);
     }
 
     // Точные доли света точки самого пикселя (солнце, углы, две лампы): потоки пикселя

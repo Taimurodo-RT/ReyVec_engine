@@ -1,7 +1,7 @@
 // Освещение точки сцены «3D» (этапы 7.3–7.4): общее для прохода «сцена»
 // (raymarch_shade.slang) и краёв форм (7.6о, raymarch_edges.slang). Перед подключением
 // должен быть подключён space.slang (с ним приходит и список картинок `textures[]`).
-// Буфер геометрии — `textures[pc.gbuffer]`, тени — `textures[pc.shadows]`.
+// Буфер геометрии — `gbuffer_load` (pc.gbuffer, space.slang), тени — `textures[pc.shadows]`.
 
 // Небо: к горизонту светлее.
 float3 sky(float3 dir)
@@ -33,8 +33,8 @@ static const float3 GROUND = float3(0.12, 0.12, 0.13);
 // тени пикселя растянуты из чужой или далёкой поверхности, ненадёжны (7.6с).
 float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
 {
-    uint gw, gh, sw, sh;
-    textures[pc.gbuffer].GetDimensions(gw, gh);
+    uint sw, sh;
+    int2 gsize = gbuffer_size();
     textures[pc.shadows].GetDimensions(sw, sh);
     int2 base = px >> 1;
     float2 f = float2(px & 1) * 0.5;
@@ -48,7 +48,7 @@ float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
         float bilinear = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y);
         if (bilinear <= 0.0)
             continue;
-        float4 g = textures[pc.gbuffer].Load(int3(min(hp * 2, int2(gw, gh) - 1), 0));
+        float4 g = gbuffer_load(min(hp * 2, gsize - 1));
         if (g.x < 0.0)
             continue;
         float depth = saturate(1.0 - abs(g.x - t) / (0.02 * t + 0.05));
@@ -69,7 +69,7 @@ float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
     for (uint k = 0; k < 16; k++)
     {
         int2 hp = clamp(base + int2(int(k & 3) - 1, int(k >> 2) - 1), int2(0, 0), int2(sw, sh) - 1);
-        float4 g = textures[pc.gbuffer].Load(int3(min(hp * 2, int2(gw, gh) - 1), 0));
+        float4 g = gbuffer_load(min(hp * 2, gsize - 1));
         if (g.x < 0.0)
             continue;
         float depth = saturate(1.0 - abs(g.x - t) / (0.02 * t + 0.05));

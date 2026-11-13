@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use reyvec_sdf::SpaceFrame;
 use reyvec_sdf::shape3d::{
-    MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_with,
+    MAX_MATERIALS, MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_with,
 };
 
 /// Сколько слов помещается в буфер сцены кадра (4 МБ: треугольники 2.5D-вида, 7.9б).
@@ -17,6 +17,7 @@ pub(crate) const MAX_WORDS: usize = 1024 * 1024;
 /// нарушен; панель показывает их каждый кадр, 7.18б).
 static WARNED_OBJECTS: AtomicBool = AtomicBool::new(false);
 static WARNED_WORDS: AtomicBool = AtomicBool::new(false);
+static WARNED_MATERIALS: AtomicBool = AtomicBool::new(false);
 
 /// Пишет предупреждение один раз на нарушение предела: `over` — предел нарушен сейчас.
 fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
@@ -130,6 +131,14 @@ pub(crate) fn pack_with(
         )
     });
     programs.truncate(MAX_OBJECTS);
+    // Буфер геометрии различает MAX_MATERIALS материалов (7.20б): у остальных цвет
+    // последнего.
+    warn_once(&WARNED_MATERIALS, materials.len() > MAX_MATERIALS, || {
+        format!(
+            "материалов сцены 3D больше предела: {} из {MAX_MATERIALS}, у лишних цвет последнего",
+            materials.len()
+        )
+    });
     let mut words = pack_scene_with(&programs, materials, &frame.lamps, level_field, free);
     let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
     let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;

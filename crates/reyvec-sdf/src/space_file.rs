@@ -11,7 +11,9 @@ use glam::Vec3;
 use serde::Deserialize;
 
 use crate::mesh3d::{MAX_TRIANGLES, Mesh3};
-use crate::shape3d::{Bob, Circle, Lamp3, Material3, Shape3, compile, motion_offset, rotation};
+use crate::shape3d::{
+    Bob, Circle, Lamp3, MAX_MATERIALS, Material3, Shape3, compile, motion_offset, rotation,
+};
 
 /// Встроенный пример: тот же текст, что `scenes/3d/space.ron` в папке проекта.
 pub const EXAMPLE: &str = include_str!("../../../scenes/3d/space.ron");
@@ -297,6 +299,12 @@ impl SpaceScene {
                 materials.len() as u32 - 1
             }));
         }
+        if materials.len() > MAX_MATERIALS {
+            return Err(format!(
+                "материалов (с лампочками) {}, больше {MAX_MATERIALS} не бывает",
+                materials.len()
+            ));
+        }
         Ok(Self {
             materials,
             lamps: file.lamps,
@@ -429,6 +437,27 @@ mod tests {
         // По умолчанию лучи вычислительным шейдером: обновление (update.bat) затирает
         // правки в файлах сцен, и строка `compute: true` пропадала.
         assert!(SpaceScene::parse(EXAMPLE).unwrap().compute);
+    }
+
+    /// Буфер геометрии различает MAX_MATERIALS материалов (7.20б): файл с большим числом —
+    /// понятная ошибка, а не тихо слитые цвета.
+    #[test]
+    fn too_many_materials_is_an_error() {
+        let list = |n: usize| {
+            (0..n)
+                .map(|i| format!(r##"(name: "м{i}", color: "#808080")"##))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let file = |n: usize| {
+            format!(
+                r##"(format: "reyvec-space", version: 1, materials: [{}])"##,
+                list(n)
+            )
+        };
+        assert!(SpaceScene::parse(&file(MAX_MATERIALS)).is_ok());
+        let err = SpaceScene::parse(&file(MAX_MATERIALS + 1)).unwrap_err();
+        assert!(err.contains(&MAX_MATERIALS.to_string()), "{err}");
     }
 
     #[test]
