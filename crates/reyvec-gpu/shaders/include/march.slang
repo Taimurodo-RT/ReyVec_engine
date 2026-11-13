@@ -1,8 +1,10 @@
 // Шагание луча глаза (7.3): общее для прохода «реймарчинг» (raymarch.slang) и краёв
 // форм (7.6о, raymarch_edges.slang). Список картинок `textures[]` приходит из
-// textures.slang. Начальные длины — `textures[pc.cone]`, полигоны — `textures[pc.meshes]`.
+// textures.slang. Начальные длины — `textures[pc.cone]`, полигоны — `pc.meshes`
+// (упакованные, mesh_sample).
 
 #include "space.slang"
+#include "mesh.slang"
 
 // Нормаль у точки попадания `p` (на расстоянии `t` по лучу). Ближе NORMAL_NEAR к точкам
 // тетраэдра настоящая форма всегда есть, поэтому объекты дальше отвечают шаром-границей —
@@ -40,8 +42,9 @@ float3 normal_at(float3 p, float t)
 }
 
 // Точка буфера геометрии для пикселя `px` (точка экрана `screen`). Общая для
-// пиксельного шейдера и вычислительного (опыт 7.6м).
-float4 march_pixel(int2 px, float2 screen)
+// пиксельного шейдера и вычислительного (опыт 7.6м). Лучи краёв (raymarch_edges.slang)
+// передают свой номер `sub` и середину пикселя `center` на экране, луч середины — −1.
+float4 march_pixel(int2 px, float2 screen, int sub, float2 center)
 {
     count_ray();
     Ray ray = screen_ray(screen);
@@ -53,7 +56,21 @@ float4 march_pixel(int2 px, float2 screen)
     // не попал раньше — пиксель их.
     float4 mesh = float4(-1.0, 0.0, 0.0, 0.0);
     if ((pc.flags & SPACE_FLAG_MESHES) != 0)
-        mesh = textures[pc.meshes].Load(int3(px, 0));
+    {
+        mesh = mesh_sample(px, sub);
+        // Расстояние в картинке — луча середины пикселя до плоскости грани (без затенения
+        // по образцам). Лучу края со своим образцом — до той же плоскости по его
+        // направлению; почти вдоль грани — как есть. Без образцов все лучи пикселя берут
+        // одну точку, как до 7.18е2.
+        if (sub >= 0 && mesh.x >= 0.0 && (pc.flags & SPACE_FLAG_MESH_MS) != 0)
+        {
+            Ray middle = screen_ray(center);
+            float3 n = oct_decode(mesh.zw);
+            float facing = dot(ray.dir, n);
+            if (abs(facing) > 0.05)
+                mesh.x = dot(middle.origin + middle.dir * mesh.x - ray.origin, n) / facing;
+        }
+    }
     float limit = mesh.x >= 0.0 ? min(mesh.x, ray.limit) : ray.limit;
     // Плоскости (пол, стены) — формулой (7.6и): луч шагает только среди остальных форм
     // и не дальше точки плоскости; не встретив ничего раньше, пиксель берёт её.

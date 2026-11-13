@@ -103,7 +103,10 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     {
         float2 at = float2(px) + 0.5 + (pairs ? SUBPIXEL_PAIR[sub] : SUBPIXEL[sub]);
         float2 screen = float2(at.x / float(w) * 2.0 - 1.0, 1.0 - at.y / float(h) * 2.0);
-        float4 g = march_pixel(px, screen);
+        float2 middle = float2(px) + 0.5;
+        float2 center = float2(middle.x / float(w) * 2.0 - 1.0, 1.0 - middle.y / float(h) * 2.0);
+        // Полигоны (7.18е2): свой образец MSAA у каждого луча — край призмы ровный.
+        float4 g = march_pixel(px, screen, int(sub), center);
         if (g.x < 0.0)
             color = sky(screen_ray(screen).dir);
         else

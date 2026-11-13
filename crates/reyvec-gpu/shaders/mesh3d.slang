@@ -1,8 +1,9 @@
 // Сцена «3D», проход «полигоны 3D» (опыт совмещения 7.6ж): полигональные модели
-// растеризацией с глубиной в свой буфер геометрии — той же раскладки, что у
-// «реймарчинга» (расстояние вдоль луча, материал, нормаль). «Реймарчинг» не шагает
-// дальше этих точек и берёт их, если луч раньше ни во что не попал; тени, затенение
-// в углах и свет дальше общие (raymarch_shadow.slang, raymarch_shade.slang).
+// растеризацией с глубиной в свой буфер геометрии — то же, что у «реймарчинга»
+// (расстояние вдоль луча, материал, нормаль), упакованное в 8 байт (pack_mesh).
+// «Реймарчинг» не шагает дальше этих точек и берёт их, если луч раньше ни во что не
+// попал; тени, затенение в углах и свет дальше общие (raymarch_shadow.slang,
+// raymarch_shade.slang).
 //
 // Вершины лежат в буфере сцены (crates/reyvec-gpu/src/space.rs): слово 7 заголовка —
 // начало раздела моделей (раскладка — MESH_HEADER_WORDS в space.slang), потом вершины
@@ -52,8 +53,11 @@ MeshOut vs_main(uint vertex : SV_VulkanVertexID)
     return o;
 }
 
+// Точка — упакованной (pack_mesh, 7.18е2). Без затенения по образцам: при MSAA все
+// накрытые образцы пикселя получают одно и то же — расстояние луча середины пикселя до
+// плоскости грани; лучи краёв пересчитывают его для своей точки (march.slang).
 [shader("fragment")]
-float4 fs_main(MeshOut input) : SV_Target
+uint4 fs_main(MeshOut input) : SV_Target
 {
     // Луч этого пикселя — как у «реймарчинга»: расстояние считается от его начала.
     float2 size = float2(round(pc.aspect * pc.height), pc.height);
@@ -63,5 +67,5 @@ float4 fs_main(MeshOut input) : SV_Target
     float3 n = normalize(cross(ddx(input.world), ddy(input.world)));
     if (dot(n, ray.dir) > 0.0)
         n = -n;
-    return float4(t, float(input.material), oct_encode(n));
+    return uint4(pack_mesh(t, input.material, n), 0, 0);
 }

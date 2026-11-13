@@ -98,6 +98,12 @@ static const uint SPACE_FLAG_EDGE_PAIRS = 4;
 // Тени ламп от треугольников — картами теней (7.9б, 2.5D-вид треугольниками): номер
 // картинки карт в общем списке текстур — старшие 16 бит pc.flags.
 static const uint SPACE_FLAG_SHADOW_MAP = 8;
+// Картинка «полигоны 3D» с образцами MSAA (7.18е2): 2 или 4 образца на пиксель (бит 5:
+// 0 — два, 1 — четыре). Луч края `sub` читает образец номер (pc.flags >> (8 + 2·sub)) & 3
+// — ближайший к его точке пикселя (таблица в demo.rs, mesh_samples).
+static const uint SPACE_FLAG_MESH_MS = 16;
+static const uint SPACE_FLAG_MESH_X4 = 32;
+static const uint MESH_SAMPLE_SHIFT = 8;
 // Раздел полигонов (слово 7 заголовка сцены): число вершин, число карт теней, 2 запасных,
 // матрица камеры, матрицы ламп для карт теней (по 16 чисел, столбцами), потом вершины.
 static const uint MESH_HEADER_WORDS = 52;
@@ -432,6 +438,26 @@ float3 oct_decode(float2 e)
     if (n.z < 0.0)
         n.xy = (1.0 - abs(n.yx)) * select(n.xy >= 0.0, float2(1.0), float2(-1.0));
     return normalize(n);
+}
+
+// Точка картинки «полигоны 3D» (7.18е2, R32G32_UINT — вдвое меньше RGBA32F: при 2× MSAA
+// цвет занимает столько же байт, сколько RGBA32F без образцов): x — расстояние вдоль луча
+// (биты float), y — бит 31 «есть попадание», 11 бит материала, по 10 бит на две половины
+// нормали. Множитель 1022 оставляет 0 и ±1 точными: нормали граней вдоль осей не
+// наклоняются. Очистка картинки — нули: бит попадания 0.
+uint2 pack_mesh(float t, uint material, float3 n)
+{
+    uint2 e = uint2(round(saturate(oct_encode(n) * 0.5 + 0.5) * 1022.0));
+    return uint2(asuint(t), 0x80000000u | (min(material, 2047u) << 20) | (e.x << 10) | e.y);
+}
+
+// Обратно в раскладку буфера геометрии (RGBA32F): без попадания — x = −1.
+float4 unpack_mesh(uint2 v)
+{
+    if ((v.y & 0x80000000u) == 0)
+        return float4(-1.0, 0.0, 0.0, 0.0);
+    float2 e = float2(float((v.y >> 10) & 1023u), float(v.y & 1023u)) / 1022.0 * 2.0 - 1.0;
+    return float4(asfloat(v.x), float((v.y >> 20) & 2047u), e);
 }
 
 // Буфер геометрии одной точки экрана (см. raymarch.slang).

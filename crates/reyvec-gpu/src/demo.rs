@@ -582,6 +582,11 @@ pub(crate) struct Demo {
     space_march: vk::Pipeline,
     /// Полигональные модели сцены «3D» (7.6ж, `mesh3d.slang`) в свой буфер геометрии.
     space_mesh: vk::Pipeline,
+    /// …то же с образцами MSAA 2× и 4× (7.18е2): ровные края призм; null — не умеет.
+    space_mesh_ms: [vk::Pipeline; 2],
+    /// Сколько образцов видеокарта умеет для картинки полигонов (2× и 4×, только при
+    /// стандартных точках образцов).
+    mesh_counts: vk::SampleCountFlags,
     /// Карты теней ламп от треугольников (7.9б, `mesh_shadow.slang`).
     space_mesh_shadow: vk::Pipeline,
     space_cone: vk::Pipeline,
@@ -618,6 +623,9 @@ pub(crate) struct Demo {
     /// Без карт теней ламп в режиме треугольников (7.18е; только для тестов).
     #[cfg(test)]
     no_shadow_maps: bool,
+    /// Картинка полигонов без образцов MSAA (7.18е2; только для тестов).
+    #[cfg(test)]
+    no_mesh_msaa: bool,
     /// Конвейеры со счётчиками; `None` — ещё не собраны.
     space_counted: Option<CountedPipelines>,
     /// Буфер счётчиков и его копия для процессора, свои у каждого кадра в полёте.
@@ -914,6 +922,8 @@ impl Demo {
             & limits.framebuffer_stencil_sample_counts;
         let scene_format = pick_scene_format(ctx, msaa_counts);
         tracing::info!("Формат кадра сцены: {scene_format:?}");
+        let mesh_counts = pick_mesh_counts(ctx, &limits);
+        tracing::info!("Образцы картинки полигонов 3D: {mesh_counts:?}");
         tracing::info!(
             "Поле расстояний света: в {} раза меньше кадра по каждой стороне",
             field_downscale_for(ctx.adapter.kind)
@@ -938,6 +948,8 @@ impl Demo {
             sdf: vk::Pipeline::null(),
             space_march: vk::Pipeline::null(),
             space_mesh: vk::Pipeline::null(),
+            space_mesh_ms: [vk::Pipeline::null(); 2],
+            mesh_counts,
             space_mesh_shadow: vk::Pipeline::null(),
             space_cone: vk::Pipeline::null(),
             space_shadow: vk::Pipeline::null(),
@@ -955,6 +967,8 @@ impl Demo {
             full_normal: false,
             #[cfg(test)]
             no_shadow_maps: false,
+            #[cfg(test)]
+            no_mesh_msaa: false,
             space_counted: None,
             space_counter_buffers: vec![None; frames_in_flight],
             space_counted_slots: vec![false; frames_in_flight],
@@ -1135,10 +1149,23 @@ impl Demo {
                 res,
                 shaders,
                 "mesh3d",
-                GBUFFER_FORMAT,
+                MESH_FORMAT,
                 Msaa::Off,
                 Some(MESH_DEPTH_FORMAT),
             )?;
+            for (slot, msaa) in [Msaa::X2, Msaa::X4].into_iter().enumerate() {
+                if demo.mesh_counts.contains(msaa.samples()) {
+                    demo.space_mesh_ms[slot] = build(
+                        ctx,
+                        res,
+                        shaders,
+                        "mesh3d",
+                        MESH_FORMAT,
+                        msaa,
+                        Some(MESH_DEPTH_FORMAT),
+                    )?;
+                }
+            }
             demo.space_mesh_shadow = build(
                 ctx,
                 res,
@@ -1598,6 +1625,18 @@ impl Demo {
     #[cfg(test)]
     pub(crate) fn set_no_shadow_maps(&mut self, on: bool) {
         self.no_shadow_maps = on;
+    }
+
+    /// Картинка полигонов без образцов MSAA (7.18е2) — для сравнения.
+    #[cfg(test)]
+    pub(crate) fn set_no_mesh_msaa(&mut self, on: bool) {
+        self.no_mesh_msaa = on;
+    }
+
+    /// Образцы картинки полигонов, которые видеокарта умеет (7.18е2).
+    #[cfg(test)]
+    pub(crate) fn mesh_counts(&self) -> vk::SampleCountFlags {
+        self.mesh_counts
     }
 
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
@@ -2703,12 +2742,37 @@ impl Demo {
                 ),
                 "raymarch" => (&mut self.space_march, GBUFFER_FORMAT, Msaa::Off, None),
                 "raymarch_cone" => (&mut self.space_cone, CONE_FORMAT, Msaa::Off, None),
-                "mesh3d" => (
-                    &mut self.space_mesh,
-                    GBUFFER_FORMAT,
-                    Msaa::Off,
-                    Some(MESH_DEPTH_FORMAT),
-                ),
+                "mesh3d" => {
+                    // Варианты с образцами MSAA (7.18е2) — те же шейдеры.
+                    for (slot, msaa) in [Msaa::X2, Msaa::X4].into_iter().enumerate() {
+                        if !self.mesh_counts.contains(msaa.samples()) {
+                            continue;
+                        }
+                        let built = build(
+                            ctx,
+                            res,
+                            shaders,
+                            name,
+                            MESH_FORMAT,
+                            msaa,
+                            Some(MESH_DEPTH_FORMAT),
+                        );
+                        match built {
+                            Ok(new) => {
+                                let old = std::mem::replace(&mut self.space_mesh_ms[slot], new);
+                                // SAFETY: видеокарта простаивает (условие функции).
+                                unsafe { ctx.device.destroy_pipeline(old, None) };
+                            }
+                            Err(e) => shaders.set_error(name, e.to_string()),
+                        }
+                    }
+                    (
+                        &mut self.space_mesh,
+                        MESH_FORMAT,
+                        Msaa::Off,
+                        Some(MESH_DEPTH_FORMAT),
+                    )
+                }
                 "mesh_shadow" => (
                     &mut self.space_mesh_shadow,
                     SHADOW_MAP_FORMAT,
@@ -3132,7 +3196,12 @@ impl Demo {
                     .space_field
                     .prepare(ctx, res, slot, space_camera.eye, programs);
             }
-            let view_proj = space_camera.view_proj(aspect);
+            // Соотношение сторон — картинки лучей 3D, а не окна: при уменьшенном
+            // разрешении 3D с нечётным размером окна (div_ceil) они чуть расходятся, и
+            // образцы картинки полигонов сдвинулись бы от лучей края к бокам экрана (7.18е2).
+            let ray_extent = self.space_scale.apply(extent);
+            let ray_aspect = ray_extent.width as f32 / ray_extent.height.max(1) as f32;
+            let view_proj = space_camera.view_proj(ray_aspect);
             self.space_view_culled = level || !self.space.view_culling_off;
             if self.space_view_culled {
                 // У уровня солнца нет: его заслонки не держим, иначе в кадр комнаты
@@ -3492,9 +3561,42 @@ impl Demo {
             // Полигональные модели (7.6ж): растеризация с глубиной в свой буфер геометрии
             // той же раскладки. «Реймарчинг» не шагает дальше них и берёт их точку, если
             // луч ни во что не попал раньше.
+            //
+            // С образцами MSAA (7.18е2) по числу лучей краёв: каждый луч края берёт свой
+            // образец, и край призмы получает столько же ступеней, сколько край формы SDF.
+            let pairs = ext != frame.extent;
+            #[cfg(not(test))]
+            let mesh_counts = self.mesh_counts;
+            #[cfg(test)]
+            let mesh_counts = if self.no_mesh_msaa {
+                vk::SampleCountFlags::empty()
+            } else {
+                self.mesh_counts
+            };
+            let (mesh_msaa, mesh_flags) = if frame.space_edges.is_some() {
+                mesh_samples(mesh_counts, pairs)
+            } else {
+                (Msaa::Off, 0)
+            };
+            let mesh_pipeline = match mesh_msaa {
+                Msaa::X2 => self.space_mesh_ms[0],
+                Msaa::X4 => self.space_mesh_ms[1],
+                _ => self.space_mesh,
+            };
+            let (mesh_msaa, mesh_flags, mesh_pipeline) = if mesh_pipeline == vk::Pipeline::null() {
+                (Msaa::Off, 0, self.space_mesh)
+            } else {
+                (mesh_msaa, mesh_flags, mesh_pipeline)
+            };
             let meshes = (frame.space_vertices > 0).then(|| {
-                let meshes = graph.create("полигоны 3D", ext, GBUFFER_FORMAT);
-                let depth = graph.create("глубина полигонов 3D", ext, MESH_DEPTH_FORMAT);
+                let samples = mesh_msaa.samples();
+                let meshes = graph.create_multisampled("полигоны 3D", ext, MESH_FORMAT, samples);
+                let depth = graph.create_multisampled(
+                    "глубина полигонов 3D",
+                    ext,
+                    MESH_DEPTH_FORMAT,
+                    samples,
+                );
                 graph.add_pass(
                     "полигоны 3D",
                     &[
@@ -3514,19 +3616,20 @@ impl Demo {
                         // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
                         // этого кадра жив, пока кадр рисуется.
                         unsafe {
+                            // Нули: бит попадания упакованной точки — 0 (pack_mesh).
                             begin_depth_pass(
                                 d,
                                 cmd,
                                 p.view(meshes),
                                 p.view(depth),
                                 ext,
-                                [-1.0, 0.0, 0.0, 0.0],
+                                [0.0, 0.0, 0.0, 0.0],
                             );
                             bindless.bind(d, cmd);
                             d.cmd_bind_pipeline(
                                 cmd,
                                 vk::PipelineBindPoint::GRAPHICS,
-                                self.space_mesh,
+                                mesh_pipeline,
                             );
                             d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                             d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
@@ -3536,6 +3639,12 @@ impl Demo {
                 );
                 meshes
             });
+            // Флаги чтения полигонов для «реймарчинга» и «краёв 3D».
+            let mesh_bits = if meshes.is_some() {
+                SPACE_FLAG_MESHES | mesh_flags
+            } else {
+                0
+            };
             let gbuffer = graph.create("буфер геометрии 3D", ext, GBUFFER_FORMAT);
             if frame.space_compute {
                 // Опыт 7.6м: те же лучи вычислительным шейдером, прямо в картинку буфера
@@ -3559,7 +3668,7 @@ impl Demo {
                             meshes: meshes.map_or(0, |m| p.texture(m)),
                             ..SpaceSlots::default()
                         },
-                        u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
+                        mesh_bits,
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл конусы (и полигоны) в чтение, буфер геометрии в
@@ -3591,7 +3700,7 @@ impl Demo {
                             meshes: meshes.map_or(0, |m| p.texture(m)),
                             ..SpaceSlots::default()
                         },
-                        u32::from(meshes.is_some()) * SPACE_FLAG_MESHES,
+                        mesh_bits,
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл буфер геометрии в цель рисования; буфер сцены
@@ -3720,114 +3829,117 @@ impl Demo {
                     SPACE_FLAG_EDGE_PAIRS
                 };
                 let edges = graph.create("края 3D", ext, EDGE_FORMAT);
-                graph.add_pass(
-                    "края 3D: поиск",
-                    &[
-                        (gbuffer, Access::ComputeSampled),
-                        (edges, Access::ComputeWrite),
-                    ],
-                    move |p| {
-                        let push = space_push(
-                            &camera,
-                            ext,
-                            frame.time,
-                            frame.space_address,
-                            SpaceSlots {
-                                gbuffer: p.texture(gbuffer),
-                                target: p.storage(edges),
-                                edges: list,
-                                ..SpaceSlots::default()
-                            },
-                            pairs,
+                // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
+                // расходятся, — край, даже если буфер геометрии у соседей одинаков.
+                let mut find_uses = vec![
+                    (gbuffer, Access::ComputeSampled),
+                    (edges, Access::ComputeWrite),
+                ];
+                if let Some(m) = meshes {
+                    find_uses.push((m, Access::ComputeSampled));
+                }
+                graph.add_pass("края 3D: поиск", &find_uses, move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            gbuffer: p.texture(gbuffer),
+                            target: p.storage(edges),
+                            meshes: meshes.map_or(0, |m| p.texture(m)),
+                            edges: list,
+                            ..SpaceSlots::default()
+                        },
+                        mesh_bits | pairs,
+                    );
+                    // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей.
+                    let start: Vec<u8> = [0u32, 1, 1, 0]
+                        .iter()
+                        .flat_map(|w| w.to_ne_bytes())
+                        .collect();
+                    // Список этого кадра в прошлый раз читали проход «края 3D» и копия
+                    // счётчика для процессора.
+                    let before_reset = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(
+                            vk::PipelineStageFlags2::COMPUTE_SHADER
+                                | vk::PipelineStageFlags2::DRAW_INDIRECT
+                                | vk::PipelineStageFlags2::COPY,
+                        )
+                        .src_access_mask(
+                            vk::AccessFlags2::SHADER_STORAGE_READ
+                                | vk::AccessFlags2::INDIRECT_COMMAND_READ
+                                | vk::AccessFlags2::TRANSFER_READ,
+                        )
+                        .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
+                    let after_reset = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(
+                            vk::AccessFlags2::SHADER_STORAGE_READ
+                                | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                        )];
+                    let after = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                        .dst_stage_mask(
+                            vk::PipelineStageFlags2::COMPUTE_SHADER
+                                | vk::PipelineStageFlags2::DRAW_INDIRECT
+                                | vk::PipelineStageFlags2::COPY,
+                        )
+                        .dst_access_mask(
+                            vk::AccessFlags2::SHADER_STORAGE_READ
+                                | vk::AccessFlags2::INDIRECT_COMMAND_READ
+                                | vk::AccessFlags2::TRANSFER_READ,
+                        )];
+                    // Начало списка (со счётчиком пикселей) — процессору, для панели
+                    // (7.18б); читается, когда кадр закончен.
+                    let count_copy = [vk::BufferCopy::default().size(16)];
+                    let to_host = [vk::BufferMemoryBarrier2::default()
+                        .buffer(count_buffer)
+                        .size(vk::WHOLE_SIZE)
+                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                        .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл буфер геометрии (и полигоны) в чтение, а
+                    // картинку краёв в запись; список краёв и буфер сцены этого кадра
+                    // живы, пока кадр рисуется; барьеры выше упорядочивают список с
+                    // прошлым кадром и со следующим проходом.
+                    unsafe {
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&before_reset),
                         );
-                        // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей.
-                        let start: Vec<u8> = [0u32, 1, 1, 0]
-                            .iter()
-                            .flat_map(|w| w.to_ne_bytes())
-                            .collect();
-                        // Список этого кадра в прошлый раз читали проход «края 3D» и копия
-                        // счётчика для процессора.
-                        let before_reset = [vk::MemoryBarrier2::default()
-                            .src_stage_mask(
-                                vk::PipelineStageFlags2::COMPUTE_SHADER
-                                    | vk::PipelineStageFlags2::DRAW_INDIRECT
-                                    | vk::PipelineStageFlags2::COPY,
-                            )
-                            .src_access_mask(
-                                vk::AccessFlags2::SHADER_STORAGE_READ
-                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ
-                                    | vk::AccessFlags2::TRANSFER_READ,
-                            )
-                            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-                            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)];
-                        let after_reset = [vk::MemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .dst_access_mask(
-                                vk::AccessFlags2::SHADER_STORAGE_READ
-                                    | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                            )];
-                        let after = [vk::MemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                            .dst_stage_mask(
-                                vk::PipelineStageFlags2::COMPUTE_SHADER
-                                    | vk::PipelineStageFlags2::DRAW_INDIRECT
-                                    | vk::PipelineStageFlags2::COPY,
-                            )
-                            .dst_access_mask(
-                                vk::AccessFlags2::SHADER_STORAGE_READ
-                                    | vk::AccessFlags2::INDIRECT_COMMAND_READ
-                                    | vk::AccessFlags2::TRANSFER_READ,
-                            )];
-                        // Начало списка (со счётчиком пикселей) — процессору, для панели
-                        // (7.18б); читается, когда кадр закончен.
-                        let count_copy = [vk::BufferCopy::default().size(16)];
-                        let to_host = [vk::BufferMemoryBarrier2::default()
-                            .buffer(count_buffer)
-                            .size(vk::WHOLE_SIZE)
-                            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                            .dst_access_mask(vk::AccessFlags2::HOST_READ)
-                            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
-                        let (d, cmd) = (p.device, p.cmd);
-                        // SAFETY: граф перевёл буфер геометрии в чтение, а картинку краёв в
-                        // запись; список краёв и буфер сцены этого кадра живы, пока кадр
-                        // рисуется; барьеры выше упорядочивают список с прошлым кадром и
-                        // со следующим проходом.
-                        unsafe {
-                            d.cmd_pipeline_barrier2(
-                                cmd,
-                                &vk::DependencyInfo::default().memory_barriers(&before_reset),
-                            );
-                            d.cmd_update_buffer(cmd, list_buffer, 0, &start);
-                            d.cmd_pipeline_barrier2(
-                                cmd,
-                                &vk::DependencyInfo::default().memory_barriers(&after_reset),
-                            );
-                            bindless.bind_compute(d, cmd);
-                            d.cmd_bind_pipeline(
-                                cmd,
-                                vk::PipelineBindPoint::COMPUTE,
-                                self.space_edge_find,
-                            );
-                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                            d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
-                            d.cmd_pipeline_barrier2(
-                                cmd,
-                                &vk::DependencyInfo::default().memory_barriers(&after),
-                            );
-                            d.cmd_copy_buffer(cmd, list_buffer, count_buffer, &count_copy);
-                            d.cmd_pipeline_barrier2(
-                                cmd,
-                                &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
-                            );
-                        }
-                    },
-                );
+                        d.cmd_update_buffer(cmd, list_buffer, 0, &start);
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&after_reset),
+                        );
+                        bindless.bind_compute(d, cmd);
+                        d.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.space_edge_find,
+                        );
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&after),
+                        );
+                        d.cmd_copy_buffer(cmd, list_buffer, count_buffer, &count_copy);
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().buffer_memory_barriers(&to_host),
+                        );
+                    }
+                });
                 let mut uses = vec![
                     (cone, Access::ComputeSampled),
                     (gbuffer, Access::ComputeSampled),
@@ -3854,7 +3966,7 @@ impl Demo {
                             meshes: meshes.map_or(0, |m| p.texture(m)),
                             edges: list,
                         },
-                        (u32::from(meshes.is_some()) * SPACE_FLAG_MESHES) | pairs | map_flags(p),
+                        mesh_bits | pairs | map_flags(p),
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
@@ -4523,6 +4635,9 @@ impl Demo {
             ctx.device.destroy_pipeline(self.sdf, None);
             ctx.device.destroy_pipeline(self.space_march, None);
             ctx.device.destroy_pipeline(self.space_mesh, None);
+            for p in self.space_mesh_ms {
+                ctx.device.destroy_pipeline(p, None);
+            }
             ctx.device.destroy_pipeline(self.space_mesh_shadow, None);
             ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
@@ -4554,6 +4669,7 @@ impl Demo {
         self.sdf = vk::Pipeline::null();
         self.space_march = vk::Pipeline::null();
         self.space_mesh = vk::Pipeline::null();
+        self.space_mesh_ms = [vk::Pipeline::null(); 2];
         self.space_mesh_shadow = vk::Pipeline::null();
         self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
@@ -4767,6 +4883,66 @@ const GBUFFER_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
 const CONE_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 /// Глубина прохода «полигоны 3D» (7.6ж). D32 видеокарты умеют все.
 const MESH_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+/// Картинка «полигоны 3D» (7.18е2): упакованная точка — расстояние, материал и нормаль в
+/// 8 байтах (`pack_mesh` в space.slang), вдвое меньше [`GBUFFER_FORMAT`]: с образцами MSAA
+/// 2× цвет занимает столько же байт, сколько было без них (глубина D32 и 4× — больше).
+const MESH_FORMAT: vk::Format = vk::Format::R32G32_UINT;
+/// Флаг сцены «3D»: у картинки полигонов образцы MSAA (7.18е2); с [`SPACE_FLAG_MESH_X4`]
+/// их четыре, без — два. Какой образец берёт луч края — таблица с бита
+/// [`MESH_SAMPLE_SHIFT`] (как в space.slang).
+const SPACE_FLAG_MESH_MS: u32 = 16;
+const SPACE_FLAG_MESH_X4: u32 = 32;
+const MESH_SAMPLE_SHIFT: u32 = 8;
+/// Точки лучей краёв в пикселе, от его середины (как SUBPIXEL и SUBPIXEL_PAIR в
+/// raymarch_edges.slang).
+const EDGE_RAYS_4: [[f32; 2]; 4] = [
+    [-0.125, -0.375],
+    [0.375, -0.125],
+    [0.125, 0.375],
+    [-0.375, 0.125],
+];
+const EDGE_RAYS_2: [[f32; 2]; 2] = [[0.25, 0.25], [-0.25, -0.25]];
+/// Стандартные точки образцов MSAA Vulkan (standardSampleLocations), от середины пикселя.
+const SAMPLES_2: [[f32; 2]; 2] = [[0.25, 0.25], [-0.25, -0.25]];
+const SAMPLES_4: [[f32; 2]; 4] = [
+    [-0.125, -0.375],
+    [0.375, -0.125],
+    [-0.375, 0.125],
+    [0.125, 0.375],
+];
+
+/// Образцы картинки полигонов (7.18е2) для лучей краёв: при `pairs` лучей два, иначе
+/// четыре; столько же образцов, если видеокарта умеет (`counts`), иначе другое число
+/// (тогда каждый луч берёт ближайший к своей точке образец), а без MSAA — без них.
+/// Ответ — число образцов и флаги для констант.
+fn mesh_samples(counts: vk::SampleCountFlags, pairs: bool) -> (Msaa, u32) {
+    let (want, other) = if pairs {
+        (Msaa::X2, Msaa::X4)
+    } else {
+        (Msaa::X4, Msaa::X2)
+    };
+    let Some(msaa) = [want, other]
+        .into_iter()
+        .find(|m| counts.contains(m.samples()))
+    else {
+        return (Msaa::Off, 0);
+    };
+    let rays: &[[f32; 2]] = if pairs { &EDGE_RAYS_2 } else { &EDGE_RAYS_4 };
+    let (samples, x4): (&[[f32; 2]], u32) = if msaa == Msaa::X4 {
+        (&SAMPLES_4, SPACE_FLAG_MESH_X4)
+    } else {
+        (&SAMPLES_2, 0)
+    };
+    let mut flags = SPACE_FLAG_MESH_MS | x4;
+    for (k, r) in rays.iter().enumerate() {
+        let distance = |s: &[f32; 2]| (s[0] - r[0]).powi(2) + (s[1] - r[1]).powi(2);
+        let nearest = (0..samples.len())
+            .min_by(|&a, &b| distance(&samples[a]).total_cmp(&distance(&samples[b])))
+            .unwrap_or(0) as u32;
+        flags |= nearest << (MESH_SAMPLE_SHIFT + 2 * k as u32);
+    }
+    (msaa, flags)
+}
 /// Флаг сцены «3D»: у «реймарчинга» есть буфер геометрии полигонов (как в raymarch.slang).
 const SPACE_FLAG_MESHES: u32 = 1;
 /// Флаг сцены «3D»: края форм сглажены (7.6о), «сцена» берёт их цвет из картинки краёв.
@@ -5022,6 +5198,41 @@ fn pick_scene_format(ctx: &GpuContext, msaa_counts: vk::SampleCountFlags) -> vk:
     } else {
         LAYER_FORMAT
     }
+}
+
+/// Числа образцов MSAA для картинки «полигоны 3D» (7.18е2): рисовать в неё с глубиной и
+/// читать её целыми числами в шейдере; только при стандартных точках образцов — лучи
+/// краёв знают, где они. Пусто — без образцов.
+fn pick_mesh_counts(ctx: &GpuContext, limits: &vk::PhysicalDeviceLimits) -> vk::SampleCountFlags {
+    if limits.standard_sample_locations == vk::FALSE {
+        return vk::SampleCountFlags::empty();
+    }
+    let image = |format, usage| {
+        // SAFETY: physical получен из этого экземпляра.
+        unsafe {
+            ctx.instance().get_physical_device_image_format_properties(
+                ctx.physical,
+                format,
+                vk::ImageType::TYPE_2D,
+                vk::ImageTiling::OPTIMAL,
+                usage,
+                vk::ImageCreateFlags::empty(),
+            )
+        }
+        .map_or(vk::SampleCountFlags::empty(), |p| p.sample_counts)
+    };
+    limits.framebuffer_color_sample_counts
+        & limits.framebuffer_depth_sample_counts
+        & limits.sampled_image_integer_sample_counts
+        & image(
+            MESH_FORMAT,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )
+        & image(
+            MESH_DEPTH_FORMAT,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        )
+        & (vk::SampleCountFlags::TYPE_2 | vk::SampleCountFlags::TYPE_4)
 }
 
 pub(crate) fn pick_stencil_format(ctx: &GpuContext) -> Result<vk::Format, GpuError> {
