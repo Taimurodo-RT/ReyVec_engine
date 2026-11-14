@@ -450,10 +450,15 @@ impl<'a> RenderGraph<'a> {
                     initial.push(img.initial);
                 }
                 Source::Transient => {
+                    let poison = pool.poison.filter(|_| is_color(img.format));
                     let key = TransientKey {
                         extent: img.extent,
                         format: img.format,
-                        usage: usage[i],
+                        usage: if poison.is_some() {
+                            usage[i] | vk::ImageUsageFlags::TRANSFER_DST
+                        } else {
+                            usage[i]
+                        },
                         samples: img.samples,
                     };
                     let entry = pool.acquire(ctx, bindless, key, frame, img.name)?;
@@ -466,10 +471,18 @@ impl<'a> RenderGraph<'a> {
                     });
                     // Содержимое прошлого кадра не нужно (UNDEFINED), но дождаться
                     // прошлого использования этой картинки видеокартой нужно.
-                    initial.push(ImageState {
+                    let state = ImageState {
                         layout: vk::ImageLayout::UNDEFINED,
                         ..e.state
-                    });
+                    };
+                    match poison {
+                        // SAFETY: cmd в состоянии записи (условие функции), картинка из
+                        // пула жива и не используется после прошлого кадра (state).
+                        Some(p) => initial.push(unsafe {
+                            fill_poison(ctx, cmd, e.texture.image, img.format, state, p)
+                        }),
+                        None => initial.push(state),
+                    }
                     pooled.push((i, entry));
                 }
             }
@@ -566,6 +579,103 @@ struct PoolEntry {
 pub(crate) struct TransientPool {
     entries: Vec<PoolEntry>,
     free_slots: Vec<u32>,
+    /// Проверка на чтение незаполненной памяти (8.0): перед кадром каждая временная
+    /// картинка цвета заливается «мусором». Если проход читает то, что в этом кадре никто
+    /// не записал, кадр зависит от мусора, и два кадра с разным мусором не совпадут.
+    poison: Option<Poison>,
+}
+
+/// Чем залить временные картинки для проверки [`TransientPool::poison`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum Poison {
+    /// Не-число (NaN) в плавающих картинках, все единицы в целых.
+    Nan,
+    /// Обычное число (0,25 и 0x5A5A_5A5A): с ним мусор не прячется за NaN.
+    Number,
+}
+
+/// Картинка цвета (не глубина и не трафарет): только её можно залить `cmd_clear_color_image`.
+fn is_color(format: vk::Format) -> bool {
+    full_range(format).aspect_mask == vk::ImageAspectFlags::COLOR
+}
+
+/// Целый формат: заливается целыми числами, а не плавающими.
+fn is_integer(format: vk::Format) -> bool {
+    use vk::Format as F;
+    matches!(
+        format,
+        F::R8_UINT
+            | F::R16_UINT
+            | F::R32_UINT
+            | F::R32G32_UINT
+            | F::R32G32B32A32_UINT
+            | F::R16G16_UINT
+            | F::R16G16B16A16_UINT
+            | F::R8G8B8A8_UINT
+            | F::R32_SINT
+            | F::R32G32_SINT
+            | F::R16_SINT
+    )
+}
+
+/// Заливает картинку мусором `poison` и возвращает её новое состояние (после очистки).
+///
+/// # Safety
+/// `cmd` в состоянии записи, `image` жива, `old` — её настоящее состояние.
+unsafe fn fill_poison(
+    ctx: &GpuContext,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    format: vk::Format,
+    old: ImageState,
+    poison: Poison,
+) -> ImageState {
+    let d = &ctx.device;
+    let range = full_range(format);
+    let to_clear = image_barrier(
+        image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        old.stage,
+        old.access,
+        vk::PipelineStageFlags2::CLEAR,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    )
+    .subresource_range(range);
+    let value = match (poison, is_integer(format)) {
+        (Poison::Nan, false) => vk::ClearColorValue {
+            float32: [f32::NAN; 4],
+        },
+        (Poison::Number, false) => vk::ClearColorValue {
+            float32: [0.25, 0.75, 0.5, 0.125],
+        },
+        (Poison::Nan, true) => vk::ClearColorValue {
+            uint32: [u32::MAX; 4],
+        },
+        (Poison::Number, true) => vk::ClearColorValue {
+            uint32: [0x5A5A_5A5A; 4],
+        },
+    };
+    // SAFETY: условие функции; барьер переводит картинку в раскладку очистки.
+    unsafe {
+        d.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&[to_clear]),
+        );
+        d.cmd_clear_color_image(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &value,
+            &[range],
+        );
+    }
+    ImageState {
+        layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        stage: vk::PipelineStageFlags2::CLEAR,
+        access: vk::AccessFlags2::TRANSFER_WRITE,
+    }
 }
 
 impl TransientPool {
@@ -574,7 +684,14 @@ impl TransientPool {
             entries: Vec::new(),
             // В обратном порядке, чтобы pop() отдавал ячейки по возрастанию.
             free_slots: (FIRST_TRANSIENT_SLOT..MAX_TEXTURES).rev().collect(),
+            poison: None,
         }
+    }
+
+    /// Включает проверку на чтение незаполненной памяти (см. [`Poison`]).
+    #[allow(dead_code)]
+    pub fn set_poison(&mut self, poison: Option<Poison>) {
+        self.poison = poison;
     }
 
     /// Начало кадра `frame`. Удаляет картинки, которые не понадобились прошлому кадру и
