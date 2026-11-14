@@ -512,6 +512,11 @@ fn render(
         // Проверка на чтение незаполненной памяти (8.0).
         #[cfg(test)]
         r.transients.set_poison(tests::POISON.get());
+        // Замер краёв по частям (8.1).
+        #[cfg(test)]
+        if let Some(demo) = r.demo.as_mut() {
+            demo.set_edge_probe(tests::EDGE_PROBE.get());
+        }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
             .create_command_pool(
@@ -787,9 +792,51 @@ pub(crate) mod tests {
         pub(super) static LEVEL_FIELD_IN_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Кадр со счётчиками лучей (7.18д2).
         pub(super) static SPACE_COUNTERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Замер краёв по частям (8.1).
+        pub(super) static EDGE_PROBE: std::cell::Cell<crate::EdgeProbe> =
+            const { std::cell::Cell::new(crate::EdgeProbe::Off) };
         /// Временные картинки залиты мусором (8.0).
         pub(super) static POISON: std::cell::Cell<Option<crate::graph::Poison>> =
             const { std::cell::Cell::new(None) };
+    }
+
+    /// Замер краёв по частям (8.1): каждый вариант рисуется без ошибок Vulkan и меняет
+    /// только края — остальная картинка та же, что «как обычно».
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn edge_probes_change_only_edges() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let base = render_headless(&options, &hollow_side()).expect("кадр");
+        let edges = base
+            .space_stats
+            .as_ref()
+            .and_then(|s| s.edge_pixels)
+            .unwrap_or(0);
+        assert!(edges > 0, "в кадре есть края");
+        for probe in crate::EdgeProbe::ALL {
+            EDGE_PROBE.set(probe);
+            let frame = render_headless(&options, &hollow_side());
+            EDGE_PROBE.set(crate::EdgeProbe::Off);
+            let frame = frame.expect("кадр с замером краёв");
+            let (changed, _, _) = image_diff(&base.image, &frame.image);
+            eprintln!(
+                "{}: отличаются {changed} пикселей, краёв {edges}",
+                probe.title()
+            );
+            assert!(
+                changed as u64 <= u64::from(edges),
+                "{}: отличаются {changed} пикселей, а краёв только {edges}",
+                probe.title()
+            );
+            if probe == crate::EdgeProbe::Off {
+                assert_eq!(changed, 0, "«как обычно» не меняет кадр");
+            }
+        }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
     /// Ни один проход не читает то, что в этом кадре никто не записал (8.0). Кадр

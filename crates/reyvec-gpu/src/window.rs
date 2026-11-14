@@ -698,6 +698,20 @@ impl WindowRenderer {
             .map_or((false, false), |d| d.space_counters(&self.ctx))
     }
 
+    /// Замер «краёв 3D» по частям (8.1).
+    pub fn edge_probe(&self) -> crate::EdgeProbe {
+        self.demo
+            .as_ref()
+            .map_or(crate::EdgeProbe::Off, |d| d.edge_probe())
+    }
+
+    /// Выбирает, что проход «края 3D» пропускает для замера (со следующего кадра).
+    pub fn set_edge_probe(&mut self, probe: crate::EdgeProbe) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_edge_probe(probe);
+        }
+    }
+
     /// Длинный шаг в пустоте (7.18д4): включён ли.
     pub fn space_free(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.space_free())

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use egui::{Color32, FontData, FontDefinitions, FontFamily, RichText};
 use reyvec_gpu::{
-    DemoScene, FillMode, GpuFrameTimings, GraphReport, LevelFieldStatus, LevelRender, Msaa,
-    SpaceScale, UiFrame,
+    DemoScene, EdgeProbe, FillMode, GpuFrameTimings, GraphReport, LevelFieldStatus, LevelRender,
+    Msaa, SpaceScale, UiFrame,
 };
 use winit::event::WindowEvent;
 
@@ -38,6 +38,8 @@ pub(crate) enum PanelAction {
     SpaceCounters(bool),
     /// Длинный шаг в пустоте (7.18д4).
     SpaceFree(bool),
+    /// Замер «краёв 3D» по частям (8.1).
+    EdgeProbe(EdgeProbe),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -142,6 +144,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_counters: (bool, bool),
     /// Длинный шаг в пустоте (7.18д4): включён ли.
     pub space_free: bool,
+    /// Замер «краёв 3D» по частям (8.1).
+    pub edge_probe: EdgeProbe,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -780,6 +784,24 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             .changed()
         {
             actions.push(PanelAction::SpaceFree(free));
+        }
+        if info.space_smooth.0 {
+            ui.label("Замер краёв 3D").on_hover_text(
+                "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
+                 По разнице времени строки «края 3D» с «как обычно» видно, сколько стоит \
+                 эта часть. Края при этом рисуются неверно — после замера верните \
+                 «как обычно»",
+            );
+            ui.horizontal_wrapped(|ui| {
+                for probe in EdgeProbe::ALL {
+                    if ui
+                        .selectable_label(info.edge_probe == probe, probe.title())
+                        .clicked()
+                    {
+                        actions.push(PanelAction::EdgeProbe(probe));
+                    }
+                }
+            });
         }
         ui.label("Разрешение 3D").on_hover_text(
             "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
@@ -1485,6 +1507,7 @@ mod tests {
             space_smooth: (true, true),
             space_counters: (true, true),
             space_free: true,
+            edge_probe: EdgeProbe::Off,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

@@ -43,6 +43,14 @@ static const float2 SUBPIXEL_PAIR[2] = {
     float2(-0.25, -0.25),
 };
 
+// Замер по частям (8.1, слово 6 заголовка списка, как EdgeProbe в demo.rs): проход
+// пропускает одну часть работы, и по разнице времени на ПК видно, сколько она стоит.
+// Картинка краёв при этом неверная.
+static const uint EDGE_PROBE_NO_EXACT_SHADOWS = 1;
+static const uint EDGE_PROBE_NO_SUB_RAYS = 2;
+static const uint EDGE_PROBE_NO_SHADING = 3;
+static const uint EDGE_PROBE_EMPTY = 4;
+
 groupshared float3 colors[64];
 // Точные доли света пикселей группы: [пиксель][солнце, углы, лампа 1, лампа 2].
 groupshared float parts[32][4];
@@ -56,6 +64,9 @@ static const uint PART_OF_QUARTER[4] = { 2, 3, 1, 0 };
 void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
 {
     // Лучей на пиксель: 4 или 2. Лучи пикселя — соседние потоки одной группы.
+    uint probe = pc.edges[6];
+    if (probe == EDGE_PROBE_EMPTY)
+        return;
     bool pairs = (pc.flags & SPACE_FLAG_EDGE_PAIRS) != 0;
     uint shift = pairs ? 1 : 2;
     uint rays = 1u << shift;
@@ -118,7 +129,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
             uint part = pairs ? (k == 0 ? 2 + (lane >> 5) : 1 - (lane >> 5))
                               : PART_OF_QUARTER[lane >> 4];
             float value = 1.0;
-            if (g.x >= 0.0)
+            if (g.x >= 0.0 && probe != EDGE_PROBE_NO_EXACT_SHADOWS)
                 value = shadow_part(surface, n, g.x, part);
             parts[mine][part] = value;
         }
@@ -139,17 +150,23 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         float2 middle = float2(px) + 0.5;
         float2 center = float2(middle.x / float(w) * 2.0 - 1.0, 1.0 - middle.y / float(h) * 2.0);
         // Полигоны (7.18е2): свой образец MSAA у каждого луча — край призмы ровный.
-        float4 g = march_pixel(px, screen, int(sub), center);
+        float4 g = probe == EDGE_PROBE_NO_SUB_RAYS ? g0 : march_pixel(px, screen, int(sub), center);
         if (g.x < 0.0)
             color = sky(screen_ray(screen).dir);
         else
         {
             float3 n = oct_decode(g.zw);
-            // Та же поверхность, что у точки пикселя: тот же материал, глубина и сторона.
-            bool same = g0.x >= 0.0 && abs(g.y - g0.y) < 0.5
-                && abs(g.x - g0.x) < 0.02 * g0.x + 0.05 && dot(n, n0) > 0.9;
-            float4 shadows = same ? exact : upsampled_shadows(px, g.x, n);
-            color = shade_lit(screen, g, shadows);
+            if (probe == EDGE_PROBE_NO_SHADING)
+                color = n * 0.5 + 0.5;
+            else
+            {
+                // Та же поверхность, что у точки пикселя: тот же материал, глубина и
+                // сторона.
+                bool same = g0.x >= 0.0 && abs(g.y - g0.y) < 0.5
+                    && abs(g.x - g0.x) < 0.02 * g0.x + 0.05 && dot(n, n0) > 0.9;
+                float4 shadows = same ? exact : upsampled_shadows(px, g.x, n);
+                color = shade_lit(screen, g, shadows);
+            }
         }
     }
     counters_flush(PASS_EDGES, id.x >> 6);
