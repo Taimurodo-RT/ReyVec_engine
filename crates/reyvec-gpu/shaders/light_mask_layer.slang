@@ -33,31 +33,38 @@ VertexOut vs_main(uint vertex : SV_VulkanVertexID)
     return o;
 }
 
-// Прозрачность картинки слоя в точке `pixel` (пиксели картинки). Сэмплер смешивает 2×2
-// соседних пикселя, поэтому точка прижимается к прямоугольнику слоя на полпикселя: за его
-// краем память не очищена, и без этого там читался мусор (столбик точек в поле).
-float layer_alpha(float2 pixel, float2 size)
+// Прозрачность картинки слоя в точке `pixel` (пиксели картинки), смесь 2×2 соседних
+// пикселей по положению точки. За прямоугольником слоя память картинки не очищена
+// (картинка больше прямоугольника), поэтому смесь считается вручную из пикселей,
+// прижатых к прямоугольнику. Раньше точку прижимали на полпикселя и брали сэмплером, но
+// у края сэмплер всё равно касается пикселя за прямоугольником с почти нулевым весом
+// (веса округляются), и мусор оттуда — особенно не-число — попадал в маску (8.0).
+float layer_alpha(float2 pixel)
 {
-    pixel = clamp(pixel, float2(0.5, 0.5), pc.extent - 0.5);
-    return textures[pc.texture].SampleLevel(samplers[0], pixel / size, 0.0).a;
+    int2 last = int2(pc.extent) - 1;
+    float2 p = clamp(pixel, float2(0.5, 0.5), pc.extent - 0.5) - 0.5;
+    int2 i = int2(floor(p));
+    float2 f = p - float2(i);
+    float a00 = textures[pc.texture].Load(int3(clamp(i, int2(0, 0), last), 0)).a;
+    float a10 = textures[pc.texture].Load(int3(clamp(i + int2(1, 0), int2(0, 0), last), 0)).a;
+    float a01 = textures[pc.texture].Load(int3(clamp(i + int2(0, 1), int2(0, 0), last), 0)).a;
+    float a11 = textures[pc.texture].Load(int3(clamp(i + int2(1, 1), int2(0, 0), last), 0)).a;
+    return lerp(lerp(a00, a10, f.x), lerp(a01, a11, f.x), f.y);
 }
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
     // Середина точки маски в пикселях кадра, затем в пикселях картинки слоя. Точка маски
-    // накрывает downscale × downscale пикселей кадра: четыре выборки сэмплером (каждая
+    // накрывает downscale × downscale пикселей кадра: четыре смеси (каждая
     // смешивает 2×2 пикселя) усредняют их все при уменьшении в 2 и 4 раза.
     float2 frame_pixel = input.position.xy * pc.downscale;
-    uint w, h;
-    textures[pc.texture].GetDimensions(w, h);
-    float2 size = float2(w, h);
     float2 center = frame_pixel - float2(pc.offset);
     float q = pc.downscale * 0.25;
     float alpha = 0.0;
-    alpha += layer_alpha(center + float2(-q, -q), size);
-    alpha += layer_alpha(center + float2(q, -q), size);
-    alpha += layer_alpha(center + float2(-q, q), size);
-    alpha += layer_alpha(center + float2(q, q), size);
+    alpha += layer_alpha(center + float2(-q, -q));
+    alpha += layer_alpha(center + float2(q, -q));
+    alpha += layer_alpha(center + float2(-q, q));
+    alpha += layer_alpha(center + float2(q, q));
     return float4(alpha * 0.25, 0.0, 0.0, 1.0);
 }
