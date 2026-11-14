@@ -18,19 +18,19 @@ flowchart LR
         mem["память:<br/>буферы и картинки"]
         list["общий список текстур<br/>(bindless)"]
         shaders["шейдеры Slang<br/>и их правка на лету"]
-        graph["граф кадра<br/>проходы и барьеры"]
+        rgraph["граф кадра<br/>проходы и барьеры"]
         time["замер времени проходов"]
     end
     vk["Vulkan"]
     card["Видеокарта<br/>RTX 5080 или Radeon"]
 
-    engine --> graph
+    engine --> rgraph
     engine --> mem
-    graph --> shaders
-    graph --> list
+    rgraph --> shaders
+    rgraph --> list
     pick --> vk
     mem --> vk
-    graph --> vk
+    rgraph --> vk
     time --> vk
     vk --> card
 ```
