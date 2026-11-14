@@ -450,7 +450,10 @@ impl<'a> RenderGraph<'a> {
                     initial.push(img.initial);
                 }
                 Source::Transient => {
-                    let poison = pool.poison.filter(|_| is_color(img.format));
+                    let poison = pool
+                        .poison
+                        .filter(|_| is_color(img.format))
+                        .filter(|_| pool.poison_only.is_none_or(|n| n == img.name));
                     let key = TransientKey {
                         extent: img.extent,
                         format: img.format,
@@ -583,6 +586,8 @@ pub(crate) struct TransientPool {
     /// картинка цвета заливается «мусором». Если проход читает то, что в этом кадре никто
     /// не записал, кадр зависит от мусора, и два кадра с разным мусором не совпадут.
     poison: Option<Poison>,
+    /// …только картинки с этим именем (чтобы найти, какая из них читается незаполненной).
+    poison_only: Option<&'static str>,
 }
 
 /// Чем залить временные картинки для проверки [`TransientPool::poison`].
@@ -685,13 +690,15 @@ impl TransientPool {
             // В обратном порядке, чтобы pop() отдавал ячейки по возрастанию.
             free_slots: (FIRST_TRANSIENT_SLOT..MAX_TEXTURES).rev().collect(),
             poison: None,
+            poison_only: None,
         }
     }
 
     /// Включает проверку на чтение незаполненной памяти (см. [`Poison`]).
     #[allow(dead_code)]
-    pub fn set_poison(&mut self, poison: Option<Poison>) {
+    pub fn set_poison(&mut self, poison: Option<Poison>, only: Option<&'static str>) {
         self.poison = poison;
+        self.poison_only = only;
     }
 
     /// Начало кадра `frame`. Удаляет картинки, которые не понадобились прошлому кадру и

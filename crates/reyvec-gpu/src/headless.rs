@@ -511,7 +511,8 @@ fn render(
         }
         // Проверка на чтение незаполненной памяти (8.0).
         #[cfg(test)]
-        r.transients.set_poison(tests::POISON.get());
+        r.transients
+            .set_poison(tests::POISON.get(), tests::POISON_ONLY.get());
         // Замер краёв по частям (8.1).
         #[cfg(test)]
         if let Some(demo) = r.demo.as_mut() {
@@ -795,6 +796,9 @@ pub(crate) mod tests {
         /// Замер краёв по частям (8.1).
         pub(super) static EDGE_PROBE: std::cell::Cell<crate::EdgeProbe> =
             const { std::cell::Cell::new(crate::EdgeProbe::Off) };
+        /// Мусором залиты только картинки с этим именем (8.0).
+        pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
         /// Временные картинки залиты мусором (8.0).
         pub(super) static POISON: std::cell::Cell<Option<crate::graph::Poison>> =
             const { std::cell::Cell::new(None) };
@@ -919,40 +923,75 @@ pub(crate) mod tests {
                 Some(level(crate::LevelRender::Triangles)),
             ),
         ];
-        let errors = validation_error_count();
-        let mut failed = Vec::new();
-        for (name, scene, play) in &cases {
+        // Имена временных картинок, по которым ищется виновная, если кадры разошлись.
+        const NAMES: [&str; 19] = [
+            "кадр сцены",
+            "маска теней",
+            "семена поля",
+            "поле расстояний",
+            "свет",
+            "каскад света",
+            "свечение вниз",
+            "свечение вверх",
+            "слой",
+            "слой MSAA",
+            "конусы 3D",
+            "буфер геометрии 3D",
+            "тени 3D",
+            "края 3D",
+            "цвет 3D",
+            "полигоны 3D",
+            "глубина полигонов 3D",
+            "карты теней ламп",
+            "глубина карт теней",
+        ];
+        // Сколько пикселей отличается, их границы и первый отличающийся пиксель.
+        let compare = |scene: &HeadlessScene, play: Option<&HeadlessPlay>, only| {
             let mut frames = Vec::new();
             for poison in [Poison::Nan, Poison::Number] {
                 POISON.set(Some(poison));
-                let frame = render_headless_play(&options, scene, play.as_ref());
+                POISON_ONLY.set(only);
+                let frame = render_headless_play(&options, scene, play);
                 POISON.set(None);
+                POISON_ONLY.set(None);
                 frames.push(frame.expect("кадр").image);
             }
             let (a, b) = (&frames[0], &frames[1]);
-            let (mut count, mut lo, mut hi) = (0usize, [u32::MAX; 2], [0u32; 2]);
+            let (mut count, mut lo, mut hi, mut first) = (0usize, [u32::MAX; 2], [0u32; 2], None);
             for y in 0..a.height {
                 for x in 0..a.width {
                     if a.pixel(x, y) != b.pixel(x, y) {
                         count += 1;
                         lo = [lo[0].min(x), lo[1].min(y)];
                         hi = [hi[0].max(x), hi[1].max(y)];
+                        first = first.or(Some(([x, y], a.pixel(x, y), b.pixel(x, y))));
                     }
                 }
             }
+            (count, lo, hi, first)
+        };
+        let errors = validation_error_count();
+        let mut failed = Vec::new();
+        for (name, scene, play) in &cases {
+            let (count, lo, hi, first) = compare(scene, play.as_ref(), None);
             eprintln!("{name}: отличаются {count} пикселей");
-            if count > 0 {
-                eprintln!(
-                    "  область x {}..={}, y {}..={}; пример: {:?} и {:?}",
-                    lo[0],
-                    hi[0],
-                    lo[1],
-                    hi[1],
-                    a.pixel(lo[0], lo[1]),
-                    b.pixel(lo[0], lo[1])
-                );
-                failed.push(*name);
+            if count == 0 {
+                continue;
             }
+            eprintln!(
+                "  область x {}..={}, y {}..={}; первый {first:?}",
+                lo[0], hi[0], lo[1], hi[1]
+            );
+            for image in NAMES {
+                let (count, lo, hi, _) = compare(scene, play.as_ref(), Some(image));
+                if count > 0 {
+                    eprintln!(
+                        "  мусор в «{image}»: {count} пикселей, x {}..={}, y {}..={}",
+                        lo[0], hi[0], lo[1], hi[1]
+                    );
+                }
+            }
+            failed.push(*name);
         }
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
         assert!(failed.is_empty(), "читают незаполненную память: {failed:?}");
