@@ -518,6 +518,7 @@ fn render(
         if let Some(demo) = r.demo.as_mut() {
             demo.set_edge_probe(tests::EDGE_PROBE.get());
             demo.set_edge_creases(tests::EDGE_CREASES.get());
+            demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -799,6 +800,9 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(crate::EdgeProbe::Off) };
         /// Складки без доп. лучей (8.2); как в песочнице, по умолчанию включены.
         pub(super) static EDGE_CREASES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        /// Точные тени краёв только у границы тени (8.2б); по умолчанию включены.
+        pub(super) static EDGE_SHADOW_REUSE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(true) };
         /// Мусором залиты только картинки с этим именем (8.0).
         pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
             const { std::cell::Cell::new(None) };
@@ -910,6 +914,87 @@ pub(crate) mod tests {
             );
             assert!(mean < 0.5, "{name}: средняя разница {mean:.4}");
         }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
+    /// Точные тени краёв только у границы тени (8.2б): картинка почти та же, что с
+    /// точными тенями у всех ненадёжных краёв (отличаются только пиксели краёв, и
+    /// ненамного), а лучей тени краёв меньше.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn edge_shadow_reuse_matches_exact_shadows() {
+        use crate::counters::PASS_EDGE_SHADOWS;
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let room = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        let level = |render| HeadlessPlay {
+            start: Some([-0.6, -0.5]),
+            level: Some(render),
+            ..Default::default()
+        };
+        let cases: Vec<(&str, HeadlessScene, Option<HeadlessPlay>)> = vec![
+            ("3D", hollow_side(), None),
+            (
+                "2.5D, поле",
+                room.clone(),
+                Some(level(crate::LevelRender::Field)),
+            ),
+            (
+                "2.5D, треугольники",
+                room,
+                Some(level(crate::LevelRender::Triangles)),
+            ),
+        ];
+        SPACE_COUNTERS.set(true);
+        for (name, scene, play) in &cases {
+            EDGE_SHADOW_REUSE.set(false);
+            let exact = render_headless_play(&options, scene, play.as_ref());
+            EDGE_SHADOW_REUSE.set(true);
+            let exact = exact.expect("кадр с точными тенями");
+            let reuse = render_headless_play(&options, scene, play.as_ref()).expect("кадр");
+            let shadow_rays = |image: &HeadlessImage| {
+                image
+                    .space_stats
+                    .as_ref()
+                    .and_then(|s| s.rays)
+                    .map(|r| r[PASS_EDGE_SHADOWS].rays)
+                    .expect("лучи посчитаны")
+            };
+            let unreliable = reuse
+                .space_stats
+                .as_ref()
+                .and_then(|s| s.edge_unreliable)
+                .unwrap_or(0);
+            let (before, after) = (shadow_rays(&exact), shadow_rays(&reuse));
+            let (changed, worst, mean) = image_diff(&exact.image, &reuse.image);
+            eprintln!(
+                "{name}: ненадёжных краёв {unreliable}, лучей тени краёв {before} → {after}, \
+                 отличаются {changed} пикселей, наибольшая разница {worst}, средняя {mean:.4}"
+            );
+            assert!(unreliable > 0, "{name}: в кадре есть ненадёжные края");
+            assert!(after < before, "{name}: лучей тени краёв меньше");
+            assert!(
+                changed as u64 <= u64::from(unreliable),
+                "{name}: отличаются {changed} пикселей, а ненадёжных краёв только {unreliable}"
+            );
+            assert!(mean < 0.5, "{name}: средняя разница {mean:.4}");
+        }
+        SPACE_COUNTERS.set(false);
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
@@ -2002,8 +2087,10 @@ pub(crate) mod tests {
             RAY_PASS_NAMES,
         };
         // Каждый край — 4 луча с шагами по сцене: без складок 8.2 (у складки лучи не
-        // шагают). Каждый тест идёт в своём потоке, переключатель потом не возвращается.
+        // шагают), и у каждого ненадёжного — свои лучи тени (без 8.2б). Каждый тест идёт в
+        // своём потоке, переключатели потом не возвращаются.
         EDGE_CREASES.set(false);
+        EDGE_SHADOW_REUSE.set(false);
         let options = GpuOptions {
             validation: true,
             gpu: None,
