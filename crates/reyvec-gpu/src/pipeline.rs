@@ -80,6 +80,31 @@ pub(crate) fn graphics_pipeline_stencil(
     samples: vk::SampleCountFlags,
     stencil: Option<Stencil>,
 ) -> Result<vk::Pipeline, GpuError> {
+    graphics_pipeline_targets(
+        device,
+        layout,
+        vert_spv,
+        frag_spv,
+        &[format],
+        blend,
+        samples,
+        stencil,
+    )
+}
+
+/// Как [`graphics_pipeline_stencil`], но с несколькими целями рисования `formats`
+/// (SV_Target0, SV_Target1…, у всех одно смешивание `blend`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn graphics_pipeline_targets(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    vert_spv: &[u8],
+    frag_spv: &[u8],
+    formats: &[vk::Format],
+    blend: Blend,
+    samples: vk::SampleCountFlags,
+    stencil: Option<Stencil>,
+) -> Result<vk::Pipeline, GpuError> {
     let vert = create_shader(device, vert_spv)?;
     let frag = match create_shader(device, frag_spv) {
         Ok(f) => f,
@@ -144,14 +169,13 @@ pub(crate) fn graphics_pipeline_stencil(
             .dst_alpha_blend_factor(F::ONE_MINUS_SRC_ALPHA)
             .alpha_blend_op(vk::BlendOp::ADD);
     }
-    let blend_attachment = [attachment];
+    let blend_attachment = vec![attachment; formats.len()];
     let blend_state =
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachment);
     let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-    let formats = [format];
     let mut rendering =
-        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+        vk::PipelineRenderingCreateInfo::default().color_attachment_formats(formats);
     match stencil {
         Some(s) if s.usage == StencilUse::Depth => {
             rendering = rendering.depth_attachment_format(s.format);
@@ -318,14 +342,36 @@ pub(crate) unsafe fn begin_depth_pass(
     extent: vk::Extent2D,
     clear: [f32; 4],
 ) {
-    let colors = [vk::RenderingAttachmentInfo::default()
-        .image_view(view)
-        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .load_op(vk::AttachmentLoadOp::CLEAR)
-        .store_op(vk::AttachmentStoreOp::STORE)
-        .clear_value(vk::ClearValue {
-            color: vk::ClearColorValue { float32: clear },
-        })];
+    // SAFETY: условие функции.
+    unsafe { begin_depth_pass_targets(device, cmd, &[view], depth_view, extent, clear) }
+}
+
+/// Как [`begin_depth_pass`], но с несколькими целями рисования `views` (все очищаются
+/// одним `clear`).
+///
+/// # Safety
+/// Как у [`begin_depth_pass`].
+pub(crate) unsafe fn begin_depth_pass_targets(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    views: &[vk::ImageView],
+    depth_view: vk::ImageView,
+    extent: vk::Extent2D,
+    clear: [f32; 4],
+) {
+    let colors: Vec<vk::RenderingAttachmentInfo> = views
+        .iter()
+        .map(|&view| {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: clear },
+                })
+        })
+        .collect();
     let depth = vk::RenderingAttachmentInfo::default()
         .image_view(depth_view)
         .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)

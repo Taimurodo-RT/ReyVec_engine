@@ -112,10 +112,13 @@ impl ShaderLibrary {
                     changed.extend(self.shaders.keys().cloned());
                 }
             } else if let Some(name) = shader_name(&path) {
-                // Вариант со счётчиками лучей (7.18д2) подключает этот файл целиком.
-                let counted = format!("{name}_counted");
-                if self.shaders.contains_key(&counted) {
-                    changed.insert(counted);
+                // Варианты со счётчиками лучей (7.18д2) и с цветом текстур (8.14б2)
+                // подключают этот файл целиком.
+                for suffix in ["_counted", "_color"] {
+                    let variant = format!("{name}{suffix}");
+                    if self.shaders.contains_key(&variant) {
+                        changed.insert(variant);
+                    }
                 }
                 changed.insert(name);
             }

@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use serde::Deserialize;
 
 use crate::mesh3d::{MAX_TRIANGLES, Mesh3};
@@ -181,6 +181,8 @@ pub struct MeshFrame {
     pub material: u32,
     /// Нормали вершин тех же треугольников (в мире, 8.14б). Пусто — грани плоские.
     pub normals: Vec<[Vec3; 3]>,
+    /// Точки текстуры вершин тех же треугольников (8.14б2). Пусто — без текстуры.
+    pub uvs: Vec<[Vec2; 3]>,
 }
 
 /// Модель сцены, готовая к кадрам: части по материалам (номер материала и треугольники в
@@ -207,6 +209,8 @@ pub struct SpaceScene {
     meshes: Vec<SceneMesh>,
     /// Заметки о чтении файла для журнала (например, у каких кусков моделей нет тени).
     pub notes: Vec<String>,
+    /// Текстуры цвета моделей (8.14б2): на них ссылаются материалы (`Material3::texture`).
+    pub textures: Vec<std::sync::Arc<crate::model3d::ModelTexture>>,
     /// Камера из файла (если записана).
     pub camera: Option<CameraEntry>,
     /// Сетка отсева выключена в файле (`culling: false`).
@@ -267,6 +271,7 @@ impl SpaceScene {
                     .map_err(|e| format!("материал «{}»: {e}", m.name))?,
                 glow: m.glow,
                 grid: m.grid,
+                texture: 0,
             });
         }
         let mut object_materials = Vec::new();
@@ -284,6 +289,8 @@ impl SpaceScene {
         }
         let mut meshes = Vec::new();
         let mut notes = Vec::new();
+        let mut textures = Vec::new();
+        let mut texture_keys: Vec<(std::path::PathBuf, usize)> = Vec::new();
         for (i, m) in file.meshes.iter().enumerate() {
             let label = if m.name.is_empty() {
                 format!("модель {}", i + 1)
@@ -310,6 +317,20 @@ impl SpaceScene {
                     let mut parts = Vec::new();
                     let mut all = Vec::new();
                     for part in model.parts {
+                        // Текстура: одна картинка одного файла — одна на сцену, сколько бы
+                        // моделей её ни брали.
+                        let texture = part.texture.map(|t| {
+                            let t = &model.textures[t];
+                            let key = (full.clone(), t.image);
+                            match texture_keys.iter().position(|k| *k == key) {
+                                Some(at) => at as u32 + 1,
+                                None => {
+                                    texture_keys.push(key);
+                                    textures.push(t.clone());
+                                    textures.len() as u32
+                                }
+                            }
+                        });
                         let index = match material {
                             Some(index) => index,
                             None => {
@@ -317,13 +338,15 @@ impl SpaceScene {
                                     color: part.color,
                                     glow: 0.0,
                                     grid: false,
+                                    texture: texture.unwrap_or(0),
                                 });
                                 materials.len() as u32 - 1
                             }
                         };
-                        if part.textured {
+                        if part.texture.is_some() && material.is_some() {
                             notes.push(format!(
-                                "{label}: у материала «{}» есть текстура, пока рисуется только его цвет",
+                                "{label}: у материала «{}» есть текстура, но задан свой материал — \
+                                 текстура не рисуется",
                                 part.material
                             ));
                         }
@@ -332,6 +355,11 @@ impl SpaceScene {
                             triangles: part.triangles,
                             material: index,
                             normals: part.normals,
+                            uvs: if material.is_some() {
+                                Vec::new()
+                            } else {
+                                part.uvs
+                            },
                         });
                     }
                     let (proxies, skipped) = if m.shadow {
@@ -360,7 +388,7 @@ impl SpaceScene {
                         vec![MeshFrame {
                             triangles: mesh.triangles(),
                             material: index,
-                            normals: Vec::new(),
+                            ..MeshFrame::default()
                         }],
                         proxies,
                     )
@@ -391,6 +419,7 @@ impl SpaceScene {
                     color,
                     glow: BULB_GLOW,
                     grid: false,
+                    texture: 0,
                 });
                 materials.len() as u32 - 1
             }));
@@ -410,6 +439,7 @@ impl SpaceScene {
             object_materials,
             meshes,
             notes,
+            textures,
             camera: file.camera,
             culling_off: !file.culling,
             view_culling_off: !file.view_culling,
@@ -478,6 +508,7 @@ impl SpaceScene {
                         .collect(),
                     material: part.material,
                     normals: part.normals.iter().map(|t| t.map(|n| r * n)).collect(),
+                    uvs: part.uvs.clone(),
                 });
             }
             proxies.extend(
@@ -631,21 +662,31 @@ mod tests {
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
         let text = include_str!("../../../scenes/3d/models.ron");
         let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
-        assert_eq!(scene.mesh_count(), 3);
-        // 4 материала сцены, 4 — из файла станка (первая модель без material), 2 лампочки.
-        assert_eq!(scene.materials.len(), 10);
+        assert_eq!(scene.mesh_count(), 4);
+        // 4 материала сцены, 4 — из файла станка (первая модель без material), 1 — доски
+        // ящика, 2 лампочки.
+        assert_eq!(scene.materials.len(), 11);
+        // Текстура досок ящика (8.14б2) — одна на сцену, на неё ссылается материал досок.
+        assert_eq!(scene.textures.len(), 1);
+        let boards: Vec<_> = scene.materials.iter().filter(|m| m.texture != 0).collect();
+        assert_eq!(boards.len(), 1);
+        assert_eq!(boards[0].texture, 1);
         let orange = scene
             .materials
             .iter()
             .position(|m| m.color == [0.80, 0.30, 0.05]);
         assert!(orange.is_some(), "цвет корпуса из файла");
         let frame = scene.frame(0.0);
-        // Станок — 4 части по материалам, малый станок — тоже 4 (все «золото»), коробка — 1.
-        assert_eq!(frame.meshes.len(), 9);
+        // Станок — 4 части по материалам, малый станок — тоже 4 (все «золото»), ящик и
+        // коробка — по 1.
+        assert_eq!(frame.meshes.len(), 10);
+        // У ящика точки текстуры, у остальных нет.
+        assert_eq!(frame.meshes[8].uvs.len(), 12);
+        assert!(frame.meshes[..8].iter().all(|m| m.uvs.is_empty()));
         let gold = 1;
         assert!(frame.meshes[4..8].iter().all(|m| m.material == gold));
-        // Тени: 6 кусков станка, 6 малого, 1 коробка.
-        assert_eq!(frame.proxies.len(), 13);
+        // Тени: 6 кусков станка, 6 малого, ящик и коробка.
+        assert_eq!(frame.proxies.len(), 14);
         // Малый станок вдвое меньше: верх дымохода на 1.5 × 0.5.
         let top = frame.meshes[4..8]
             .iter()

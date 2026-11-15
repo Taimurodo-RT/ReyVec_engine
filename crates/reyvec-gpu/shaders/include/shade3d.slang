@@ -1,7 +1,10 @@
 // Освещение точки сцены «3D» (этапы 7.3–7.4): общее для прохода «сцена»
 // (raymarch_shade.slang) и краёв форм (7.6о, raymarch_edges.slang). Перед подключением
 // должен быть подключён space.slang (с ним приходит и список картинок `textures[]`).
-// Буфер геометрии — `gbuffer_load` (pc.gbuffer, space.slang), тени — `textures[pc.shadows]`.
+// Буфер геометрии — `gbuffer_load` (pc.gbuffer, space.slang), тени — `textures[pc.shadows]`,
+// цвет текстур полигонов — mesh_tint (mesh.slang, 8.14б2).
+
+#include "mesh.slang"
 
 // Небо: к горизонту светлее.
 float3 sky(float3 dir)
@@ -122,8 +125,9 @@ float4 upsampled_shadows(int2 px, float t, float3 n)
     return upsampled_shadows_checked(px, t, n, similar);
 }
 
-// То же с готовыми долями света `shadows` (солнце, углы, две лампы).
-float3 shade_lit(float2 screen, float4 g, float4 shadows)
+// То же с готовыми долями света `shadows` (солнце, углы, две лампы). `px` и `sub` —
+// пиксель и луч края в нём (−1 — луч середины): по ним берётся цвет текстуры полигона.
+float3 shade_lit(float2 screen, float4 g, float4 shadows, int2 px, int sub)
 {
     Ray ray = screen_ray(screen);
     float t = g.x;
@@ -142,6 +146,8 @@ float3 shade_lit(float2 screen, float4 g, float4 shadows)
     uint m = pc.scene[2] + material * 8;
     float3 albedo = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 1]), asfloat(pc.scene[m + 2]));
     bool grid_on = (pc.scene[m + 3] & MATERIAL_GRID) != 0;
+    if ((pc.scene[m + 3] & MATERIAL_TEXTURED) != 0)
+        albedo *= mesh_tint(px, sub, g.y);
     float glow = asfloat(pc.scene[m + 4]);
     float3 n = oct_decode(g.zw);
     if (grid_on)
@@ -200,6 +206,6 @@ float3 shade_point(float2 screen, float4 g, int2 px)
 {
     if (g.x < 0.0)
         return sky(screen_ray(screen).dir);
-    return shade_lit(screen, g, upsampled_shadows(px, g.x, oct_decode(g.zw)));
+    return shade_lit(screen, g, upsampled_shadows(px, g.x, oct_decode(g.zw)), px, -1);
 }
 

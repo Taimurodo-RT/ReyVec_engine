@@ -7,15 +7,19 @@
 //
 // Вершины лежат в буфере сцены (crates/reyvec-gpu/src/space.rs): слово 7 заголовка —
 // начало раздела моделей (раскладка — MESH_HEADER_WORDS в space.slang), потом вершины
-// по 4 слова (место и слово материала), по 3 на треугольник.
+// по 5 слов (место, слово материала и точка текстуры), по 3 на треугольник.
 // Слово материала без бита 31 — просто номер: грань плоская, нормаль — по наклону соседних
 // точек. С битом 31 (модели glTF с нормалями, 8.14б) — раскладка pack_mesh: 11 бит
 // материала и нормаль вершины; нормаль плавно меняется по грани (гладкие грани).
+//
+// Текстуры цвета (8.14б2): вариант mesh3d_color.slang (MESH_COLOR) пишет ещё картинку
+// «цвет полигонов 3D» — цвет текстуры точки (у материала с флагом MATERIAL_TEXTURED,
+// номер картинки — слово 5 записи материала), у остальных белый. Освещение умножает на
+// него цвет материала (shade3d.slang, mesh_tint). Без текстур в кадре движок берёт этот
+// файл как есть: лишней картинки нет.
 
 #define SPACE_OWN_VERTEX
 #include "include/space.slang"
-
-static const uint VERTEX_WORDS = 4;
 
 struct MeshOut
 {
@@ -24,6 +28,8 @@ struct MeshOut
     nointerpolation uint material : MATERIAL;
     // Нормаль вершины; нулевая — грань плоская.
     float3 normal : NORMAL;
+    // Точка текстуры (8.14б2).
+    float2 uv : TEXCOORD;
 };
 
 [shader("vertex")]
@@ -39,9 +45,10 @@ MeshOut vs_main(uint vertex : SV_VulkanVertexID)
         o.world = float3(0.0, 0.0, 0.0);
         o.material = 0;
         o.normal = float3(0.0, 0.0, 0.0);
+        o.uv = float2(0.0, 0.0);
         return o;
     }
-    uint v = at + MESH_HEADER_WORDS + vertex * VERTEX_WORDS;
+    uint v = at + MESH_HEADER_WORDS + vertex * MESH_VERTEX_WORDS;
     float3 p = float3(asfloat(pc.scene[v]), asfloat(pc.scene[v + 1]), asfloat(pc.scene[v + 2]));
     uint m = at + MESH_VIEW_PROJ;
     float4 clip = float4(0.0, 0.0, 0.0, 0.0);
@@ -66,14 +73,15 @@ MeshOut vs_main(uint vertex : SV_VulkanVertexID)
         o.material = word;
         o.normal = float3(0.0, 0.0, 0.0);
     }
+    uint uv = pc.scene[v + 4];
+    o.uv = float2(f16tof32(uv & 0xffff), f16tof32(uv >> 16));
     return o;
 }
 
 // Точка — упакованной (pack_mesh, 7.18е2). Без затенения по образцам: при MSAA все
 // накрытые образцы пикселя получают одно и то же — расстояние луча середины пикселя до
 // плоскости грани; лучи краёв пересчитывают его для своей точки (march.slang).
-[shader("fragment")]
-uint4 fs_main(MeshOut input) : SV_Target
+uint4 mesh_point(MeshOut input)
 {
     // Луч этого пикселя — как у «реймарчинга»: расстояние считается от его начала.
     float2 size = float2(round(pc.aspect * pc.height), pc.height);
@@ -87,3 +95,39 @@ uint4 fs_main(MeshOut input) : SV_Target
         n = -n;
     return uint4(pack_mesh(t, input.material, n), 0, 0);
 }
+
+#ifdef MESH_COLOR
+struct MeshTargets
+{
+    uint4 mesh : SV_Target0;
+    float4 color : SV_Target1;
+};
+
+// Цвет текстуры точки (белый у материала без текстуры). Сглаживающий сэмплер с повтором
+// (тот же, что у слоёв поля, binding 4) и уровни уменьшения текстуры: вдали не рябит.
+[shader("fragment")]
+MeshTargets fs_main(MeshOut input)
+{
+    MeshTargets o;
+    o.mesh = mesh_point(input);
+    uint material = min(input.material, max(pc.scene[3], 1) - 1);
+    uint m = pc.scene[2] + material * 8;
+    // Наклон точки текстуры к соседним пикселям — до ветвления: внутри него соседние
+    // пиксели могут не считаться, и уровень текстуры вышел бы любым.
+    float2 dx = ddx(input.uv), dy = ddy(input.uv);
+    o.color = float4(1.0, 1.0, 1.0, 1.0);
+    if ((pc.scene[m + 3] & MATERIAL_TEXTURED) != 0)
+    {
+        // У соседних треугольников бывают разные текстуры: номер не общий для группы.
+        uint slot = NonUniformResourceIndex(pc.scene[m + 5]);
+        o.color = float4(textures[slot].SampleGrad(field_sampler, input.uv, dx, dy).rgb, 1.0);
+    }
+    return o;
+}
+#else
+[shader("fragment")]
+uint4 fs_main(MeshOut input) : SV_Target
+{
+    return mesh_point(input);
+}
+#endif

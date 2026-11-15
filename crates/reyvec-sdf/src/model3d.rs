@@ -3,7 +3,9 @@
 //!
 //! Из файла берутся треугольники всех узлов сцены (с их сдвигами, поворотами и
 //! масштабами), нормали вершин (если они есть — грани гладкие, 8.14б) и цвет каждого
-//! материала (`baseColorFactor`). Текстуры, анимация и кости пока не читаются.
+//! материала (`baseColorFactor`), а у материала с текстурой цвета (`baseColorTexture`,
+//! 8.14б2) — сама картинка (PNG или JPEG, в `.glb` или файлом рядом) и точки текстуры
+//! вершин (`TEXCOORD`). Анимация и кости пока не читаются.
 //!
 //! Тень модели бросают невидимые заменители SDF ([`convex_proxies`]): модель делится на
 //! связные куски, и каждый выпуклый кусок получает свой заменитель — пересечение
@@ -12,8 +14,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 
 use crate::mesh3d::convex_proxy;
 use crate::shape3d::Shape3;
@@ -25,21 +28,45 @@ pub struct ModelPart {
     pub material: String,
     /// Цвет материала (линейный, как в glTF).
     pub color: [f32; 3],
-    /// Есть ли у материала текстура цвета (пока не рисуется).
-    pub textured: bool,
+    /// Текстура цвета материала: номер в [`Model::textures`]. Её цвет умножается на
+    /// `color`.
+    pub texture: Option<usize>,
     /// Треугольники в координатах модели.
     pub triangles: Vec<[Vec3; 3]>,
     /// Нормали вершин тех же треугольников (единичные, в координатах модели). Пусто —
     /// нормалей в файле нет, грани плоские. Если нормали есть только у части сеток этого
     /// материала, у остальных треугольников здесь нормаль их грани.
     pub normals: Vec<[Vec3; 3]>,
+    /// Точки текстуры вершин тех же треугольников (только у части с текстурой; если у
+    /// сетки их нет — нули).
+    pub uvs: Vec<[Vec2; 3]>,
 }
 
 /// Модель из файла: части по материалам.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Model {
     pub parts: Vec<ModelPart>,
+    /// Текстуры цвета (на них ссылаются части по номеру).
+    pub textures: Vec<Arc<ModelTexture>>,
 }
+
+/// Текстура цвета (8.14б2): точки RGBA по 4 байта, цвет в sRGB, как в файле. Уровни
+/// уменьшения (mip) уже посчитаны: каждый вдвое меньше прошлого, до 1×1. Вдали точка
+/// экрана накрывает много точек текстуры, и видеокарта берёт уровень, где они уже
+/// усреднены: без этого текстура вдали рябит. Больше [`MAX_TEXTURE_SIZE`] по стороне
+/// картинка уменьшается при чтении.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelTexture {
+    /// Номер картинки в файле (одна картинка у нескольких материалов читается один раз).
+    pub image: usize,
+    pub width: u32,
+    pub height: u32,
+    /// Уровни от полного размера: `levels[k]` — `max(width >> k, 1)` × `max(height >> k, 1)`.
+    pub levels: Vec<Vec<u8>>,
+}
+
+/// Больше точек по стороне у текстуры модели не бывает: большие уменьшаются при чтении.
+pub const MAX_TEXTURE_SIZE: u32 = 2048;
 
 impl Model {
     /// Всего треугольников.
@@ -85,6 +112,7 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
         }
         buffers.push(bytes);
     }
+    let mut textures: Vec<Arc<ModelTexture>> = Vec::new();
     let scene = gltf
         .document
         .default_scene()
@@ -133,6 +161,20 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
                 None => {
                     let pbr = material.pbr_metallic_roughness();
                     let c = pbr.base_color_factor();
+                    let texture = match pbr.base_color_texture() {
+                        Some(info) => {
+                            let image = info.texture().source();
+                            match textures.iter().position(|t| t.image == image.index()) {
+                                Some(t) => Some(t),
+                                None => {
+                                    let t = read_texture(&image, &buffers, dir)?;
+                                    textures.push(Arc::new(t));
+                                    Some(textures.len() - 1)
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     parts.push((
                         key,
                         ModelPart {
@@ -144,15 +186,26 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
                                 str::to_owned,
                             ),
                             color: [c[0], c[1], c[2]],
-                            textured: pbr.base_color_texture().is_some(),
+                            texture,
                             triangles: Vec::new(),
                             normals: Vec::new(),
+                            uvs: Vec::new(),
                         },
                     ));
                     parts.len() - 1
                 }
             };
             let part = &mut parts[at].1;
+            // Точки текстуры — из того набора, на который ссылается текстура материала.
+            let uvs: Option<Vec<Vec2>> = part.texture.and_then(|_| {
+                let set = material
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                    .map_or(0, |i| i.tex_coord());
+                reader
+                    .read_tex_coords(set)
+                    .map(|t| t.into_f32().map(Vec2::from).collect())
+            });
             if normals.is_some() && part.normals.len() < part.triangles.len() {
                 // Нормали появились у второй сетки материала: первым — нормали их граней.
                 let flat: Vec<[Vec3; 3]> = part.triangles[part.normals.len()..]
@@ -186,6 +239,14 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
                     None if !part.normals.is_empty() => part.normals.push([face_normal(&t); 3]),
                     None => {}
                 }
+                if part.texture.is_some() {
+                    let get = |i: u32| {
+                        uvs.as_ref()
+                            .and_then(|u| u.get(i as usize).copied())
+                            .unwrap_or(Vec2::ZERO)
+                    };
+                    part.uvs.push([get(i[0]), get(i[1]), get(i[2])]);
+                }
                 part.triangles.push(t);
             }
         }
@@ -196,7 +257,112 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
     }
     Ok(Model {
         parts: parts.into_iter().map(|(_, p)| p).collect(),
+        textures,
     })
+}
+
+/// Читает картинку `image` (PNG или JPEG: из двоичного раздела `.glb` или файлом рядом с
+/// моделью) и считает её уровни уменьшения.
+fn read_texture(
+    image: &gltf::Image,
+    buffers: &[Vec<u8>],
+    dir: Option<&Path>,
+) -> Result<ModelTexture, String> {
+    let label = image.name().map_or_else(
+        || format!("картинка {}", image.index() + 1),
+        |n| format!("картинка «{n}»"),
+    );
+    let file;
+    let bytes: &[u8] = match image.source() {
+        gltf::image::Source::View { view, .. } => {
+            let buffer = buffers
+                .get(view.buffer().index())
+                .ok_or_else(|| format!("{label}: нет буфера {}", view.buffer().index()))?;
+            buffer
+                .get(view.offset()..view.offset() + view.length())
+                .ok_or_else(|| format!("{label}: лежит за концом буфера"))?
+        }
+        gltf::image::Source::Uri { uri, .. } if uri.starts_with("data:") => {
+            return Err(format!(
+                "{label}: вписана в текст (data:), так движок не читает: сохрани модель как .glb"
+            ));
+        }
+        gltf::image::Source::Uri { uri, .. } => {
+            let path = dir.unwrap_or(Path::new(".")).join(uri);
+            file = std::fs::read(&path).map_err(|e| format!("файл {}: {e}", path.display()))?;
+            &file
+        }
+    };
+    let mut picture = image::load_from_memory(bytes)
+        .map_err(|e| format!("{label}: не прочитать (нужен PNG или JPEG): {e}"))?
+        .to_rgba8();
+    while picture.width().max(picture.height()) > MAX_TEXTURE_SIZE {
+        let (w, h) = (picture.width(), picture.height());
+        let half = halve(&picture, w, h);
+        picture = image::RgbaImage::from_raw((w / 2).max(1), (h / 2).max(1), half)
+            .expect("размер уменьшенной картинки");
+    }
+    let (width, height) = (picture.width(), picture.height());
+    let mut levels = vec![picture.into_raw()];
+    let (mut w, mut h) = (width, height);
+    while w > 1 || h > 1 {
+        let next = halve(levels.last().expect("есть уровень"), w, h);
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        levels.push(next);
+    }
+    Ok(ModelTexture {
+        image: image.index(),
+        width,
+        height,
+        levels,
+    })
+}
+
+/// Картинка RGBA (sRGB) `w`×`h`, уменьшенная вдвое (по стороне 1 — не меньше 1): каждая
+/// точка — среднее квадрата 2×2 (или пары у стороны 1). Цвет усредняется в линейном виде,
+/// иначе уменьшенная картинка темнеет.
+fn halve(pixels: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+    let to_linear = |c: u8| {
+        let c = f32::from(c) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let to_srgb = |c: f32| {
+        let c = if c <= 0.003_130_8 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (c * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+    };
+    let mut out = Vec::with_capacity((nw * nh * 4) as usize);
+    for y in 0..nh {
+        for x in 0..nw {
+            let mut sum = [0.0f32; 4];
+            let mut n = 0.0;
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let (sx, sy) = ((2 * x + dx).min(w - 1), (2 * y + dy).min(h - 1));
+                let at = ((sy * w + sx) * 4) as usize;
+                for k in 0..3 {
+                    sum[k] += to_linear(pixels[at + k]);
+                }
+                sum[3] += f32::from(pixels[at + 3]);
+                n += 1.0;
+            }
+            out.extend([
+                to_srgb(sum[0] / n),
+                to_srgb(sum[1] / n),
+                to_srgb(sum[2] / n),
+                (sum[3] / n + 0.5) as u8,
+            ]);
+        }
+    }
+    out
 }
 
 /// Нормаль грани (по обходу вершин).
@@ -321,6 +487,52 @@ mod tests {
         assert_eq!(count("труба"), 48);
         let body = m.parts.iter().find(|p| p.material == "корпус").unwrap();
         assert!((body.color[0] - 0.80).abs() < 1e-6);
+    }
+
+    #[test]
+    fn crate_texture_is_read_with_levels() {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scenes/3d/models/crate.glb"
+        ));
+        let m = load(path, 1.0).unwrap();
+        assert_eq!(m.parts.len(), 1);
+        assert_eq!(m.textures.len(), 1);
+        let part = &m.parts[0];
+        assert_eq!(part.texture, Some(0));
+        assert_eq!(part.triangles.len(), 12);
+        assert_eq!(part.uvs.len(), 12);
+        assert!(
+            part.uvs
+                .iter()
+                .flatten()
+                .all(|u| (0.0..=1.0).contains(&u.x) && (0.0..=1.0).contains(&u.y))
+        );
+        assert!(part.uvs.iter().flatten().any(|u| *u == Vec2::new(1.0, 0.0)));
+        let t = &m.textures[0];
+        assert_eq!((t.width, t.height), (64, 64));
+        // 64, 32, 16, 8, 4, 2, 1.
+        assert_eq!(t.levels.len(), 7);
+        for (k, level) in t.levels.iter().enumerate() {
+            let side = 64usize >> k;
+            assert_eq!(level.len(), side * side * 4, "уровень {k}");
+        }
+        // Угол — тёмная рамка, середина края — светлые доски; последний уровень — среднее.
+        let px = |x: usize, y: usize| &t.levels[0][(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert!(px(1, 1)[0] < 110, "{:?}", px(1, 1));
+        assert!(px(40, 20)[0] > 150, "{:?}", px(40, 20));
+        let last = &t.levels[6];
+        assert!(last[0] > 100 && last[0] < 175 && last[3] == 255, "{last:?}");
+    }
+
+    #[test]
+    fn halving_averages_in_linear_light() {
+        // Чёрное и белое пополам дают не 128, а 188: так середина не темнеет вдали.
+        let pixels = [0u8, 0, 0, 255, 255, 255, 255, 255];
+        let half = halve(&pixels, 2, 1);
+        assert_eq!(half.len(), 4);
+        assert!((186..=190).contains(&half[0]), "{half:?}");
+        assert_eq!(half[3], 255);
     }
 
     #[test]
