@@ -517,6 +517,7 @@ fn render(
         #[cfg(test)]
         if let Some(demo) = r.demo.as_mut() {
             demo.set_edge_probe(tests::EDGE_PROBE.get());
+            demo.set_edge_creases(tests::EDGE_CREASES.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -796,6 +797,8 @@ pub(crate) mod tests {
         /// Замер краёв по частям (8.1).
         pub(super) static EDGE_PROBE: std::cell::Cell<crate::EdgeProbe> =
             const { std::cell::Cell::new(crate::EdgeProbe::Off) };
+        /// Складки без доп. лучей (8.2); как в песочнице, по умолчанию включены.
+        pub(super) static EDGE_CREASES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Мусором залиты только картинки с этим именем (8.0).
         pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
             const { std::cell::Cell::new(None) };
@@ -839,6 +842,73 @@ pub(crate) mod tests {
             if probe == crate::EdgeProbe::Off {
                 assert_eq!(changed, 0, "«как обычно» не меняет кадр");
             }
+        }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
+    /// Складки без доп. лучей (8.2) рисуют края почти так же, как доп. лучи с шагами по
+    /// сцене: отличаются только пиксели краёв, и ненамного.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn crease_edges_match_marched_edges() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let room = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        let level = |render| HeadlessPlay {
+            start: Some([-0.6, -0.5]),
+            level: Some(render),
+            ..Default::default()
+        };
+        let cases: Vec<(&str, HeadlessScene, Option<HeadlessPlay>)> = vec![
+            ("3D", hollow_side(), None),
+            (
+                "2.5D, поле",
+                room.clone(),
+                Some(level(crate::LevelRender::Field)),
+            ),
+            (
+                "2.5D, треугольники",
+                room,
+                Some(level(crate::LevelRender::Triangles)),
+            ),
+        ];
+        for (name, scene, play) in &cases {
+            EDGE_CREASES.set(false);
+            let marched = render_headless_play(&options, scene, play.as_ref());
+            EDGE_CREASES.set(true);
+            let marched = marched.expect("кадр без складок");
+            let creases = render_headless_play(&options, scene, play.as_ref()).expect("кадр");
+            let edges = creases
+                .space_stats
+                .as_ref()
+                .and_then(|s| s.edge_pixels)
+                .unwrap_or(0);
+            let (changed, worst, mean) = image_diff(&marched.image, &creases.image);
+            eprintln!(
+                "{name}: краёв {edges}, отличаются {changed} пикселей, \
+                 наибольшая разница {worst}, средняя {mean:.4}"
+            );
+            assert!(edges > 0, "{name}: в кадре есть края");
+            assert!(
+                changed as u64 <= u64::from(edges),
+                "{name}: отличаются {changed} пикселей, а краёв только {edges}"
+            );
+            assert!(mean < 0.5, "{name}: средняя разница {mean:.4}");
         }
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
@@ -1931,6 +2001,9 @@ pub(crate) mod tests {
             PASS_AO, PASS_CONE, PASS_EDGE_SHADOWS, PASS_EDGES, PASS_MARCH, PASS_SHADOWS,
             RAY_PASS_NAMES,
         };
+        // Каждый край — 4 луча с шагами по сцене: без складок 8.2 (у складки лучи не
+        // шагают). Каждый тест идёт в своём потоке, переключатель потом не возвращается.
+        EDGE_CREASES.set(false);
         let options = GpuOptions {
             validation: true,
             gpu: None,
@@ -2133,6 +2206,9 @@ pub(crate) mod tests {
     #[ignore = "нужен драйвер Vulkan"]
     fn level_view_normal_shortcut_is_exact() {
         use crate::counters::{PASS_EDGES, PASS_MARCH, RAY_PASS_NAMES};
+        // Сравнение лучей краёв с прежним способом нормали — на одном и том же наборе лучей
+        // с шагами: без складок 8.2.
+        EDGE_CREASES.set(false);
         let options = GpuOptions {
             validation: true,
             gpu: None,

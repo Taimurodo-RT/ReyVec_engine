@@ -40,6 +40,7 @@ pub(crate) enum PanelAction {
     SpaceFree(bool),
     /// Замер «краёв 3D» по частям (8.1).
     EdgeProbe(EdgeProbe),
+    EdgeCreases(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -146,6 +147,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_free: bool,
     /// Замер «краёв 3D» по частям (8.1).
     pub edge_probe: EdgeProbe,
+    /// Складки без доп. лучей в «краях 3D» (8.2).
+    pub edge_creases: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -786,6 +789,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             actions.push(PanelAction::SpaceFree(free));
         }
         if info.space_smooth.0 {
+            let mut creases = info.edge_creases;
+            if ui
+                .checkbox(&mut creases, "Края: складки без доп. лучей")
+                .on_hover_text(
+                    "8.2: на ребре, где сходятся две плоскости (угол коробки, стык передней \
+                     грани и бока), доп. лучи края не шагают по сцене, а пересекают эти две \
+                     плоскости. Так быстрее. Выключите, чтобы сравнить вид и время «края 3D» \
+                     с прежним способом",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::EdgeCreases(creases));
+            }
             ui.label("Замер краёв 3D").on_hover_text(
                 "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
                  По разнице времени строки «края 3D» с «как обычно» видно, сколько стоит \
@@ -1508,6 +1524,7 @@ mod tests {
             space_counters: (true, true),
             space_free: true,
             edge_probe: EdgeProbe::Off,
+            edge_creases: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

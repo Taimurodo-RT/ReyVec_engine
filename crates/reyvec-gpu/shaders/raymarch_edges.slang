@@ -50,6 +50,125 @@ static const uint EDGE_PROBE_NO_EXACT_SHADOWS = 1;
 static const uint EDGE_PROBE_NO_SUB_RAYS = 2;
 static const uint EDGE_PROBE_NO_SHADING = 3;
 static const uint EDGE_PROBE_EMPTY = 4;
+// Бит 8 того же слова (8.2): складки без доп. лучей. Слово 6 — замер (младшие 8 бит)
+// и этот бит, как Demo::edge_list_word в demo.rs.
+static const uint EDGE_CREASES = 0x100;
+
+// Складка (8.2): пиксель, где сходятся две плоские (или почти плоские) поверхности —
+// ребро коробки, стык передней грани и бока выдавленной фигуры, угол пола и стены. Тут
+// доп. лучам незачем шагать по сцене: каждый луч пересекает обе плоскости, и видна та, в
+// которую он входит в тело (у выпуклого ребра — дальняя, у вогнутого угла — ближняя).
+// Плоскости — точка самого пикселя и точка соседа на другой стороне ребра. Пиксель
+// считается складкой, только если эта модель повторяет буфер геометрии: середина пикселя
+// попадает в свою плоскость, середина соседа — в его, а остальные соседи лежат на одной
+// из двух. Иначе (небо рядом, разрыв по глубине, третья поверхность, образцы полигонов
+// расходятся) — обычные доп. лучи.
+struct Crease
+{
+    bool ok;
+    float3 p0;
+    float3 n0;
+    float4 g1; // буфер геометрии соседа за ребром
+    float3 p1;
+    float3 n1;
+    bool convex;
+};
+
+// Расстояние вдоль луча до плоскости (точка `p`, нормаль `n`); −1 — луч почти вдоль неё.
+float plane_t(Ray r, float3 p, float3 n)
+{
+    float facing = dot(r.dir, n);
+    return abs(facing) > 0.05 ? dot(p - r.origin, n) / facing : -1.0;
+}
+
+// Что видно на луче `r` по модели складки: x — расстояние (−1 — модель не годится),
+// y — 0 своя плоскость, 1 — соседа.
+float2 crease_hit(Crease c, Ray r)
+{
+    float ta = plane_t(r, c.p0, c.n0);
+    float tb = plane_t(r, c.p1, c.n1);
+    if (ta <= 0.0 || tb <= 0.0)
+        return float2(-1.0, 0.0);
+    bool other = c.convex ? tb > ta : tb < ta;
+    return float2(other ? tb : ta, other ? 1.0 : 0.0);
+}
+
+float2 screen_of(float2 at, uint w, uint h)
+{
+    return float2(at.x / float(w) * 2.0 - 1.0, 1.0 - at.y / float(h) * 2.0);
+}
+
+bool near_t(float a, float b)
+{
+    return abs(a - b) <= 0.01 * b + 0.01;
+}
+
+Crease find_crease(int2 px, float4 g0, uint w, uint h)
+{
+    Crease c;
+    c.ok = false;
+    c.g1 = float4(-1.0, 0.0, 0.0, 0.0);
+    c.p0 = float3(0.0, 0.0, 0.0);
+    c.n0 = oct_decode(g0.zw);
+    c.p1 = c.p0;
+    c.n1 = c.n0;
+    c.convex = true;
+    if (g0.x < 0.0 || mesh_mixed(px, g0.x))
+        return c;
+    Ray r0 = screen_ray(screen_of(float2(px) + 0.5, w, h));
+    c.p0 = r0.origin + r0.dir * g0.x;
+    bool have = false;
+    for (uint k = 0; k < 4; k++)
+    {
+        int2 o = k < 2 ? int2(int(k) * 2 - 1, 0) : int2(0, int(k) * 2 - 5);
+        int2 q = px + o;
+        if (any(q < 0) || q.x >= int(w) || q.y >= int(h))
+            continue;
+        float4 g1 = gbuffer_load(q);
+        if (g1.x < 0.0)
+            return c;
+        Ray r1 = screen_ray(screen_of(float2(q) + 0.5, w, h));
+        float3 n1 = oct_decode(g1.zw);
+        // Сосед на своей плоскости: тот же материал, та же сторона, попадание по плоскости.
+        float ta = plane_t(r1, c.p0, c.n0);
+        if (abs(g1.y - g0.y) < 0.5 && dot(n1, c.n0) > 0.9 && ta > 0.0 && near_t(g1.x, ta))
+            continue;
+        float3 p1 = r1.origin + r1.dir * g1.x;
+        if (have)
+        {
+            // Второй сосед за ребром — на той же второй плоскости, иначе это не складка.
+            float tb = plane_t(r1, c.p1, c.n1);
+            if (abs(g1.y - c.g1.y) < 0.5 && dot(n1, c.n1) > 0.9 && tb > 0.0 && near_t(g1.x, tb))
+                continue;
+            return c;
+        }
+        have = true;
+        c.g1 = g1;
+        c.p1 = p1;
+        c.n1 = n1;
+    }
+    // Плоскости почти параллельны — это ступенька по глубине, а не ребро.
+    if (!have || abs(dot(c.n0, c.n1)) > 0.995)
+        return c;
+    c.convex = dot(c.p1 - c.p0, c.n0) < 0.0;
+    // Модель повторяет буфер геометрии в середине пикселя и у всех соседей.
+    float2 mine = crease_hit(c, r0);
+    if (mine.x < 0.0 || mine.y != 0.0 || !near_t(mine.x, g0.x))
+        return c;
+    for (uint k = 0; k < 4; k++)
+    {
+        int2 o = k < 2 ? int2(int(k) * 2 - 1, 0) : int2(0, int(k) * 2 - 5);
+        int2 q = px + o;
+        if (any(q < 0) || q.x >= int(w) || q.y >= int(h))
+            continue;
+        float4 g1 = gbuffer_load(q);
+        float2 hit = crease_hit(c, screen_ray(screen_of(float2(q) + 0.5, w, h)));
+        if (hit.x < 0.0 || !near_t(hit.x, g1.x))
+            return c;
+    }
+    c.ok = true;
+    return c;
+}
 
 groupshared float3 colors[64];
 // Точные доли света пикселей группы: [пиксель][солнце, углы, лампа 1, лампа 2].
@@ -64,7 +183,8 @@ static const uint PART_OF_QUARTER[4] = { 2, 3, 1, 0 };
 void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
 {
     // Лучей на пиксель: 4 или 2. Лучи пикселя — соседние потоки одной группы.
-    uint probe = pc.edges[6];
+    uint probe = pc.edges[6] & 0xff;
+    bool creases = (pc.edges[6] & EDGE_CREASES) != 0;
     if (probe == EDGE_PROBE_EMPTY)
         return;
     bool pairs = (pc.flags & SPACE_FLAG_EDGE_PAIRS) != 0;
@@ -149,8 +269,25 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         float2 screen = float2(at.x / float(w) * 2.0 - 1.0, 1.0 - at.y / float(h) * 2.0);
         float2 middle = float2(px) + 0.5;
         float2 center = float2(middle.x / float(w) * 2.0 - 1.0, 1.0 - middle.y / float(h) * 2.0);
+        // Складка (8.2): доп. луч берёт одну из двух плоскостей без шагов по сцене.
         // Полигоны (7.18е2): свой образец MSAA у каждого луча — край призмы ровный.
-        float4 g = probe == EDGE_PROBE_NO_SUB_RAYS ? g0 : march_pixel(px, screen, int(sub), center);
+        float4 g = g0;
+        bool marched = probe != EDGE_PROBE_NO_SUB_RAYS;
+        if (marched && creases)
+        {
+            Crease c = find_crease(px, g0, w, h);
+            if (c.ok)
+            {
+                float2 hit = crease_hit(c, screen_ray(screen));
+                if (hit.x >= 0.0)
+                {
+                    g = hit.y == 0.0 ? float4(hit.x, g0.yzw) : float4(hit.x, c.g1.yzw);
+                    marched = false;
+                }
+            }
+        }
+        if (marched)
+            g = march_pixel(px, screen, int(sub), center);
         if (g.x < 0.0)
             color = sky(screen_ray(screen).dir);
         else
