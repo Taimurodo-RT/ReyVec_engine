@@ -393,6 +393,13 @@ impl App {
                 r.set_space_free(on);
                 tracing::info!("Длинный шаг в пустоте: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::EdgeCreases(on) => {
+                r.set_edge_creases(on);
+                tracing::info!(
+                    "Края 3D: складки без доп. лучей {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::EdgeProbe(probe) => {
                 r.set_edge_probe(probe);
                 tracing::info!("Замер краёв 3D: {}", probe.title());
@@ -632,6 +639,7 @@ impl App {
                 space_counters: renderer.space_counters(),
                 space_free: renderer.space_free(),
                 edge_probe: renderer.edge_probe(),
+                edge_creases: renderer.edge_creases(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
                 level_render: renderer.level_render(),

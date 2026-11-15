@@ -676,6 +676,8 @@ pub(crate) struct Demo {
     space_free: bool,
     /// Замер «краёв 3D» по частям (8.1).
     edge_probe: EdgeProbe,
+    /// Складки без доп. лучей в «краях 3D» (8.2; `false` — как до 8.2, для сравнения).
+    edge_creases: bool,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -1032,6 +1034,7 @@ impl Demo {
             level_field_apart: true,
             space_free: true,
             edge_probe: EdgeProbe::Off,
+            edge_creases: true,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -1717,6 +1720,16 @@ impl Demo {
     /// Выбирает, что проход «края 3D» пропускает для замера (со следующего кадра).
     pub fn set_edge_probe(&mut self, probe: EdgeProbe) {
         self.edge_probe = probe;
+    }
+
+    /// Складки без доп. лучей в «краях 3D» (8.2).
+    pub fn edge_creases(&self) -> bool {
+        self.edge_creases
+    }
+
+    /// Включает и выключает складки без доп. лучей (выключено — как до 8.2).
+    pub fn set_edge_creases(&mut self, on: bool) {
+        self.edge_creases = on;
     }
 
     /// Нормаль всегда по всей сцене (7.18д5) — для сравнения с обычной.
@@ -4255,7 +4268,8 @@ impl Demo {
                 SPACE_FLAG_EDGE_PAIRS
             };
             let edges = graph.create("края 3D", ext, EDGE_FORMAT);
-            let probe = self.edge_probe.word();
+            // Слово 6 заголовка: замер (8.1) и бит складок (8.2, EDGE_CREASES).
+            let probe = self.edge_probe.word() | if self.edge_creases { 0x100 } else { 0 };
             // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
             // расходятся, — край, даже если буфер геометрии у соседей одинаков.
             let mut find_uses = vec![
