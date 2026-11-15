@@ -32,6 +32,20 @@ struct MeshOut
     float2 uv : TEXCOORD;
 };
 
+// Число половинной точности из 16 бит (как f16_bits в space.rs). Не f16tof32: тот
+// требует от видеокарты чисел half (shaderFloat16, shaderInt16), а их умеют не все.
+float half_bits(uint h)
+{
+    float sign = (h & 0x8000u) != 0 ? -1.0 : 1.0;
+    uint e = (h >> 10) & 0x1fu;
+    uint m = h & 0x3ffu;
+    if (e == 0)
+        return sign * float(m) * (1.0 / 16777216.0); // денормальное: m · 2^−24
+    if (e == 31)
+        return sign * 65504.0; // бесконечность и не-число — самое большое число
+    return sign * asfloat(((e + 112u) << 23) | (m << 13));
+}
+
 [shader("vertex")]
 MeshOut vs_main(uint vertex : SV_VulkanVertexID)
 {
@@ -74,7 +88,7 @@ MeshOut vs_main(uint vertex : SV_VulkanVertexID)
         o.normal = float3(0.0, 0.0, 0.0);
     }
     uint uv = pc.scene[v + 4];
-    o.uv = float2(f16tof32(uv & 0xffff), f16tof32(uv >> 16));
+    o.uv = float2(half_bits(uv & 0xffff), half_bits(uv >> 16));
     return o;
 }
 
