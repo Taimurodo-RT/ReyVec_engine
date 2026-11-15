@@ -2001,6 +2001,9 @@ pub(crate) mod tests {
             PASS_AO, PASS_CONE, PASS_EDGE_SHADOWS, PASS_EDGES, PASS_MARCH, PASS_SHADOWS,
             RAY_PASS_NAMES,
         };
+        // Каждый край — 4 луча с шагами по сцене: без складок 8.2 (у складки лучи не
+        // шагают). Каждый тест идёт в своём потоке, переключатель потом не возвращается.
+        EDGE_CREASES.set(false);
         let options = GpuOptions {
             validation: true,
             gpu: None,
@@ -2203,6 +2206,9 @@ pub(crate) mod tests {
     #[ignore = "нужен драйвер Vulkan"]
     fn level_view_normal_shortcut_is_exact() {
         use crate::counters::{PASS_EDGES, PASS_MARCH, RAY_PASS_NAMES};
+        // Сравнение лучей краёв с прежним способом нормали — на одном и том же наборе лучей
+        // с шагами: без складок 8.2.
+        EDGE_CREASES.set(false);
         let options = GpuOptions {
             validation: true,
             gpu: None,
