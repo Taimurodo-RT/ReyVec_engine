@@ -678,6 +678,8 @@ pub(crate) struct Demo {
     edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2; `false` — как до 8.2, для сравнения).
     edge_creases: bool,
+    /// Точные тени краёв только у границы тени (8.2б; `false` — как до 8.2б).
+    edge_shadow_reuse: bool,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -1035,6 +1037,7 @@ impl Demo {
             space_free: true,
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
+            edge_shadow_reuse: true,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -1730,6 +1733,16 @@ impl Demo {
     /// Включает и выключает складки без доп. лучей (выключено — как до 8.2).
     pub fn set_edge_creases(&mut self, on: bool) {
         self.edge_creases = on;
+    }
+
+    /// Точные тени краёв только у границы тени (8.2б).
+    pub fn edge_shadow_reuse(&self) -> bool {
+        self.edge_shadow_reuse
+    }
+
+    /// Включает и выключает 8.2б (выключено — точные тени у всех ненадёжных краёв).
+    pub fn set_edge_shadow_reuse(&mut self, on: bool) {
+        self.edge_shadow_reuse = on;
     }
 
     /// Нормаль всегда по всей сцене (7.18д5) — для сравнения с обычной.
@@ -4268,8 +4281,11 @@ impl Demo {
                 SPACE_FLAG_EDGE_PAIRS
             };
             let edges = graph.create("края 3D", ext, EDGE_FORMAT);
-            // Слово 6 заголовка: замер (8.1) и бит складок (8.2, EDGE_CREASES).
-            let probe = self.edge_probe.word() | if self.edge_creases { 0x100 } else { 0 };
+            // Слово 6 заголовка: замер (8.1), бит складок (8.2а, EDGE_CREASES) и бит
+            // теней у границы (8.2б, EDGE_SHADOW_REUSE).
+            let probe = self.edge_probe.word()
+                | if self.edge_creases { 0x100 } else { 0 }
+                | if self.edge_shadow_reuse { 0x200 } else { 0 };
             // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
             // расходятся, — край, даже если буфер геометрии у соседей одинаков.
             let mut find_uses = vec![

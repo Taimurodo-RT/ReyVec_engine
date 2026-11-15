@@ -41,6 +41,7 @@ pub(crate) enum PanelAction {
     /// Замер «краёв 3D» по частям (8.1).
     EdgeProbe(EdgeProbe),
     EdgeCreases(bool),
+    EdgeShadowReuse(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -149,6 +150,8 @@ pub(crate) struct PanelInfo<'a> {
     pub edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2).
     pub edge_creases: bool,
+    /// Точные тени краёв только у границы тени (8.2б).
+    pub edge_shadow_reuse: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -801,6 +804,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::EdgeCreases(creases));
+            }
+            let mut reuse = info.edge_shadow_reuse;
+            if ui
+                .checkbox(&mut reuse, "Края: точные тени только у границы тени")
+                .on_hover_text(
+                    "8.2б: у края, где картинка теней ненадёжна, свои лучи тени пускаются \
+                     только для того света, у которого рядом проходит граница тени. \
+                     Остальное берётся из картинки теней. Выключите, чтобы сравнить вид и \
+                     время «края 3D» с прежним способом",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::EdgeShadowReuse(reuse));
             }
             ui.label("Замер краёв 3D").on_hover_text(
                 "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
@@ -1525,6 +1541,7 @@ mod tests {
             space_free: true,
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
+            edge_shadow_reuse: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

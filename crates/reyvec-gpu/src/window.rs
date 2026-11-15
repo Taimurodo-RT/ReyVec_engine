@@ -724,6 +724,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Точные тени краёв только у границы тени (8.2б).
+    pub fn edge_shadow_reuse(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.edge_shadow_reuse())
+    }
+
+    /// Включает и выключает 8.2б.
+    pub fn set_edge_shadow_reuse(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_edge_shadow_reuse(on);
+        }
+    }
+
     /// Длинный шаг в пустоте (7.18д4): включён ли.
     pub fn space_free(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.space_free())
