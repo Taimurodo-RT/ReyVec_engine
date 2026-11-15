@@ -12,6 +12,7 @@ use std::path::Path;
 use glam::{Vec2, Vec3};
 use serde::Deserialize;
 
+use crate::brick3d::{Brick, BrickRef};
 use crate::mesh3d::{MAX_TRIANGLES, Mesh3};
 use crate::shape3d::{
     Bob, Circle, Lamp3, MAX_MATERIALS, Material3, Shape3, compile, motion_offset, rotation,
@@ -192,7 +193,11 @@ struct SceneMesh {
     entry: MeshEntry,
     /// Части по материалам в координатах модели.
     parts: Vec<MeshFrame>,
+    /// Заменители из плоскостей граней выпуклых кусков (7.6ж, 8.14) — для сравнения с
+    /// кирпичом и для моделей, у которых кирпича нет.
     proxies: Vec<Shape3>,
+    /// «Кирпич поля» модели (8.15): один заменитель на всю модель.
+    brick: Option<Shape3>,
 }
 
 /// Сцена, готовая к кадрам: материалы по номерам, лампы и предметы с номерами материалов.
@@ -211,6 +216,12 @@ pub struct SpaceScene {
     pub notes: Vec<String>,
     /// Текстуры цвета моделей (8.14б2): на них ссылаются материалы (`Material3::texture`).
     pub textures: Vec<std::sync::Arc<crate::model3d::ModelTexture>>,
+    /// Кирпичи поля моделей (8.15): видеокарта загружает их картинки и ставит номера
+    /// ([`crate::brick3d::Brick::set_texture`]). Одна модель одного размера — один кирпич.
+    pub bricks: Vec<BrickRef>,
+    /// Тени моделей от плоскостей граней, как до 8.15 (для сравнения на панели); обычно
+    /// (false) — от кирпичей поля.
+    pub plane_shadows: bool,
     /// Камера из файла (если записана).
     pub camera: Option<CameraEntry>,
     /// Сетка отсева выключена в файле (`culling: false`).
@@ -291,6 +302,8 @@ impl SpaceScene {
         let mut notes = Vec::new();
         let mut textures = Vec::new();
         let mut texture_keys: Vec<(std::path::PathBuf, usize)> = Vec::new();
+        let mut bricks: Vec<BrickRef> = Vec::new();
+        let mut brick_keys: Vec<String> = Vec::new();
         for (i, m) in file.meshes.iter().enumerate() {
             let label = if m.name.is_empty() {
                 format!("модель {}", i + 1)
@@ -308,6 +321,14 @@ impl SpaceScene {
                     ));
                 };
                 Some(index as u32)
+            };
+            // Ключ кирпича: та же модель того же размера — тот же кирпич.
+            let brick_key = match &m.mesh {
+                Mesh3::Model { file: path, scale } => {
+                    let full = dir.map_or_else(|| Path::new(path).to_path_buf(), |d| d.join(path));
+                    format!("{}|{}", full.display(), scale.to_bits())
+                }
+                mesh => format!("{mesh:?}"),
             };
             let (parts, proxies) = match &m.mesh {
                 Mesh3::Model { file: path, scale } => {
@@ -400,10 +421,37 @@ impl SpaceScene {
                     "{label}: {count} граней, больше {MAX_TRIANGLES} не бывает"
                 ));
             }
+            let brick = if m.shadow {
+                let made = match brick_keys.iter().position(|k| *k == brick_key) {
+                    Some(at) => Some(bricks[at].clone()),
+                    None => {
+                        let all: Vec<[Vec3; 3]> = parts
+                            .iter()
+                            .flat_map(|p| p.triangles.iter().copied())
+                            .collect();
+                        let (brick, open) = Brick::bake(&all);
+                        if open > 0 {
+                            notes.push(format!(
+                                "{label}: {open} незамкнутых кусков без тени (у них нет «внутри»)"
+                            ));
+                        }
+                        brick.map(|b| {
+                            let b = BrickRef(std::sync::Arc::new(b));
+                            brick_keys.push(brick_key);
+                            bricks.push(b.clone());
+                            b
+                        })
+                    }
+                };
+                made.map(|brick| Shape3::Brick { brick })
+            } else {
+                None
+            };
             meshes.push(SceneMesh {
                 entry: m.clone(),
                 parts,
                 proxies,
+                brick,
             });
         }
         let mut lamp_colors = Vec::new();
@@ -440,6 +488,8 @@ impl SpaceScene {
             meshes,
             notes,
             textures,
+            bricks,
+            plane_shadows: false,
             camera: file.camera,
             culling_off: !file.culling,
             view_culling_off: !file.view_culling,
@@ -511,11 +561,16 @@ impl SpaceScene {
                     uvs: part.uvs.clone(),
                 });
             }
-            proxies.extend(
-                mesh.proxies
-                    .iter()
-                    .map(|p| p.clone().placed(at.to_array(), turn)),
-            );
+            match &mesh.brick {
+                Some(brick) if !self.plane_shadows => {
+                    proxies.push(brick.clone().placed(at.to_array(), turn));
+                }
+                _ => proxies.extend(
+                    mesh.proxies
+                        .iter()
+                        .map(|p| p.clone().placed(at.to_array(), turn)),
+                ),
+            }
         }
         SpaceFrame {
             shapes,
@@ -685,8 +740,19 @@ mod tests {
         assert!(frame.meshes[..8].iter().all(|m| m.uvs.is_empty()));
         let gold = 1;
         assert!(frame.meshes[4..8].iter().all(|m| m.material == gold));
-        // Тени: 6 кусков станка, 6 малого, ящик и коробка.
-        assert_eq!(frame.proxies.len(), 14);
+        // Тени (8.15): по кирпичу поля на модель — станок, малый станок (другой размер —
+        // свой кирпич), ящик и коробка.
+        assert_eq!(frame.proxies.len(), 4);
+        assert_eq!(scene.bricks.len(), 4);
+        // Кирпич станка: середина корпуса в тени-заменителе, точка над корпусом — нет.
+        let machine = &frame.proxies[0];
+        let world = |v: Vec3| crate::shape3d::rotation([0.0, -20.0, 0.0]) * v;
+        assert!(machine.distance(world(Vec3::new(-0.25, 0.6, 0.0))) < 0.0);
+        assert!(machine.distance(world(Vec3::new(-0.25, 1.05, 0.0))) > 0.0);
+        // Как до 8.15: 6 кусков станка, 6 малого, ящик и коробка.
+        let mut planes = scene.clone();
+        planes.plane_shadows = true;
+        assert_eq!(planes.frame(0.0).proxies.len(), 14);
         // Малый станок вдвое меньше: верх дымохода на 1.5 × 0.5.
         let top = frame.meshes[4..8]
             .iter()

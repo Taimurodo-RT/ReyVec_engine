@@ -736,6 +736,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Тени моделей от кирпичей поля (8.15): включено ли.
+    pub fn brick_shadows(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| !d.plane_shadows())
+    }
+
+    /// Включает тени моделей от кирпичей поля (выключено — от плоскостей граней).
+    pub fn set_brick_shadows(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_plane_shadows(!on);
+        }
+    }
+
     /// Длинный шаг в пустоте (7.18д4): включён ли.
     pub fn space_free(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.space_free())

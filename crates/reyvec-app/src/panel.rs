@@ -42,6 +42,8 @@ pub(crate) enum PanelAction {
     EdgeProbe(EdgeProbe),
     EdgeCreases(bool),
     EdgeShadowReuse(bool),
+    /// Тени моделей от кирпичей поля (8.15).
+    BrickShadows(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -152,6 +154,8 @@ pub(crate) struct PanelInfo<'a> {
     pub edge_creases: bool,
     /// Точные тени краёв только у границы тени (8.2б).
     pub edge_shadow_reuse: bool,
+    /// Тени моделей от кирпичей поля (8.15).
+    pub brick_shadows: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -817,6 +821,18 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::EdgeShadowReuse(reuse));
+            }
+            let mut bricks = info.brick_shadows;
+            if ui
+                .checkbox(&mut bricks, "Тени моделей: кирпич поля")
+                .on_hover_text(
+                    "8.15: тень модели из файла бросает её запечённая сетка расстояний — \
+                     одно чтение картинки на шаг луча. Выключите, чтобы сравнить вид и \
+                     время «теней 3D» с прежними заменителями из плоскостей граней",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::BrickShadows(bricks));
             }
             ui.label("Замер краёв 3D").on_hover_text(
                 "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
@@ -1542,6 +1558,7 @@ mod tests {
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,
+            brick_shadows: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

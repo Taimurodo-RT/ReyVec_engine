@@ -519,6 +519,7 @@ fn render(
             demo.set_edge_probe(tests::EDGE_PROBE.get());
             demo.set_edge_creases(tests::EDGE_CREASES.get());
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
+            demo.set_plane_shadows(tests::PLANE_SHADOWS.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -803,6 +804,8 @@ pub(crate) mod tests {
         /// Точные тени краёв только у границы тени (8.2б); по умолчанию включены.
         pub(super) static EDGE_SHADOW_REUSE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(true) };
+        /// Тени моделей от плоскостей граней, как до 8.15 (обычно — от кирпичей поля).
+        pub(super) static PLANE_SHADOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Мусором залиты только картинки с этим именем (8.0).
         pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
             const { std::cell::Cell::new(None) };
@@ -1087,6 +1090,69 @@ pub(crate) mod tests {
             // Рамка темнее досок: текстура, а не ровный цвет.
             assert!(spread > 12.0, "{name}: разброс {spread}");
         }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
+    /// Тени моделей от кирпичей поля (8.15) — почти те же, что от прежних заменителей из
+    /// плоскостей граней: сцена моделей рисуется с кирпичами, с плоскостями и совсем без
+    /// теней моделей. Кирпичи от плоскостей отличаются намного меньше, чем «без теней»
+    /// от плоскостей: кирпич бросает ту же тень, а не пропал.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn brick_shadows_match_plane_shadows() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let file = include_str!("../../../scenes/3d/models.ron");
+        let scene = |text: String| HeadlessScene {
+            width: 320,
+            height: 240,
+            time: 0.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(text.into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let bricks = render_headless(&options, &scene(file.to_owned())).expect("кадр");
+        PLANE_SHADOWS.set(true);
+        let planes = render_headless(&options, &scene(file.to_owned()));
+        PLANE_SHADOWS.set(false);
+        let planes = planes.expect("кадр");
+        let none = render_headless(
+            &options,
+            &scene(file.replace("mesh: ", "shadow: false, mesh: ")),
+        )
+        .expect("кадр");
+        let differ = |a: &[u8], b: &[u8]| {
+            a.chunks_exact(4)
+                .zip(b.chunks_exact(4))
+                .filter(|(x, y)| x[..3].iter().zip(&y[..3]).any(|(p, q)| p.abs_diff(*q) > 16))
+                .count()
+        };
+        let brick_vs_planes = differ(&bricks.image.rgba, &planes.image.rgba);
+        let none_vs_planes = differ(&none.image.rgba, &planes.image.rgba);
+        eprintln!(
+            "пикселей отличается: кирпичи от плоскостей {brick_vs_planes}, без теней от \
+             плоскостей {none_vs_planes}"
+        );
+        assert!(
+            none_vs_planes > 1500,
+            "тени моделей в кадре: {none_vs_planes}"
+        );
+        assert!(
+            brick_vs_planes * 3 < none_vs_planes,
+            "кирпичи бросают ту же тень: {brick_vs_planes} из {none_vs_planes}"
+        );
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
