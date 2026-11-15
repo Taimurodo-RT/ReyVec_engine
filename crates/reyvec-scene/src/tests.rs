@@ -583,6 +583,30 @@ fn watcher_sees_saves() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn watcher_with_models_sees_model_saves() {
+    let dir = std::env::temp_dir().join(format!("reyvec-space-watch-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("models")).unwrap();
+    let path = dir.join("space.ron");
+    std::fs::write(&path, "текст сцены").unwrap();
+    let mut watcher = SceneWatcher::with_models(&path).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(watcher.poll().is_none());
+    // Записи в чужие файлы не в счёт, запись модели во вложенной папке — да.
+    std::fs::write(dir.join("заметки.txt"), "x").unwrap();
+    std::fs::write(dir.join("models").join("machine.glb"), "x").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        if let Some(t) = watcher.poll() {
+            break t.unwrap();
+        }
+        assert!(Instant::now() < deadline, "сохранение модели не замечено");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(text, "текст сцены");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn world(text: &str) -> SceneWorld {
     let file = SceneFile::parse(text).unwrap();
     let mut lib = library();

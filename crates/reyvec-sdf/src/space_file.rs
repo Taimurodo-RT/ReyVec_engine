@@ -7,6 +7,8 @@
 //! Движение (покачивание, круг, вращение) записано данными и считается на каждый кадр
 //! ([`SpaceFile::frame`]).
 
+use std::path::Path;
+
 use glam::Vec3;
 use serde::Deserialize;
 
@@ -148,12 +150,14 @@ pub struct CameraEntry {
 }
 
 /// Полигональная модель (7.6ж): многогранник, материал, место, поворот, движение.
-/// `shadow: false` — без тени (заменителя SDF нет).
+/// `shadow: false` — без тени (заменителя SDF нет). У модели из файла (`Model`, 8.14)
+/// материал можно не писать: тогда цвета берутся из материалов файла.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshEntry {
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub material: String,
     #[serde(default)]
     pub at: [f32; 3],
@@ -177,6 +181,15 @@ pub struct MeshFrame {
     pub material: u32,
 }
 
+/// Модель сцены, готовая к кадрам: части по материалам (номер материала и треугольники в
+/// координатах модели) и заменители для теней.
+#[derive(Clone, Debug, PartialEq)]
+struct SceneMesh {
+    entry: MeshEntry,
+    parts: Vec<(u32, Vec<[Vec3; 3]>)>,
+    proxies: Vec<Shape3>,
+}
+
 /// Сцена, готовая к кадрам: материалы по номерам, лампы и предметы с номерами материалов.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SpaceScene {
@@ -188,7 +201,9 @@ pub struct SpaceScene {
     bulbs: Vec<Option<u32>>,
     objects: Vec<ObjectEntry>,
     object_materials: Vec<u32>,
-    meshes: Vec<(MeshEntry, u32, Vec<[Vec3; 3]>, Shape3)>,
+    meshes: Vec<SceneMesh>,
+    /// Заметки о чтении файла для журнала (например, у каких кусков моделей нет тени).
+    pub notes: Vec<String>,
     /// Камера из файла (если записана).
     pub camera: Option<CameraEntry>,
     /// Сетка отсева выключена в файле (`culling: false`).
@@ -216,8 +231,14 @@ pub struct SpaceFrame {
 const BULB_GLOW: f32 = 4.0;
 
 impl SpaceScene {
-    /// Читает текст файла. Ошибка — строка для человека (где и что не так).
+    /// Читает текст файла; пути к моделям glTF — от рабочей папки. Ошибка — строка для
+    /// человека (где и что не так).
     pub fn parse(text: &str) -> Result<Self, String> {
+        Self::parse_in(text, None)
+    }
+
+    /// Читает текст файла; пути к моделям glTF — от папки `dir` (папки файла сцены).
+    pub fn parse_in(text: &str, dir: Option<&Path>) -> Result<Self, String> {
         let file: SpaceFile = ron::from_str(text).map_err(|e| e.to_string())?;
         if file.format != "reyvec-space" {
             return Err(format!(
@@ -259,28 +280,89 @@ impl SpaceScene {
             compile(&o.shape).map_err(|e| format!("{label}: {e}"))?;
         }
         let mut meshes = Vec::new();
+        let mut notes = Vec::new();
         for (i, m) in file.meshes.iter().enumerate() {
             let label = if m.name.is_empty() {
                 format!("модель {}", i + 1)
             } else {
                 format!("модель «{}»", m.name)
             };
-            let Some(index) = file.materials.iter().position(|e| e.name == m.material) else {
-                return Err(format!(
-                    "{label}: нет материала «{}» (есть: {})",
-                    m.material,
-                    names(&file.materials)
-                ));
+            let material = if m.material.is_empty() {
+                None
+            } else {
+                let Some(index) = file.materials.iter().position(|e| e.name == m.material) else {
+                    return Err(format!(
+                        "{label}: нет материала «{}» (есть: {})",
+                        m.material,
+                        names(&file.materials)
+                    ));
+                };
+                Some(index as u32)
             };
-            let triangles = m.mesh.triangles();
-            if triangles.len() > MAX_TRIANGLES {
+            let (parts, proxies) = match &m.mesh {
+                Mesh3::Model { file: path, scale } => {
+                    let full = dir.map_or_else(|| Path::new(path).to_path_buf(), |d| d.join(path));
+                    let model =
+                        crate::model3d::load(&full, *scale).map_err(|e| format!("{label}: {e}"))?;
+                    let mut parts = Vec::new();
+                    let mut all = Vec::new();
+                    for part in model.parts {
+                        let index = match material {
+                            Some(index) => index,
+                            None => {
+                                materials.push(Material3 {
+                                    color: part.color,
+                                    glow: 0.0,
+                                    grid: false,
+                                });
+                                materials.len() as u32 - 1
+                            }
+                        };
+                        if part.textured {
+                            notes.push(format!(
+                                "{label}: у материала «{}» есть текстура, пока рисуется только его цвет",
+                                part.material
+                            ));
+                        }
+                        all.extend_from_slice(&part.triangles);
+                        parts.push((index, part.triangles));
+                    }
+                    let (proxies, skipped) = if m.shadow {
+                        crate::model3d::convex_proxies(&all)
+                    } else {
+                        (Vec::new(), 0)
+                    };
+                    if skipped > 0 {
+                        notes.push(format!(
+                            "{label}: {skipped} кусков без тени (невыпуклые, плоские или больше {})",
+                            crate::model3d::MAX_PROXIES
+                        ));
+                    }
+                    (parts, proxies)
+                }
+                mesh => {
+                    let Some(index) = material else {
+                        return Err(format!("{label}: нужен материал (material: \"…\")"));
+                    };
+                    let proxies = if m.shadow {
+                        vec![mesh.shadow_proxy()]
+                    } else {
+                        Vec::new()
+                    };
+                    (vec![(index, mesh.triangles())], proxies)
+                }
+            };
+            let count: usize = parts.iter().map(|p| p.1.len()).sum();
+            if count > MAX_TRIANGLES {
                 return Err(format!(
-                    "{label}: {} граней, больше {MAX_TRIANGLES} не бывает",
-                    triangles.len()
+                    "{label}: {count} граней, больше {MAX_TRIANGLES} не бывает"
                 ));
             }
-            let proxy = m.mesh.shadow_proxy();
-            meshes.push((m.clone(), index as u32, triangles, proxy));
+            meshes.push(SceneMesh {
+                entry: m.clone(),
+                parts,
+                proxies,
+            });
         }
         let mut lamp_colors = Vec::new();
         let mut bulbs = Vec::new();
@@ -313,6 +395,7 @@ impl SpaceScene {
             objects: file.objects,
             object_materials,
             meshes,
+            notes,
             camera: file.camera,
             culling_off: !file.culling,
             view_culling_off: !file.view_culling,
@@ -367,17 +450,22 @@ impl SpaceScene {
         }
         let mut meshes = Vec::new();
         let mut proxies = Vec::new();
-        for (m, material, triangles, proxy) in &self.meshes {
+        for mesh in &self.meshes {
+            let m = &mesh.entry;
             let at = Vec3::from(m.at) + motion_offset(&m.bob, &m.circle, time);
             let turn = [0, 1, 2].map(|i| m.turn[i] + m.spin[i] * time);
             let r = rotation(turn);
-            meshes.push(MeshFrame {
-                triangles: triangles.iter().map(|t| t.map(|v| at + r * v)).collect(),
-                material: *material,
-            });
-            if m.shadow {
-                proxies.push(proxy.clone().placed(at.to_array(), turn));
+            for (material, triangles) in &mesh.parts {
+                meshes.push(MeshFrame {
+                    triangles: triangles.iter().map(|t| t.map(|v| at + r * v)).collect(),
+                    material: *material,
+                });
             }
+            proxies.extend(
+                mesh.proxies
+                    .iter()
+                    .map(|p| p.clone().placed(at.to_array(), turn)),
+            );
         }
         SpaceFrame {
             shapes,
@@ -517,5 +605,54 @@ mod tests {
             s.distance(Vec3::new(0.0, 3.0, 0.0)) < -0.49,
             "без времени — момент 0"
         );
+    }
+
+    #[test]
+    fn models_scene_reads_gltf() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/models.ron");
+        let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
+        assert_eq!(scene.mesh_count(), 3);
+        // 4 материала сцены, 4 — из файла станка (первая модель без material), 2 лампочки.
+        assert_eq!(scene.materials.len(), 10);
+        let orange = scene
+            .materials
+            .iter()
+            .position(|m| m.color == [0.80, 0.30, 0.05]);
+        assert!(orange.is_some(), "цвет корпуса из файла");
+        let frame = scene.frame(0.0);
+        // Станок — 4 части по материалам, малый станок — тоже 4 (все «золото»), коробка — 1.
+        assert_eq!(frame.meshes.len(), 9);
+        let gold = 1;
+        assert!(frame.meshes[4..8].iter().all(|m| m.material == gold));
+        // Тени: 6 кусков станка, 6 малого, 1 коробка.
+        assert_eq!(frame.proxies.len(), 13);
+        // Малый станок вдвое меньше: верх дымохода на 1.5 × 0.5.
+        let top = frame.meshes[4..8]
+            .iter()
+            .flat_map(|m| m.triangles.iter().flatten())
+            .map(|v| v.y)
+            .fold(0.0, f32::max);
+        assert!((top - 0.75).abs() < 1e-4, "{top}");
+        assert!(scene.notes.is_empty(), "{:?}", scene.notes);
+    }
+
+    #[test]
+    fn model_errors_say_what_is_wrong() {
+        let scene = |meshes: &str| {
+            format!(
+                r#"(format: "reyvec-space", version: 1,
+                    materials: [(name: "м", color: (1.0, 1.0, 1.0))], meshes: [{meshes}])"#
+            )
+        };
+        let e = SpaceScene::parse(&scene(r#"(name: "к", mesh: Block(size: (1.0, 1.0, 1.0)))"#))
+            .unwrap_err();
+        assert!(e.contains("модель «к»") && e.contains("материал"), "{e}");
+        let e = SpaceScene::parse_in(
+            &scene(r#"(name: "нет", mesh: Model(file: "нет.glb"))"#),
+            Some(Path::new("/нет/папки")),
+        )
+        .unwrap_err();
+        assert!(e.contains("модель «нет»") && e.contains("нет.glb"), "{e}");
     }
 }

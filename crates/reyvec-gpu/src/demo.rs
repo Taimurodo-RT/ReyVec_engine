@@ -249,6 +249,9 @@ pub struct UserFiles {
     pub scene_dir: Option<std::path::PathBuf>,
     /// Текст файла объёмной сцены «3D» (RON, этап 7.5). Без него — пример `scenes/3d/space.ron`.
     pub space: Option<std::sync::Arc<str>>,
+    /// Папка файла сцены «3D»: от неё считаются пути к моделям glTF (8.14). Без неё — от
+    /// рабочей папки.
+    pub space_dir: Option<std::path::PathBuf>,
 }
 
 impl UserFiles {
@@ -1148,6 +1151,7 @@ impl Demo {
                 .space
                 .as_deref()
                 .unwrap_or(reyvec_sdf::space_file::EXAMPLE),
+            files.space_dir.as_deref(),
         );
         // Если что-то не соберётся, Drop не нужен: destroy() убирает null-конвейеры спокойно.
         let built = (|| {
@@ -1375,12 +1379,19 @@ impl Demo {
         }
     }
 
-    /// Читает текст файла сцены «3D» (7.5). Если в нём ошибка, остаётся прошлая сцена,
-    /// а ошибка видна через [`Demo::space_error`].
-    pub fn set_space_file(&mut self, text: &str) {
-        match reyvec_sdf::SpaceScene::parse(text) {
+    /// Читает текст файла сцены «3D» (7.5); пути к моделям glTF — от папки `dir`. Если в
+    /// нём ошибка, остаётся прошлая сцена, а ошибка видна через [`Demo::space_error`].
+    pub fn set_space_file(&mut self, text: &str, dir: Option<&std::path::Path>) {
+        match reyvec_sdf::SpaceScene::parse_in(text, dir) {
             Ok(space) => {
-                tracing::info!("Сцена 3D из файла: предметов {}", space.object_count());
+                tracing::info!(
+                    "Сцена 3D из файла: предметов {}, моделей {}",
+                    space.object_count(),
+                    space.mesh_count()
+                );
+                for note in &space.notes {
+                    tracing::info!("Сцена 3D: {note}");
+                }
                 // Камера из файла ставится, когда её запись поменялась (или появилась):
                 // правка остального файла не сбивает полёт.
                 if space.camera != self.space.camera {

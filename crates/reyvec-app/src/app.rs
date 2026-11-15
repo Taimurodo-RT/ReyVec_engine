@@ -260,7 +260,7 @@ impl App {
             }
         }
         if let Some(path) = &self.config.space_file {
-            match reyvec_scene::SceneWatcher::new(path) {
+            match reyvec_scene::SceneWatcher::with_models(path) {
                 Ok(w) => {
                     self.space_file_label = Some(w.path().display().to_string());
                     self.space_watcher = Some(w);

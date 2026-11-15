@@ -270,6 +270,19 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
+        // 8.14: модель из файла glTF (`scenes/3d/models.ron`, станок `models/machine.glb`):
+        // цвета материалов файла, та же модель одним материалом, тени от выпуклых кусков.
+        Case {
+            name: "space-models-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/models.ron").into()),
+                    space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
         // 7.7: векторные контуры, выдавленные и повёрнутые в объёмные формы
         // (`scenes/3d/vector.ron`).
         Case {

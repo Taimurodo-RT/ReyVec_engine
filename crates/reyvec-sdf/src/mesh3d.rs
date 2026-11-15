@@ -7,8 +7,8 @@
 //! SDF чуть внутри модели ([`Mesh3::shadow_proxy`]). Так делает Unreal: у полигональной
 //! модели есть своё поле расстояний только для теней и затенения.
 //!
-//! Пока модели — простые выпуклые многогранники, собранные кодом (настоящие модели из
-//! файлов glTF — этап 8). Грани плоские: нормаль пиксельный шейдер берёт из наклона
+//! Встроенные модели — простые выпуклые многогранники, собранные кодом; модели из файлов
+//! glTF читает [`crate::model3d`] (8.14). Грани плоские: нормаль пиксельный шейдер берёт из наклона
 //! соседних точек, вершинам нормали не нужны.
 
 use glam::Vec3;
@@ -34,10 +34,22 @@ pub enum Mesh3 {
         height: f32,
         sides: u32,
     },
+    /// Модель из файла glTF (8.14): путь от папки файла сцены, `scale` — во сколько раз
+    /// увеличить. Треугольники читает файл сцены ([`crate::model3d::load`]), а не
+    /// [`Mesh3::triangles`].
+    Model {
+        file: String,
+        #[serde(default = "one")]
+        scale: f32,
+    },
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 /// Больше граней на модель не бывает: модели собираются на процессоре каждый кадр.
-pub const MAX_TRIANGLES: usize = 4096;
+pub const MAX_TRIANGLES: usize = 16384;
 /// Заменитель с плоскостями граней — пока граней не больше этого, иначе шар внутри.
 const MAX_PROXY_PLANES: usize = 32;
 
@@ -52,6 +64,7 @@ impl Mesh3 {
                 height,
                 sides,
             } => crystal(radius, height * 0.5, sides.clamp(3, 24)),
+            Self::Model { .. } => Vec::new(),
         }
     }
 
@@ -60,41 +73,55 @@ impl Mesh3 {
     /// заменителе и модель не затеняла сама себя. Пока плоскостей граней немного —
     /// пересечение полупространств (точная выпуклая форма), иначе шар внутри.
     pub fn shadow_proxy(&self) -> Shape3 {
-        let triangles = self.triangles();
-        let mut planes: Vec<(Vec3, f32)> = Vec::new();
-        let mut outer = 0.0f32;
-        for t in &triangles {
-            let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
-            if n == Vec3::ZERO {
-                continue;
-            }
-            let d = n.dot(t[0]);
-            if !planes
-                .iter()
-                .any(|(m, e)| m.dot(n) > 0.9999 && (e - d).abs() < 1e-4)
-            {
-                planes.push((n, d));
-            }
-            outer = t.iter().fold(outer, |o, v| o.max(v.length()));
-        }
-        let inner = planes.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
-        let inset = 0.03 * outer;
-        if planes.len() > MAX_PROXY_PLANES || !inner.is_finite() {
-            return Shape3::Sphere {
-                radius: (inner - inset).max(0.0),
-            };
-        }
-        // Шар снаружи — граница для отсева (у плоскостей её нет), форму он не меняет.
-        let mut shapes = vec![Shape3::Sphere { radius: outer }];
-        shapes.extend(planes.iter().map(|&(n, d)| Shape3::Plane {
-            normal: n.to_array(),
-            offset: d - inset,
-        }));
-        Shape3::Intersect {
-            shapes,
-            smooth: 0.0,
-        }
+        convex_proxy(&self.triangles()).unwrap_or(Shape3::Sphere { radius: 0.0 })
     }
+}
+
+/// Заменитель для выпуклого многогранника с серединой в начале координат (7.6ж, для
+/// моделей из файлов — 8.14): пересечение полупространств граней, сдвинутых внутрь на 3 %
+/// размера, а если плоскостей больше [`MAX_PROXY_PLANES`] — шар внутри. Нормаль грани
+/// берётся от середины наружу, так что обход треугольников не важен. `None` — у формы
+/// нет объёма (плоская или пустая).
+pub(crate) fn convex_proxy(triangles: &[[Vec3; 3]]) -> Option<Shape3> {
+    let mut planes: Vec<(Vec3, f32)> = Vec::new();
+    let mut outer = 0.0f32;
+    for t in triangles {
+        let mut n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
+        if n == Vec3::ZERO {
+            continue;
+        }
+        if n.dot(t[0]) < 0.0 {
+            n = -n;
+        }
+        let d = n.dot(t[0]);
+        if !planes
+            .iter()
+            .any(|(m, e)| m.dot(n) > 0.9999 && (e - d).abs() < 1e-4)
+        {
+            planes.push((n, d));
+        }
+        outer = t.iter().fold(outer, |o, v| o.max(v.length()));
+    }
+    let inner = planes.iter().map(|p| p.1).fold(f32::INFINITY, f32::min);
+    let inset = 0.03 * outer;
+    if !inner.is_finite() || inner <= inset {
+        return None;
+    }
+    if planes.len() > MAX_PROXY_PLANES {
+        return Some(Shape3::Sphere {
+            radius: inner - inset,
+        });
+    }
+    // Шар снаружи — граница для отсева (у плоскостей её нет), форму он не меняет.
+    let mut shapes = vec![Shape3::Sphere { radius: outer }];
+    shapes.extend(planes.iter().map(|&(n, d)| Shape3::Plane {
+        normal: n.to_array(),
+        offset: d - inset,
+    }));
+    Some(Shape3::Intersect {
+        shapes,
+        smooth: 0.0,
+    })
 }
 
 fn icosphere(radius: f32, detail: u32) -> Vec<[Vec3; 3]> {

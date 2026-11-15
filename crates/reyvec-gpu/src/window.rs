@@ -498,7 +498,7 @@ impl WindowRenderer {
     pub fn set_space_file(&mut self, text: &str) {
         self.files.space = Some(text.into());
         if let Some(demo) = self.demo.as_mut() {
-            demo.set_space_file(text);
+            demo.set_space_file(text, self.files.space_dir.as_deref());
         }
     }
 
