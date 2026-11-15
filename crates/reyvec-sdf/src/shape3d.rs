@@ -24,6 +24,7 @@ use std::sync::Arc;
 use glam::{Mat3, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
+use crate::brick3d::{BRICK_PRIM_WORDS, BrickRef};
 use crate::layer_field::LayerField;
 use crate::profile2d::{FIELD_HEADER_WORDS, Profile, field_distance};
 
@@ -80,6 +81,11 @@ pub enum Shape3 {
         #[serde(default)]
         round: f32,
     },
+    /// «Кирпич поля» (8.15, [`crate::brick3d`]): запечённое расстояние до полигональной
+    /// модели, чуть внутри неё. Невидимый заменитель модели для теней и затенения в
+    /// углах. В файл сцены не записывается — его печёт чтение модели.
+    #[serde(skip)]
+    Brick { brick: BrickRef },
     /// Объединение: всё, что есть хотя бы в одной форме.
     Union {
         shapes: Vec<Shape3>,
@@ -242,6 +248,7 @@ impl Shape3 {
                 depth,
                 round,
             } => field.0.sample(p, *depth * 0.5, *round, 0).0,
+            Self::Brick { brick } => brick.0.sample(p) + brick.0.inset(),
             Self::Union { shapes, smooth } => shapes
                 .iter()
                 .map(|s| s.distance(p))
@@ -351,6 +358,7 @@ impl Shape3 {
                 let (lo, hi) = profile.bounds();
                 Some(extrude_bounds(lo, hi, *depth))
             }
+            Self::Brick { brick } => Some(brick.0.bounds()),
             Self::Revolve { profile, offset } => {
                 let (lo, hi) = profile.bounds();
                 let r = (offset + lo.x.abs().max(hi.x.abs())).abs();
@@ -505,6 +513,8 @@ pub mod prim {
     pub const REVOLVE: u32 = 7;
     /// Поле слоя (7.18б): 2D-поле в картинке, выдавленное в толщину слоя.
     pub const FIELD: u32 = 8;
+    /// «Кирпич поля» (8.15): объёмная сетка расстояний модели в картинке.
+    pub const BRICK: u32 = 9;
 }
 
 /// Слов на примитив: команда, материал, 12 матрицы, масштаб, 4 параметра (без данных
@@ -544,6 +554,9 @@ pub struct Program {
     /// Поля слоя (7.18б) в порядке примитивов `PRIM_FIELD` в словах: по ним считает
     /// зеркало на процессоре, видеокарта читает картинки по номерам из слов.
     pub fields: Vec<FieldRef>,
+    /// Кирпичи поля (8.15) в порядке примитивов `PRIM_BRICK`: по ним считает зеркало на
+    /// процессоре.
+    pub bricks: Vec<BrickRef>,
 }
 
 /// Почему форму нельзя превратить в программу.
@@ -599,14 +612,16 @@ pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
         shadow_only: false,
         no_shadow: false,
         fields: out.fields,
+        bricks: out.bricks,
     })
 }
 
-/// Куда пишется программа: слова и поля слоя по порядку их примитивов.
+/// Куда пишется программа: слова, поля слоя и кирпичи по порядку их примитивов.
 #[derive(Default)]
 struct Emit {
     words: Vec<u32>,
     fields: Vec<FieldRef>,
+    bricks: Vec<BrickRef>,
 }
 
 /// Пишет команды формы и возвращает, сколько места на стеке ей понадобилось (`base` уже
@@ -695,6 +710,21 @@ fn emit(
             out.fields.push(field.clone());
             Ok(1)
         }
+        // Кирпич без картинки (видеокарта её не загрузила) — тени нет: точка.
+        Shape3::Brick { brick } => match brick.0.texture() {
+            Some(_) => {
+                let b = &brick.0;
+                prim_with(
+                    prim::BRICK,
+                    [b.inset(), b.band(), 0.0, 0.0],
+                    &b.header_words(),
+                    out,
+                )?;
+                out.bricks.push(brick.clone());
+                Ok(1)
+            }
+            None => prim(prim::SPHERE, [0.0; 4], out),
+        },
         Shape3::Union { shapes, smooth } => {
             chain(shapes, op::UNION, *smooth, at, material, base, out)
         }
@@ -830,6 +860,7 @@ impl Program {
         let mut stack: Vec<(f32, u32)> = Vec::with_capacity(STACK);
         let mut i = 0;
         let mut fields = self.fields.iter();
+        let mut bricks = self.bricks.iter();
         while i < w.len() {
             let code = w[i] & 0xff;
             if code == op::PRIM {
@@ -872,6 +903,10 @@ impl Program {
                             None => f32::MAX,
                         }
                     }
+                    prim::BRICK if data >= BRICK_PRIM_WORDS => match bricks.next() {
+                        Some(b) => b.0.sample(local) + a[0],
+                        None => f32::MAX,
+                    },
                     _ => {
                         debug_assert!(kind == prim::PLANE, "неизвестный вид примитива {kind}");
                         sd_plane(local, Vec3::new(a[0], a[1], a[2]), a[3])

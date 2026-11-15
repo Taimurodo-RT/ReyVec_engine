@@ -30,12 +30,16 @@ static const uint PRIM_PLANE = 5;
 static const uint PRIM_EXTRUDE = 6;
 static const uint PRIM_REVOLVE = 7;
 static const uint PRIM_FIELD = 8;
+static const uint PRIM_BRICK = 9;
 
 static const uint PRIM_WORDS = 19;
 static const uint FIELD_HEADER_WORDS = 8;
 // Слов данных у поля слоя: номер картинки поля, номер картинки материалов, угол (x, y),
 // шаг, nx | ny << 16, прямоугольник фигуры (4), 2 запасных (shape3d::FIELD_PRIM_WORDS).
 static const uint FIELD_PRIM_WORDS = 12;
+// Слов данных у кирпича поля (8.15): номер картинки, угол сетки (3), шаг, nx | ny << 16,
+// nz, 1 запасное (brick3d::BRICK_PRIM_WORDS).
+static const uint BRICK_PRIM_WORDS = 8;
 static const uint OP_WORDS = 2;
 static const uint SDF_STACK = 8;
 
@@ -168,6 +172,41 @@ float layer_material(uint* code, uint at, uint mslot, float2 p)
     return floor(id * 65535.0 + 0.5);
 }
 
+// «Кирпич поля» (8.15): число объёмной сетки расстояний модели в точке `q` (координаты
+// модели), без отступа внутрь. Зеркало Brick::sample в crates/reyvec-sdf/src/brick3d.rs.
+// Картинка R16_SFLOAT шириной nx и высотой ny · nz (слои Z друг под другом): два
+// сглаженных чтения соседних слоёв и смесь между ними. Точка внутри слоя прижата к
+// крайним точкам сетки, поэтому чтение не залезает в соседний слой. За сеткой — оценка
+// снизу от её края.
+float sd3_brick(uint* code, uint at, float3 q)
+{
+    count_field();
+    uint slot = code[at];
+    float3 corner = float3(asfloat(code[at + 1]), asfloat(code[at + 2]), asfloat(code[at + 3]));
+    float cell = asfloat(code[at + 4]);
+    uint nx = code[at + 5] & 0xffff;
+    uint ny = code[at + 5] >> 16;
+    uint nz = code[at + 6];
+    float3 g = (q - corner) / cell - 0.5;
+    float3 top = float3(float(nx) - 1.0, float(ny) - 1.0, float(nz) - 1.0);
+    float3 gc = clamp(g, float3(0.0, 0.0, 0.0), top);
+    float e = length(g - gc) * cell;
+    float z0 = min(floor(gc.z), top.z - 1.0);
+    float tz = gc.z - z0;
+    float2 inv = 1.0 / float2(float(nx), float(ny * nz));
+    float2 uv = float2(gc.x + 0.5, gc.y + 0.5 + z0 * float(ny)) * inv;
+    float a = textures[NonUniformResourceIndex(slot)].SampleLevel(samplers[0], uv, 0.0).x;
+    float b = textures[NonUniformResourceIndex(slot)].SampleLevel(
+        samplers[0], uv + float2(0.0, float(ny) * inv.y), 0.0).x;
+    float v = lerp(a, b, tz);
+    if (e > 0.0)
+    {
+        float vp = max(v, 0.0);
+        return sqrt(e * e + vp * vp);
+    }
+    return v;
+}
+
 // Выдавливание: d2 — расстояние до 2D-фигуры в точке (x, y), толщина ±half по Z.
 float sd3_extrude(float3 p, float d2, float half_depth, float round)
 {
@@ -248,6 +287,8 @@ float2 sdf_primitive(uint* code, uint i, float3 p)
         else if (first && mslot != 0 && d < LAYER_MATERIAL_NEAR)
             material = layer_material(code, at, mslot, q.xy);
     }
+    else if (kind == PRIM_BRICK)
+        d = sd3_brick(code, i + PRIM_WORDS, q) + a.x;
     else
         d = sd3_plane(q, a.xyz, a.w);
     return float2(d * scale, material);

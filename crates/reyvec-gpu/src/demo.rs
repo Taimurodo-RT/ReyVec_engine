@@ -652,6 +652,11 @@ pub(crate) struct Demo {
         std::sync::Arc<reyvec_sdf::model3d::ModelTexture>,
         Option<TextureId>,
     )>,
+    /// Кирпичи поля моделей сцены «3D» (8.15): кирпич сцены и его картинка (None — не
+    /// загрузилась, модель без тени).
+    space_bricks: Vec<(reyvec_sdf::brick3d::BrickRef, Option<TextureId>)>,
+    /// Тени моделей от плоскостей граней, как до 8.15 (для сравнения с кирпичами).
+    space_plane_shadows: bool,
     /// Сколько образцов видеокарта умеет для картинки полигонов (2× и 4×, только при
     /// стандартных точках образцов).
     mesh_counts: vk::SampleCountFlags,
@@ -1034,6 +1039,8 @@ impl Demo {
             space_mesh_ms: [vk::Pipeline::null(); 2],
             space_mesh_color: [vk::Pipeline::null(); 3],
             space_textures: Vec::new(),
+            space_bricks: Vec::new(),
+            space_plane_shadows: false,
             mesh_counts,
             space_mesh_shadow: vk::Pipeline::null(),
             space_cone: vk::Pipeline::null(),
@@ -1470,6 +1477,73 @@ impl Demo {
             .iter()
             .map(|(_, id)| id.map(|id| id.0))
             .collect()
+    }
+
+    /// Загружает картинки кирпичей поля сцены «3D» (8.15), если сцена сменилась, и
+    /// убирает прежние. Номер картинки кирпич узнаёт сам (`Brick::set_texture`): его
+    /// программа читает номер при сборке кадра. Не загрузился — модель без тени, причина
+    /// в журнале.
+    fn sync_space_bricks(&mut self, ctx: &GpuContext, res: &mut GpuResources) {
+        let same = self.space_bricks.len() == self.space.bricks.len()
+            && self
+                .space_bricks
+                .iter()
+                .zip(&self.space.bricks)
+                .all(|((old, _), new)| old == new);
+        if same {
+            return;
+        }
+        for (_, id) in self.space_bricks.drain(..) {
+            if let Some(id) = id {
+                res.destroy_texture(id);
+            }
+        }
+        for (k, brick) in self.space.bricks.iter().enumerate() {
+            let b = &brick.0;
+            let (width, height) = b.image_size();
+            let [nx, ny, nz] = b.size();
+            let name = format!("кирпич поля {} ({nx}×{ny}×{nz})", k + 1);
+            let made = res
+                .create_texture_format(
+                    ctx,
+                    width,
+                    height,
+                    vk::Format::R16_SFLOAT,
+                    vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                    &name,
+                )
+                .and_then(|id| {
+                    let extent = vk::Extent2D { width, height };
+                    match res.upload_texture_bytes(ctx, id, extent, &b.bytes()) {
+                        Ok(()) => Ok(id),
+                        Err(e) => {
+                            res.destroy_texture(id);
+                            Err(e)
+                        }
+                    }
+                });
+            let id = match made {
+                Ok(id) => {
+                    b.set_texture(id.0);
+                    Some(id)
+                }
+                Err(e) => {
+                    tracing::warn!("Сцена 3D: {name} не загрузился, модель без тени: {e}");
+                    None
+                }
+            };
+            self.space_bricks.push((brick.clone(), id));
+        }
+    }
+
+    /// Тени моделей от плоскостей граней, как до 8.15 (для сравнения с кирпичами поля).
+    pub fn plane_shadows(&self) -> bool {
+        self.space_plane_shadows
+    }
+
+    /// Включает тени моделей от плоскостей граней (выключено — от кирпичей поля).
+    pub fn set_plane_shadows(&mut self, on: bool) {
+        self.space_plane_shadows = on;
     }
 
     /// Ошибка в последнем сохранении файла сцены «3D» (рисуется прошлая сцена).
@@ -3413,6 +3487,9 @@ impl Demo {
                     crate::level3d::lamps(&self.file_scene, [center[0] as f32, center[1] as f32]);
                 (frame, Some(made.materials))
             } else {
+                // Кирпичи поля (8.15) — до сборки кадра: их программы берут номера картинок.
+                self.sync_space_bricks(ctx, res);
+                self.space.plane_shadows = self.space_plane_shadows;
                 (self.space.frame(time), None)
             };
             if level {
