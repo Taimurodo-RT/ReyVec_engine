@@ -425,6 +425,10 @@ fn main() -> ExitCode {
                 .as_deref()
                 .and_then(std::path::Path::parent)
                 .map(std::path::Path::to_path_buf),
+            space_dir: space_file
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf),
             space: space_text,
         },
         (Err(code), _) | (_, Err(code)) => return code,

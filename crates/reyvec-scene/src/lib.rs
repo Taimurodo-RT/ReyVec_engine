@@ -2087,6 +2087,17 @@ impl SceneWatcher {
     pub const QUIET: Duration = Duration::from_millis(120);
 
     pub fn new(path: &Path) -> Result<Self, notify::Error> {
+        Self::watch(path, false)
+    }
+
+    /// То же для файла сцены «3D» (8.14): сохранение модели glTF (`.glb`, `.gltf`,
+    /// `.bin`) в его папке или вложенных папках тоже считается сохранением сцены — сцена
+    /// перечитывается вместе с моделями.
+    pub fn with_models(path: &Path) -> Result<Self, notify::Error> {
+        Self::watch(path, true)
+    }
+
+    fn watch(path: &Path, models: bool) -> Result<Self, notify::Error> {
         use notify::Watcher as _;
 
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
@@ -2102,15 +2113,26 @@ impl SceneWatcher {
                 if !(event.kind.is_modify() || event.kind.is_create()) {
                     return;
                 }
+                let model = |p: &Path| {
+                    models
+                        && p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                            ["glb", "gltf", "bin"].contains(&e.to_lowercase().as_str())
+                        })
+                };
                 if event
                     .paths
                     .iter()
-                    .any(|p| p.file_name().map(ToOwned::to_owned) == name)
+                    .any(|p| p.file_name().map(ToOwned::to_owned) == name || model(p))
                 {
                     let _ = tx.send(());
                 }
             })?;
-        watcher.watch(&dir, notify::RecursiveMode::NonRecursive)?;
+        let mode = if models {
+            notify::RecursiveMode::Recursive
+        } else {
+            notify::RecursiveMode::NonRecursive
+        };
+        watcher.watch(&dir, mode)?;
         tracing::info!(
             "Слежу за файлом сцены {}: после сохранения сцена обновится сама",
             path.display()

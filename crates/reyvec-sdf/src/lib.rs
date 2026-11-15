@@ -17,6 +17,7 @@ pub mod grid3d;
 pub mod layer_bake;
 pub mod layer_field;
 pub mod mesh3d;
+pub mod model3d;
 pub mod profile2d;
 pub mod shape3d;
 pub mod space_file;
