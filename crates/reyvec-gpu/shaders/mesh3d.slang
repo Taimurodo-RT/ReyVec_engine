@@ -7,8 +7,10 @@
 //
 // Вершины лежат в буфере сцены (crates/reyvec-gpu/src/space.rs): слово 7 заголовка —
 // начало раздела моделей (раскладка — MESH_HEADER_WORDS в space.slang), потом вершины
-// по 4 слова (место и номер материала), по 3 на треугольник.
-// Грани плоские: нормаль — по наклону соседних точек.
+// по 4 слова (место и слово материала), по 3 на треугольник.
+// Слово материала без бита 31 — просто номер: грань плоская, нормаль — по наклону соседних
+// точек. С битом 31 (модели glTF с нормалями, 8.14б) — раскладка pack_mesh: 11 бит
+// материала и нормаль вершины; нормаль плавно меняется по грани (гладкие грани).
 
 #define SPACE_OWN_VERTEX
 #include "include/space.slang"
@@ -20,6 +22,8 @@ struct MeshOut
     float4 position : SV_Position;
     float3 world : WORLD;
     nointerpolation uint material : MATERIAL;
+    // Нормаль вершины; нулевая — грань плоская.
+    float3 normal : NORMAL;
 };
 
 [shader("vertex")]
@@ -34,6 +38,7 @@ MeshOut vs_main(uint vertex : SV_VulkanVertexID)
         o.position = float4(0.0, 0.0, -1.0, 1.0);
         o.world = float3(0.0, 0.0, 0.0);
         o.material = 0;
+        o.normal = float3(0.0, 0.0, 0.0);
         return o;
     }
     uint v = at + MESH_HEADER_WORDS + vertex * VERTEX_WORDS;
@@ -49,7 +54,18 @@ MeshOut vs_main(uint vertex : SV_VulkanVertexID)
     // У камеры y экрана вверх, у Vulkan — вниз.
     o.position = float4(clip.x, -clip.y, clip.z, clip.w);
     o.world = p;
-    o.material = pc.scene[v + 3];
+    uint word = pc.scene[v + 3];
+    if ((word & 0x80000000u) != 0)
+    {
+        float4 m = unpack_mesh(uint2(0u, word));
+        o.material = uint(m.y);
+        o.normal = oct_decode(m.zw);
+    }
+    else
+    {
+        o.material = word;
+        o.normal = float3(0.0, 0.0, 0.0);
+    }
     return o;
 }
 
@@ -64,7 +80,9 @@ uint4 fs_main(MeshOut input) : SV_Target
     float2 s = float2(input.position.x / size.x * 2.0 - 1.0, 1.0 - input.position.y / size.y * 2.0);
     Ray ray = screen_ray(s);
     float t = dot(input.world - ray.origin, ray.dir);
-    float3 n = normalize(cross(ddx(input.world), ddy(input.world)));
+    float3 n = dot(input.normal, input.normal) > 1e-8
+        ? normalize(input.normal)
+        : normalize(cross(ddx(input.world), ddy(input.world)));
     if (dot(n, ray.dir) > 0.0)
         n = -n;
     return uint4(pack_mesh(t, input.material, n), 0, 0);

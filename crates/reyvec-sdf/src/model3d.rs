@@ -2,8 +2,8 @@
 //! `.bin` рядом.
 //!
 //! Из файла берутся треугольники всех узлов сцены (с их сдвигами, поворотами и
-//! масштабами) и цвет каждого материала (`baseColorFactor`). Текстуры, гладкие нормали,
-//! анимация и кости пока не читаются: модель рисуется плоскими гранями цветом материала.
+//! масштабами), нормали вершин (если они есть — грани гладкие, 8.14б) и цвет каждого
+//! материала (`baseColorFactor`). Текстуры, анимация и кости пока не читаются.
 //!
 //! Тень модели бросают невидимые заменители SDF ([`convex_proxies`]): модель делится на
 //! связные куски, и каждый выпуклый кусок получает свой заменитель — пересечение
@@ -29,6 +29,10 @@ pub struct ModelPart {
     pub textured: bool,
     /// Треугольники в координатах модели.
     pub triangles: Vec<[Vec3; 3]>,
+    /// Нормали вершин тех же треугольников (единичные, в координатах модели). Пусто —
+    /// нормалей в файле нет, грани плоские. Если нормали есть только у части сеток этого
+    /// материала, у остальных треугольников здесь нормаль их грани.
+    pub normals: Vec<[Vec3; 3]>,
 }
 
 /// Модель из файла: части по материалам.
@@ -107,6 +111,17 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
             let points: Vec<Vec3> = positions
                 .map(|p| world.transform_point3(Vec3::from(p)))
                 .collect();
+            // Нормали поворачиваются обратной транспонированной матрицей: так они остаются
+            // перпендикулярны граням и при неравном масштабе по осям.
+            let normal_matrix = world.inverse().transpose();
+            let normals: Option<Vec<Vec3>> = reader.read_normals().map(|n| {
+                n.map(|n| {
+                    normal_matrix
+                        .transform_vector3(Vec3::from(n))
+                        .normalize_or_zero()
+                })
+                .collect()
+            });
             let indices: Vec<u32> = match reader.read_indices() {
                 Some(i) => i.into_u32().collect(),
                 None => (0..points.len() as u32).collect(),
@@ -131,21 +146,47 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
                             color: [c[0], c[1], c[2]],
                             textured: pbr.base_color_texture().is_some(),
                             triangles: Vec::new(),
+                            normals: Vec::new(),
                         },
                     ));
                     parts.len() - 1
                 }
             };
-            let triangles = &mut parts[at].1.triangles;
+            let part = &mut parts[at].1;
+            if normals.is_some() && part.normals.len() < part.triangles.len() {
+                // Нормали появились у второй сетки материала: первым — нормали их граней.
+                let flat: Vec<[Vec3; 3]> = part.triangles[part.normals.len()..]
+                    .iter()
+                    .map(|t| [face_normal(t); 3])
+                    .collect();
+                part.normals.extend(flat);
+            }
             for t in indices.chunks_exact(3) {
-                let v = [t[0], t[1], t[2]].map(|i| points.get(i as usize).copied());
+                let i = [t[0], t[1], t[2]];
+                let v = i.map(|i| points.get(i as usize).copied());
                 let [Some(a), Some(b), Some(c)] = v else {
                     return Err(format!(
                         "модель «{}»: номер вершины за концом списка",
                         mesh.name().unwrap_or("без имени")
                     ));
                 };
-                triangles.push([a, b, c]);
+                let t = [a, b, c];
+                let n = normals.as_ref().map(|n| {
+                    let flat = face_normal(&t);
+                    let get = |i: u32| {
+                        n.get(i as usize)
+                            .copied()
+                            .filter(|v| *v != Vec3::ZERO)
+                            .unwrap_or(flat)
+                    };
+                    [get(i[0]), get(i[1]), get(i[2])]
+                });
+                match n {
+                    Some(n) => part.normals.push(n),
+                    None if !part.normals.is_empty() => part.normals.push([face_normal(&t); 3]),
+                    None => {}
+                }
+                part.triangles.push(t);
             }
         }
     }
@@ -156,6 +197,11 @@ pub fn from_bytes(data: &[u8], dir: Option<&Path>, scale: f32) -> Result<Model, 
     Ok(Model {
         parts: parts.into_iter().map(|(_, p)| p).collect(),
     })
+}
+
+/// Нормаль грани (по обходу вершин).
+fn face_normal(t: &[Vec3; 3]) -> Vec3 {
+    (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero()
 }
 
 /// Связные куски модели: треугольники с общими вершинами (по месту) — один кусок.
@@ -318,6 +364,47 @@ mod tests {
             .map(|v| v.y)
             .fold(0.0, f32::max);
         assert!((top - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normals_from_file_follow_nodes() {
+        let m = machine();
+        let part = |name: &str| m.parts.iter().find(|p| p.material == name).unwrap();
+        // У коробок нормалей в файле нет — грани плоские.
+        assert!(part("корпус").normals.is_empty());
+        // Баки: нормали на каждую вершину, единичные; на боку — по радиусу (вбок), на
+        // крышках — вверх или вниз. У второго бака масштаб по осям разный (0.9, 0.8, 0.9),
+        // нормали всё равно перпендикулярны граням.
+        let tank = part("бак");
+        assert_eq!(tank.normals.len(), tank.triangles.len());
+        for (t, n) in tank.triangles.iter().zip(&tank.normals) {
+            for (v, n) in t.iter().zip(n) {
+                assert!((n.length() - 1.0).abs() < 1e-4);
+                let side = n.y.abs() < 1e-4;
+                let cap = (n.y.abs() - 1.0).abs() < 1e-4;
+                assert!(side || cap, "{n}");
+                if side {
+                    // От оси бака наружу.
+                    // Бак 1: ось (0.5, 0.22), радиус 0.22; бак 2: ось (0.5, −0.24), 0.198.
+                    let off = |z: f32, r: f32| {
+                        let d = Vec3::new(v.x - 0.5, 0.0, v.z - z);
+                        (d, (d.length() - r).abs())
+                    };
+                    let (a, b) = (off(0.22, 0.22), off(-0.24, 0.198));
+                    let out = if a.1 < b.1 { a.0 } else { b.0 }.normalize();
+                    assert!(out.dot(*n) > 0.999, "{v} {n}");
+                }
+            }
+        }
+        // Труба лежит вдоль X: нормали её бока поперёк X.
+        let pipe = part("труба");
+        let across = pipe
+            .normals
+            .iter()
+            .flatten()
+            .filter(|n| n.x.abs() < 1e-4)
+            .count();
+        assert_eq!(across, 24 * 3, "12 сторон, по 2 треугольника");
     }
 
     #[test]

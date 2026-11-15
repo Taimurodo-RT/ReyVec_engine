@@ -9,19 +9,30 @@ def box(w, h, d):
     return p, i
 
 def cylinder(r, h, sides):
-    p = []
+    # Side with radial normals (smooth), caps with their own vertices and flat normals.
+    p, n, i = [], [], []
     for k in range(sides):
         a = 2 * math.pi * k / sides
-        p.append((r * math.cos(a), -h / 2, -r * math.sin(a)))
-        p.append((r * math.cos(a), h / 2, -r * math.sin(a)))
-    p += [(0, -h / 2, 0), (0, h / 2, 0)]
-    bot, top = 2 * sides, 2 * sides + 1
-    i = []
+        c, s_ = math.cos(a), -math.sin(a)
+        p += [(r * c, -h / 2, r * s_), (r * c, h / 2, r * s_)]
+        n += [(c, 0, s_), (c, 0, s_)]
     for k in range(sides):
         a0, a1 = 2 * k, 2 * k + 1
         b0, b1 = 2 * ((k + 1) % sides), 2 * ((k + 1) % sides) + 1
-        i += [a0, b0, b1, a0, b1, a1, bot, b0, a0, top, a1, b1]
-    return p, i
+        i += [a0, b0, b1, a0, b1, a1]
+    for y, ny in ((-h / 2, -1), (h / 2, 1)):
+        base = len(p)
+        for k in range(sides):
+            a = 2 * math.pi * k / sides
+            p.append((r * math.cos(a), y, -r * math.sin(a)))
+            n.append((0, ny, 0))
+        p.append((0, y, 0))
+        n.append((0, ny, 0))
+        center = base + sides
+        for k in range(sides):
+            a, b = base + k, base + (k + 1) % sides
+            i += [center, b, a] if ny < 0 else [center, a, b]
+    return p, i, n
 
 blob = bytearray()
 views, accessors, meshes = [], [], []
@@ -33,12 +44,16 @@ def add(data, target):
     blob.extend(data)
     return len(views) - 1
 
-def mesh(name, material, p, i=None):
+def mesh(name, material, p, i=None, n=None):
     pos = add(b"".join(struct.pack("<3f", *v) for v in p), 34962)
     lo = [min(v[k] for v in p) for k in range(3)]
     hi = [max(v[k] for v in p) for k in range(3)]
     accessors.append({"bufferView": pos, "componentType": 5126, "count": len(p), "type": "VEC3", "min": lo, "max": hi})
     prim = {"attributes": {"POSITION": len(accessors) - 1}, "material": material}
+    if n is not None:
+        nv = add(b"".join(struct.pack("<3f", *v) for v in n), 34962)
+        accessors.append({"bufferView": nv, "componentType": 5126, "count": len(n), "type": "VEC3"})
+        prim["attributes"]["NORMAL"] = len(accessors) - 1
     if i is not None:
         idx = add(struct.pack("<%dH" % len(i), *i), 34963)
         accessors.append({"bufferView": idx, "componentType": 5123, "count": len(i), "type": "SCALAR"})

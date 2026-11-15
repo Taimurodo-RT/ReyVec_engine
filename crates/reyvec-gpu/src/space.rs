@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use glam::Vec3;
 use reyvec_sdf::SpaceFrame;
 use reyvec_sdf::shape3d::{
     MAX_MATERIALS, MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_with,
@@ -44,8 +45,31 @@ const SCENE_NO_SUN: u32 = 2;
 /// Бит 2 слова 11: нормаль по всей сцене (как SCENE_FULL_NORMAL в `include/march.slang`).
 #[cfg(test)]
 const SCENE_FULL_NORMAL: u32 = 4;
-/// Слов на вершину: место (3 числа) и номер материала.
+/// Слов на вершину: место (3 числа) и слово материала ([`vertex_word`]).
 const VERTEX_WORDS: usize = 4;
+
+/// Слово материала вершины модели. Без нормали — просто номер материала (грань плоская,
+/// нормаль шейдер берёт из наклона соседних точек). С нормалью (8.14б, гладкие грани) —
+/// раскладка как у `pack_mesh` в `space.slang`: бит 31, 11 бит материала, по 10 бит на
+/// две половины нормали (oct_encode).
+fn vertex_word(material: u32, normal: Option<Vec3>) -> u32 {
+    let Some(n) = normal else {
+        return material;
+    };
+    let e = oct_encode(n).map(|v| ((v * 0.5 + 0.5).clamp(0.0, 1.0) * 1022.0).round() as u32);
+    0x8000_0000 | (material.min(2047) << 20) | (e[0] << 10) | e[1]
+}
+
+/// Нормаль в два числа −1…1 (октаэдр), как `oct_encode` в `space.slang`.
+fn oct_encode(n: Vec3) -> [f32; 2] {
+    let n = n / (n.x.abs() + n.y.abs() + n.z.abs()).max(1e-20);
+    if n.z >= 0.0 {
+        [n.x, n.y]
+    } else {
+        let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+        [(1.0 - n.y.abs()) * sign(n.x), (1.0 - n.x.abs()) * sign(n.y)]
+    }
+}
 
 /// Сцена кадра для видеокарты.
 pub(crate) struct Packed {
@@ -165,10 +189,11 @@ pub(crate) fn pack_with(
     words.extend([(triangles * 3) as u32, 0, 0, 0]);
     words.extend([0u32; MESH_HEADER_WORDS - 4]);
     for m in &frame.meshes {
-        for t in &m.triangles {
-            for v in t {
+        for (i, t) in m.triangles.iter().enumerate() {
+            let normals = m.normals.get(i);
+            for (k, v) in t.iter().enumerate() {
                 words.extend(v.to_array().map(f32::to_bits));
-                words.push(m.material);
+                words.push(vertex_word(m.material, normals.map(|n| n[k])));
             }
         }
     }
@@ -422,6 +447,7 @@ mod tests {
         frame.meshes.push(reyvec_sdf::space_file::MeshFrame {
             triangles: vec![t; triangles],
             material: 0,
+            normals: Vec::new(),
         });
         let packed = pack(&frame, &scene.materials, true);
         assert!(packed.overflow.is_some_and(|w| w > MAX_WORDS));
@@ -488,5 +514,37 @@ mod tests {
         set_view_proj(&mut words, glam::Mat4::IDENTITY);
         assert_eq!(f32::from_bits(words[at + 4]), 1.0);
         assert_eq!(f32::from_bits(words[at + 9]), 1.0);
+    }
+
+    #[test]
+    fn vertex_word_packs_normal_like_pack_mesh() {
+        // Без нормали — просто номер материала (бит 31 пуст: шейдер берёт плоскую грань).
+        assert_eq!(vertex_word(7, None), 7);
+        // С нормалью: бит 31, материал в битах 20…30, половины нормали по 10 бит.
+        let decode = |w: u32| {
+            let e = [(w >> 10) & 1023, w & 1023].map(|v| v as f32 / 1022.0 * 2.0 - 1.0);
+            let mut n = Vec3::new(e[0], e[1], 1.0 - e[0].abs() - e[1].abs());
+            if n.z < 0.0 {
+                let sign = |v: f32| if v >= 0.0 { 1.0 } else { -1.0 };
+                let (x, y) = (n.x, n.y);
+                n.x = (1.0 - y.abs()) * sign(x);
+                n.y = (1.0 - x.abs()) * sign(y);
+            }
+            n.normalize()
+        };
+        for n in [
+            Vec3::X,
+            -Vec3::Y,
+            -Vec3::Z,
+            Vec3::new(0.3, -0.5, -0.8).normalize(),
+            Vec3::new(-0.7, 0.1, 0.7).normalize(),
+        ] {
+            let w = vertex_word(5, Some(n));
+            assert_eq!(w >> 31, 1);
+            assert_eq!((w >> 20) & 2047, 5);
+            assert!(decode(w).dot(n) > 0.9999, "{n} -> {}", decode(w));
+        }
+        // Номер материала больше 11 бит упирается в 2047, как у pack_mesh.
+        assert_eq!((vertex_word(5000, Some(Vec3::Y)) >> 20) & 2047, 2047);
     }
 }

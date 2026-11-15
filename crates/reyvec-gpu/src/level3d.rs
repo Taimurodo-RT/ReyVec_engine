@@ -558,6 +558,7 @@ impl Prisms {
             .map(|(material, triangles)| MeshFrame {
                 triangles,
                 material,
+                normals: Vec::new(),
             })
             .collect();
         // Порядок не важен для картинки, но одинаковый от кадра к кадру.

@@ -175,10 +175,12 @@ pub struct MeshEntry {
 }
 
 /// Модель в один момент: треугольники в мире и номер материала.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MeshFrame {
     pub triangles: Vec<[Vec3; 3]>,
     pub material: u32,
+    /// Нормали вершин тех же треугольников (в мире, 8.14б). Пусто — грани плоские.
+    pub normals: Vec<[Vec3; 3]>,
 }
 
 /// Модель сцены, готовая к кадрам: части по материалам (номер материала и треугольники в
@@ -186,7 +188,8 @@ pub struct MeshFrame {
 #[derive(Clone, Debug, PartialEq)]
 struct SceneMesh {
     entry: MeshEntry,
-    parts: Vec<(u32, Vec<[Vec3; 3]>)>,
+    /// Части по материалам в координатах модели.
+    parts: Vec<MeshFrame>,
     proxies: Vec<Shape3>,
 }
 
@@ -325,7 +328,11 @@ impl SpaceScene {
                             ));
                         }
                         all.extend_from_slice(&part.triangles);
-                        parts.push((index, part.triangles));
+                        parts.push(MeshFrame {
+                            triangles: part.triangles,
+                            material: index,
+                            normals: part.normals,
+                        });
                     }
                     let (proxies, skipped) = if m.shadow {
                         crate::model3d::convex_proxies(&all)
@@ -349,10 +356,17 @@ impl SpaceScene {
                     } else {
                         Vec::new()
                     };
-                    (vec![(index, mesh.triangles())], proxies)
+                    (
+                        vec![MeshFrame {
+                            triangles: mesh.triangles(),
+                            material: index,
+                            normals: Vec::new(),
+                        }],
+                        proxies,
+                    )
                 }
             };
-            let count: usize = parts.iter().map(|p| p.1.len()).sum();
+            let count: usize = parts.iter().map(|p| p.triangles.len()).sum();
             if count > MAX_TRIANGLES {
                 return Err(format!(
                     "{label}: {count} граней, больше {MAX_TRIANGLES} не бывает"
@@ -455,10 +469,15 @@ impl SpaceScene {
             let at = Vec3::from(m.at) + motion_offset(&m.bob, &m.circle, time);
             let turn = [0, 1, 2].map(|i| m.turn[i] + m.spin[i] * time);
             let r = rotation(turn);
-            for (material, triangles) in &mesh.parts {
+            for part in &mesh.parts {
                 meshes.push(MeshFrame {
-                    triangles: triangles.iter().map(|t| t.map(|v| at + r * v)).collect(),
-                    material: *material,
+                    triangles: part
+                        .triangles
+                        .iter()
+                        .map(|t| t.map(|v| at + r * v))
+                        .collect(),
+                    material: part.material,
+                    normals: part.normals.iter().map(|t| t.map(|n| r * n)).collect(),
                 });
             }
             proxies.extend(
