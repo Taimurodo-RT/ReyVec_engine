@@ -509,6 +509,15 @@ fn render(
                 demo.set_level_edit(tests::LEVEL_EDIT.get());
             }
         }
+        // Проверка на чтение незаполненной памяти (8.0).
+        #[cfg(test)]
+        r.transients
+            .set_poison(tests::POISON.get(), tests::POISON_ONLY.get());
+        // Замер краёв по частям (8.1).
+        #[cfg(test)]
+        if let Some(demo) = r.demo.as_mut() {
+            demo.set_edge_probe(tests::EDGE_PROBE.get());
+        }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
             .create_command_pool(
@@ -784,6 +793,208 @@ pub(crate) mod tests {
         pub(super) static LEVEL_FIELD_IN_LOOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Кадр со счётчиками лучей (7.18д2).
         pub(super) static SPACE_COUNTERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Замер краёв по частям (8.1).
+        pub(super) static EDGE_PROBE: std::cell::Cell<crate::EdgeProbe> =
+            const { std::cell::Cell::new(crate::EdgeProbe::Off) };
+        /// Мусором залиты только картинки с этим именем (8.0).
+        pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
+        /// Временные картинки залиты мусором (8.0).
+        pub(super) static POISON: std::cell::Cell<Option<crate::graph::Poison>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Замер краёв по частям (8.1): каждый вариант рисуется без ошибок Vulkan и меняет
+    /// только края — остальная картинка та же, что «как обычно».
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn edge_probes_change_only_edges() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let base = render_headless(&options, &hollow_side()).expect("кадр");
+        let edges = base
+            .space_stats
+            .as_ref()
+            .and_then(|s| s.edge_pixels)
+            .unwrap_or(0);
+        assert!(edges > 0, "в кадре есть края");
+        for probe in crate::EdgeProbe::ALL {
+            EDGE_PROBE.set(probe);
+            let frame = render_headless(&options, &hollow_side());
+            EDGE_PROBE.set(crate::EdgeProbe::Off);
+            let frame = frame.expect("кадр с замером краёв");
+            let (changed, _, _) = image_diff(&base.image, &frame.image);
+            eprintln!(
+                "{}: отличаются {changed} пикселей, краёв {edges}",
+                probe.title()
+            );
+            assert!(
+                changed as u64 <= u64::from(edges),
+                "{}: отличаются {changed} пикселей, а краёв только {edges}",
+                probe.title()
+            );
+            if probe == crate::EdgeProbe::Off {
+                assert_eq!(changed, 0, "«как обычно» не меняет кадр");
+            }
+        }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
+    /// Ни один проход не читает то, что в этом кадре никто не записал (8.0). Кадр
+    /// рисуется дважды: временные картинки перед ним залиты разным мусором (не-числом и
+    /// обычным числом). Если проход читает незаполненную память, мусор попадает в кадр, и
+    /// кадры расходятся. Так нашлось чтение по краю света в 2D-комнате: на ПК Романа оно
+    /// не видно, но на другом драйвере может дать цветные точки.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn no_pass_reads_unwritten_memory() {
+        use crate::graph::Poison;
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let base = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::File,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::Triangles,
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        let room = HeadlessPlay {
+            start: Some([-0.6, -0.5]),
+            ..Default::default()
+        };
+        let level = |render| HeadlessPlay {
+            level: Some(render),
+            ..room.clone()
+        };
+        let cases: Vec<(&str, HeadlessScene, Option<HeadlessPlay>)> = vec![
+            ("2D-комната", base.clone(), Some(room.clone())),
+            (
+                "2D-комната, каскады",
+                HeadlessScene {
+                    cascades: true,
+                    ..base.clone()
+                },
+                Some(room.clone()),
+            ),
+            (
+                "лаборатория",
+                HeadlessScene {
+                    scene: DemoScene::Lab,
+                    ..base.clone()
+                },
+                None,
+            ),
+            (
+                "лампы",
+                HeadlessScene {
+                    scene: DemoScene::Lamps,
+                    ..base.clone()
+                },
+                None,
+            ),
+            (
+                "слизь и магия",
+                HeadlessScene {
+                    scene: DemoScene::Blobs,
+                    ..base.clone()
+                },
+                None,
+            ),
+            ("3D", hollow_side(), None),
+            (
+                "2.5D, поле",
+                base.clone(),
+                Some(level(crate::LevelRender::Field)),
+            ),
+            (
+                "2.5D, треугольники",
+                base.clone(),
+                Some(level(crate::LevelRender::Triangles)),
+            ),
+        ];
+        // Имена временных картинок, по которым ищется виновная, если кадры разошлись.
+        const NAMES: [&str; 19] = [
+            "кадр сцены",
+            "маска теней",
+            "семена поля",
+            "поле расстояний",
+            "свет",
+            "каскад света",
+            "свечение вниз",
+            "свечение вверх",
+            "слой",
+            "слой MSAA",
+            "конусы 3D",
+            "буфер геометрии 3D",
+            "тени 3D",
+            "края 3D",
+            "цвет 3D",
+            "полигоны 3D",
+            "глубина полигонов 3D",
+            "карты теней ламп",
+            "глубина карт теней",
+        ];
+        // Сколько пикселей отличается, их границы и первый отличающийся пиксель.
+        let compare = |scene: &HeadlessScene, play: Option<&HeadlessPlay>, only| {
+            let mut frames = Vec::new();
+            for poison in [Poison::Nan, Poison::Number] {
+                POISON.set(Some(poison));
+                POISON_ONLY.set(only);
+                let frame = render_headless_play(&options, scene, play);
+                POISON.set(None);
+                POISON_ONLY.set(None);
+                frames.push(frame.expect("кадр").image);
+            }
+            let (a, b) = (&frames[0], &frames[1]);
+            let (mut count, mut lo, mut hi, mut first) = (0usize, [u32::MAX; 2], [0u32; 2], None);
+            for y in 0..a.height {
+                for x in 0..a.width {
+                    if a.pixel(x, y) != b.pixel(x, y) {
+                        count += 1;
+                        lo = [lo[0].min(x), lo[1].min(y)];
+                        hi = [hi[0].max(x), hi[1].max(y)];
+                        first = first.or(Some(([x, y], a.pixel(x, y), b.pixel(x, y))));
+                    }
+                }
+            }
+            (count, lo, hi, first)
+        };
+        let errors = validation_error_count();
+        let mut failed = Vec::new();
+        for (name, scene, play) in &cases {
+            let (count, lo, hi, first) = compare(scene, play.as_ref(), None);
+            eprintln!("{name}: отличаются {count} пикселей");
+            if count == 0 {
+                continue;
+            }
+            eprintln!(
+                "  область x {}..={}, y {}..={}; первый {first:?}",
+                lo[0], hi[0], lo[1], hi[1]
+            );
+            for image in NAMES {
+                let (count, lo, hi, _) = compare(scene, play.as_ref(), Some(image));
+                if count > 0 {
+                    eprintln!(
+                        "  мусор в «{image}»: {count} пикселей, x {}..={}, y {}..={}",
+                        lo[0], hi[0], lo[1], hi[1]
+                    );
+                }
+            }
+            failed.push(*name);
+        }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        assert!(failed.is_empty(), "читают незаполненную память: {failed:?}");
     }
 
     /// Сцена «3D» для опыта 7.18б: пол, две лампы и две выдавленные фигуры верхнего

@@ -433,6 +433,57 @@ pub enum SpaceScale {
     Half,
 }
 
+/// Замер «краёв 3D» по частям (8.1): что проход краёв пропускает, чтобы по разнице времени
+/// на ПК было видно, сколько стоит каждая часть. Картинка краёв при этом неверная — это
+/// только для замера.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EdgeProbe {
+    /// Края считаются как обычно.
+    #[default]
+    Off,
+    /// Без точных теней на ненадёжных краях (доли света = 1).
+    NoExactShadows,
+    /// Без дополнительных лучей: все лучи пикселя берут точку его середины.
+    NoSubRays,
+    /// Лучи идут, но без освещения: цвет — просто нормаль.
+    NoShading,
+    /// Проход краёв сразу выходит: остаётся только запуск и чтение списка.
+    Empty,
+}
+
+impl EdgeProbe {
+    /// Все варианты для панели.
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::NoExactShadows,
+        Self::NoSubRays,
+        Self::NoShading,
+        Self::Empty,
+    ];
+
+    /// Название для панели и лога.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Off => "как обычно",
+            Self::NoExactShadows => "без точных теней",
+            Self::NoSubRays => "без доп. лучей",
+            Self::NoShading => "без освещения",
+            Self::Empty => "пустой проход",
+        }
+    }
+
+    /// Слово 6 заголовка списка краёв (как EDGE_PROBE_* в raymarch_edges.slang).
+    fn word(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::NoExactShadows => 1,
+            Self::NoSubRays => 2,
+            Self::NoShading => 3,
+            Self::Empty => 4,
+        }
+    }
+}
+
 impl SpaceScale {
     /// Все варианты для панели.
     pub const ALL: [Self; 3] = [Self::Full, Self::ThreeQuarters, Self::Half];
@@ -620,6 +671,8 @@ pub(crate) struct Demo {
     level_field_apart: bool,
     /// Длинный шаг в пустоте (7.18д4, флажок на панели).
     space_free: bool,
+    /// Замер «краёв 3D» по частям (8.1).
+    edge_probe: EdgeProbe,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -975,6 +1028,7 @@ impl Demo {
             space_counters_on: false,
             level_field_apart: true,
             space_free: true,
+            edge_probe: EdgeProbe::Off,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -1642,6 +1696,16 @@ impl Demo {
     /// сравнения картинки и времени).
     pub fn set_space_free(&mut self, on: bool) {
         self.space_free = on;
+    }
+
+    /// Замер «краёв 3D» по частям (8.1).
+    pub fn edge_probe(&self) -> EdgeProbe {
+        self.edge_probe
+    }
+
+    /// Выбирает, что проход «края 3D» пропускает для замера (со следующего кадра).
+    pub fn set_edge_probe(&mut self, probe: EdgeProbe) {
+        self.edge_probe = probe;
     }
 
     /// Нормаль всегда по всей сцене (7.18д5) — для сравнения с обычной.
@@ -4180,6 +4244,7 @@ impl Demo {
                 SPACE_FLAG_EDGE_PAIRS
             };
             let edges = graph.create("края 3D", ext, EDGE_FORMAT);
+            let probe = self.edge_probe.word();
             // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
             // расходятся, — край, даже если буфер геометрии у соседей одинаков.
             let mut find_uses = vec![
@@ -4205,8 +4270,9 @@ impl Demo {
                     mesh_bits | pairs,
                 );
                 // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей всего, 0
-                // ненадёжных и 0 надёжных (7.19а), два слова не заняты.
-                let start: Vec<u8> = [0u32, 1, 1, 0, 0, 0, 0, 0]
+                // ненадёжных и 0 надёжных (7.19а), замер краёв по частям (8.1), одно слово
+                // не занято.
+                let start: Vec<u8> = [0u32, 1, 1, 0, 0, 0, probe, 0]
                     .iter()
                     .flat_map(|w| w.to_ne_bytes())
                     .collect();
