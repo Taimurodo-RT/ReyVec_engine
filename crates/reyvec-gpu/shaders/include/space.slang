@@ -107,9 +107,18 @@ static const uint MESH_SAMPLE_SHIFT = 8;
 // Вывод «3D» прямо в окно (7.20а): шум против полос (дизеринг) — у растяжения в проходе
 // «вывод» (raymarch_upscale.slang) и у «освещения 3D» при 100 % (raymarch_shade.slang).
 static const uint SPACE_FLAG_DITHER = 64;
+// Освещение умножает цвет материалов с текстурой на «цвет полигонов 3D» (8.14б2): её
+// номер — старшие 16 бит pc.meshes (include/mesh.slang, mesh_tint).
+static const uint SPACE_FLAG_MESH_COLOR = 128;
+// Флаг материала (8.14б2, как shape3d::MATERIAL_TEXTURED): у полигонов цвет умножается на
+// цвет текстуры, её номер в общем списке — слово 5 записи материала.
+static const uint MATERIAL_TEXTURED = 2;
 // Раздел полигонов (слово 7 заголовка сцены): число вершин, число карт теней, 2 запасных,
 // матрица камеры, матрицы ламп для карт теней (по 16 чисел, столбцами), потом вершины.
 static const uint MESH_HEADER_WORDS = 52;
+// Слов на вершину (как VERTEX_WORDS в space.rs): место, слово материала, точка текстуры
+// (8.14б2: u и v числами половинной точности).
+static const uint MESH_VERTEX_WORDS = 5;
 static const uint MESH_VIEW_PROJ = 4;
 static const uint MESH_SHADOW_PROJ = 20;
 // Слово 11 заголовка сцены, бит 1: солнца нет (2.5D-вид — уровень в помещении).

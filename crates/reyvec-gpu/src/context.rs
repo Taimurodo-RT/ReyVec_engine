@@ -323,9 +323,15 @@ unsafe extern "system" fn debug_callback(
         let n = VALIDATION_ERRORS.fetch_add(1, Ordering::Relaxed);
         tracing::error!(target: "vulkan", "{kind:?}: {message}");
         // Первые ошибки ещё и в вывод ошибок: в тестах лог не настроен, а без текста
-        // упавшую проверку валидации не разобрать (вывод виден у упавших тестов).
+        // упавшую проверку валидации не разобрать. Прямо в stderr, мимо перехвата вывода
+        // тестов: ошибка часто случается в тесте, который сам не падает (счётчик общий на
+        // все тесты), и тогда её текст иначе пропал бы.
         if n < 8 {
-            eprintln!("Ошибка валидации Vulkan: {kind:?}: {message}");
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "Ошибка валидации Vulkan: {kind:?}: {message}"
+            );
         }
     } else if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
         tracing::warn!(target: "vulkan", "{kind:?}: {message}");

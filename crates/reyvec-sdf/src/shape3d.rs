@@ -916,10 +916,18 @@ pub struct Material3 {
     /// Рисовать на поверхности сетку через 1 и 10 м (пол сцены «3D»).
     #[serde(default)]
     pub grid: bool,
+    /// Текстура цвета (8.14б2): номер в `SpaceScene::textures` плюс 1, 0 — без текстуры.
+    /// Ставится только у материалов моделей из файлов, в файле сцены не пишется. В буфере
+    /// сцены видеокарта заменяет его номером картинки в общем списке текстур.
+    #[serde(skip)]
+    pub texture: u32,
 }
 
 /// Флаг материала: сетка на поверхности.
 pub const MATERIAL_GRID: u32 = 1;
+/// Флаг материала (8.14б2): у полигонов с ним цвет умножается на текстуру; номер
+/// текстуры — слово 5 записи материала.
+pub const MATERIAL_TEXTURED: u32 = 2;
 
 /// Лампа: точечный источник света с мягкой тенью.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1065,8 +1073,10 @@ pub fn pack_scene_with(
     }
     for m in materials {
         out.extend(m.color.map(f32::to_bits));
-        out.push(u32::from(m.grid) * MATERIAL_GRID);
-        out.extend([m.glow.to_bits(), 0, 0, 0]);
+        out.push(
+            (u32::from(m.grid) * MATERIAL_GRID) | (u32::from(m.texture != 0) * MATERIAL_TEXTURED),
+        );
+        out.extend([m.glow.to_bits(), m.texture, 0, 0]);
     }
     for l in lamps {
         out.extend(l.at.map(f32::to_bits));
@@ -1341,6 +1351,7 @@ mod tests {
             color: [0.5, 0.5, 0.5],
             glow: 0.0,
             grid: true,
+            texture: 0,
         }];
         let lamps = [Lamp3 {
             at: [1.0, 2.0, 3.0],

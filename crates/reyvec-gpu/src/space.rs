@@ -45,8 +45,82 @@ const SCENE_NO_SUN: u32 = 2;
 /// Бит 2 слова 11: нормаль по всей сцене (как SCENE_FULL_NORMAL в `include/march.slang`).
 #[cfg(test)]
 const SCENE_FULL_NORMAL: u32 = 4;
-/// Слов на вершину: место (3 числа) и слово материала ([`vertex_word`]).
-const VERTEX_WORDS: usize = 4;
+/// Слов на вершину: место (3 числа), слово материала ([`vertex_word`]) и точка текстуры
+/// (8.14б2: два числа половинной точности, [`uv_word`]; 0 — без текстуры).
+const VERTEX_WORDS: usize = 5;
+
+/// Точка текстуры вершины: u в младших 16 битах, v в старших, числами половинной
+/// точности (как `f16tof32` в шейдере). Хватает и для повторов текстуры: до 2048 точек
+/// текстуры дробная часть держится точнее, чем в 1/2 точки.
+fn uv_word(uv: glam::Vec2) -> u32 {
+    u32::from(f16_bits(uv.x)) | (u32::from(f16_bits(uv.y)) << 16)
+}
+
+/// Число половинной точности (IEEE 754 binary16) с округлением к ближайшему; слишком
+/// большие — бесконечность, слишком малые — ноль.
+fn f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mantissa = bits & 0x7f_ffff;
+    if exp == 0xff {
+        // Бесконечность и не-число.
+        return sign | 0x7c00 | if mantissa != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        // Денормальное: мантисса с неявной единицей, сдвинутая вправо.
+        let m = mantissa | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = 1u32 << (shift - 1);
+        let rounded = (m + half - 1 + ((m >> shift) & 1)) >> shift;
+        return sign | rounded as u16;
+    }
+    let rounded = mantissa + 0xfff + ((mantissa >> 13) & 1);
+    let (e, rounded) = if rounded & 0x80_0000 != 0 {
+        (e + 1, 0)
+    } else {
+        (e, rounded)
+    };
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    sign | ((e as u16) << 10) | (rounded >> 13) as u16
+}
+
+/// Есть ли в буфере сцены `words` материал с текстурой (флаг MATERIAL_TEXTURED).
+pub(crate) fn has_textures(words: &[u32]) -> bool {
+    let (at, count) = (words[2] as usize, words[3] as usize);
+    (0..count).any(|m| words[at + m * 8 + 3] & reyvec_sdf::shape3d::MATERIAL_TEXTURED != 0)
+}
+
+/// Ставит в записи материалов буфера сцены `words` (pack_scene) вместо номера текстуры
+/// сцены (`Material3::texture`, слово 5) номер её картинки в общем списке текстур:
+/// `slots[k]` — у текстуры `k + 1`. Текстура без картинки (не загрузилась) снимает флаг
+/// MATERIAL_TEXTURED: материал рисуется своим цветом.
+pub(crate) fn set_texture_slots(words: &mut [u32], slots: &[Option<u32>]) {
+    let (at, count) = (words[2] as usize, words[3] as usize);
+    for m in 0..count {
+        let w = at + m * 8;
+        let texture = words[w + 5] as usize;
+        if texture == 0 {
+            continue;
+        }
+        match slots.get(texture - 1).copied().flatten() {
+            Some(slot) => words[w + 5] = slot,
+            None => {
+                words[w + 3] &= !reyvec_sdf::shape3d::MATERIAL_TEXTURED;
+                words[w + 5] = 0;
+            }
+        }
+    }
+}
 
 /// Слово материала вершины модели. Без нормали — просто номер материала (грань плоская,
 /// нормаль шейдер берёт из наклона соседних точек). С нормалью (8.14б, гладкие грани) —
@@ -191,9 +265,11 @@ pub(crate) fn pack_with(
     for m in &frame.meshes {
         for (i, t) in m.triangles.iter().enumerate() {
             let normals = m.normals.get(i);
+            let uvs = m.uvs.get(i);
             for (k, v) in t.iter().enumerate() {
                 words.extend(v.to_array().map(f32::to_bits));
                 words.push(vertex_word(m.material, normals.map(|n| n[k])));
+                words.push(uvs.map_or(0, |u| uv_word(u[k])));
             }
         }
     }
@@ -441,13 +517,13 @@ mod tests {
     fn overflow_is_reported() {
         let scene = reyvec_sdf::SpaceScene::parse(reyvec_sdf::space_file::EXAMPLE).unwrap();
         let mut frame = scene.frame(1.0);
-        // Один треугольник — 12 слов; столько треугольников точно не поместится.
+        // Один треугольник — 15 слов; столько треугольников точно не поместится.
         let triangles = MAX_WORDS / (3 * VERTEX_WORDS) + 1;
         let t = [glam::Vec3::ZERO, glam::Vec3::X, glam::Vec3::Y];
         frame.meshes.push(reyvec_sdf::space_file::MeshFrame {
             triangles: vec![t; triangles],
             material: 0,
-            normals: Vec::new(),
+            ..Default::default()
         });
         let packed = pack(&frame, &scene.materials, true);
         assert!(packed.overflow.is_some_and(|w| w > MAX_WORDS));

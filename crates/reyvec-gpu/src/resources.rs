@@ -13,7 +13,7 @@ use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use crate::bindless::Bindless;
 use crate::context::GpuContext;
-use crate::pipeline::{full_range, image_barrier};
+use crate::pipeline::{color_range, full_range, image_barrier};
 use crate::{GpuError, VkResultExt};
 
 /// Номер текстуры. Это же номер в общем списке текстур, по которому шейдер её читает.
@@ -343,6 +343,89 @@ impl GpuResources {
             return Err(e);
         }
         Ok(id)
+    }
+
+    /// Создаёт текстуру RGBA8 с уровнями уменьшения (mip, 8.14б2) и загружает их:
+    /// `levels[k]` — точки уровня `k` размером `max(width >> k, 1)` × `max(height >> k, 1)`.
+    /// Ждёт окончания загрузки (для загрузки сцены, не каждый кадр).
+    pub fn create_texture_levels(
+        &mut self,
+        ctx: &GpuContext,
+        width: u32,
+        height: u32,
+        levels: &[Vec<u8>],
+        srgb: bool,
+        name: &str,
+    ) -> Result<TextureId, GpuError> {
+        let mut extents = Vec::with_capacity(levels.len());
+        let mut bytes = Vec::new();
+        for (k, level) in levels.iter().enumerate() {
+            let extent = vk::Extent2D {
+                width: (width >> k).max(1),
+                height: (height >> k).max(1),
+            };
+            if level.len() != (extent.width * extent.height * 4) as usize {
+                return Err(GpuError::Memory(format!(
+                    "текстура «{name}»: у уровня {k} {} байт вместо {}",
+                    level.len(),
+                    extent.width * extent.height * 4
+                )));
+            }
+            // Начало каждого уровня в буфере кратно 4 (так требует копирование).
+            extents.push((bytes.len() as u64, extent));
+            bytes.extend_from_slice(level);
+        }
+        if extents.is_empty() {
+            return Err(GpuError::Memory(format!("текстура «{name}» без точек")));
+        }
+        let format = if srgb {
+            vk::Format::R8G8B8A8_SRGB
+        } else {
+            vk::Format::R8G8B8A8_UNORM
+        };
+        let texture = create_image(
+            ctx,
+            vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+            format,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::SampleCountFlags::TYPE_1,
+            extents.len() as u32,
+            name,
+        )?;
+        let image = texture.image;
+        let staging = match self.staging(ctx, &bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                destroy_texture(ctx, texture);
+                return Err(e);
+            }
+        };
+        let result = self.immediate(ctx, |d, cmd| {
+            // SAFETY: картинка и временный буфер живы до конца немедленной отправки.
+            unsafe { record_texture_levels_upload(d, cmd, image, staging.raw, &extents) };
+        });
+        destroy_buffer(ctx, staging);
+        if let Err(e) = result {
+            destroy_texture(ctx, texture);
+            return Err(e);
+        }
+        let view = texture.view;
+        let slot = self.textures.insert(texture);
+        if slot >= crate::graph::FIRST_TRANSIENT_SLOT {
+            let t = self.textures.take(slot).expect("только что вставлена");
+            self.textures.release(slot);
+            destroy_texture(ctx, t);
+            return Err(GpuError::Memory(format!(
+                "текстур больше {}",
+                crate::graph::FIRST_TRANSIENT_SLOT
+            )));
+        }
+        self.bindless.write_texture(ctx, slot, view);
+        Ok(TextureId(slot))
     }
 
     /// Загружает в только что созданную пустую текстуру `id` (раскладка UNDEFINED)
@@ -699,6 +782,7 @@ pub(crate) fn create_texture(
         format,
         usage,
         samples,
+        1,
         name,
     )
 }
@@ -721,17 +805,20 @@ pub(crate) fn create_volume(
         format,
         usage,
         vk::SampleCountFlags::TYPE_1,
+        1,
         name,
     )
 }
 
-/// Картинка с видом: плоская при `extent.depth == 1`, иначе объёмная.
+/// Картинка с видом: плоская при `extent.depth == 1`, иначе объёмная; `levels` уровней
+/// уменьшения (mip, у плоских текстур моделей 8.14б2, иначе 1).
 fn create_image(
     ctx: &GpuContext,
     extent: vk::Extent3D,
     format: vk::Format,
     usage: vk::ImageUsageFlags,
     samples: vk::SampleCountFlags,
+    levels: u32,
     name: &str,
 ) -> Result<Texture, GpuError> {
     let d = &ctx.device;
@@ -744,7 +831,7 @@ fn create_image(
         })
         .format(format)
         .extent(extent)
-        .mip_levels(1)
+        .mip_levels(levels)
         .array_layers(1)
         .samples(samples)
         .tiling(vk::ImageTiling::OPTIMAL)
@@ -784,7 +871,7 @@ fn create_image(
             vk::ImageViewType::TYPE_2D
         })
         .format(format)
-        .subresource_range(full_range(format));
+        .subresource_range(full_range(format).level_count(levels));
     // SAFETY: картинка с привязанной памятью.
     match unsafe { d.create_image_view(&view_info, None) } {
         Ok(v) => texture.view = v,
@@ -873,6 +960,80 @@ pub(crate) unsafe fn record_texture_upload(
             image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &region,
+        );
+        d.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_read),
+        );
+    }
+}
+
+/// Записывает загрузку всех уровней новой текстуры (раскладка UNDEFINED) из буфера
+/// `src`: уровень `k` лежит с байта `levels[k].0` размером `levels[k].1`. После неё
+/// текстуру читают пиксельные и вычислительные шейдеры.
+///
+/// # Safety
+/// `cmd` в записи, `image` и `src` живы до окончания команд; у картинки столько уровней,
+/// сколько в `levels`, а буфер вмещает их все.
+pub(crate) unsafe fn record_texture_levels_upload(
+    d: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    src: vk::Buffer,
+    levels: &[(u64, vk::Extent2D)],
+) {
+    let range = color_range().level_count(levels.len() as u32);
+    let to_dst = [image_barrier(
+        image,
+        vk::ImageLayout::UNDEFINED,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::PipelineStageFlags2::NONE,
+        vk::AccessFlags2::NONE,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+    )
+    .subresource_range(range)];
+    let regions: Vec<vk::BufferImageCopy> = levels
+        .iter()
+        .enumerate()
+        .map(|(k, &(offset, extent))| {
+            vk::BufferImageCopy::default()
+                .buffer_offset(offset)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(k as u32)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: extent.width,
+                    height: extent.height,
+                    depth: 1,
+                })
+        })
+        .collect();
+    let to_read = [image_barrier(
+        image,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags2::COPY,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER,
+        vk::AccessFlags2::SHADER_SAMPLED_READ,
+    )
+    .subresource_range(range)];
+    // SAFETY: условие функции.
+    unsafe {
+        d.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&to_dst),
+        );
+        d.cmd_copy_buffer_to_image(
+            cmd,
+            src,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
         );
         d.cmd_pipeline_barrier2(
             cmd,

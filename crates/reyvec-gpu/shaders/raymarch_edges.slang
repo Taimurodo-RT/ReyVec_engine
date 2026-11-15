@@ -393,7 +393,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
                 bool same = g0.x >= 0.0 && abs(g.y - g0.y) < 0.5
                     && abs(g.x - g0.x) < 0.02 * g0.x + 0.05 && dot(n, n0) > 0.9;
                 float4 shadows = same ? exact : upsampled_shadows(px, g.x, n);
-                color = shade_lit(screen, g, shadows);
+                color = shade_lit(screen, g, shadows, px, int(sub));
             }
         }
     }

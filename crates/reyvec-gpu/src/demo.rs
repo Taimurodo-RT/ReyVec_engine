@@ -29,7 +29,7 @@ use crate::lights::{LIGHT_SIZE, MAX_LIGHTS};
 use crate::pipeline::Blend;
 use crate::pipeline::{
     CLEAR_COLOR, Stencil, StencilUse, begin_color_pass, begin_color_pass_with, begin_depth_pass,
-    begin_scene_pass, graphics_pipeline_stencil,
+    begin_depth_pass_targets, begin_scene_pass, graphics_pipeline_stencil,
 };
 use crate::resources::{BufferId, BufferMemory, GpuResources, TextureId};
 use crate::shaders::ShaderLibrary;
@@ -591,6 +591,9 @@ pub(crate) struct FrameData {
     /// Вершин полигональных моделей сцены «3D» (7.6ж; 0 — моделей нет, проход
     /// «полигоны 3D» не нужен).
     space_vertices: u32,
+    /// В кадре есть полигоны с текстурой цвета (8.14б2): «полигоны 3D» пишут ещё
+    /// картинку «цвет полигонов 3D», освещение умножает на неё цвет материала.
+    space_textured: bool,
     /// Карт теней ламп от треугольников (7.9б; 0 — тени ламп только по формам SDF).
     space_shadow_maps: u32,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
@@ -641,6 +644,14 @@ pub(crate) struct Demo {
     space_mesh: vk::Pipeline,
     /// …то же с образцами MSAA 2× и 4× (7.18е2): ровные края призм; null — не умеет.
     space_mesh_ms: [vk::Pipeline; 2],
+    /// Полигоны с цветом текстур (8.14б2, `mesh3d_color.slang`): без MSAA, 2× и 4×.
+    space_mesh_color: [vk::Pipeline; 3],
+    /// Текстуры моделей сцены «3D» (8.14б2): картинка сцены и её номер в общем списке
+    /// (None — не загрузилась, материал рисуется своим цветом).
+    space_textures: Vec<(
+        std::sync::Arc<reyvec_sdf::model3d::ModelTexture>,
+        Option<TextureId>,
+    )>,
     /// Сколько образцов видеокарта умеет для картинки полигонов (2× и 4×, только при
     /// стандартных точках образцов).
     mesh_counts: vk::SampleCountFlags,
@@ -1021,6 +1032,8 @@ impl Demo {
             space_march: vk::Pipeline::null(),
             space_mesh: vk::Pipeline::null(),
             space_mesh_ms: [vk::Pipeline::null(); 2],
+            space_mesh_color: [vk::Pipeline::null(); 3],
+            space_textures: Vec::new(),
             mesh_counts,
             space_mesh_shadow: vk::Pipeline::null(),
             space_cone: vk::Pipeline::null(),
@@ -1246,6 +1259,11 @@ impl Demo {
                     )?;
                 }
             }
+            for (slot, msaa) in [Msaa::Off, Msaa::X2, Msaa::X4].into_iter().enumerate() {
+                if msaa == Msaa::Off || demo.mesh_counts.contains(msaa.samples()) {
+                    demo.space_mesh_color[slot] = build_mesh_color(ctx, res, shaders, msaa)?;
+                }
+            }
             demo.space_mesh_shadow = build(
                 ctx,
                 res,
@@ -1412,6 +1430,46 @@ impl Demo {
                 self.space_error = Some(e);
             }
         }
+    }
+
+    /// Загружает текстуры моделей сцены «3D» (8.14б2), если сцена сменилась, и убирает
+    /// прежние. Ответ — номер картинки каждой текстуры сцены в общем списке (None — не
+    /// загрузилась: материал рисуется своим цветом, причина в журнале).
+    fn sync_space_textures(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+    ) -> Vec<Option<u32>> {
+        let same = self.space_textures.len() == self.space.textures.len()
+            && self
+                .space_textures
+                .iter()
+                .zip(&self.space.textures)
+                .all(|((old, _), new)| std::sync::Arc::ptr_eq(old, new));
+        if !same {
+            for (_, id) in self.space_textures.drain(..) {
+                if let Some(id) = id {
+                    res.destroy_texture(id);
+                }
+            }
+            for (k, t) in self.space.textures.iter().enumerate() {
+                let name = format!("текстура модели {}", k + 1);
+                let id = match res
+                    .create_texture_levels(ctx, t.width, t.height, &t.levels, true, &name)
+                {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!("Сцена 3D: {name} не загрузилась: {e}");
+                        None
+                    }
+                };
+                self.space_textures.push((t.clone(), id));
+            }
+        }
+        self.space_textures
+            .iter()
+            .map(|(_, id)| id.map(|id| id.0))
+            .collect()
     }
 
     /// Ошибка в последнем сохранении файла сцены «3D» (рисуется прошлая сцена).
@@ -2933,6 +2991,22 @@ impl Demo {
                         Some(MESH_DEPTH_FORMAT),
                     )
                 }
+                "mesh3d_color" => {
+                    for (slot, msaa) in [Msaa::Off, Msaa::X2, Msaa::X4].into_iter().enumerate() {
+                        if msaa != Msaa::Off && !self.mesh_counts.contains(msaa.samples()) {
+                            continue;
+                        }
+                        match build_mesh_color(ctx, res, shaders, msaa) {
+                            Ok(new) => {
+                                let old = std::mem::replace(&mut self.space_mesh_color[slot], new);
+                                // SAFETY: видеокарта простаивает (условие функции).
+                                unsafe { ctx.device.destroy_pipeline(old, None) };
+                            }
+                            Err(e) => shaders.set_error(name, e.to_string()),
+                        }
+                    }
+                    continue;
+                }
                 "mesh_shadow" => (
                     &mut self.space_mesh_shadow,
                     SHADOW_MAP_FORMAT,
@@ -3298,6 +3372,7 @@ impl Demo {
         res.write_buffer(blob_buffer, 0, &blob_bytes);
         let space_buffer = self.space_buffers[slot];
         let mut space_vertices = 0;
+        let mut space_textured = false;
         let mut space_shadow_maps = 0;
         let mut space_counters = None;
         let space_compute =
@@ -3387,6 +3462,14 @@ impl Demo {
                 self.space_field.ao_from_field,
             );
             space_vertices = packed.vertices;
+            // Текстуры моделей (8.14б2): номера их картинок — в записи материалов.
+            if !level {
+                let slots = self.sync_space_textures(ctx, res);
+                crate::space::set_texture_slots(&mut packed.words, &slots);
+                space_textured = space_vertices > 0
+                    && crate::space::has_textures(&packed.words)
+                    && self.space_mesh_color[0] != vk::Pipeline::null();
+            }
             if level {
                 crate::space::set_no_sun(&mut packed.words);
                 // Треугольники (7.9б): карты теней двух первых ламп, если есть чем рисовать.
@@ -3455,6 +3538,7 @@ impl Demo {
             sprite_count: count as u32,
             space_address: res.buffer_address(space_buffer),
             space_vertices,
+            space_textured,
             space_shadow_maps,
             space_compute,
             space_edges,
@@ -3508,7 +3592,7 @@ impl Demo {
         }
         if self.direct_space(frame) {
             // При разрешении 3D 100 % освещение красит прямо в окно, иначе «вывод» растягивает.
-            let (_, _, _, color) = self.add_space_passes(graph, bindless, frame, Some(target));
+            let (_, _, _, color, _) = self.add_space_passes(graph, bindless, frame, Some(target));
             if let Some(color) = color {
                 self.add_direct_output(graph, bindless, frame, color, target);
             }
@@ -3669,7 +3753,7 @@ impl Demo {
             (target_image, Access::ColorAttachment),
             (stencil, Access::StencilAttachment),
         ];
-        if let Some((g, s, e, color)) = gbuffer {
+        if let Some((g, s, e, color, tint)) = gbuffer {
             if let Some(c) = color {
                 uses.push((c, Access::Sampled));
             } else {
@@ -3677,6 +3761,10 @@ impl Demo {
                 uses.push((s, Access::Sampled));
                 if let Some(e) = e {
                     uses.push((e, Access::Sampled));
+                }
+                if let Some(((m, c), _)) = tint {
+                    uses.push((m, Access::Sampled));
+                    uses.push((c, Access::Sampled));
                 }
             }
         }
@@ -3732,7 +3820,7 @@ impl Demo {
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
                 }
-                if let Some((_, _, _, Some(c))) = gbuffer {
+                if let Some((_, _, _, Some(c), _)) = gbuffer {
                     // Растяжение уменьшенной сцены «3D» на весь кадр (7.14).
                     let push = space_push(
                         &frame.space_camera,
@@ -3748,7 +3836,7 @@ impl Demo {
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_upscale);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_draw(cmd, 3, 1, 0, 0);
-                } else if let Some((g, s, e, None)) = gbuffer {
+                } else if let Some((g, s, e, None, tint)) = gbuffer {
                     let push = space_push(
                         &frame.space_camera,
                         frame.extent,
@@ -3758,9 +3846,10 @@ impl Demo {
                             gbuffer: p.texture(g),
                             shadows: p.texture(s),
                             target: e.map_or(0, |e| p.texture(e)),
+                            meshes: tint.map_or(0, |(t, _)| tint_slot(p, t)),
                             ..SpaceSlots::default()
                         },
-                        u32::from(e.is_some()) * SPACE_FLAG_EDGES,
+                        (u32::from(e.is_some()) * SPACE_FLAG_EDGES) | tint.map_or(0, |(_, b)| b),
                     );
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.space_shade);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
@@ -3944,12 +4033,7 @@ impl Demo {
         bindless: &'a Bindless,
         frame: FrameData,
         direct: Option<ImageHandle>,
-    ) -> (
-        ImageHandle,
-        ImageHandle,
-        Option<ImageHandle>,
-        Option<ImageHandle>,
-    ) {
+    ) -> SpacePasses {
         let layout = bindless.pipeline_layout;
         let camera = frame.space_camera;
         let ext = frame.space_extent;
@@ -4049,52 +4133,88 @@ impl Demo {
         } else {
             (mesh_msaa, mesh_flags, mesh_pipeline)
         };
+        // Текстуры цвета (8.14б2): тот же проход с второй целью «цвет полигонов 3D».
+        let color_pipeline = match mesh_msaa {
+            Msaa::X2 => self.space_mesh_color[1],
+            Msaa::X4 => self.space_mesh_color[2],
+            _ => self.space_mesh_color[0],
+        };
+        let textured = frame.space_textured && color_pipeline != vk::Pipeline::null();
         let meshes = (frame.space_vertices > 0).then(|| {
             let samples = mesh_msaa.samples();
             let meshes = graph.create_multisampled("полигоны 3D", ext, MESH_FORMAT, samples);
+            let colors = textured.then(|| {
+                graph.create_multisampled("цвет полигонов 3D", ext, MESH_COLOR_FORMAT, samples)
+            });
             let depth =
                 graph.create_multisampled("глубина полигонов 3D", ext, MESH_DEPTH_FORMAT, samples);
-            graph.add_pass(
-                "полигоны 3D",
-                &[
-                    (meshes, Access::ColorAttachment),
-                    (depth, Access::StencilAttachment),
-                ],
-                move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots::default(),
-                        0,
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
-                    // этого кадра жив, пока кадр рисуется.
-                    unsafe {
-                        // Нули: бит попадания упакованной точки — 0 (pack_mesh).
-                        begin_depth_pass(
+            let mut uses = vec![
+                (meshes, Access::ColorAttachment),
+                (depth, Access::StencilAttachment),
+            ];
+            if let Some(c) = colors {
+                uses.push((c, Access::ColorAttachment));
+            }
+            let mesh_pipeline = if colors.is_some() {
+                color_pipeline
+            } else {
+                mesh_pipeline
+            };
+            graph.add_pass("полигоны 3D", &uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots::default(),
+                    0,
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл картинки в цели рисования; буфер сцены
+                // этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    // Нули: бит попадания упакованной точки — 0 (pack_mesh). Цвет
+                    // полигонов читается только там, где полигоны есть.
+                    match colors {
+                        Some(c) => begin_depth_pass_targets(
+                            d,
+                            cmd,
+                            &[p.view(meshes), p.view(c)],
+                            p.view(depth),
+                            ext,
+                            [0.0, 0.0, 0.0, 0.0],
+                        ),
+                        None => begin_depth_pass(
                             d,
                             cmd,
                             p.view(meshes),
                             p.view(depth),
                             ext,
                             [0.0, 0.0, 0.0, 0.0],
-                        );
-                        bindless.bind(d, cmd);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, mesh_pipeline);
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
-                        d.cmd_end_rendering(cmd);
+                        ),
                     }
-                },
-            );
-            meshes
+                    bindless.bind(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, mesh_pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
+                    d.cmd_end_rendering(cmd);
+                }
+            });
+            (meshes, colors)
         });
+        // Полигоны и их цвет (8.14б2), если в кадре есть текстуры.
+        let tint = meshes.and_then(|(m, c)| c.map(|c| (m, c)));
+        let meshes = meshes.map(|(m, _)| m);
         // Флаги чтения полигонов для «реймарчинга» и «краёв 3D».
         let mesh_bits = if meshes.is_some() {
             SPACE_FLAG_MESHES | mesh_flags
+        } else {
+            0
+        };
+        // Для освещения с текстурами (8.14б2): какие образцы полигонов есть, и что их цвет
+        // — в старших 16 битах номера полигонов (tint_slot).
+        let tint_bits = if tint.is_some() {
+            SPACE_FLAG_MESHES | mesh_flags | SPACE_FLAG_MESH_COLOR
         } else {
             0
         };
@@ -4404,6 +4524,9 @@ impl Demo {
             if let Some(m) = meshes {
                 uses.push((m, Access::ComputeSampled));
             }
+            if let Some((_, c)) = tint {
+                uses.push((c, Access::ComputeSampled));
+            }
             if let Some(m) = shadow_maps {
                 uses.push((m, Access::ComputeSampled));
             }
@@ -4418,10 +4541,13 @@ impl Demo {
                         shadows: p.texture(shadows),
                         target: p.storage(edges),
                         cone: p.texture(cone),
-                        meshes: meshes.map_or(0, |m| p.texture(m)),
+                        meshes: tint.map_or_else(
+                            || meshes.map_or(0, |m| p.texture(m)),
+                            |t| tint_slot(p, t),
+                        ),
                         edges: list,
                     },
-                    mesh_bits | pairs | map_flags(p),
+                    mesh_bits | tint_bits | pairs | map_flags(p),
                 );
                 let (d, cmd) = (p.device, p.cmd);
                 // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
@@ -4459,6 +4585,10 @@ impl Demo {
             if let Some(e) = edges {
                 uses.push((e, Access::Sampled));
             }
+            if let Some((m, c)) = tint {
+                uses.push((m, Access::Sampled));
+                uses.push((c, Access::Sampled));
+            }
             let (pipeline, dither) = match window {
                 Some(_) => (
                     self.space_shade_present,
@@ -4476,9 +4606,10 @@ impl Demo {
                         gbuffer: p.texture(gbuffer),
                         shadows: p.texture(shadows),
                         target: edges.map_or(0, |e| p.texture(e)),
+                        meshes: tint.map_or(0, |t| tint_slot(p, t)),
                         ..SpaceSlots::default()
                     },
-                    (u32::from(edges.is_some()) * SPACE_FLAG_EDGES) | dither,
+                    (u32::from(edges.is_some()) * SPACE_FLAG_EDGES) | dither | tint_bits,
                 );
                 let (d, cmd) = (p.device, p.cmd);
                 // SAFETY: граф перевёл картинки 3D в чтение, а цвет (или окно) в цель
@@ -4495,7 +4626,7 @@ impl Demo {
             color
         });
         let color = lit.filter(|_| window.is_none());
-        (gbuffer, shadows, edges, color)
+        (gbuffer, shadows, edges, color, tint.map(|t| (t, tint_bits)))
     }
 
     /// Проходы поля расстояний сцены «свет» (4.2): «маска» рисует фигуры, отбрасывающие
@@ -4889,6 +5020,9 @@ impl Demo {
             for p in self.space_mesh_ms {
                 ctx.device.destroy_pipeline(p, None);
             }
+            for p in self.space_mesh_color {
+                ctx.device.destroy_pipeline(p, None);
+            }
             ctx.device.destroy_pipeline(self.space_mesh_shadow, None);
             ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
@@ -4923,6 +5057,7 @@ impl Demo {
         self.space_march = vk::Pipeline::null();
         self.space_mesh = vk::Pipeline::null();
         self.space_mesh_ms = [vk::Pipeline::null(); 2];
+        self.space_mesh_color = [vk::Pipeline::null(); 3];
         self.space_mesh_shadow = vk::Pipeline::null();
         self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
@@ -5043,6 +5178,23 @@ fn sdf_push(
 /// и номера картинок в общем списке текстур: буфера геометрии (7.3) и теней (7.4).
 /// Картинки и буферы, которые читают и пишут проходы сцены «3D» (поля `Push` в
 /// `include/space.slang`).
+/// Что дают проходы сцены «3D» (add_space_passes): буфер геометрии, тени, цвет краёв,
+/// цвет при уменьшенном разрешении или прямом выводе и (8.14б2) полигоны с их цветом и
+/// флаги их чтения для освещения.
+type SpacePasses = (
+    ImageHandle,
+    ImageHandle,
+    Option<ImageHandle>,
+    Option<ImageHandle>,
+    Option<((ImageHandle, ImageHandle), u32)>,
+);
+
+/// Номер полигонов для освещения с текстурами (8.14б2): картинка полигонов в младших 16
+/// битах, их цвета — в старших (как mesh_slot и tint_slot в include/mesh.slang).
+fn tint_slot(p: &PassContext, (meshes, colors): (ImageHandle, ImageHandle)) -> u32 {
+    p.texture(meshes) | (p.texture(colors) << 16)
+}
+
 #[derive(Clone, Copy, Default)]
 struct SpaceSlots {
     gbuffer: u32,
@@ -5144,6 +5296,9 @@ const MESH_DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 /// 8 байтах (`pack_mesh` в space.slang), вдвое меньше прежнего RGBA32F: с образцами MSAA
 /// 2× цвет занимает столько же байт, сколько было без них (глубина D32 и 4× — больше).
 const MESH_FORMAT: vk::Format = vk::Format::R32G32_UINT;
+/// Картинка «цвет полигонов 3D» (8.14б2): цвет текстуры точки полигона. sRGB: 8 бит на
+/// канал без полос в тёмном, видеокарта сама переводит в линейный при чтении.
+const MESH_COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 /// Флаг сцены «3D»: у картинки полигонов образцы MSAA (7.18е2); с [`SPACE_FLAG_MESH_X4`]
 /// их четыре, без — два. Какой образец берёт луч края — таблица с бита
 /// [`MESH_SAMPLE_SHIFT`] (как в space.slang).
@@ -5214,6 +5369,9 @@ const SPACE_FLAG_SHADOW_MAP: u32 = 8;
 /// растяжения в проходе «вывод» (raymarch_upscale.slang) и у «освещения 3D» при 100 %
 /// (raymarch_shade.slang).
 const SPACE_FLAG_DITHER: u32 = 64;
+/// Освещение умножает цвет материалов с текстурой на «цвет полигонов 3D» (8.14б2): её
+/// номер — старшие 16 бит `meshes` в константах.
+const SPACE_FLAG_MESH_COLOR: u32 = 128;
 /// Карта тени лампы (7.9б): расстояние от лампы до ближней поверхности.
 const SHADOW_MAP_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 /// Сторона карты тени лампы, точек.
@@ -5422,6 +5580,30 @@ fn build(
             } else {
                 StencilUse::Ignore
             },
+        }),
+    )
+}
+
+/// Конвейер «полигоны 3D» с цветом текстур (8.14б2, `mesh3d_color.slang`): две цели —
+/// упакованная точка и цвет полигонов.
+fn build_mesh_color(
+    ctx: &GpuContext,
+    res: &GpuResources,
+    shaders: &ShaderLibrary,
+    msaa: Msaa,
+) -> Result<vk::Pipeline, GpuError> {
+    let pair = shaders.get("mesh3d_color");
+    crate::pipeline::graphics_pipeline_targets(
+        &ctx.device,
+        res.bindless.pipeline_layout,
+        &pair.vs,
+        &pair.fs,
+        &[MESH_FORMAT, MESH_COLOR_FORMAT],
+        Blend::Opaque,
+        msaa.samples(),
+        Some(Stencil {
+            format: MESH_DEPTH_FORMAT,
+            usage: StencilUse::Depth,
         }),
     )
 }

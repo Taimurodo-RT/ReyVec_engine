@@ -8,7 +8,6 @@
 #define SPACE_OWN_VERTEX
 #include "include/space.slang"
 
-static const uint VERTEX_WORDS = 4;
 
 struct ShadowOut
 {
@@ -30,7 +29,7 @@ ShadowOut vs_main(uint vertex : SV_VulkanVertexID, uint lamp : SV_VulkanInstance
         o.world = float3(0.0, 0.0, 0.0);
         return o;
     }
-    uint v = at + MESH_HEADER_WORDS + vertex * VERTEX_WORDS;
+    uint v = at + MESH_HEADER_WORDS + vertex * MESH_VERTEX_WORDS;
     float3 p = float3(asfloat(pc.scene[v]), asfloat(pc.scene[v + 1]), asfloat(pc.scene[v + 2]));
     uint m = at + MESH_SHADOW_PROJ + lamp * 16;
     float4 clip = float4(0.0, 0.0, 0.0, 0.0);

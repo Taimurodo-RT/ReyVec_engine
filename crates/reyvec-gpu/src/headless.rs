@@ -998,6 +998,98 @@ pub(crate) mod tests {
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
+    /// Текстура цвета модели (8.14б2): ящик `models/crate.glb` рисуется с картинкой досок
+    /// — коричневый, с тёмной рамкой и светлыми досками, а не ровно-белый, как тот же ящик
+    /// с белым материалом сцены. Так в обычном кадре (образцы MSAA, края), без образцов
+    /// и при уменьшенном разрешении 3D (освещение своим проходом).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn model_texture_colors_crate() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let text = |material: &str| {
+            format!(
+                r#"(
+    format: "reyvec-space",
+    version: 1,
+    camera: Some((eye: (1.3, 1.1, 1.6), look_at: (0.0, 0.35, 0.0))),
+    materials: [
+        (name: "пол", color: (0.18, 0.19, 0.21), grid: true),
+        (name: "белый", color: (1.0, 1.0, 1.0)),
+    ],
+    lamps: [(at: (1.5, 2.5, 2.0), color: (1.0, 1.0, 1.0), power: 6.0, range: 8.0)],
+    objects: [(name: "пол", material: "пол", shape: Plane(normal: (0.0, 1.0, 0.0), offset: 0.0))],
+    meshes: [(name: "ящик", {material} mesh: Model(file: "models/crate.glb"))],
+)"#
+            )
+        };
+        let scene = |material: &str| HeadlessScene {
+            width: 320,
+            height: 240,
+            time: 0.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(text(material).into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        for (name, scale, no_ms) in [
+            ("обычно", crate::SpaceScale::Full, false),
+            ("без образцов MSAA", crate::SpaceScale::Full, true),
+            ("разрешение 3D 50 %", crate::SpaceScale::Half, false),
+        ] {
+            SPACE_SCALE.set(scale);
+            NO_MESH_MSAA.set(no_ms);
+            let textured = render_headless(&options, &scene(""));
+            let white = render_headless(&options, &scene("material: \"белый\","));
+            SPACE_SCALE.set(crate::SpaceScale::Full);
+            NO_MESH_MSAA.set(false);
+            let (textured, white) = (textured.expect("кадр"), white.expect("кадр"));
+            let (a, b) = (&textured.image.rgba, &white.image.rgba);
+            // Пиксели ящика — где кадры расходятся.
+            let mut sum = [0.0f64; 3];
+            let mut lum = Vec::new();
+            for (pa, pb) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+                if pa[..3]
+                    .iter()
+                    .zip(&pb[..3])
+                    .any(|(x, y)| x.abs_diff(*y) > 8)
+                {
+                    for k in 0..3 {
+                        sum[k] += f64::from(pa[k]);
+                    }
+                    lum.push(
+                        f64::from(pa[0]) * 0.3 + f64::from(pa[1]) * 0.6 + f64::from(pa[2]) * 0.1,
+                    );
+                }
+            }
+            let n = lum.len().max(1) as f64;
+            let mean = sum.map(|v| v / n);
+            let avg = lum.iter().sum::<f64>() / n;
+            let spread = (lum.iter().map(|l| (l - avg) * (l - avg)).sum::<f64>() / n).sqrt();
+            eprintln!(
+                "{name}: пикселей ящика {}, средний цвет {mean:.0?}, разброс яркости {spread:.1}",
+                lum.len()
+            );
+            assert!(lum.len() > 3000, "{name}: ящик в кадре");
+            // Доски коричневые: красного заметно больше синего.
+            assert!(mean[0] > mean[2] * 1.4, "{name}: цвет {mean:?}");
+            // Рамка темнее досок: текстура, а не ровный цвет.
+            assert!(spread > 12.0, "{name}: разброс {spread}");
+        }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
     /// Ни один проход не читает то, что в этом кадре никто не записал (8.0). Кадр
     /// рисуется дважды: временные картинки перед ним залиты разным мусором (не-числом и
     /// обычным числом). Если проход читает незаполненную память, мусор попадает в кадр, и

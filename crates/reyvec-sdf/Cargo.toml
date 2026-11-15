@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 glam.workspace = true
 gltf.workspace = true
+image = { workspace = true, features = ["png", "jpeg"] }
 kurbo.workspace = true
 ron.workspace = true
 serde.workspace = true
