@@ -734,8 +734,9 @@ pub(crate) struct Demo {
     /// Точные тени краёв только у границы тени (8.2б; `false` — как до 8.2б).
     edge_shadow_reuse: bool,
     /// Края: два луча вместо четырёх там, где пиксель накрывает больше
-    /// [`EDGE_FAR_METERS`] (8.11б, опыт; по умолчанию выключено).
-    edge_far: bool,
+    /// этого числа метров (8.11б, опыт; 0 — выключено, как по умолчанию; во включённом
+    /// виде — [`EDGE_FAR_METERS`]).
+    edge_far: f32,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -1100,7 +1101,7 @@ impl Demo {
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,
-            edge_far: false,
+            edge_far: 0.0,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -1941,12 +1942,18 @@ impl Demo {
 
     /// Края: два луча вдали (8.11б).
     pub fn edge_far(&self) -> bool {
-        self.edge_far
+        self.edge_far > 0.0
     }
 
     /// Включает и выключает 8.11б.
     pub fn set_edge_far(&mut self, on: bool) {
-        self.edge_far = on;
+        self.edge_far = if on { EDGE_FAR_METERS } else { 0.0 };
+    }
+
+    /// 8.11б с другим порогом (метров; 0 — выключено), для подбора порога в тестах.
+    #[cfg(test)]
+    pub fn set_edge_far_meters(&mut self, meters: f32) {
+        self.edge_far = meters;
     }
 
     /// Нормаль всегда по всей сцене (7.18д5) — для сравнения с обычной.
@@ -4612,7 +4619,7 @@ impl Demo {
                 header[2] = 1;
                 header[6] = probe;
                 // Порог «края: два луча вдали» (8.11б), 0 — выключено.
-                header[9] = if far { EDGE_FAR_METERS.to_bits() } else { 0 };
+                header[9] = far.to_bits();
                 let start: Vec<u8> = header.iter().flat_map(|w| w.to_ne_bytes()).collect();
                 // Список этого кадра в прошлый раз читали проход «края 3D» и копия
                 // счётчика для процессора.
