@@ -638,6 +638,9 @@ pub struct Program {
     /// Светящийся предмет (огонёк, шар-светильник; 7.9б): виден, но теней и затенения
     /// в углах не даёт. Иначе он у самой лампы и бросает от неё тень на всё вокруг.
     pub no_shadow: bool,
+    /// Неподвижный предмет (8.8б): сетка отсева раскладывает его один раз
+    /// ([`crate::grid3d::GridCache`]).
+    pub still: bool,
     /// Поля слоя (7.18б) в порядке примитивов `PRIM_FIELD` в словах: по ним считает
     /// зеркало на процессоре, видеокарта читает картинки по номерам из слов.
     pub fields: Vec<FieldRef>,
@@ -699,6 +702,7 @@ pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
         bounds_box: tight_box(shape),
         shadow_only: false,
         no_shadow: false,
+        still: false,
         fields: out.fields,
         bricks: out.bricks,
     })
@@ -1160,6 +1164,26 @@ pub fn pack_scene_with(
     level_field: bool,
     grid: GridOptions,
 ) -> Vec<u32> {
+    pack_scene_cached(
+        objects,
+        materials,
+        lamps,
+        level_field,
+        grid,
+        &mut crate::grid3d::GridCache::default(),
+    )
+}
+
+/// То же; сетка отсева берёт готовый вклад неподвижного из `cache` (8.8б,
+/// [`crate::grid3d::Grid::build_cached`]). Слова те же, что у [`pack_scene_with`].
+pub fn pack_scene_cached(
+    objects: &[Program],
+    materials: &[Material3],
+    lamps: &[Lamp3],
+    level_field: bool,
+    grid: GridOptions,
+    cache: &mut crate::grid3d::GridCache,
+) -> Vec<u32> {
     let objects_at = HEADER_WORDS;
     let materials_at = objects_at + objects.len() * OBJECT_WORDS;
     let lamps_at = materials_at + materials.len() * MATERIAL_WORDS;
@@ -1225,7 +1249,7 @@ pub fn pack_scene_with(
     out[9] = planes.len() as u32;
     out.extend(&planes);
     let field = field.map(|i| i as u32);
-    let grid = crate::grid3d::Grid::build_with(objects, field, grid);
+    let grid = crate::grid3d::Grid::build_cached(objects, field, grid, cache);
     if !grid.cells.is_empty() {
         out[6] = out.len() as u32;
         let at = out.len();

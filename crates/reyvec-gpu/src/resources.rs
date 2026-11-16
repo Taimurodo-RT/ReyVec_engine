@@ -250,6 +250,33 @@ impl GpuResources {
         }
     }
 
+    /// То же для слов: пишет их прямо в отображённую память, без промежуточного списка
+    /// байт (у сцены «3D» на тысячу предметов это пол-миллиона слов каждый кадр, 8.8б).
+    pub fn write_words(&mut self, id: BufferId, offset: usize, words: &[u32]) {
+        let Some(buffer) = self
+            .buffers
+            .items
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_mut)
+        else {
+            return;
+        };
+        let Some(slice) = buffer
+            .allocation
+            .as_mut()
+            .and_then(Allocation::mapped_slice_mut)
+        else {
+            tracing::error!("буфер {id:?} не доступен процессору для записи");
+            return;
+        };
+        let Some(tail) = slice.get_mut(offset..) else {
+            return;
+        };
+        for (out, w) in tail.chunks_exact_mut(4).zip(words) {
+            out.copy_from_slice(&w.to_ne_bytes());
+        }
+    }
+
     /// Читает первые `len` байт буфера, доступного процессору ([`BufferMemory::GpuToCpu`]).
     /// Видеокарта должна закончить запись в него (кадр с записью закончен).
     pub fn read_buffer(&self, id: BufferId, len: usize) -> Option<Vec<u8>> {

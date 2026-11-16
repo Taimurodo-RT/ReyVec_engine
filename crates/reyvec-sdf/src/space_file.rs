@@ -243,10 +243,21 @@ pub struct SpaceFrame {
     /// Светящиеся предметы без теней (2.5D-вид, 7.9б): глаз их видит, тени и затенение
     /// в углах — нет.
     pub glows: Vec<Shape3>,
+    /// Неподвижен ли предмет (8.8б): по одному на `shapes`, потом по одному на `proxies`.
+    /// Пусто — не известно (всё считается движущимся). Неподвижное сетка отсева
+    /// раскладывает один раз ([`crate::grid3d::GridCache`]).
+    pub still: Vec<bool>,
 }
 
 /// Свечение шарика лампы: ярче 1, чтобы вокруг был ореол.
 const BULB_GLOW: f32 = 4.0;
+
+/// Двигается ли предмет с такими покачиванием, кругом и вращением.
+fn moves(bob: &Bob, circle: &Circle, spin: &[f32; 3]) -> bool {
+    bob.period != 0.0 && bob.by != [0.0; 3]
+        || circle.period != 0.0 && circle.radius != [0.0; 2]
+        || spin.iter().any(|&s| s != 0.0)
+}
 
 impl SpaceScene {
     /// Читает текст файла; пути к моделям glTF — от рабочей папки. Ошибка — строка для
@@ -511,11 +522,6 @@ impl SpaceScene {
 
     /// Сколько предметов и моделей движется (покачивание, круг, вращение; 8.7).
     pub fn moving_count(&self) -> usize {
-        let moves = |bob: &Bob, circle: &Circle, spin: &[f32; 3]| {
-            bob.period != 0.0 && bob.by != [0.0; 3]
-                || circle.period != 0.0 && circle.radius != [0.0; 2]
-                || spin.iter().any(|&s| s != 0.0)
-        };
         self.objects
             .iter()
             .filter(|o| {
@@ -536,6 +542,13 @@ impl SpaceScene {
 
     /// Предметы и лампы в момент `time` (секунды).
     pub fn frame(&self, time: f32) -> SpaceFrame {
+        let mut still: Vec<bool> = self
+            .objects
+            .iter()
+            .map(|o| {
+                !moves(&o.bob, &o.circle, &o.spin) && !matches!(o.shape, Shape3::Animate { .. })
+            })
+            .collect();
         let mut shapes: Vec<Shape3> = self
             .objects
             .iter()
@@ -560,12 +573,15 @@ impl SpaceScene {
             });
             if let Some(material) = bulb {
                 shapes.push(Shape3::Sphere { radius: l.bulb }.at(at).paint(*material));
+                still.push(!moves(&l.bob, &l.circle, &[0.0; 3]));
             }
         }
         let mut meshes = Vec::new();
         let mut proxies = Vec::new();
+        let shapes_count = still.len();
         for mesh in &self.meshes {
             let m = &mesh.entry;
+            let mesh_still = !moves(&m.bob, &m.circle, &m.spin);
             let at = Vec3::from(m.at) + motion_offset(&m.bob, &m.circle, time);
             let turn = [0, 1, 2].map(|i| m.turn[i] + m.spin[i] * time);
             let r = rotation(turn);
@@ -591,6 +607,7 @@ impl SpaceScene {
                         .map(|p| p.clone().placed(at.to_array(), turn)),
                 ),
             }
+            still.resize(shapes_count + proxies.len(), mesh_still);
         }
         SpaceFrame {
             shapes,
@@ -598,6 +615,7 @@ impl SpaceScene {
             meshes,
             proxies,
             glows: Vec::new(),
+            still,
         }
     }
 }

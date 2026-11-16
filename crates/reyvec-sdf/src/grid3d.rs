@@ -60,12 +60,122 @@ impl Default for GridOptions {
 /// Граница объекта для сетки: коробка `lo..hi`, раздутая на `r`. Шар — коробка-точка с
 /// радиусом, плотная коробка — с радиусом 0. Расстояние от клетки до такой границы —
 /// расстояние между коробками минус `r`, оно складывается из зазоров по осям.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Bound {
     index: u32,
+    /// Неподвижный предмет ([`Program::still`]).
+    still: bool,
     lo: Vec3,
     hi: Vec3,
     r: f32,
+}
+
+/// Что нужно, чтобы готовый вклад неподвижного подошёл к новому кадру: та же сетка, те же
+/// настройки и столько же конечных объектов.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CacheKey {
+    origin: [u32; 3],
+    cell: u32,
+    dims: [u32; 3],
+    options: GridOptions,
+    squared: bool,
+}
+
+/// Сетка прошлых кадров для [`Grid::build_cached`] (8.8б): вклад объектов, которые не
+/// двигаются, — их пары (клетка, объект) и свободное расстояние от них.
+#[derive(Clone, Debug, Default)]
+pub struct GridCache {
+    key: Option<CacheKey>,
+    /// Неподвижное: места в списке границ и сами границы.
+    base: Vec<u32>,
+    base_bounds: Vec<Bound>,
+    base_pairs: Vec<(u32, u32)>,
+    base_free: Vec<f32>,
+    /// Сколько раз неподвижное пересчитывалось (для тестов и счётчиков).
+    pub rebuilds: usize,
+    /// Сколько объектов посчитано заново в последнем кадре.
+    pub moved: usize,
+}
+
+impl Bound {
+    /// Место и размер без номера объекта.
+    fn shape_bits(&self) -> [u32; 7] {
+        let [a, b, c] = self.lo.to_array().map(f32::to_bits);
+        let [d, e, f] = self.hi.to_array().map(f32::to_bits);
+        [a, b, c, d, e, f, self.r.to_bits()]
+    }
+}
+
+impl GridCache {
+    /// Находит неподвижное в новых границах `bounds` по порядку (номера могли сдвинуться
+    /// из-за отсева по взгляду) и переписывает номера в его парах. `false` — что-то из
+    /// неподвижного сдвинулось или пропало.
+    fn relocate(&mut self, bounds: &[Bound]) -> bool {
+        let mut found = Vec::with_capacity(self.base.len());
+        let mut p = 0;
+        for b in &self.base_bounds {
+            let bits = b.shape_bits();
+            while p < bounds.len() && bounds[p].shape_bits() != bits {
+                p += 1;
+            }
+            if p == bounds.len() {
+                return false;
+            }
+            found.push(p as u32);
+            p += 1;
+        }
+        if found == self.base
+            && self
+                .base_bounds
+                .iter()
+                .zip(&found)
+                .all(|(b, &p)| b.index == bounds[p as usize].index)
+        {
+            return true;
+        }
+        // Пары по порядку объектов: номер каждого объекта меняется на новый, порядок
+        // сохраняется (неподвижное найдено в том же порядке). Старые номера в
+        // `base_bounds` ещё не переписаны, по ним и узнаётся объект пары.
+        let mut k = 0;
+        for pair in &mut self.base_pairs {
+            while self.base_bounds[k].index != pair.1 {
+                k += 1;
+            }
+            pair.1 = bounds[found[k] as usize].index;
+        }
+        for (b, &p) in self.base_bounds.iter_mut().zip(&found) {
+            *b = bounds[p as usize];
+        }
+        self.base = found;
+        true
+    }
+
+    /// Забыть всё: следующий кадр считается целиком.
+    pub fn clear(&mut self) {
+        *self = Self {
+            rebuilds: self.rebuilds,
+            ..Self::default()
+        };
+    }
+}
+
+/// Две последовательности пар, каждая по порядку объектов, — в одну по порядку объектов
+/// (пары одного объекта идут подряд и остаются подряд).
+fn merge_by_object(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].1 <= b[j].1 {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    out
 }
 
 fn object_bounds(objects: &[Program], boxes: bool) -> Vec<Bound> {
@@ -75,15 +185,18 @@ fn object_bounds(objects: &[Program], boxes: bool) -> Vec<Bound> {
         .filter_map(|(i, p)| {
             let (c, r) = p.bounds?;
             let index = i as u32;
+            let still = p.still;
             Some(match p.bounds_box.filter(|_| boxes) {
                 Some((lo, hi)) => Bound {
                     index,
+                    still,
                     lo,
                     hi,
                     r: 0.0,
                 },
                 None => Bound {
                     index,
+                    still,
                     lo: c,
                     hi: c,
                     r: r.max(0.0),
@@ -149,16 +262,83 @@ impl Grid {
     /// То же с полем уровня `field` (номер объекта; `None` — все бесконечные формы в
     /// списке, как до 7.18д3) и настройками `options`.
     pub fn build_with(objects: &[Program], field: Option<u32>, options: GridOptions) -> Self {
+        Self::build_cached(objects, field, options, &mut GridCache::default())
+    }
+
+    /// То же, но вклад объектов, не менявшихся с прошлого кадра, берётся из `cache`
+    /// (8.8б): неподвижное раскладывается по клеткам один раз. Ответ тот же до бита, что
+    /// у [`Grid::build_with`].
+    pub fn build_cached(
+        objects: &[Program],
+        field: Option<u32>,
+        options: GridOptions,
+        cache: &mut GridCache,
+    ) -> Self {
         let bounds = object_bounds(objects, options.boxes);
         let max_cells = if options.boxes {
             MAX_CELLS
         } else {
             SPHERE_MAX_CELLS
         };
-        let mut grid = Self::lists(objects, field, &bounds, max_cells);
-        if options.free {
-            grid.fill_free(&bounds);
+        let mut grid = Self::geometry(objects, field, &bounds, max_cells);
+        if grid.dims == [0; 3] {
+            cache.clear();
+            return grid;
         }
+        // У коробок (радиус 0) свободное расстояние хранится квадратом: без корня в каждой
+        // клетке, корень — в конце, один на клетку.
+        let squared = bounds.iter().all(|b| b.r == 0.0);
+        let key = CacheKey {
+            origin: grid.origin.to_array().map(f32::to_bits),
+            cell: grid.cell.to_bits(),
+            dims: grid.dims,
+            options,
+            squared,
+        };
+        // Неподвижное знает сцена ([`Program::still`]): движущееся считается каждый кадр.
+        let unchanged: Vec<bool> = bounds.iter().map(|b| b.still).collect();
+        let still = unchanged.iter().filter(|&&u| u).count();
+        // Готовое подходит, если неподвижное то же (номера могли сдвинуться: отсев по
+        // взгляду убрал или вернул объект перед ним).
+        let reuse = cache.key == Some(key) && still == cache.base.len() && cache.relocate(&bounds);
+        if !reuse {
+            // Неподвижное — то, что не изменилось с прошлого кадра; его вклад считается
+            // сейчас и дальше берётся готовым, пока оно не сдвинется.
+            cache.base = (0..bounds.len() as u32)
+                .filter(|&p| unchanged[p as usize])
+                .collect();
+            cache.base_bounds = cache.base.iter().map(|&p| bounds[p as usize]).collect();
+            cache.base_pairs.clear();
+            grid.touch(&cache.base_bounds, &mut cache.base_pairs);
+            cache.base_free.clear();
+            if options.free {
+                cache
+                    .base_free
+                    .resize(grid.cells_len(), grid.free_cap(squared));
+                grid.add_free(&cache.base_bounds, &mut cache.base_free, squared);
+            }
+            cache.rebuilds += 1;
+        }
+        let mut in_base = vec![false; bounds.len()];
+        for &p in &cache.base {
+            in_base[p as usize] = true;
+        }
+        let rest: Vec<Bound> = bounds
+            .iter()
+            .zip(&in_base)
+            .filter(|(_, b)| !**b)
+            .map(|(b, _)| *b)
+            .collect();
+        let mut pairs = Vec::with_capacity(rest.len() * 32);
+        grid.touch(&rest, &mut pairs);
+        grid.fill_lists(&merge_by_object(&cache.base_pairs, &pairs));
+        if options.free {
+            let mut free = cache.base_free.clone();
+            grid.add_free(&rest, &mut free, squared);
+            grid.finish_free(&free, squared);
+        }
+        cache.moved = rest.len();
+        cache.key = Some(key);
         grid
     }
 
@@ -170,8 +350,14 @@ impl Grid {
         }
     }
 
-    /// Списки клеток по границам `bounds`, не больше `max_cells` клеток.
-    fn lists(objects: &[Program], field: Option<u32>, bounds: &[Bound], max_cells: usize) -> Self {
+    /// Размеры сетки по границам `bounds` (не больше `max_cells` клеток) и бесконечные
+    /// объекты; клетки пустые. Без конечных объектов клеток нет (`dims` нули).
+    fn geometry(
+        objects: &[Program],
+        field: Option<u32>,
+        bounds: &[Bound],
+        max_cells: usize,
+    ) -> Self {
         let planes = crate::shape3d::plane_objects(objects);
         let (mut unbounded, flat): (Vec<u32>, Vec<u32>) = (0..objects.len() as u32)
             .filter(|&i| objects[i as usize].bounds.is_none() && Some(i) != field)
@@ -224,24 +410,31 @@ impl Grid {
         grid.margin = margin;
         grid.inner_lo = lo;
         grid.inner_hi = hi;
+        grid
+    }
 
-        // Клетки, к которым граница объекта ближе margin. Два прохода: сначала счёт
-        // (сколько объектов в каждой клетке), потом раскладка по местам — без отдельного
-        // списка на клетку.
-        let [nx, ny, nz] = dims.map(|d| d as usize);
+    fn cells_len(&self) -> usize {
+        self.dims.iter().map(|&d| d as usize).product()
+    }
+
+    /// Пары (клетка, объект) для клеток, к которым граница объекта ближе margin, по
+    /// порядку объектов: потом раскладка по клеткам подсчётом ([`Grid::fill_lists`]).
+    fn touch(&self, bounds: &[Bound], pairs: &mut Vec<(u32, u32)>) {
+        let [nx, ny, nz] = self.dims.map(|d| d as usize);
         let top = Vec3::new(nx as f32 - 1.0, ny as f32 - 1.0, nz as f32 - 1.0);
-        let origin = grid.origin;
+        let (origin, cell, margin) = (self.origin, self.cell, self.margin);
         // Клетки по осям, которых граница касается, и квадраты зазоров до них; клетка
-        // в списке, если сумма зазоров меньше reach². Одни и те же для счёта и раскладки.
-        let touched = |b: &Bound, f: &mut dyn FnMut(usize)| {
+        // в списке, если сумма зазоров меньше reach².
+        let mut gx: Vec<f32> = Vec::new();
+        for b in bounds {
             let reach = b.r + margin;
-            // На клетку шире с каждой стороны: на самой границе округление в делении
-            // могло бы потерять клетку, которую сравнение ниже (и свободное расстояние,
-            // `fill_free`) считает близкой. Лишние клетки отсеет сравнение.
-            let first = ((b.lo - reach - origin) / cell - 1.0)
+            // Чуть шире (на сотую клетки) с каждой стороны: на самой границе округление в
+            // делении могло бы потерять клетку, которую сравнение ниже (и свободное
+            // расстояние, `add_free`) считает близкой. Лишние клетки отсеет сравнение.
+            let first = ((b.lo - reach - origin) / cell - 0.01)
                 .floor()
                 .clamp(Vec3::ZERO, top);
-            let last = ((b.hi + reach - origin) / cell + 1.0)
+            let last = ((b.hi + reach - origin) / cell + 0.01)
                 .floor()
                 .clamp(Vec3::ZERO, top);
             let axis = |k: usize, o: f32, b0: f32, b1: f32| {
@@ -251,9 +444,8 @@ impl Grid {
             };
             let far = reach * reach;
             let x0 = first.x as usize;
-            let gx: Vec<f32> = (x0..=last.x as usize)
-                .map(|x| axis(x, origin.x, b.lo.x, b.hi.x))
-                .collect();
+            gx.clear();
+            gx.extend((x0..=last.x as usize).map(|x| axis(x, origin.x, b.lo.x, b.hi.x)));
             for z in first.z as usize..=last.z as usize {
                 let dz = axis(z, origin.z, b.lo.z, b.hi.z);
                 for y in first.y as usize..=last.y as usize {
@@ -264,18 +456,22 @@ impl Grid {
                     let row = (z * ny + y) * nx + x0;
                     for (k, &dx) in gx.iter().enumerate() {
                         if dyz + dx < far {
-                            f(row + k);
+                            pairs.push(((row + k) as u32, b.index));
                         }
                     }
                 }
             }
-        };
-        let mut counts = vec![0u32; nx * ny * nz];
-        for b in bounds {
-            touched(b, &mut |k| counts[k] += 1);
+        }
+    }
+
+    /// Списки клеток из пар (клетка, объект): в списке клетки объекты в порядке пар.
+    fn fill_lists(&mut self, pairs: &[(u32, u32)]) {
+        let mut counts = vec![0u32; self.cells_len()];
+        for &(k, _) in pairs {
+            counts[k as usize] += 1;
         }
         let mut start = 0;
-        grid.cells = counts
+        self.cells = counts
             .iter()
             .map(|&count| {
                 let cell = Cell {
@@ -287,15 +483,13 @@ impl Grid {
                 cell
             })
             .collect();
-        grid.items = vec![0; start as usize];
-        let mut fill: Vec<u32> = grid.cells.iter().map(|c| c.start).collect();
-        for b in bounds {
-            touched(b, &mut |k| {
-                grid.items[fill[k] as usize] = b.index;
-                fill[k] += 1;
-            });
+        self.items = vec![0; start as usize];
+        let mut fill: Vec<u32> = self.cells.iter().map(|c| c.start).collect();
+        for &(k, i) in pairs {
+            let at = &mut fill[k as usize];
+            self.items[*at as usize] = i;
+            *at += 1;
         }
-        grid
     }
 
     /// Свободное расстояние клеток (7.18д4): для клетки — наименьшее по конечным объектам
@@ -307,12 +501,18 @@ impl Grid {
     /// FREE_CAP), квадрат расстояния до коробки — сумма трёх заранее посчитанных по осям.
     /// Округление вниз до миллиметра и ещё −1 мм: шейдер находит клетку точки с ошибкой
     /// округления, запас её покрывает.
-    fn fill_free(&mut self, bounds: &[Bound]) {
-        if self.cells.is_empty() {
-            return;
+    fn free_cap(&self, squared: bool) -> f32 {
+        if squared {
+            FREE_CAP * FREE_CAP
+        } else {
+            FREE_CAP
         }
+    }
+
+    /// Вклад границ `bounds` в свободное расстояние клеток `free` (квадраты, если
+    /// `squared`; начальное значение — [`Grid::free_cap`]).
+    fn add_free(&self, bounds: &[Bound], free: &mut [f32], squared: bool) {
         let [nx, ny, nz] = self.dims.map(|d| d as usize);
-        let mut free = vec![FREE_CAP; self.cells.len()];
         // Квадрат зазора по оси между отрезком клетки `k` и отрезком границы `b0..b1`.
         let axis = |b0: f32, b1: f32, o: f32, k: usize| {
             let lo = o + k as f32 * self.cell;
@@ -359,16 +559,29 @@ impl Grid {
                     }
                     let row = (z * ny + y) * nx;
                     // Без ветвлений: цикл по строке складывается в векторные команды.
-                    for (f, &dx) in free[row + x0..=row + x1].iter_mut().zip(&gx) {
-                        let sum = dyz + dx;
-                        let d = sum.sqrt() - r;
-                        // Не f32::min: сравнение складывается в одну команду minps.
-                        *f = if d < *f && sum >= listed { d } else { *f };
+                    let cells = free[row + x0..=row + x1].iter_mut().zip(&gx);
+                    if squared {
+                        for (f, &dx) in cells {
+                            let sum = dyz + dx;
+                            // Не f32::min: сравнение складывается в одну команду minps.
+                            *f = if sum < *f && sum >= listed { sum } else { *f };
+                        }
+                    } else {
+                        for (f, &dx) in cells {
+                            let sum = dyz + dx;
+                            let d = sum.sqrt() - r;
+                            *f = if d < *f && sum >= listed { d } else { *f };
+                        }
                     }
                 }
             }
         }
-        for (cell, f) in self.cells.iter_mut().zip(free) {
+    }
+
+    /// Свободное расстояние клеток из [`Grid::add_free`].
+    fn finish_free(&mut self, free: &[f32], squared: bool) {
+        for (cell, &f) in self.cells.iter_mut().zip(free) {
+            let f = if squared { f.sqrt() } else { f };
             // Внутри шара разность отрицательна: свободного места нет.
             cell.free_mm = ((f * 1000.0).floor() - 1.0).clamp(0.0, 65535.0) as u16;
         }
@@ -791,6 +1004,71 @@ mod tests {
         check(&objects);
         for options in BOTH {
             free_matches_brute_with(&objects, options);
+        }
+    }
+
+    /// Сетка с готовым вкладом неподвижного (8.8б) та же до бита, что посчитанная
+    /// целиком, кадр за кадром; неподвижное пересчитывается, только когда меняется
+    /// набор объектов.
+    #[test]
+    fn cached_grid_matches_full_build() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let factory =
+            crate::SpaceScene::parse_in(include_str!("../../../scenes/3d/factory.ron"), Some(dir))
+                .unwrap();
+        let stress =
+            crate::SpaceScene::parse(include_str!("../../../scenes/3d/stress.ron")).unwrap();
+        for (name, scene) in [("завод", &factory), ("стресс", &stress)] {
+            let frame = |t: f32| -> Vec<Program> {
+                let f = scene.frame(t);
+                f.shapes
+                    .iter()
+                    .chain(&f.proxies)
+                    .zip(&f.still)
+                    .map(|(s, &still)| Program {
+                        still,
+                        ..compile(s).unwrap()
+                    })
+                    .collect()
+            };
+            for options in BOTH {
+                let mut cache = GridCache::default();
+                for k in 0..4 {
+                    let objects = frame(1.0 + k as f32 * 0.016);
+                    let field = crate::shape3d::level_field_object(&objects).map(|i| i as u32);
+                    let cached = Grid::build_cached(&objects, field, options, &mut cache);
+                    let full = Grid::build_with(&objects, field, options);
+                    assert!(cached == full, "{name} {options:?}, кадр {k}");
+                }
+                // Неподвижное раскладывается в первом кадре, дальше берётся готовым.
+                assert_eq!(cache.rebuilds, 1, "{name} {options:?}");
+                assert!(cache.moved < 400, "{name}: заново {}", cache.moved);
+                // Отсев по взгляду убрал движущийся объект: номера неподвижного за ним
+                // сдвинулись, но готовое подходит (номера в парах переписаны). Убранное
+                // неподвижное — пересчёт.
+                let moving = frame(1.0)
+                    .iter()
+                    .position(|p| !p.still && p.bounds.is_some());
+                for (k, drop) in [moving, moving, None, Some(1)].into_iter().enumerate() {
+                    let mut objects = frame(1.064 + k as f32 * 0.016);
+                    if let Some(d) = drop {
+                        objects.remove(d);
+                    }
+                    let field = crate::shape3d::level_field_object(&objects).map(|i| i as u32);
+                    let before = cache.rebuilds;
+                    let cached = Grid::build_cached(&objects, field, options, &mut cache);
+                    assert!(
+                        cached == Grid::build_with(&objects, field, options),
+                        "{name} {options:?}, без {drop:?}"
+                    );
+                    let still_removed = k == 3 && frame(1.0)[1].still;
+                    assert_eq!(
+                        cache.rebuilds - before,
+                        usize::from(still_removed),
+                        "{name}: шаг {k}"
+                    );
+                }
+            }
         }
     }
 

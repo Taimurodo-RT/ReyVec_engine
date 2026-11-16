@@ -9,7 +9,7 @@ use glam::Vec3;
 use reyvec_sdf::SpaceFrame;
 use reyvec_sdf::grid3d::GridOptions;
 use reyvec_sdf::shape3d::{
-    MAX_MATERIALS, MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_with,
+    MAX_MATERIALS, MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_cached,
 };
 
 /// Сколько слов помещается в буфер сцены кадра (4 МБ: треугольники 2.5D-вида, 7.9б).
@@ -212,6 +212,7 @@ pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -
 /// То же; `level_field: false` — поле уровня считается в общем переборе объектов, как до
 /// 7.18д3 (для сравнения в тестах); `grid` — как строить сетку отсева (без
 /// свободного расстояния — как до 7.18д4, по шарам — как до 8.8а; для сравнения на панели).
+#[cfg(test)]
 pub(crate) fn pack_with(
     frame: &SpaceFrame,
     materials: &[Material3],
@@ -219,7 +220,35 @@ pub(crate) fn pack_with(
     level_field: bool,
     grid: GridOptions,
 ) -> Packed {
-    let mut programs = programs(frame);
+    pack_cached(
+        frame,
+        materials,
+        culling,
+        level_field,
+        grid,
+        &mut PackCache::default(),
+    )
+}
+
+/// Готовое из прошлых кадров (8.8б): вклад неподвижного в сетку отсева и слова вершин
+/// частей моделей, которые не изменились.
+#[derive(Default)]
+pub(crate) struct PackCache {
+    pub grid: reyvec_sdf::grid3d::GridCache,
+    meshes: Vec<(reyvec_sdf::space_file::MeshFrame, Vec<u32>)>,
+    programs: Vec<(Shape3, Result<Program, reyvec_sdf::shape3d::CompileError>)>,
+}
+
+/// То же, что [`pack_with`], с готовым из `cache`; слова те же.
+pub(crate) fn pack_cached(
+    frame: &SpaceFrame,
+    materials: &[Material3],
+    culling: bool,
+    level_field: bool,
+    grid: GridOptions,
+    cache: &mut PackCache,
+) -> Packed {
+    let mut programs = programs_cached(frame, Some(&mut cache.programs));
     // Шейдер читает не больше MAX_OBJECTS объектов и молча пропускает остальные:
     // обрезаем список здесь, чтобы зеркало на процессоре (сетка отсева) видело то же.
     let dropped = programs.len().saturating_sub(MAX_OBJECTS);
@@ -238,7 +267,14 @@ pub(crate) fn pack_with(
             materials.len()
         )
     });
-    let mut words = pack_scene_with(&programs, materials, &frame.lamps, level_field, grid);
+    let mut words = pack_scene_cached(
+        &programs,
+        materials,
+        &frame.lamps,
+        level_field,
+        grid,
+        &mut cache.grid,
+    );
     let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
     let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;
     let needed = words.len() + mesh_words;
@@ -260,18 +296,36 @@ pub(crate) fn pack_with(
         words[6] = 0;
     }
     let grid = grid_stats(&words);
+    words.reserve(mesh_words);
     words[7] = words.len() as u32;
     words.extend([(triangles * 3) as u32, 0, 0, 0]);
     words.extend([0u32; MESH_HEADER_WORDS - 4]);
-    for m in &frame.meshes {
+    // Часть модели, такая же, как в прошлом кадре (неподвижный станок), берёт готовые
+    // слова: упаковка нормалей и точек текстуры — самое дорогое здесь.
+    cache.meshes.truncate(frame.meshes.len());
+    for (n, m) in frame.meshes.iter().enumerate() {
+        if let Some((source, packed)) = cache.meshes.get(n)
+            && source == m
+        {
+            words.extend_from_slice(packed);
+            continue;
+        }
+        let mut packed = Vec::with_capacity(m.triangles.len() * 3 * VERTEX_WORDS);
         for (i, t) in m.triangles.iter().enumerate() {
             let normals = m.normals.get(i);
             let uvs = m.uvs.get(i);
             for (k, v) in t.iter().enumerate() {
-                words.extend(v.to_array().map(f32::to_bits));
-                words.push(vertex_word(m.material, normals.map(|n| n[k])));
-                words.push(uvs.map_or(0, |u| uv_word(u[k])));
+                packed.extend(v.to_array().map(f32::to_bits));
+                packed.push(vertex_word(m.material, normals.map(|n| n[k])));
+                packed.push(uvs.map_or(0, |u| uv_word(u[k])));
             }
+        }
+        words.extend_from_slice(&packed);
+        let entry = (m.clone(), packed);
+        if n < cache.meshes.len() {
+            cache.meshes[n] = entry;
+        } else {
+            cache.meshes.push(entry);
         }
     }
     Packed {
@@ -287,25 +341,64 @@ pub(crate) fn pack_with(
 /// Программы форм кадра: предметы, потом невидимые заменители моделей (7.6ж). Форма,
 /// которую не вышло превратить в программу, пропускается с записью в журнал.
 pub(crate) fn programs(frame: &SpaceFrame) -> Vec<Program> {
-    let build = |shapes: &[Shape3], shadow_only: bool, no_shadow: bool| -> Vec<Program> {
-        shapes
-            .iter()
-            .filter_map(|s| match compile(s) {
-                Ok(mut p) => {
-                    p.shadow_only = shadow_only;
-                    p.no_shadow = no_shadow;
-                    Some(p)
-                }
-                Err(e) => {
-                    tracing::warn!("форма 3D пропущена: {e}");
-                    None
-                }
-            })
-            .collect()
+    programs_cached(frame, None)
+}
+
+/// То же; форма, такая же, как на том же месте в прошлом кадре, берёт готовую программу
+/// из `cache` (8.8б: неподвижные предметы не превращаются в программу каждый кадр).
+pub(crate) fn programs_cached(
+    frame: &SpaceFrame,
+    mut cache: Option<&mut Vec<(Shape3, Result<Program, reyvec_sdf::shape3d::CompileError>)>>,
+) -> Vec<Program> {
+    let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
+    if let Some(cache) = cache.as_mut() {
+        cache.truncate(total);
+    }
+    let mut at = 0;
+    let mut compile_cached = |s: &Shape3| -> Result<Program, reyvec_sdf::shape3d::CompileError> {
+        let n = at;
+        at += 1;
+        let Some(cache) = cache.as_mut() else {
+            return compile(s);
+        };
+        if let Some((source, program)) = cache.get(n)
+            && source == s
+        {
+            return program.clone();
+        }
+        let program = compile(s);
+        let entry = (s.clone(), program.clone());
+        if n < cache.len() {
+            cache[n] = entry;
+        } else {
+            cache.push(entry);
+        }
+        program
     };
-    let mut programs = build(&frame.shapes, false, false);
-    programs.extend(build(&frame.proxies, true, false));
-    programs.extend(build(&frame.glows, false, true));
+    // Флаги неподвижности (8.8б): по одному на предмет, потом на заменитель.
+    let still = |i: usize| frame.still.get(i).copied().unwrap_or(false);
+    let mut build =
+        |shapes: &[Shape3], first: Option<usize>, shadow_only: bool, no_shadow: bool| {
+            shapes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| match compile_cached(s) {
+                    Ok(mut p) => {
+                        p.shadow_only = shadow_only;
+                        p.no_shadow = no_shadow;
+                        p.still = first.is_some_and(|f| still(f + i));
+                        Some(p)
+                    }
+                    Err(e) => {
+                        tracing::warn!("форма 3D пропущена: {e}");
+                        None
+                    }
+                })
+                .collect::<Vec<Program>>()
+        };
+    let mut programs = build(&frame.shapes, Some(0), false, false);
+    programs.extend(build(&frame.proxies, Some(frame.shapes.len()), true, false));
+    programs.extend(build(&frame.glows, None, false, true));
     programs
 }
 
