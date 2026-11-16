@@ -668,7 +668,10 @@ fn render(
             (Some(gpu), Some(demo)) => demo.space_stats().map(|mut s| {
                 s.edge_pixels = demo.edge_pixels(gpu, 0);
                 s.edge_unreliable = demo.edge_unreliable(gpu, 0);
-                s.rays = demo.ray_counts(gpu, 0);
+                if let Some((rays, edges)) = demo.ray_counts(gpu, 0) {
+                    s.rays = Some(rays);
+                    s.edge_kinds = s.edge_pixels.map(|_| edges);
+                }
                 s
             }),
             _ => None,
@@ -2436,12 +2439,89 @@ pub(crate) mod tests {
                 "{name}: {:?}, ненадёжных {unreliable}",
                 rays[PASS_EDGE_SHADOWS]
             );
+            // Края по причине (8.11а): каждый пиксель края — ровно одна причина.
+            let kinds = stats.edge_kinds.expect("края по причине посчитаны");
+            eprintln!("{name}, края: {kinds:?}");
+            assert_edge_kinds(&kinds, edge_pixels, name);
             if let Some(t) = &image.gpu_timings {
                 eprintln!("{name} со счётчиками: {}", t.describe());
             }
         }
         let rays = field.space_stats.and_then(|s| s.rays).expect("лучи");
         assert!(rays[PASS_MARCH].field > 0, "поле читается");
+    }
+
+    /// Счётчики краёв (8.11а) сходятся: причины в сумме дают все пиксели края, почти
+    /// невидимых не больше, чем краёв с соседом (у краёв моделей соседа нет).
+    fn assert_edge_kinds(k: &crate::EdgeCounts, edge_pixels: u64, name: &str) {
+        assert_eq!(k.pixels, edge_pixels, "{name}: {k:?}");
+        assert_eq!(
+            k.mesh + k.sky + k.material + k.normal + k.depth,
+            k.pixels,
+            "{name}: {k:?}"
+        );
+        assert!(k.faint2 <= k.faint8, "{name}: {k:?}");
+        assert!(k.faint8 <= k.pixels - k.mesh, "{name}: {k:?}");
+    }
+
+    /// Края завода по причине (8.11а): какие края цеха в большинстве и сколько из них
+    /// почти не видно. Числа — события, а не время: на любой видеокарте при том же
+    /// размере кадра те же. Печатает долю каждой причины для выбора следующих шагов.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn factory_edges_by_reason() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 960,
+            height: 540,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/factory.ron").into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let plain = render_headless(&options, &scene).expect("кадр");
+        SPACE_COUNTERS.set(true);
+        let counted = render_headless(&options, &scene);
+        SPACE_COUNTERS.set(false);
+        let counted = counted.expect("кадр со счётчиками");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+        let (changed, _, _) = image_diff(&plain.image, &counted.image);
+        assert_eq!(changed, 0, "со счётчиками картинка та же");
+        let stats = counted.space_stats.expect("числа сцены 3D");
+        let edge_pixels = u64::from(stats.edge_pixels.expect("края посчитаны"));
+        let k = stats.edge_kinds.expect("края по причине");
+        let share = |n: u64| n as f64 * 100.0 / k.pixels.max(1) as f64;
+        eprintln!(
+            "завод {}×{}: краёв {} ({:.1} % кадра); модели {:.1} %, небо {:.1} %, материал \
+             {:.1} %, нормаль {:.1} %, глубина {:.1} %; почти не видно: ≤2/255 {:.1} %, \
+             ≤8/255 {:.1} %",
+            scene.width,
+            scene.height,
+            k.pixels,
+            k.pixels as f64 * 100.0 / f64::from(stats.pixels),
+            share(k.mesh),
+            share(k.sky),
+            share(k.material),
+            share(k.normal),
+            share(k.depth),
+            share(k.faint2),
+            share(k.faint8),
+        );
+        assert_edge_kinds(&k, edge_pixels, "завод");
+        assert!(k.pixels > 1000, "{k:?}");
     }
 
     /// Поле уровня до перебора объектов (7.18д3): та же картинка до байта и те же шаги и

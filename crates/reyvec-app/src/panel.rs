@@ -1342,7 +1342,43 @@ fn ray_count_section(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats, counting: bo
             }
             None => {}
         }
+        if let Some(k) = &s.edge_kinds {
+            ui.label(mono(edge_kind_lines(k).join("\n"))).on_hover_text(
+                "Почему пиксель попал в края (8.11а): у моделей расходятся образцы полигонов, \
+                 у соседа небо, другой материал, резко другая нормаль (ребро коробки или \
+                 силуэт) или разрыв по глубине (силуэт на фоне). «Почти не видно» — цвет \
+                 пикселя и соседа за краем на экране отличается не больше чем на 2 или 8 \
+                 ступеней из 255: сглаживание там глазу почти незаметно",
+            );
+        }
     });
+}
+
+/// Строки «Края 3D по причине» (8.11а): доли от всех пикселей края.
+fn edge_kind_lines(k: &reyvec_gpu::EdgeCounts) -> Vec<String> {
+    let share = |n: u64| {
+        if k.pixels == 0 {
+            0.0
+        } else {
+            n as f64 * 100.0 / k.pixels as f64
+        }
+    };
+    vec![
+        format!("Края 3D по причине ({}):", amount(k.pixels)),
+        format!(
+            "  модели {:.0} %, небо {:.0} %, материал {:.0} %, нормаль {:.0} %, глубина {:.0} %",
+            share(k.mesh),
+            share(k.sky),
+            share(k.material),
+            share(k.normal),
+            share(k.depth)
+        ),
+        format!(
+            "  почти не видно: до 2/255 {:.0} %, до 8/255 {:.0} %",
+            share(k.faint2),
+            share(k.faint8)
+        ),
+    ]
 }
 
 fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
@@ -1599,6 +1635,27 @@ mod tests {
     }
 
     #[test]
+    fn edge_kinds_are_shares_of_all_edges() {
+        let k = reyvec_gpu::EdgeCounts {
+            pixels: 200,
+            mesh: 20,
+            sky: 30,
+            material: 50,
+            normal: 80,
+            depth: 20,
+            faint2: 10,
+            faint8: 40,
+        };
+        let lines = edge_kind_lines(&k);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].contains("модели 10 %"), "{}", lines[1]);
+        assert!(lines[1].contains("нормаль 40 %"), "{}", lines[1]);
+        assert!(lines[2].contains("до 8/255 20 %"), "{}", lines[2]);
+        let empty = edge_kind_lines(&reyvec_gpu::EdgeCounts::default());
+        assert!(empty[1].contains("модели 0 %"), "{}", empty[1]);
+    }
+
+    #[test]
     fn budget_colors() {
         assert_eq!(
             budget_color(1.0, GPU_BUDGET_MS),
@@ -1717,6 +1774,16 @@ mod tests {
                         material: 900_000,
                     }; reyvec_gpu::RAY_PASSES],
                 ),
+                edge_kinds: Some(reyvec_gpu::EdgeCounts {
+                    pixels: 61_200,
+                    mesh: 3_000,
+                    sky: 9_000,
+                    material: 20_000,
+                    normal: 25_000,
+                    depth: 4_200,
+                    faint2: 6_000,
+                    faint8: 15_000,
+                }),
             }),
             space_compute: (false, false),
             space_smooth: (true, true),

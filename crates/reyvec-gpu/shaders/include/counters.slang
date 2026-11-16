@@ -14,6 +14,9 @@ static const uint PASS_SHADOWS = 2;
 static const uint PASS_AO = 3;
 static const uint PASS_EDGES = 4;
 static const uint PASS_EDGE_SHADOWS = 5;
+// Поиск краёв (8.11а): в тех же восьми словах — счётчики краёв, а не лучей
+// (count_edge в raymarch_edge_find.slang, EdgeCounts в counters.rs).
+static const uint PASS_EDGE_FIND = 6;
 
 #ifdef SPACE_COUNTERS
 // У каждого потока свои (в SPIR-V — Private): сигнатуры функций не меняются.
