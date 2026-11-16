@@ -140,9 +140,20 @@ pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4, sun: bool) -> ViewCul
         None => true,
         Some((c, r)) => frustum.sphere(c, r + AO_MARGIN) || shadows.casts(&frustum, c, r),
     };
-    frame.shapes.retain(keep);
+    let shapes: Vec<bool> = frame.shapes.iter().map(keep).collect();
     // Заменители моделей невидимы: им важны только тени и углы.
-    frame.proxies.retain(keep);
+    let proxies: Vec<bool> = frame.proxies.iter().map(keep).collect();
+    // Флаги неподвижности (8.8б) — вместе с формами.
+    if frame.still.len() == shapes.len() + proxies.len() {
+        let mut kept = shapes.iter().chain(&proxies);
+        frame.still.retain(|_| *kept.next().unwrap_or(&false));
+    } else {
+        frame.still.clear();
+    }
+    let mut kept = shapes.iter();
+    frame.shapes.retain(|_| *kept.next().unwrap_or(&false));
+    let mut kept = proxies.iter();
+    frame.proxies.retain(|_| *kept.next().unwrap_or(&false));
     // Теней светящиеся не дают: нужны, только если их видно.
     frame
         .glows
@@ -224,6 +235,7 @@ mod tests {
             meshes: Vec::new(),
             proxies: Vec::new(),
             glows: Vec::new(),
+            still: Vec::new(),
         };
         let mut with_sun = frame();
         assert_eq!(

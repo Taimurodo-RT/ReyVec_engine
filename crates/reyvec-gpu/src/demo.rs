@@ -706,6 +706,8 @@ pub(crate) struct Demo {
     space_free: bool,
     /// Сетка отсева по плотным коробкам (8.8а, флажок на панели).
     space_boxes: bool,
+    /// Готовое из прошлых кадров для упаковки сцены «3D» (8.8б).
+    space_pack_cache: crate::space::PackCache,
     /// Замер «краёв 3D» по частям (8.1).
     edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2; `false` — как до 8.2, для сравнения).
@@ -1072,6 +1074,7 @@ impl Demo {
             level_field_apart: true,
             space_free: true,
             space_boxes: true,
+            space_pack_cache: Default::default(),
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,
@@ -3557,7 +3560,7 @@ impl Demo {
             let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             let culling = level || !self.space.culling_off;
             self.space_culled = culling;
-            let mut packed = crate::space::pack_with(
+            let mut packed = crate::space::pack_cached(
                 &frame,
                 materials,
                 culling,
@@ -3566,6 +3569,7 @@ impl Demo {
                     free: self.space_free,
                     boxes: self.space_boxes,
                 },
+                &mut self.space_pack_cache,
             );
             self.space_grid = packed.grid;
             crate::space::set_view_proj(&mut packed.words, view_proj);
@@ -3614,8 +3618,7 @@ impl Demo {
             }
             .filter(|&(_, address, _, _)| crate::space::set_counters(&mut packed.words, address))
             .map(|(pipelines, _, gpu, host)| (pipelines, gpu, host));
-            let bytes: Vec<u8> = packed.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-            res.write_buffer(space_buffer, 0, &bytes);
+            res.write_words(space_buffer, 0, &packed.words);
             // Запекание поля уровня прямо в кадре (снимки, тесты) — не сборка кадра.
             let build_ms = (built - started).saturating_sub(baked_inline).as_secs_f64() * 1000.0;
             let pack_ms = built.elapsed().as_secs_f64() * 1000.0;

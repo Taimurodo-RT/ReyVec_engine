@@ -1030,6 +1030,7 @@ impl Level3d {
                 meshes: prisms.into_meshes(),
                 proxies: Vec::new(),
                 glows,
+                still: Vec::new(),
             },
             materials: materials.list,
         }
