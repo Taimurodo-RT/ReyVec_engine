@@ -317,16 +317,7 @@ impl Panel {
             if !visible {
                 return;
             }
-            egui::Window::new("Счётчики")
-                .title_bar(false)
-                .resizable(false)
-                .default_pos([12.0, 12.0])
-                .show(ui.ctx(), |ui| contents(ui, info, history));
-            egui::Window::new("Сцены")
-                .title_bar(false)
-                .resizable(false)
-                .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
-                .show(ui.ctx(), |ui| controls(ui, info, actions));
+            show_panels(ui.ctx(), info, history, actions);
         });
         self.state
             .handle_platform_output(window, out.platform_output);
@@ -339,14 +330,106 @@ impl Panel {
     }
 }
 
+/// Отступ панелей от краёв окна, точек.
+const PANEL_MARGIN: f32 = 12.0;
+/// Ширина левой панели («Счётчики»): длинные строки переносятся, таблицы — моноширинные.
+const COUNTERS_WIDTH: f32 = 560.0;
+/// Ширина правой панели («Сцены»).
+const CONTROLS_WIDTH: f32 = 300.0;
+
+/// Обе панели: слева счётчики, справа сцены и настройки. Каждая не шире своей ширины и
+/// не выше окна: что не влезло, прокручивается колесом внутри панели, разделы
+/// сворачиваются по щелчку на заголовке.
+fn show_panels(
+    ctx: &egui::Context,
+    info: &PanelInfo,
+    history: &VecDeque<f32>,
+    actions: &mut Vec<PanelAction>,
+) {
+    let screen = ctx.content_rect();
+    // Рамка окна egui и отступы сверху и снизу.
+    let height = (screen.height() - PANEL_MARGIN * 2.0 - 16.0).max(120.0);
+    egui::Window::new("Счётчики")
+        .id(egui::Id::unique("Счётчики"))
+        .title_bar(false)
+        .resizable(false)
+        .default_pos([PANEL_MARGIN, PANEL_MARGIN])
+        .max_width(COUNTERS_WIDTH)
+        .show(ctx, |ui| {
+            ui.set_max_width(COUNTERS_WIDTH);
+            egui::ScrollArea::vertical()
+                .id_salt("счётчики")
+                .max_height(height)
+                .min_scrolled_height(height)
+                .show(ui, |ui| contents(ui, info, history));
+        });
+    egui::Window::new("Сцены")
+        .id(egui::Id::unique("Сцены"))
+        .title_bar(false)
+        .resizable(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-PANEL_MARGIN, PANEL_MARGIN])
+        .max_width(CONTROLS_WIDTH)
+        .show(ctx, |ui| {
+            ui.set_max_width(CONTROLS_WIDTH);
+            egui::ScrollArea::vertical()
+                .id_salt("сцены")
+                .max_height(height)
+                .min_scrolled_height(height)
+                .show(ui, |ui| controls(ui, info, actions));
+        });
+}
+
+/// Раздел панели, который сворачивается щелчком по заголовку.
+fn section(
+    ui: &mut egui::Ui,
+    title: &str,
+    open: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) -> egui::CollapsingResponse<()> {
+    egui::CollapsingHeader::new(RichText::new(title).strong())
+        .id_salt(title)
+        // В тестах раскрыто всё: проверяется самый длинный вид панелей.
+        .default_open(open || cfg!(test))
+        .show(ui, add)
+}
+
+fn mono(text: String) -> RichText {
+    RichText::new(text).family(FontFamily::Monospace)
+}
+
 fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
-    let mono = |text: String| RichText::new(text).family(FontFamily::Monospace);
-    ui.label(RichText::new("Счётчики").strong());
+    let red = Color32::from_rgb(255, 90, 80);
+    ui.label(RichText::new("Счётчики").strong()).on_hover_text(
+        "Сцены и настройки — на панели справа (или клавишами в скобках). Колесо и мышь \
+         двигают камеру, F1 прячет панели. Разделы сворачиваются щелчком по заголовку, \
+         колесо над панелью прокручивает её",
+    );
     ui.label(format!("{}, {}", info.adapter, info.mode));
     ui.label(mono(format!(
         "Окно {}×{}   {:.0} FPS, {:.2} мс",
         info.extent[0], info.extent[1], info.fps, info.frame_ms
     )));
+    // Ошибки видны всегда, даже со свёрнутыми разделами.
+    if info.validation && info.validation_errors > 0 {
+        ui.label(
+            mono(format!(
+                "Ошибок валидации Vulkan: {}",
+                info.validation_errors
+            ))
+            .color(red),
+        );
+    }
+    if let Some(err) = &info.shader_error {
+        ui.label(RichText::new(format!("Ошибка шейдера: {err}")).color(red));
+    }
+    if let Some(err) = &info.space_error {
+        ui.label(RichText::new(format!("Ошибка в файле сцены 3D: {err}")).color(red));
+    }
+    if info.scene_id == DemoScene::File
+        && let Some(err) = &info.scene_error
+    {
+        ui.label(RichText::new(format!("Ошибка в файле сцены: {err}")).color(red));
+    }
     ui.separator();
 
     match info.gpu {
@@ -359,9 +442,6 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 ))
                 .color(color),
             );
-            for p in &gpu.passes {
-                ui.label(mono(format!("  {:<8} {:.3} мс", p.name, p.ms)));
-            }
             let raymarch: Vec<f64> = gpu
                 .passes
                 .iter()
@@ -387,341 +467,357 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
                 );
             }
             gpu_chart(ui, history);
+            section(ui, "Проходы видеокарты", true, |ui| {
+                // Два столбца: список проходов вдвое короче.
+                let half = gpu.passes.len().div_ceil(2);
+                egui::Grid::new("проходы")
+                    .num_columns(2)
+                    .spacing([24.0, 2.0])
+                    .show(ui, |ui| {
+                        for row in 0..half {
+                            for p in gpu.passes.iter().skip(row).step_by(half.max(1)).take(2) {
+                                ui.label(mono(format!("{:<9}{:>7.3} мс", p.name, p.ms)));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
         }
         None => {
             ui.label("Видеокарта не умеет замерять время проходов");
         }
     }
-    ui.separator();
 
-    if let Some(graph) = info.graph {
-        ui.label(format!("Граф: {}", graph.passes.join(" → ")));
-        ui.label(mono(format!(
-            "Барьеров {}, временных картинок {}",
-            graph.barriers, graph.transient_images
-        )));
-    }
-    if info.validation {
-        let errors = info.validation_errors;
-        let text = mono(format!("Ошибок валидации Vulkan: {errors}"));
-        ui.label(if errors == 0 {
-            text
-        } else {
-            text.color(Color32::from_rgb(255, 90, 80))
-        });
-    } else {
-        ui.label("Проверка Vulkan выключена (--validation)");
-    }
-    match &info.shader_error {
-        Some(err) => {
-            ui.label(
-                RichText::new(format!("Ошибка шейдера: {err}"))
-                    .color(Color32::from_rgb(255, 90, 80)),
-            );
-        }
-        None if info.hot_reload => {
-            ui.label("Шейдеры: перезагрузка на лету включена");
-        }
-        None => {}
-    }
     if let Some(text) = &info.space {
-        ui.label(mono(text.clone()));
-        ui.label(
-            "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — смотреть \
-             вокруг, колесо — скорость, Tab — перспектива или плоская, R — в начало",
-        );
-        let culling = grid_text(info);
-        let rays = match info.space_compute {
-            (_, true) => "лучи вычислительным шейдером",
-            (true, false) => {
-                "лучи пиксельным шейдером: видеокарта не умеет вычислительный вариант, см. журнал"
-            }
-            (false, false) => "лучи пиксельным шейдером (compute: false)",
-        };
-        let culling = format!("{culling}, {rays}");
-        match (&info.space_error, info.space_file) {
-            (Some(err), _) => {
-                ui.label(
-                    RichText::new(format!("Ошибка в файле сцены 3D: {err}"))
-                        .color(Color32::from_rgb(255, 90, 80)),
+        section(ui, "Сцена 3D", true, |ui| {
+            ui.label(mono(text.clone())).on_hover_text(
+                "Полёт: W A S D, E и Q — вверх и вниз, Shift — быстрее; кнопка мыши — \
+                 смотреть вокруг, колесо — скорость, Tab — перспектива или плоская, R — в \
+                 начало",
+            );
+            let culling = grid_text(info);
+            let rays = match info.space_compute {
+                (_, true) => "лучи вычислительным шейдером",
+                (true, false) => {
+                    "лучи пиксельным шейдером: видеокарта не умеет вычислительный вариант, см. журнал"
+                }
+                (false, false) => "лучи пиксельным шейдером (compute: false)",
+            };
+            if info.space_error.is_none() {
+                let file = info.space_file.map_or(
+                    "встроенный пример (файл не найден)".to_string(),
+                    |path| format!("{path} (правка видна сразу)"),
                 );
-            }
-            (None, Some(path)) => {
                 ui.label(format!(
-                    "Файл сцены 3D: {path}, предметов {}, {culling} (правка видна сразу)",
+                    "Файл сцены 3D: {file}, предметов {}; {culling}, {rays}",
                     info.space_objects
                 ));
             }
-            (None, None) => {
-                ui.label(format!(
-                    "Файл сцены 3D: встроенный пример (файл не найден), предметов {}, {culling}",
-                    info.space_objects
-                ));
+            if let Some(stats) = &info.space_stats {
+                space_stats_lines(ui, stats);
             }
-        }
+        });
         if let Some(stats) = &info.space_stats {
-            space_stats_lines(ui, stats, info.space_counters.0);
+            ray_count_section(ui, stats, info.space_counters.0);
         }
     }
     if info.scene_id == DemoScene::File {
-        match (&info.scene_error, info.scene_file) {
-            (Some(err), _) => {
-                ui.label(
-                    RichText::new(format!("Ошибка в файле сцены: {err}"))
-                        .color(Color32::from_rgb(255, 90, 80)),
-                );
+        section(ui, "Уровень", true, |ui| {
+            if info.scene_error.is_none() {
+                ui.label(match info.scene_file {
+                    Some(path) => format!("Файл сцены: {path} (правка видна сразу)"),
+                    None => "Файл сцены: встроенный пример (файл не найден)".to_string(),
+                });
             }
-            (None, Some(path)) => {
-                ui.label(format!("Файл сцены: {path} (правка видна сразу)"));
+            if let Some((steps, ms)) = info.logic {
+                ui.label(mono(format!(
+                    "Логика: свой поток, 60 шагов/с, шаг {ms:.3} мс (сделано {steps})"
+                )));
             }
-            (None, None) => {
-                ui.label("Файл сцены: встроенный пример (файл не найден)");
+            if let Some(p) = info.player {
+                ui.label(mono(player_text(&p.view, info.follow)));
+                ui.label(mono(input_text(&p, info.gamepad)));
             }
-        }
-        if let Some((steps, ms)) = info.logic {
-            ui.label(mono(format!(
-                "Логика: свой поток, 60 шагов/с, шаг {ms:.3} мс (сделано {steps})"
-            )));
-        }
-        if let Some(p) = info.player {
-            ui.label(mono(player_text(&p.view, info.follow)));
-            ui.label(mono(input_text(&p, info.gamepad)));
-        }
+            if let Some(p) = &info.physics {
+                ui.label(mono(physics_text(p)));
+            }
+            if let Some(s) = &info.scripts {
+                ui.label(mono(scripts_text(s)));
+                for e in &s.errors {
+                    ui.label(RichText::new(format!("Ошибка скрипта: {e}")).color(red));
+                }
+            }
+            if let Some(stats) = info.particles {
+                ui.label(mono(particles_text(&stats)));
+            }
+            if let Some(a) = &info.audio {
+                ui.label(mono(audio_text(a)));
+            }
+        });
         // 2.5D-вид (7.18б): те же счётчики, что у сцены «3D», — по ним сравнивается поле
         // слоя с формами; снимок панели в точке «комната» — база для 7.18в.
         if info.level_view {
-            ui.label(mono(format!("2.5D-вид: {}", grid_text(info))));
-            if let Some(text) = level_field_text(info.level_field) {
-                ui.label(mono(text));
-            }
-            if let Some(stats) = &info.space_stats {
-                space_stats_lines(ui, stats, info.space_counters.0);
-            }
-        }
-        if let Some(p) = &info.physics {
-            ui.label(mono(physics_text(p)));
-        }
-        if let Some(s) = &info.scripts {
-            ui.label(mono(scripts_text(s)));
-            for e in &s.errors {
-                ui.label(
-                    RichText::new(format!("Ошибка скрипта: {e}"))
-                        .color(Color32::from_rgb(255, 90, 80)),
-                );
+            section(ui, "2.5D-вид", true, |ui| {
+                ui.label(mono(format!("2.5D-вид: {}", grid_text(info))));
+                if let Some(text) = level_field_text(info.level_field) {
+                    ui.label(mono(text));
+                }
+                if info.space.is_none()
+                    && let Some(stats) = &info.space_stats
+                {
+                    space_stats_lines(ui, stats);
+                }
+            });
+            if info.space.is_none()
+                && let Some(stats) = &info.space_stats
+            {
+                ray_count_section(ui, stats, info.space_counters.0);
             }
         }
-        if let Some(stats) = info.particles {
-            ui.label(mono(particles_text(&stats)));
-        }
-        if let Some(a) = &info.audio {
-            ui.label(mono(audio_text(a)));
-        }
-        ui.label(mono(loading_text(&info.loading)));
-        if let Some(d) = &info.loading.details {
+        section(ui, "Загрузка и память", false, |ui| {
+            ui.label(mono(loading_text(&info.loading)));
+            if let Some(d) = &info.loading.details {
+                ui.label(mono(format!(
+                    "Уровни детализации: {} фигур, в фоне {:.1} мс, в кадре {:.2} мс",
+                    d.shapes, d.background_ms, d.frame_ms
+                )));
+            }
+            ui.label(mono(memory_text(&info.loading.memory)));
+        });
+    }
+    section(ui, "Устройство кадра", false, |ui| {
+        if let Some(graph) = info.graph {
+            ui.label(format!("Граф: {}", graph.passes.join(" → ")));
             ui.label(mono(format!(
-                "Уровни детализации: {} фигур, в фоне {:.1} мс, в кадре {:.2} мс",
-                d.shapes, d.background_ms, d.frame_ms
+                "Барьеров {}, временных картинок {}",
+                graph.barriers, graph.transient_images
             )));
         }
-        ui.label(mono(memory_text(&info.loading.memory)));
-    }
-    if info.cull.lights + info.cull.objects > 0 {
-        ui.label(mono(cull_text(&info.cull)));
-    }
-    if let Some(name) = info.last_snapshot {
-        ui.label(mono(format!("Снимок: {name}")));
-    }
-    ui.label(mono(format!(
-        "Сцена: {}, сглаживание: {}{}",
-        info.scene,
-        info.msaa,
-        if info.msaa_is_default {
-            " (по умолчанию для этой видеокарты)"
-        } else {
-            ""
+        if !info.validation {
+            ui.label("Проверка Vulkan выключена (--validation)");
+        } else if info.validation_errors == 0 {
+            ui.label(mono("Ошибок валидации Vulkan: 0".to_string()));
         }
-    )));
-    ui.label(mono(format!(
-        "Кадр сцены: {}",
-        if info.compact_scene {
-            "компактный (4 байта на точку)"
-        } else {
-            "точный (8 байт на точку)"
+        if info.shader_error.is_none() && info.hot_reload {
+            ui.label("Шейдеры: перезагрузка на лету включена");
         }
-    )));
-    ui.label(mono(format!(
-        "Края: {}",
-        if info.perceptual_edges {
-            "как в редакторах"
-        } else {
-            "физически точные"
+        if info.cull.lights + info.cull.objects > 0 {
+            ui.label(mono(cull_text(&info.cull)));
         }
-    )));
-    ui.label(mono(format!(
-        "Заливка: {}{}",
-        info.fill,
-        if info.zoom {
-            ", лупа ×8".to_string()
-        } else if (info.camera_zoom - 1.0).abs() > 1e-9 {
-            format!(", камера ×{}", zoom_text(info.camera_zoom))
-        } else {
-            String::new()
+        if let Some(name) = info.last_snapshot {
+            ui.label(mono(format!("Снимок: {name}")));
         }
-    )));
+        ui.label(mono(format!(
+            "Сцена: {}, сглаживание: {}{}",
+            info.scene,
+            info.msaa,
+            if info.msaa_is_default {
+                " (по умолчанию для этой видеокарты)"
+            } else {
+                ""
+            }
+        )));
+        ui.label(mono(format!(
+            "Кадр сцены: {}",
+            if info.compact_scene {
+                "компактный (4 байта на точку)"
+            } else {
+                "точный (8 байт на точку)"
+            }
+        )));
+        ui.label(mono(format!(
+            "Края: {}",
+            if info.perceptual_edges {
+                "как в редакторах"
+            } else {
+                "физически точные"
+            }
+        )));
+        ui.label(mono(format!(
+            "Заливка: {}{}",
+            info.fill,
+            if info.zoom {
+                ", лупа ×8".to_string()
+            } else if (info.camera_zoom - 1.0).abs() > 1e-9 {
+                format!(", камера ×{}", zoom_text(info.camera_zoom))
+            } else {
+                String::new()
+            }
+        )));
+    });
     if let Some(cpu) = info.vector_cpu {
-        ui.label(mono(format!(
-            "Процессор, движок: {:.3} мс ({} фигур, на экране {})",
-            cpu.engine_ms, cpu.shapes, cpu.drawn
-        )));
-        ui.label(mono(format!(
-            "Процессор, сцена песочницы: {:.3} мс",
-            cpu.scene_ms
-        )));
+        section(ui, "Векторы на процессоре", true, |ui| {
+            ui.label(mono(format!(
+                "Процессор, движок: {:.3} мс ({} фигур, на экране {})",
+                cpu.engine_ms, cpu.shapes, cpu.drawn
+            )));
+            ui.label(mono(format!(
+                "Процессор, сцена песочницы: {:.3} мс",
+                cpu.scene_ms
+            )));
+        });
     }
-    ui.label(
-        RichText::new(
-            "Сцены и настройки — на панели справа (или клавишами в скобках). \
-             Колесо и мышь двигают камеру, F1 прячет панели",
-        )
-        .weak(),
-    );
 }
 
 /// Панель справа: выбор сцены и настройки мышкой. Нажатое попадает в `actions`.
 fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>) {
-    ui.label(RichText::new("Сцены").strong());
-    for (stage, scenes) in SCENES {
-        ui.label(RichText::new(*stage).weak());
-        for (scene, key) in *scenes {
-            let text = format!("{}  ({key})", scene.title());
-            if ui.selectable_label(info.scene_id == *scene, text).clicked() {
-                actions.push(PanelAction::Scene(*scene));
-            }
-        }
-    }
-    ui.separator();
-    ui.label(RichText::new("Настройки").strong());
-    ui.label("Сглаживание (M)");
-    ui.horizontal(|ui| {
-        for m in info.msaa_options {
-            if ui
-                .selectable_label(info.msaa_now == *m, m.title())
-                .clicked()
-            {
-                actions.push(PanelAction::Msaa(*m));
-            }
+    egui::CollapsingHeader::new(
+        RichText::new(format!("Сцена: {}", info.scene_id.title())).strong(),
+    )
+    .id_salt("сцены")
+    .default_open(true)
+    .show(ui, |ui| {
+        for (stage, scenes) in SCENES {
+            ui.label(RichText::new(*stage).weak());
+            // Сцены этапа в строку с переносом: список вдвое короче.
+            ui.horizontal_wrapped(|ui| {
+                for (scene, key) in *scenes {
+                    let text = format!("{} ({key})", scene.title());
+                    if ui.selectable_label(info.scene_id == *scene, text).clicked() {
+                        actions.push(PanelAction::Scene(*scene));
+                    }
+                }
+            });
         }
     });
-    let mut compact = info.compact_scene;
-    if ui
-        .add_enabled(
-            info.compact_supported,
-            egui::Checkbox::new(&mut compact, "Компактный кадр сцены (P)"),
-        )
-        .changed()
-    {
-        actions.push(PanelAction::CompactScene(compact));
-    }
-    let mut edges = info.perceptual_edges;
-    if ui
-        .checkbox(&mut edges, "Края как в редакторах (G)")
-        .changed()
-    {
-        actions.push(PanelAction::PerceptualEdges(edges));
-    }
-    ui.label("Заливка векторов (F)");
-    for fill in [FillMode::PerShape, FillMode::Triangles, FillMode::Stencil] {
-        if ui
-            .selectable_label(info.fill_mode == fill, fill.label())
-            .clicked()
-        {
-            actions.push(PanelAction::Fill(fill));
-        }
-    }
-    let mut zoom = info.zoom;
-    if ui.checkbox(&mut zoom, "Лупа ×8 (Z)").changed() {
-        actions.push(PanelAction::Zoom(zoom));
-    }
-    if info.scene_id.uses_field() {
-        let mut field = info.light_field;
-        if ui
-            .checkbox(&mut field, "Свет: линии по полю из картинки")
-            .on_hover_text(
-                "Поле расстояний, построенное jump flooding в уменьшенном разрешении, \
-                 вместо точного расчёта. В поле попадают и векторные фигуры снизу, \
-                 кроме правой звезды: у неё нет отметки «отбрасывает тень»",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::LightField(field));
-        }
-    }
-    if info.scene_id.uses_lights() {
-        let mut glow = info.glow;
-        if ui
-            .checkbox(&mut glow, "Свечение и мягкие пересветы (B)")
-            .on_hover_text(
-                "Яркие места мягко светятся вокруг, а свет ярче белого плавно переходит \
-                 в белый, а не обрезается пятнами",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::Glow(glow));
-        }
-        let mut cascades = info.cascades;
-        if ui
-            .checkbox(&mut cascades, "Свет каскадами лучей, опыт (C)")
-            .on_hover_text(
-                "Другой способ считать свет (radiance cascades): из каждой точки лучи во \
-                 все стороны, а не к каждой лампе. Свет огибает углы и затекает в щели, \
-                 а цена почти не зависит от числа ламп. Для сравнения с обычным",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::Cascades(cascades));
-        }
-    }
-    if let Some(a) = &info.audio {
-        let mut music = a.music;
+    section(ui, "Картинка", true, |ui| {
+        ui.label("Сглаживание (M)");
+        ui.horizontal(|ui| {
+            for m in info.msaa_options {
+                if ui
+                    .selectable_label(info.msaa_now == *m, m.title())
+                    .clicked()
+                {
+                    actions.push(PanelAction::Msaa(*m));
+                }
+            }
+        });
+        let mut compact = info.compact_scene;
         if ui
             .add_enabled(
-                a.device.is_some(),
-                egui::Checkbox::new(&mut music, "Музыка (O)"),
+                info.compact_supported,
+                egui::Checkbox::new(&mut compact, "Компактный кадр сцены (P)"),
             )
             .changed()
         {
-            actions.push(PanelAction::Music(music));
+            actions.push(PanelAction::CompactScene(compact));
         }
-    }
-    if let Some(stats) = info.particles {
-        let mut fountain = stats.fountain;
+        let mut edges = info.perceptual_edges;
         if ui
-            .checkbox(&mut fountain, "Фонтан частиц для замера (V)")
+            .checkbox(&mut edges, "Края как в редакторах (G)")
+            .changed()
+        {
+            actions.push(PanelAction::PerceptualEdges(edges));
+        }
+        ui.label("Заливка векторов (F)");
+        ui.horizontal_wrapped(|ui| {
+            for fill in [FillMode::PerShape, FillMode::Triangles, FillMode::Stencil] {
+                if ui
+                    .selectable_label(info.fill_mode == fill, fill.label())
+                    .clicked()
+                {
+                    actions.push(PanelAction::Fill(fill));
+                }
+            }
+        });
+        let mut zoom = info.zoom;
+        if ui.checkbox(&mut zoom, "Лупа ×8 (Z)").changed() {
+            actions.push(PanelAction::Zoom(zoom));
+        }
+        if info.scene_id.uses_field() {
+            let mut field = info.light_field;
+            if ui
+                .checkbox(&mut field, "Свет: линии по полю из картинки")
+                .on_hover_text(
+                    "Поле расстояний, построенное jump flooding в уменьшенном разрешении, \
+                 вместо точного расчёта. В поле попадают и векторные фигуры снизу, \
+                 кроме правой звезды: у неё нет отметки «отбрасывает тень»",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::LightField(field));
+            }
+        }
+        if info.scene_id.uses_lights() {
+            let mut glow = info.glow;
+            if ui
+                .checkbox(&mut glow, "Свечение и мягкие пересветы (B)")
+                .on_hover_text(
+                    "Яркие места мягко светятся вокруг, а свет ярче белого плавно переходит \
+                 в белый, а не обрезается пятнами",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::Glow(glow));
+            }
+            let mut cascades = info.cascades;
+            if ui
+                .checkbox(&mut cascades, "Свет каскадами лучей, опыт (C)")
+                .on_hover_text(
+                    "Другой способ считать свет (radiance cascades): из каждой точки лучи во \
+                 все стороны, а не к каждой лампе. Свет огибает углы и затекает в щели, \
+                 а цена почти не зависит от числа ламп. Для сравнения с обычным",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::Cascades(cascades));
+            }
+        }
+        let mut dither = info.dither;
+        if ui
+            .checkbox(&mut dither, "Шум против полос (D)")
             .on_hover_text(
-                "Около 100 000 частиц сразу: время прохода «частицы» в счётчиках \
+                "Незаметный шум в одну ступень яркости: плавные тёмные переходы \
+             не распадаются на полосы",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::Dither(dither));
+        }
+    });
+    if info.scene_id == DemoScene::File || info.audio.is_some() || info.particles.is_some() {
+        section(ui, "Уровень, звук, частицы", true, |ui| {
+            if let Some(a) = &info.audio {
+                let mut music = a.music;
+                if ui
+                    .add_enabled(
+                        a.device.is_some(),
+                        egui::Checkbox::new(&mut music, "Музыка (O)"),
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::Music(music));
+                }
+            }
+            if let Some(stats) = info.particles {
+                let mut fountain = stats.fountain;
+                if ui
+                    .checkbox(&mut fountain, "Фонтан частиц для замера (V)")
+                    .on_hover_text(
+                        "Около 100 000 частиц сразу: время прохода «частицы» в счётчиках \
                  видеокарты показывает, сколько стоит их расчёт и рисование",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::Fountain(fountain));
-        }
-    }
-    if info.scene_id == DemoScene::File {
-        let mut level = info.level_view;
-        if ui
-            .checkbox(&mut level, "2.5D-вид уровня (F2)")
-            .on_hover_text(
-                "Тот же уровень объёмом: стены и полы — блоки, фигуры — плитки с \
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::Fountain(fountain));
+                }
+            }
+            if info.scene_id == DemoScene::File {
+                let mut level = info.level_view;
+                if ui
+                    .checkbox(&mut level, "2.5D-вид уровня (F2)")
+                    .on_hover_text(
+                        "Тот же уровень объёмом: стены и полы — блоки, фигуры — плитки с \
                  толщиной, свет и тени как в сцене «3D». Камера сбоку с небольшим \
                  наклоном сверху идёт за героем. Игра та же, переключать можно на ходу",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::LevelView(level));
-        }
-        if info.level_view {
-            ui.label("2.5D рисуется").on_hover_text(
-                "Честные тени (поле) — всё неподвижное заранее запечено в одно поле \
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::LevelView(level));
+                }
+                if info.level_view {
+                    ui.label("2.5D рисуется").on_hover_text(
+                        "Честные тени (поле) — всё неподвижное заранее запечено в одно поле \
                  (печётся в фоне доли секунды после загрузки уровня, до тех пор кадр как \
                  у SDF), подвижное (герой, лифт, монеты) — формами: точные мягкие тени и \
                  затенение в углах, по умолчанию на отдельной видеокарте. Быстро \
@@ -729,263 +825,259 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                  картами теней двух ближних ламп, формы SDF только у мягких предметов: \
                  по умолчанию на встроенной. SDF (сравнение) — всё формами без поля: \
                  картинка как у поля, но дороже; оставлен, чтобы сравнивать",
-            );
-            ui.horizontal_wrapped(|ui| {
-                for render in LevelRender::ALL {
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for render in LevelRender::ALL {
+                            if ui
+                                .selectable_label(info.level_render == render, render.title())
+                                .clicked()
+                            {
+                                actions.push(PanelAction::LevelRender(render));
+                            }
+                        }
+                    });
+                }
+            }
+            if info.scene_id == DemoScene::File {
+                ui.horizontal(|ui| {
                     if ui
-                        .selectable_label(info.level_render == render, render.title())
+                        .button("Картина в фоне (U)")
+                        .on_hover_text(
+                            "Новая тяжёлая картина на стене: несколько тысяч фигур режутся \
+                     в потоке загрузки, кадр только забирает готовое",
+                        )
                         .clicked()
                     {
-                        actions.push(PanelAction::LevelRender(render));
+                        actions.push(PanelAction::LoadPicture(true));
                     }
-                }
-            });
-        }
-    }
-    let volume = info.scene_id == DemoScene::Space || info.level_view;
-    if volume {
-        let (mut smooth, can) = info.space_smooth;
-        if ui
-            .add_enabled(
-                can,
-                egui::Checkbox::new(
-                    &mut smooth,
-                    // В сцене из файла X — рывок героя.
-                    if info.level_view {
-                        "Сглаживание 3D"
-                    } else {
-                        "Сглаживание 3D (X)"
-                    },
-                ),
-            )
-            .on_hover_text(
-                "На краях форм в пиксель идут четыре луча вместо одного: меньше лесенок. \
-                 Время — строки «края 3D» в счётчиках",
-            )
-            .on_disabled_hover_text(
-                "Видеокарта не умеет писать в картинки через общий список (см. журнал)",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::SpaceSmooth(smooth));
-        }
-        let (mut counters, can) = info.space_counters;
-        if ui
-            .add_enabled(can, egui::Checkbox::new(&mut counters, "Счётчики лучей 3D"))
-            .on_hover_text(
-                "Сколько лучей пускает каждый проход, сколько шагов делает луч и сколько \
-                 раз считается сцена — по ним видно, что дала очередная правка. Пока \
-                 включено, шейдеры считают, и время кадра чуть больше: время замеряйте с \
-                 выключенными",
-            )
-            .on_disabled_hover_text(
-                "Видеокарта не умеет складывать счётчики в пиксельном шейдере (см. журнал)",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::SpaceCounters(counters));
-        }
-        let mut free = info.space_free;
-        if ui
-            .checkbox(&mut free, "Длинный шаг в пустоте")
-            .on_hover_text(
-                "Луч в пустоте шагает сразу до ближайшего предмета (до 2 м), а не по \
-                 клетке сетки отсева: меньше шагов у теней и грубого прохода. Картинка \
-                 может чуть отличаться в полутенях и затенении углов — выключите, чтобы \
-                 сравнить картинку и время",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::SpaceFree(free));
-        }
-        let mut boxes = info.space_boxes;
-        if ui
-            .checkbox(&mut boxes, "Сетка отсева по коробкам")
-            .on_hover_text(
-                "Сетка, по которой луч узнаёт, какие предметы рядом, строится по плотным \
-                 коробкам предметов, а не по шарам вокруг них: длинная стена больше не \
-                 попадает в каждую клетку, и в сцене на тысячу предметов клетки мельче. \
-                 Выключите, чтобы сравнить время с тем, как было",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::SpaceBoxes(boxes));
-        }
-        if info.space_smooth.0 {
-            let mut creases = info.edge_creases;
-            if ui
-                .checkbox(&mut creases, "Края: складки без доп. лучей")
-                .on_hover_text(
-                    "8.2: на ребре, где сходятся две плоскости (угол коробки, стык передней \
-                     грани и бока), доп. лучи края не шагают по сцене, а пересекают эти две \
-                     плоскости. Так быстрее. Выключите, чтобы сравнить вид и время «края 3D» \
-                     с прежним способом",
-                )
-                .changed()
-            {
-                actions.push(PanelAction::EdgeCreases(creases));
-            }
-            let mut reuse = info.edge_shadow_reuse;
-            if ui
-                .checkbox(&mut reuse, "Края: точные тени только у границы тени")
-                .on_hover_text(
-                    "8.2б: у края, где картинка теней ненадёжна, свои лучи тени пускаются \
-                     только для того света, у которого рядом проходит граница тени. \
-                     Остальное берётся из картинки теней. Выключите, чтобы сравнить вид и \
-                     время «края 3D» с прежним способом",
-                )
-                .changed()
-            {
-                actions.push(PanelAction::EdgeShadowReuse(reuse));
-            }
-            let mut bricks = info.brick_shadows;
-            if ui
-                .checkbox(&mut bricks, "Тени моделей: кирпич поля")
-                .on_hover_text(
-                    "8.15: тень модели из файла бросает её запечённая сетка расстояний — \
-                     одно чтение картинки на шаг луча. Выключите, чтобы сравнить вид и \
-                     время «теней 3D» с прежними заменителями из плоскостей граней",
-                )
-                .changed()
-            {
-                actions.push(PanelAction::BrickShadows(bricks));
-            }
-            ui.label("Замер краёв 3D").on_hover_text(
-                "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
-                 По разнице времени строки «края 3D» с «как обычно» видно, сколько стоит \
-                 эта часть. Края при этом рисуются неверно — после замера верните \
-                 «как обычно»",
-            );
-            ui.horizontal_wrapped(|ui| {
-                for probe in EdgeProbe::ALL {
                     if ui
-                        .selectable_label(info.edge_probe == probe, probe.title())
+                        .button("в кадре (Shift+U)")
+                        .on_hover_text(
+                            "То же по-старому, прямо в кадре: для сравнения, на графике \
+                     времени кадра будет пик",
+                        )
                         .clicked()
                     {
-                        actions.push(PanelAction::EdgeProbe(probe));
+                        actions.push(PanelAction::LoadPicture(false));
                     }
-                }
-            });
-        }
-        ui.label("Разрешение 3D").on_hover_text(
-            "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
-                 Меньше — быстрее, картинка растягивается на весь экран (по одному кадру, \
-                 без сглаживания по времени), но мягче. На встроенной видеокарте по \
-                 умолчанию 50 %, на отдельной 100 %",
-        );
-        ui.horizontal(|ui| {
-            for scale in SpaceScale::ALL {
-                if ui
-                    .selectable_label(info.space_scale == scale, scale.title())
-                    .clicked()
-                {
-                    actions.push(PanelAction::SpaceScale(scale));
-                }
+                });
             }
         });
     }
-    if info.scene_id == DemoScene::Space {
-        let (mut field, can) = info.space_field;
-        if ui
-            .add_enabled(can, egui::Checkbox::new(&mut field, "Поле расстояний"))
-            .on_hover_text(
-                "Запечённое поле расстояний вокруг камеры (7.10): тени и затенение в углах \
+    let volume = info.scene_id == DemoScene::Space || info.level_view;
+    if volume {
+        section(ui, "3D", true, |ui| {
+            let (mut smooth, can) = info.space_smooth;
+            if ui
+                .add_enabled(
+                    can,
+                    egui::Checkbox::new(
+                        &mut smooth,
+                        // В сцене из файла X — рывок героя.
+                        if info.level_view {
+                            "Сглаживание 3D"
+                        } else {
+                            "Сглаживание 3D (X)"
+                        },
+                    ),
+                )
+                .on_hover_text(
+                    "На краях форм в пиксель идут четыре луча вместо одного: меньше лесенок. \
+                 Время — строки «края 3D» в счётчиках",
+                )
+                .on_disabled_hover_text(
+                    "Видеокарта не умеет писать в картинки через общий список (см. журнал)",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::SpaceSmooth(smooth));
+            }
+            ui.label("Разрешение 3D").on_hover_text(
+                "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
+                 Меньше — быстрее, картинка растягивается на весь экран (по одному кадру, \
+                 без сглаживания по времени), но мягче. На встроенной видеокарте по \
+                 умолчанию 50 %, на отдельной 100 %",
+            );
+            ui.horizontal(|ui| {
+                for scale in SpaceScale::ALL {
+                    if ui
+                        .selectable_label(info.space_scale == scale, scale.title())
+                        .clicked()
+                    {
+                        actions.push(PanelAction::SpaceScale(scale));
+                    }
+                }
+            });
+        });
+        section(ui, "Опыты и замеры 3D", false, |ui| {
+            let (mut counters, can) = info.space_counters;
+            if ui
+                .add_enabled(can, egui::Checkbox::new(&mut counters, "Счётчики лучей 3D"))
+                .on_hover_text(
+                    "Сколько лучей пускает каждый проход, сколько шагов делает луч и сколько \
+                 раз считается сцена — по ним видно, что дала очередная правка. Пока \
+                 включено, шейдеры считают, и время кадра чуть больше: время замеряйте с \
+                 выключенными",
+                )
+                .on_disabled_hover_text(
+                    "Видеокарта не умеет складывать счётчики в пиксельном шейдере (см. журнал)",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::SpaceCounters(counters));
+            }
+            let mut free = info.space_free;
+            if ui
+                .checkbox(&mut free, "Длинный шаг в пустоте")
+                .on_hover_text(
+                    "Луч в пустоте шагает сразу до ближайшего предмета (до 2 м), а не по \
+                 клетке сетки отсева: меньше шагов у теней и грубого прохода. Картинка \
+                 может чуть отличаться в полутенях и затенении углов — выключите, чтобы \
+                 сравнить картинку и время",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::SpaceFree(free));
+            }
+            let mut boxes = info.space_boxes;
+            if ui
+                .checkbox(&mut boxes, "Сетка отсева по коробкам")
+                .on_hover_text(
+                    "Сетка, по которой луч узнаёт, какие предметы рядом, строится по плотным \
+                 коробкам предметов, а не по шарам вокруг них: длинная стена больше не \
+                 попадает в каждую клетку, и в сцене на тысячу предметов клетки мельче. \
+                 Выключите, чтобы сравнить время с тем, как было",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::SpaceBoxes(boxes));
+            }
+            if info.space_smooth.0 {
+                let mut creases = info.edge_creases;
+                if ui
+                    .checkbox(&mut creases, "Края: складки без доп. лучей")
+                    .on_hover_text(
+                        "8.2: на ребре, где сходятся две плоскости (угол коробки, стык передней \
+                     грани и бока), доп. лучи края не шагают по сцене, а пересекают эти две \
+                     плоскости. Так быстрее. Выключите, чтобы сравнить вид и время «края 3D» \
+                     с прежним способом",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::EdgeCreases(creases));
+                }
+                let mut reuse = info.edge_shadow_reuse;
+                if ui
+                    .checkbox(&mut reuse, "Края: точные тени только у границы тени")
+                    .on_hover_text(
+                        "8.2б: у края, где картинка теней ненадёжна, свои лучи тени пускаются \
+                     только для того света, у которого рядом проходит граница тени. \
+                     Остальное берётся из картинки теней. Выключите, чтобы сравнить вид и \
+                     время «края 3D» с прежним способом",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::EdgeShadowReuse(reuse));
+                }
+                let mut bricks = info.brick_shadows;
+                if ui
+                    .checkbox(&mut bricks, "Тени моделей: кирпич поля")
+                    .on_hover_text(
+                        "8.15: тень модели из файла бросает её запечённая сетка расстояний — \
+                     одно чтение картинки на шаг луча. Выключите, чтобы сравнить вид и \
+                     время «теней 3D» с прежними заменителями из плоскостей граней",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::BrickShadows(bricks));
+                }
+                ui.label("Замер краёв 3D").on_hover_text(
+                    "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
+                 По разнице времени строки «края 3D» с «как обычно» видно, сколько стоит \
+                 эта часть. Края при этом рисуются неверно — после замера верните \
+                 «как обычно»",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for probe in EdgeProbe::ALL {
+                        if ui
+                            .selectable_label(info.edge_probe == probe, probe.title())
+                            .clicked()
+                        {
+                            actions.push(PanelAction::EdgeProbe(probe));
+                        }
+                    }
+                });
+            }
+            if info.scene_id == DemoScene::Space {
+                let (mut field, can) = info.space_field;
+                if ui
+                    .add_enabled(can, egui::Checkbox::new(&mut field, "Поле расстояний"))
+                    .on_hover_text(
+                        "Запечённое поле расстояний вокруг камеры (7.10): тени и затенение в углах \
                  не считают формы там, где поле уже говорит, что рядом пусто. Картинка та же; \
                  время поля — строка «поле» в счётчиках. Выключено по умолчанию: рядом с \
                  движущимися предметами поле пересчитывается каждый кадр и стоит дороже, \
                  чем экономит",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::SpaceField(field));
-        }
-        let (mut ao, can) = info.space_ao_field;
-        if ui
-            .add_enabled(can, egui::Checkbox::new(&mut ao, "Углы из поля"))
-            .on_hover_text(
-                "Затенение в углах берёт дальние пробы прямо из поля расстояний (7.10г): \
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::SpaceField(field));
+                }
+                let (mut ao, can) = info.space_ao_field;
+                if ui
+                    .add_enabled(can, egui::Checkbox::new(&mut ao, "Углы из поля"))
+                    .on_hover_text(
+                        "Затенение в углах берёт дальние пробы прямо из поля расстояний (7.10г): \
                  быстрее, но у тонких краёв (тоньше 3 см) углы чуть другие",
-            )
-            .on_disabled_hover_text("Нужно включённое поле расстояний")
-            .changed()
-        {
-            actions.push(PanelAction::SpaceAoField(ao));
-        }
-        let (_, can_field) = info.space_field;
-        if ui
-            .add_enabled(
-                can_field && !info.field_bench_running,
-                egui::Button::new("Сравнить поле"),
-            )
-            .on_hover_text(
-                "Время сцены замирает, и по 240 кадров меряются три положения: без поля, \
+                    )
+                    .on_disabled_hover_text("Нужно включённое поле расстояний")
+                    .changed()
+                {
+                    actions.push(PanelAction::SpaceAoField(ao));
+                }
+                let (_, can_field) = info.space_field;
+                if ui
+                    .add_enabled(
+                        can_field && !info.field_bench_running,
+                        egui::Button::new("Сравнить поле"),
+                    )
+                    .on_hover_text(
+                        "Время сцены замирает, и по 240 кадров меряются три положения: без поля, \
                  с полем, с полем и «углами из поля». Около 15 секунд; камеру не трогать. \
                  Итог — здесь и в журнале. Пока время стоит, поле не пересчитывается: цена \
                  пересчёта у движущихся предметов в этот замер не входит",
-            )
-            .clicked()
-        {
-            actions.push(PanelAction::FieldBench);
-        }
-        if let Some(text) = info.field_bench {
-            ui.label(egui::RichText::new(text).small());
-        }
-        let (mut via_field, can) = info.space_extrude_field;
-        if ui
-            .add_enabled(
-                can,
-                egui::Checkbox::new(&mut via_field, "Выдавливание через поле (опыт)"),
-            )
-            .on_hover_text(
-                "Выдавленные фигуры верхнего уровня (в vector.ron — сердце и облако) \
+                    )
+                    .clicked()
+                {
+                    actions.push(PanelAction::FieldBench);
+                }
+                if let Some(text) = info.field_bench {
+                    ui.label(egui::RichText::new(text).small());
+                }
+                let (mut via_field, can) = info.space_extrude_field;
+                if ui
+                    .add_enabled(
+                        can,
+                        egui::Checkbox::new(&mut via_field, "Выдавливание через поле (опыт)"),
+                    )
+                    .on_hover_text(
+                        "Выдавленные фигуры верхнего уровня (в vector.ron — сердце и облако) \
                  рисуются через примитив «поле слоя» (7.18б): их поле лежит в картинке, а \
                  не в словах сцены. Картинка та же, время не хуже. Звезда и указатель \
                  остаются формами: их выдавливание внутри вырезания и объединения",
-            )
-            .on_disabled_hover_text(
-                "В кадре нет выдавленных фигур верхнего уровня (есть в \
+                    )
+                    .on_disabled_hover_text(
+                        "В кадре нет выдавленных фигур верхнего уровня (есть в \
                  --space-file scenes\\3d\\vector.ron)",
-            )
-            .changed()
-        {
-            actions.push(PanelAction::SpaceExtrudeField(via_field));
-        }
-    }
-    let mut dither = info.dither;
-    if ui
-        .checkbox(&mut dither, "Шум против полос (D)")
-        .on_hover_text(
-            "Незаметный шум в одну ступень яркости: плавные тёмные переходы \
-             не распадаются на полосы",
-        )
-        .changed()
-    {
-        actions.push(PanelAction::Dither(dither));
-    }
-    if info.scene_id == DemoScene::File {
-        ui.horizontal(|ui| {
-            if ui
-                .button("Картина в фоне (U)")
-                .on_hover_text(
-                    "Новая тяжёлая картина на стене: несколько тысяч фигур режутся \
-                     в потоке загрузки, кадр только забирает готовое",
-                )
-                .clicked()
-            {
-                actions.push(PanelAction::LoadPicture(true));
-            }
-            if ui
-                .button("в кадре (Shift+U)")
-                .on_hover_text(
-                    "То же по-старому, прямо в кадре: для сравнения, на графике \
-                     времени кадра будет пик",
-                )
-                .clicked()
-            {
-                actions.push(PanelAction::LoadPicture(false));
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::SpaceExtrudeField(via_field));
+                }
             }
         });
     }
+    ui.separator();
     ui.horizontal(|ui| {
         if ui.button("Камера в начало (R)").clicked() {
             actions.push(PanelAction::ResetCamera);
@@ -1226,26 +1318,34 @@ fn level_field_text(status: LevelFieldStatus) -> Option<String> {
 
 /// Счётчики объёмного кадра (7.18б): пиксели края, время процессора, размер данных сцены;
 /// у пределов — жёлтым с 75 %, красным при нарушении (раньше о нём писал только журнал).
-fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats, counting: bool) {
-    let mono = |text: String| RichText::new(text).family(FontFamily::Monospace);
-    match &s.rays {
-        Some(rays) => {
-            let lines = ray_count_lines(rays);
-            let response = ui.label(mono(lines.join("\n")));
-            response.on_hover_text(
-                "Лучей — сколько лучей пустил проход за кадр (у «грубо» — квадратов 8×8, у \
-                 «углов» — точек). Шаг/луч — шагов на луч (у «углов» — проб на точку). \
-                 Сцена/луч — вычислений сцены на луч, в скобках из них для нормали. \
-                 Объект, форма, поле — на одно вычисление сцены: сколько объектов проверено \
-                 по шару-границе, у скольких посчитана сама форма и сколько раз прочитано \
-                 поле слоя. «Края: тени» — тени и затенение в углах пикселей края вместе",
-            );
-        }
-        None if counting => {
-            ui.label(mono("Лучи 3D: счётчики ждут кадра".to_string()));
-        }
-        None => {}
+/// Раздел «Лучи 3D (счётчики)»: таблица по проходам, пока включены счётчики (7.18д2).
+fn ray_count_section(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats, counting: bool) {
+    if s.rays.is_none() && !counting {
+        return;
     }
+    section(ui, "Лучи 3D (счётчики)", true, |ui| {
+        match &s.rays {
+            Some(rays) => {
+                let lines = ray_count_lines(rays);
+                let response = ui.label(mono(lines.join("\n")));
+                response.on_hover_text(
+                    "Лучей — сколько лучей пустил проход за кадр (у «грубо» — квадратов 8×8, у \
+                     «углов» — точек). Шаг/луч — шагов на луч (у «углов» — проб на точку). \
+                     Сцена/луч — вычислений сцены на луч, в скобках из них для нормали. \
+                     Объект, форма, поле — на одно вычисление сцены: сколько объектов проверено \
+                     по шару-границе, у скольких посчитана сама форма и сколько раз прочитано \
+                     поле слоя. «Края: тени» — тени и затенение в углах пикселей края вместе",
+                );
+            }
+            None if counting => {
+                ui.label(mono("Лучи 3D: счётчики ждут кадра".to_string()));
+            }
+            None => {}
+        }
+    });
+}
+
+fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
     let red = Color32::from_rgb(255, 90, 80);
     let edges = match s.edge_pixels {
         Some(n) => {
@@ -1525,6 +1625,38 @@ mod tests {
     }
 
     /// Панель раскладывается без окна: шрифты читаются, кириллица и цифры есть в атласе.
+    /// Обе панели целиком в окне 1280×720 и не шире своих ширин: что не влезло по высоте,
+    /// прокручивается внутри панели, а не уходит за край кадра.
+    fn assert_panels_fit(ctx: &egui::Context) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        for (name, width) in [("Счётчики", COUNTERS_WIDTH), ("Сцены", CONTROLS_WIDTH)]
+        {
+            let rect = ctx
+                .memory(|m| m.area_rect(egui::Id::unique(name)))
+                .unwrap_or_else(|| panic!("панель «{name}» не нарисована"));
+            assert!(
+                screen.contains_rect(rect),
+                "панель «{name}» выходит за окно: {rect:?}"
+            );
+            // Рамка окна egui добавляет поля с двух сторон.
+            assert!(
+                rect.width() <= width + 40.0,
+                "панель «{name}» шире {width}: {}",
+                rect.width()
+            );
+        }
+        let left = ctx
+            .memory(|m| m.area_rect(egui::Id::unique("Счётчики")))
+            .unwrap();
+        let right = ctx
+            .memory(|m| m.area_rect(egui::Id::unique("Сцены")))
+            .unwrap();
+        assert!(
+            !left.intersects(right),
+            "панели наезжают: {left:?} и {right:?}"
+        );
+    }
+
     #[test]
     fn panel_lays_out_with_cyrillic_fonts() {
         let ctx = egui::Context::default();
@@ -1721,18 +1853,27 @@ mod tests {
         let mut prims = Vec::new();
         for _ in 0..2 {
             let mut out = ctx.run_ui(input.clone(), |ui| {
-                egui::Window::new("Счётчики")
-                    .title_bar(false)
-                    .show(ui.ctx(), |ui| contents(ui, &info, &history));
-                egui::Window::new("Сцены")
-                    .title_bar(false)
-                    .show(ui.ctx(), |ui| controls(ui, &info, &mut actions));
+                show_panels(ui.ctx(), &info, &history, &mut actions);
             });
             atlas |= !out.textures_delta.set.is_empty();
             out.textures_delta.clear();
             prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         }
         assert!(!prims.is_empty(), "панель нарисована");
+        assert_panels_fit(&ctx);
+        // Сцена «3D» с 2.5D-видом: раскрыты все разделы обеих панелей.
+        let info = PanelInfo {
+            scene_id: DemoScene::Space,
+            level_view: true,
+            ..info
+        };
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(input.clone(), |ui| {
+                show_panels(ui.ctx(), &info, &history, &mut actions);
+            });
+            out.textures_delta.clear();
+        }
+        assert_panels_fit(&ctx);
         assert!(atlas, "атлас шрифта загружается");
         assert!(actions.is_empty(), "без нажатий действий нет");
     }
