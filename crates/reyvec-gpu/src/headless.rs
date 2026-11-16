@@ -522,6 +522,7 @@ fn render(
             demo.set_edge_probe(tests::EDGE_PROBE.get());
             demo.set_edge_creases(tests::EDGE_CREASES.get());
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
+            demo.set_edge_far(tests::EDGE_FAR.get());
             demo.set_plane_shadows(tests::PLANE_SHADOWS.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -668,6 +669,7 @@ fn render(
             (Some(gpu), Some(demo)) => demo.space_stats().map(|mut s| {
                 s.edge_pixels = demo.edge_pixels(gpu, 0);
                 s.edge_unreliable = demo.edge_unreliable(gpu, 0);
+                s.edge_pairs = demo.edge_pairs(gpu, 0);
                 if let Some((rays, edges)) = demo.ray_counts(gpu, 0) {
                     s.rays = Some(rays);
                     s.edge_kinds = s.edge_pixels.map(|_| edges);
@@ -812,6 +814,8 @@ pub(crate) mod tests {
         /// Точные тени краёв только у границы тени (8.2б); по умолчанию включены.
         pub(super) static EDGE_SHADOW_REUSE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(true) };
+        /// Края: два луча вдали (8.11б); как в песочнице, по умолчанию выключено.
+        pub(super) static EDGE_FAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Тени моделей от плоскостей граней, как до 8.15 (обычно — от кирпичей поля).
         pub(super) static PLANE_SHADOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Мусором залиты только картинки с этим именем (8.0).
@@ -2537,7 +2541,37 @@ pub(crate) mod tests {
             }
         }
         eprintln!("ненадёжных краёв {:?}", stats.edge_unreliable);
-        panic!("ВРЕМЕННО: напечатать числа в CI");
+        assert_eq!(
+            stats.edge_pairs,
+            Some(0),
+            "без опыта 8.11б — четыре луча у всех"
+        );
+
+        // «Края: два луча вдали» (8.11б): часть краёв берёт два луча, лучей краёв меньше,
+        // картинка отличается только на этих краях и чуть-чуть.
+        EDGE_FAR.set(true);
+        SPACE_COUNTERS.set(true);
+        let far = render_headless(&options, &scene);
+        SPACE_COUNTERS.set(false);
+        EDGE_FAR.set(false);
+        let far = far.expect("кадр с двумя лучами вдали");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+        let far_stats = far.space_stats.expect("числа сцены 3D");
+        let pairs = far_stats.edge_pairs.expect("края посчитаны");
+        assert_eq!(far_stats.edge_pixels, stats.edge_pixels, "те же края");
+        let (changed, worst, mean) = image_diff(&plain.image, &far.image);
+        let edge_rays = |s: &crate::demo::SpaceStats| s.rays.map(|r| r[4].rays);
+        eprintln!(
+            "два луча вдали: {pairs} из {edge_pixels} краёв, лучей краёв {:?} → {:?}; \
+             картинка: отличается {changed} пикселей, худшее {worst}, среднее {mean:.4}",
+            edge_rays(&stats),
+            edge_rays(&far_stats),
+        );
+        assert!(pairs > 0 && u64::from(pairs) < edge_pixels, "{pairs}");
+        if let (Some(a), Some(b)) = (edge_rays(&stats), edge_rays(&far_stats)) {
+            assert!(b < a, "{a} → {b}");
+        }
+        assert!(changed as u64 <= u64::from(pairs), "{changed} > {pairs}");
     }
 
     /// Поле уровня до перебора объектов (7.18д3): та же картинка до байта и те же шаги и
