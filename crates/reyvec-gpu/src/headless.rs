@@ -479,6 +479,9 @@ fn render(
             // Шаг в пустоте не длиннее клетки, как до 7.18д4 (для сравнения).
             #[cfg(test)]
             demo.set_space_free(!tests::FREE_OFF.get());
+            // Сетка отсева по шарам, как до 8.8а (для сравнения).
+            #[cfg(test)]
+            demo.set_space_boxes(!tests::SPHERE_GRID.get());
             // Поле уровня в общем переборе, как до 7.18д3 (для сравнения).
             #[cfg(test)]
             demo.set_level_field_apart(!tests::LEVEL_FIELD_IN_LOOP.get());
@@ -790,6 +793,8 @@ pub(crate) mod tests {
         pub(super) static LEVEL_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Шаг в пустоте не длиннее клетки сетки, как до 7.18д4.
         pub(super) static FREE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Сетка отсева по шарам-границам, как до 8.8а.
+        pub(super) static SPHERE_GRID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Нормаль по всей сцене, как до 7.18д5.
         pub(super) static FULL_NORMAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Поле уровня в общем переборе объектов, как до 7.18д3.
@@ -1141,6 +1146,30 @@ pub(crate) mod tests {
         colors.sort_unstable();
         colors.dedup();
         assert!(colors.len() > 20, "цветов {}", colors.len());
+        // Сетка по шарам (как до 8.8а) даёт ту же картинку: сетка меняет только то,
+        // сколько объектов перебирает шаг луча, и чуть — длину шагов в пустоте.
+        SPHERE_GRID.set(true);
+        let spheres = render_headless(&options, &scene);
+        SPHERE_GRID.set(false);
+        let spheres = spheres.expect("кадр");
+        for (how, f) in [("коробки", &frame), ("шары", &spheres)] {
+            if let Some(t) = &f.gpu_timings {
+                eprintln!("завод, сетка {how}: {}", t.describe());
+            }
+        }
+        let differ = frame
+            .image
+            .rgba
+            .chunks_exact(4)
+            .zip(spheres.image.rgba.chunks_exact(4))
+            .filter(|(x, y)| x[..3].iter().zip(&y[..3]).any(|(p, q)| p.abs_diff(*q) > 16))
+            .count();
+        let pixels = frame.image.rgba.len() / 4;
+        eprintln!("завод: по коробкам и по шарам заметно различаются {differ} из {pixels} точек");
+        assert!(
+            differ * 200 < pixels,
+            "различаются {differ} из {pixels} точек"
+        );
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 

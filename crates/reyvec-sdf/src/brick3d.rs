@@ -256,6 +256,12 @@ impl Brick {
         (self.corner + half, half.length())
     }
 
+    /// Коробка сетки (наименьший и наибольший углы, координаты модели): модель внутри.
+    pub fn bounds_box(&self) -> (Vec3, Vec3) {
+        let size = Vec3::from(self.size.map(|s| s as f32)) * self.cell;
+        (self.corner, self.corner + size)
+    }
+
     /// Число сетки в точке `p` (координаты модели), без отступа внутрь: то же, что
     /// считает шейдер (`sd3_brick` в `include/sdf3d.slang`), только смешивание точное.
     pub fn sample(&self, p: Vec3) -> f32 {

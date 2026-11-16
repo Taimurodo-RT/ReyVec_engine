@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use glam::Vec3;
 use reyvec_sdf::SpaceFrame;
+use reyvec_sdf::grid3d::GridOptions;
 use reyvec_sdf::shape3d::{
     MAX_MATERIALS, MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_with,
 };
@@ -205,18 +206,18 @@ pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
 /// читает и перебирает все объекты) и треугольники моделей (слово 7 заголовка — где они).
 #[cfg(test)]
 pub(crate) fn pack(frame: &SpaceFrame, materials: &[Material3], culling: bool) -> Packed {
-    pack_with(frame, materials, culling, true, true)
+    pack_with(frame, materials, culling, true, GridOptions::default())
 }
 
 /// То же; `level_field: false` — поле уровня считается в общем переборе объектов, как до
-/// 7.18д3 (для сравнения в тестах); `free: false` — шаг в пустоте не длиннее клетки
-/// сетки, как до 7.18д4 (для сравнения на панели).
+/// 7.18д3 (для сравнения в тестах); `grid` — как строить сетку отсева (без
+/// свободного расстояния — как до 7.18д4, по шарам — как до 8.8а; для сравнения на панели).
 pub(crate) fn pack_with(
     frame: &SpaceFrame,
     materials: &[Material3],
     culling: bool,
     level_field: bool,
-    free: bool,
+    grid: GridOptions,
 ) -> Packed {
     let mut programs = programs(frame);
     // Шейдер читает не больше MAX_OBJECTS объектов и молча пропускает остальные:
@@ -237,7 +238,7 @@ pub(crate) fn pack_with(
             materials.len()
         )
     });
-    let mut words = pack_scene_with(&programs, materials, &frame.lamps, level_field, free);
+    let mut words = pack_scene_with(&programs, materials, &frame.lamps, level_field, grid);
     let triangles: usize = frame.meshes.iter().map(|m| m.triangles.len()).sum();
     let mesh_words = MESH_HEADER_WORDS + triangles * 3 * VERTEX_WORDS;
     let needed = words.len() + mesh_words;

@@ -25,6 +25,7 @@ use glam::{Mat3, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 use crate::brick3d::{BRICK_PRIM_WORDS, BrickRef};
+use crate::grid3d::GridOptions;
 use crate::layer_field::LayerField;
 use crate::profile2d::{FIELD_HEADER_WORDS, Profile, field_distance};
 
@@ -399,6 +400,89 @@ impl Shape3 {
     }
 }
 
+impl Shape3 {
+    /// Коробка, в которой форма целиком (наименьший и наибольший углы, 8.8а), или `None`
+    /// для бесконечной формы. Плотнее шара для длинных и плоских предметов: у стены 60 м
+    /// шар радиусом 30 м, а коробка — толщиной в саму стену. Повёрнутая коробка берётся
+    /// по восьми углам, поэтому для повёрнутых частей она может быть шире шара: сетка
+    /// отсева берёт пересечение обеих ([`compile`]).
+    pub fn bounds_box(&self) -> Option<(Vec3, Vec3)> {
+        let centered = |half: Vec3| Some((-half.abs(), half.abs()));
+        match self {
+            Self::Sphere { radius } => centered(Vec3::splat(*radius)),
+            Self::Box { size, .. } => centered(Vec3::from(*size) * 0.5),
+            Self::Capsule { height, radius } => {
+                let r = radius.abs();
+                centered(Vec3::new(r, height.abs() * 0.5 + r, r))
+            }
+            Self::Cylinder { height, radius, .. } => {
+                centered(Vec3::new(*radius, height * 0.5, *radius))
+            }
+            Self::Torus { radius, thickness } => {
+                let t = thickness.abs();
+                let r = radius.abs() + t;
+                centered(Vec3::new(r, t, r))
+            }
+            Self::Plane { .. } => None,
+            Self::Field { field, depth, .. } => field.0.rect().map(|(lo, hi)| {
+                let half = depth.abs() * 0.5;
+                let (z0, z1) = field.0.second().map_or((-half, half), |s| {
+                    ((-half).min(s.shift - s.half), half.max(s.shift + s.half))
+                });
+                (lo.extend(z0), hi.extend(z1))
+            }),
+            Self::Extrude { profile, depth, .. } => {
+                let (lo, hi) = profile.bounds();
+                let half = depth.abs() * 0.5;
+                Some((lo.extend(-half), hi.extend(half)))
+            }
+            Self::Brick { brick } => Some(brick.0.bounds_box()),
+            Self::Revolve { profile, offset } => {
+                let (lo, hi) = profile.bounds();
+                let r = (offset + lo.x.abs().max(hi.x.abs())).abs();
+                Some((Vec3::new(-r, lo.y, -r), Vec3::new(r, hi.y, r)))
+            }
+            Self::Union { shapes, smooth } => {
+                let mut all = shapes.iter().map(Shape3::bounds_box);
+                let first = all.next()??;
+                let (lo, hi) = all.try_fold(first, |a, b| {
+                    let b = b?;
+                    Some((a.0.min(b.0), a.1.max(b.1)))
+                })?;
+                let pad = Vec3::splat(smooth.abs() * 0.5);
+                Some((lo - pad, hi + pad))
+            }
+            Self::Subtract { base, .. } => base.bounds_box(),
+            Self::Intersect { shapes, .. } => {
+                let (lo, hi) = shapes
+                    .iter()
+                    .filter_map(Shape3::bounds_box)
+                    .reduce(|a, b| (a.0.max(b.0), a.1.min(b.1)))?;
+                // Пустое пересечение — точка: формы там нет, граница не мешает.
+                Some((lo, hi.max(lo)))
+            }
+            Self::Move {
+                at,
+                turn,
+                scale,
+                shape,
+            } => {
+                let s = scale.max(1e-6);
+                let (lo, hi) = shape.bounds_box()?;
+                let m = rotation(*turn);
+                let center = Vec3::from(*at) + m * ((lo + hi) * 0.5 * s);
+                let half = (hi - lo) * 0.5 * s;
+                // Полуразмер повёрнутой коробки по оси — сумма |m_ij| · half_j.
+                let abs = Mat3::from_cols(m.x_axis.abs(), m.y_axis.abs(), m.z_axis.abs());
+                let half = abs * half;
+                Some((center - half, center + half))
+            }
+            Self::Paint { shape, .. } => shape.bounds_box(),
+            Self::Animate { .. } => self.at_time(0.0).bounds_box(),
+        }
+    }
+}
+
 /// Шар-граница выдавленного прямоугольника `lo..hi` толщиной `depth`.
 fn extrude_bounds(lo: Vec2, hi: Vec2, depth: f32) -> (Vec3, f32) {
     let half = ((hi - lo) * 0.5).extend(depth.abs() * 0.5);
@@ -545,6 +629,9 @@ pub struct Program {
     pub words: Vec<u32>,
     /// Шар, в котором форма целиком (середина, радиус); `None` — форма бесконечна.
     pub bounds: Option<(Vec3, f32)>,
+    /// Коробка, в которой форма целиком (наименьший и наибольший углы, 8.8а): по ней
+    /// строится сетка отсева. Пересечение [`Shape3::bounds_box`] с коробкой шара.
+    pub bounds_box: Option<(Vec3, Vec3)>,
     /// Невидимый заменитель полигональной модели (7.6ж): только тени и затенение в
     /// углах, лучи глаза его не видят.
     pub shadow_only: bool,
@@ -609,11 +696,21 @@ pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
     Ok(Program {
         words: out.words,
         bounds: shape.bounds(),
+        bounds_box: tight_box(shape),
         shadow_only: false,
         no_shadow: false,
         fields: out.fields,
         bricks: out.bricks,
     })
+}
+
+/// Коробка формы для сетки отсева: её коробка, подрезанная коробкой шара-границы (обе
+/// честные, значит и пересечение).
+fn tight_box(shape: &Shape3) -> Option<(Vec3, Vec3)> {
+    let (c, r) = shape.bounds()?;
+    let (lo, hi) = shape.bounds_box()?;
+    let lo = lo.max(c - r);
+    Some((lo, hi.min(c + r).max(lo)))
 }
 
 /// Куда пишется программа: слова, поля слоя и кирпичи по порядку их примитивов.
@@ -1050,18 +1147,18 @@ pub fn plane_objects(objects: &[Program]) -> Vec<u32> {
 /// - список плоскостей: номера объектов (не больше [`MAX_PLANES`]);
 /// - сетка отсева ([`crate::grid3d::Grid::write`]).
 pub fn pack_scene(objects: &[Program], materials: &[Material3], lamps: &[Lamp3]) -> Vec<u32> {
-    pack_scene_with(objects, materials, lamps, true, true)
+    pack_scene_with(objects, materials, lamps, true, GridOptions::default())
 }
 
 /// То же; `level_field: false` — поле уровня считается в общем переборе, как до 7.18д3
-/// (для сравнения в тестах); `free: false` — у клеток сетки нет свободного расстояния,
-/// шаг в пустоте не длиннее клетки, как до 7.18д4 (для сравнения на панели).
+/// (для сравнения в тестах); `grid` — как строить сетку отсева (для сравнения на
+/// панели: без свободного расстояния, как до 7.18д4; по шарам, как до 8.8а).
 pub fn pack_scene_with(
     objects: &[Program],
     materials: &[Material3],
     lamps: &[Lamp3],
     level_field: bool,
-    free: bool,
+    grid: GridOptions,
 ) -> Vec<u32> {
     let objects_at = HEADER_WORDS;
     let materials_at = objects_at + objects.len() * OBJECT_WORDS;
@@ -1128,11 +1225,7 @@ pub fn pack_scene_with(
     out[9] = planes.len() as u32;
     out.extend(&planes);
     let field = field.map(|i| i as u32);
-    let grid = if free {
-        crate::grid3d::Grid::build_with(objects, field)
-    } else {
-        crate::grid3d::Grid::build_lists(objects, field)
-    };
+    let grid = crate::grid3d::Grid::build_with(objects, field, grid);
     if !grid.cells.is_empty() {
         out[6] = out.len() as u32;
         let at = out.len();
@@ -1478,6 +1571,47 @@ mod tests {
         assert!(c.length() < 1e-6 && (r - 3.0).abs() < 1e-6);
     }
 
+    /// Коробка тоже честная (8.8а): снаружи неё расстояние до формы не меньше расстояния
+    /// до коробки; у длинной стены коробка много плотнее шара.
+    #[test]
+    fn bounds_box_holds_the_whole_shape() {
+        let Shape3::Union { shapes, .. } = sample() else {
+            unreachable!()
+        };
+        let turned = |s: Shape3| s.placed([0.3, -0.2, 0.5], [20.0, 35.0, -15.0]);
+        let mut tested = 0;
+        for shape in shapes
+            .iter()
+            .skip(1)
+            .cloned()
+            .chain(shapes.iter().skip(1).cloned().map(turned))
+        {
+            let program = compile(&shape).unwrap();
+            let (lo, hi) = program.bounds_box.expect("конечная форма");
+            for p in points() {
+                let p = p * 2.5;
+                let outside = (p - p.clamp(lo, hi)).length();
+                if outside > 0.0 {
+                    assert!(
+                        shape.distance(p) >= outside - 1e-4,
+                        "{shape:?} в {p}: до формы {}, до коробки {outside}",
+                        shape.distance(p)
+                    );
+                    tested += 1;
+                }
+            }
+        }
+        assert!(tested > 1000);
+        assert_eq!(sample().bounds_box(), None, "с полом граница бесконечна");
+        let wall = compile(&Shape3::Box {
+            size: [60.0, 1.5, 0.3],
+            round: 0.0,
+        })
+        .unwrap();
+        let (lo, hi) = wall.bounds_box.unwrap();
+        assert!((hi - lo - Vec3::new(60.0, 1.5, 0.3)).abs().max_element() < 1e-4);
+    }
+
     const STAR: &str = "M 0 1 L 0.22 0.3 L 0.95 0.31 L 0.36 -0.12 L 0.59 -0.81 \
                         L 0 -0.38 L -0.59 -0.81 L -0.36 -0.12 L -0.95 0.31 L -0.22 0.3 Z";
 
@@ -1622,7 +1756,7 @@ mod tests {
         let start = w[13] as usize;
         assert_eq!(start, w[HEADER_WORDS + OBJECT_WORDS] as usize);
         assert_eq!(&w[start..start + level.words.len()], &level.words[..]);
-        let w = pack_scene_with(&objects, &[], &[], false, true);
+        let w = pack_scene_with(&objects, &[], &[], false, GridOptions::default());
         assert_eq!(&w[12..14], &[0, 0], "выключено — как до 7.18д3");
         let w = pack_scene(&[sphere], &[], &[]);
         assert_eq!(&w[12..14], &[0, 0], "поля нет");

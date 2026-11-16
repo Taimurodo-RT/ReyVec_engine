@@ -1,19 +1,23 @@
 //! Сетка отсева для сцены «3D» (этап 7.6е): чтобы шаг луча не перебирал все объекты.
 //!
 //! Пространство вокруг конечных объектов делится на кубические клетки. У каждой клетки
-//! свой список объектов, чей шар-граница ближе `margin` (размер клетки) к клетке: от
+//! свой список объектов, чья граница ближе `margin` (размер клетки) к клетке: от
 //! любой точки клетки объекты не из списка дальше `margin`. Шаг луча в точке берёт
 //! клетку и считает только её список — так время шага зависит от того, сколько объектов
 //! рядом, а не от их общего числа.
 //!
+//! Граница объекта с 8.8а — плотная коробка ([`Program::bounds_box`]); до того был
+//! шар-граница, и длинная стена (шар радиусом в половину её длины) растягивала сетку и
+//! попадала почти в каждую клетку. Шары остались для сравнения ([`GridOptions::boxes`]).
+//!
 //! Объекты не из списка отвечают оценкой, с которой начинается шаг: до 7.18д4 это был
 //! `margin`, и в пустоте луч шагал не дальше клетки (у уровня с полем — 30 см, а луч
 //! тени к лампе длиной 1–3 м). Теперь у каждой клетки ещё своё свободное расстояние
-//! ([`Cell::free_mm`]): от любой её точки до шара-границы любого конечного объекта не
+//! ([`Cell::free_mm`]): от любой её точки до границы любого конечного объекта не
 //! ближе. Шаг начинается с большего из двух ([`Grid::start`]).
 //!
 //! Бесконечные формы (плоскость пола) в сетку не попадают: они считаются всегда.
-//! Снаружи сетки ответ — расстояние до коробки, в которой лежат все шары-границы.
+//! Снаружи сетки ответ — расстояние до коробки, в которой лежат все границы.
 //!
 //! Сетка строится на процессоре каждый кадр (объекты двигаются): для сотен объектов это
 //! десятые доли миллисекунды, свободное расстояние — примерно столько же (каждый объект
@@ -25,10 +29,74 @@ use glam::Vec3;
 
 /// К этому числу клеток подбирается размер клетки.
 const TARGET_CELLS: f32 = 2048.0;
-/// Больше клеток не бывает (буфер кадра не резиновый).
-pub const MAX_CELLS: usize = 32768;
+/// Больше клеток не бывает (буфер кадра не резиновый). До 8.8а был предел
+/// [`SPHERE_MAX_CELLS`]; с коробками сетка плотнее, и в цехе на тысячу предметов клетке
+/// не хватало места: она росла до 3 м, а списки — до 60 объектов.
+pub const MAX_CELLS: usize = 131072;
+/// Предел клеток с шарами (как до 8.8а, для сравнения на панели).
+pub const SPHERE_MAX_CELLS: usize = 32768;
 /// Клетка не мельче 25 см: мельче — длинные списки соседей и лишняя память.
 const MIN_CELL: f32 = 0.25;
+
+/// Как строится сетка (для сравнения «было/стало» на панели и в тестах).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridOptions {
+    /// Свободное расстояние клеток (7.18д4; иначе шаг в пустоте не длиннее клетки).
+    pub free: bool,
+    /// Объекты раскладываются по плотным коробкам (8.8а); иначе по шарам-границам, как
+    /// до 8.8а.
+    pub boxes: bool,
+}
+
+impl Default for GridOptions {
+    fn default() -> Self {
+        Self {
+            free: true,
+            boxes: true,
+        }
+    }
+}
+
+/// Граница объекта для сетки: коробка `lo..hi`, раздутая на `r`. Шар — коробка-точка с
+/// радиусом, плотная коробка — с радиусом 0. Расстояние от клетки до такой границы —
+/// расстояние между коробками минус `r`, оно складывается из зазоров по осям.
+#[derive(Clone, Copy, Debug)]
+struct Bound {
+    index: u32,
+    lo: Vec3,
+    hi: Vec3,
+    r: f32,
+}
+
+fn object_bounds(objects: &[Program], boxes: bool) -> Vec<Bound> {
+    objects
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let (c, r) = p.bounds?;
+            let index = i as u32;
+            Some(match p.bounds_box.filter(|_| boxes) {
+                Some((lo, hi)) => Bound {
+                    index,
+                    lo,
+                    hi,
+                    r: 0.0,
+                },
+                None => Bound {
+                    index,
+                    lo: c,
+                    hi: c,
+                    r: r.max(0.0),
+                },
+            })
+        })
+        .collect()
+}
+
+/// Зазор между отрезками `a0..a1` и `b0..b1` (0 — перекрываются).
+fn gap(a0: f32, a1: f32, b0: f32, b1: f32) -> f32 {
+    (b0 - a1).max(a0 - b1).max(0.0)
+}
 
 /// Слов в заголовке сетки и в записи клетки (раскладку читает шейдер).
 pub const GRID_HEADER_WORDS: usize = 20;
@@ -75,14 +143,22 @@ impl Grid {
     /// ([`crate::shape3d::level_field_object`]) — отдельно от списков.
     pub fn build(objects: &[Program]) -> Self {
         let field = crate::shape3d::level_field_object(objects).map(|i| i as u32);
-        Self::build_with(objects, field)
+        Self::build_with(objects, field, GridOptions::default())
     }
 
     /// То же с полем уровня `field` (номер объекта; `None` — все бесконечные формы в
-    /// списке, как до 7.18д3).
-    pub fn build_with(objects: &[Program], field: Option<u32>) -> Self {
-        let mut grid = Self::build_lists(objects, field);
-        grid.fill_free(objects);
+    /// списке, как до 7.18д3) и настройками `options`.
+    pub fn build_with(objects: &[Program], field: Option<u32>, options: GridOptions) -> Self {
+        let bounds = object_bounds(objects, options.boxes);
+        let max_cells = if options.boxes {
+            MAX_CELLS
+        } else {
+            SPHERE_MAX_CELLS
+        };
+        let mut grid = Self::lists(objects, field, &bounds, max_cells);
+        if options.free {
+            grid.fill_free(&bounds);
+        }
         grid
     }
 
@@ -94,9 +170,8 @@ impl Grid {
         }
     }
 
-    /// Сетка только со списками, без свободного расстояния (как [`Grid::clear_free`], но
-    /// без работы на него): шаг в пустоте не длиннее клетки, как до 7.18д4.
-    pub fn build_lists(objects: &[Program], field: Option<u32>) -> Self {
+    /// Списки клеток по границам `bounds`, не больше `max_cells` клеток.
+    fn lists(objects: &[Program], field: Option<u32>, bounds: &[Bound], max_cells: usize) -> Self {
         let planes = crate::shape3d::plane_objects(objects);
         let (mut unbounded, flat): (Vec<u32>, Vec<u32>) = (0..objects.len() as u32)
             .filter(|&i| objects[i as usize].bounds.is_none() && Some(i) != field)
@@ -109,25 +184,23 @@ impl Grid {
             field,
             ..Grid::default()
         };
-        let finite: Vec<(u32, Vec3, f32)> = objects
-            .iter()
-            .enumerate()
-            .filter_map(|(i, p)| p.bounds.map(|(c, r)| (i as u32, c, r.max(0.0))))
-            .collect();
-        if finite.is_empty() {
+        if bounds.is_empty() {
             return grid;
         }
         let mut lo = Vec3::splat(f32::INFINITY);
         let mut hi = Vec3::splat(f32::NEG_INFINITY);
-        for &(_, c, r) in &finite {
-            lo = lo.min(c - r);
-            hi = hi.max(c + r);
+        for b in bounds {
+            lo = lo.min(b.lo - b.r);
+            hi = hi.max(b.hi + b.r);
         }
         let extent = (hi - lo).max(Vec3::splat(MIN_CELL));
         // Клетка — по объёму сцены, но не крупнее радиуса обычного предмета: в большой и
         // густой сцене крупная клетка собирает длинные списки соседей, и каждый шаг
         // луча перебирает их все (на 200 предметах это и было узким местом).
-        let mut sizes: Vec<f32> = finite.iter().map(|f| f.2).collect();
+        let mut sizes: Vec<f32> = objects
+            .iter()
+            .filter_map(|p| p.bounds.map(|b| b.1.max(0.0)))
+            .collect();
         let mid = sizes.len() / 2;
         let typical = *sizes.select_nth_unstable_by(mid, f32::total_cmp).1;
         let mut cell = ((extent.x * extent.y * extent.z) / TARGET_CELLS)
@@ -139,7 +212,7 @@ impl Grid {
             // объекта не меньше клетки, и луч снаружи подходит к ней большими шагами.
             let d = ((extent + 2.0 * cell) / cell).ceil();
             let dims = [d.x as u32, d.y as u32, d.z as u32];
-            if dims.iter().map(|&d| d as usize).product::<usize>() <= MAX_CELLS {
+            if dims.iter().map(|&d| d as usize).product::<usize>() <= max_cells {
                 break dims;
             }
             cell *= 1.25;
@@ -152,33 +225,54 @@ impl Grid {
         grid.inner_lo = lo;
         grid.inner_hi = hi;
 
-        // Клетки, которых касается шар объекта, расширенный на margin. Два прохода:
-        // сначала счёт (сколько объектов в каждой клетке), потом раскладка по местам —
-        // без отдельного списка на клетку.
+        // Клетки, к которым граница объекта ближе margin. Два прохода: сначала счёт
+        // (сколько объектов в каждой клетке), потом раскладка по местам — без отдельного
+        // списка на клетку.
         let [nx, ny, nz] = dims.map(|d| d as usize);
         let top = Vec3::new(nx as f32 - 1.0, ny as f32 - 1.0, nz as f32 - 1.0);
-        let touched = |c: Vec3, r: f32, f: &mut dyn FnMut(usize)| {
-            let reach = r + margin;
-            let a = ((c - reach - grid.origin) / cell)
+        let origin = grid.origin;
+        // Клетки по осям, которых граница касается, и квадраты зазоров до них; клетка
+        // в списке, если сумма зазоров меньше reach². Одни и те же для счёта и раскладки.
+        let touched = |b: &Bound, f: &mut dyn FnMut(usize)| {
+            let reach = b.r + margin;
+            // На клетку шире с каждой стороны: на самой границе округление в делении
+            // могло бы потерять клетку, которую сравнение ниже (и свободное расстояние,
+            // `fill_free`) считает близкой. Лишние клетки отсеет сравнение.
+            let first = ((b.lo - reach - origin) / cell - 1.0)
                 .floor()
                 .clamp(Vec3::ZERO, top);
-            let b = ((c + reach - grid.origin) / cell)
+            let last = ((b.hi + reach - origin) / cell + 1.0)
                 .floor()
                 .clamp(Vec3::ZERO, top);
-            for z in a.z as usize..=b.z as usize {
-                for y in a.y as usize..=b.y as usize {
-                    for x in a.x as usize..=b.x as usize {
-                        let lo = grid.origin + Vec3::new(x as f32, y as f32, z as f32) * cell;
-                        if c.distance_squared(c.clamp(lo, lo + cell)) < reach * reach {
-                            f((z * ny + y) * nx + x);
+            let axis = |k: usize, o: f32, b0: f32, b1: f32| {
+                let lo = o + k as f32 * cell;
+                let g = gap(lo, lo + cell, b0, b1);
+                g * g
+            };
+            let far = reach * reach;
+            let x0 = first.x as usize;
+            let gx: Vec<f32> = (x0..=last.x as usize)
+                .map(|x| axis(x, origin.x, b.lo.x, b.hi.x))
+                .collect();
+            for z in first.z as usize..=last.z as usize {
+                let dz = axis(z, origin.z, b.lo.z, b.hi.z);
+                for y in first.y as usize..=last.y as usize {
+                    let dyz = dz + axis(y, origin.y, b.lo.y, b.hi.y);
+                    if dyz >= far {
+                        continue;
+                    }
+                    let row = (z * ny + y) * nx + x0;
+                    for (k, &dx) in gx.iter().enumerate() {
+                        if dyz + dx < far {
+                            f(row + k);
                         }
                     }
                 }
             }
         };
         let mut counts = vec![0u32; nx * ny * nz];
-        for &(_, c, r) in &finite {
-            touched(c, r, &mut |k| counts[k] += 1);
+        for b in bounds {
+            touched(b, &mut |k| counts[k] += 1);
         }
         let mut start = 0;
         grid.cells = counts
@@ -195,9 +289,9 @@ impl Grid {
             .collect();
         grid.items = vec![0; start as usize];
         let mut fill: Vec<u32> = grid.cells.iter().map(|c| c.start).collect();
-        for &(i, c, r) in &finite {
-            touched(c, r, &mut |k| {
-                grid.items[fill[k] as usize] = i;
+        for b in bounds {
+            touched(b, &mut |k| {
+                grid.items[fill[k] as usize] = b.index;
                 fill[k] += 1;
             });
         }
@@ -205,65 +299,71 @@ impl Grid {
     }
 
     /// Свободное расстояние клеток (7.18д4): для клетки — наименьшее по конечным объектам
-    /// расстояние от её коробки до шара-границы, но не больше [`FREE_CAP`]. Каждый объект
+    /// не из её списка расстояние от её коробки до границы, но не больше [`FREE_CAP`]
+    /// (объекты списка шаг считает точно, им оценка не нужна; до 8.8а они тоже входили, и
+    /// у клетки рядом с предметом оценка была почти 0 — углы в открытых местах чуть
+    /// темнели). Каждый объект
     /// метит только клетки ближе [`FREE_CAP`] к себе (у остальных до него не меньше
     /// FREE_CAP), квадрат расстояния до коробки — сумма трёх заранее посчитанных по осям.
     /// Округление вниз до миллиметра и ещё −1 мм: шейдер находит клетку точки с ошибкой
     /// округления, запас её покрывает.
-    fn fill_free(&mut self, objects: &[Program]) {
+    fn fill_free(&mut self, bounds: &[Bound]) {
         if self.cells.is_empty() {
             return;
         }
         let [nx, ny, nz] = self.dims.map(|d| d as usize);
         let mut free = vec![FREE_CAP; self.cells.len()];
-        // Зазор по оси между отрезком клетки и точкой `c` (0 — точка над клеткой).
-        let gap = |c: f32, o: f32, k: usize| {
+        // Квадрат зазора по оси между отрезком клетки `k` и отрезком границы `b0..b1`.
+        let axis = |b0: f32, b1: f32, o: f32, k: usize| {
             let lo = o + k as f32 * self.cell;
-            let hi = lo + self.cell;
-            let g = (lo - c).max(c - hi).max(0.0);
+            let g = gap(lo, lo + self.cell, b0, b1);
             g * g
         };
-        let range = |c: f32, reach: f32, o: f32, n: usize| {
-            let a = ((c - reach - o) / self.cell).floor().max(0.0) as usize;
-            let b = ((c + reach - o) / self.cell).floor().min(n as f32 - 1.0);
+        let range = |b0: f32, b1: f32, reach: f32, o: f32, n: usize| {
+            let a = ((b0 - reach - o) / self.cell).floor().max(0.0) as usize;
+            let b = ((b1 + reach - o) / self.cell).floor().min(n as f32 - 1.0);
             (a, if b < 0.0 { None } else { Some(b as usize) })
         };
         let (mut gx, mut gy, mut gz) = (Vec::new(), Vec::new(), Vec::new());
-        for (c, r) in objects.iter().filter_map(|p| p.bounds) {
-            let r = r.max(0.0);
+        for b in bounds {
+            let r = b.r;
             let reach = r + FREE_CAP;
-            let (x0, Some(x1)) = range(c.x, reach, self.origin.x, nx) else {
+            let (x0, Some(x1)) = range(b.lo.x, b.hi.x, reach, self.origin.x, nx) else {
                 continue;
             };
-            let (y0, Some(y1)) = range(c.y, reach, self.origin.y, ny) else {
+            let (y0, Some(y1)) = range(b.lo.y, b.hi.y, reach, self.origin.y, ny) else {
                 continue;
             };
-            let (z0, Some(z1)) = range(c.z, reach, self.origin.z, nz) else {
+            let (z0, Some(z1)) = range(b.lo.z, b.hi.z, reach, self.origin.z, nz) else {
                 continue;
             };
             if x0 > x1 || y0 > y1 || z0 > z1 {
                 continue;
             }
             gx.clear();
-            gx.extend((x0..=x1).map(|k| gap(c.x, self.origin.x, k)));
+            gx.extend((x0..=x1).map(|k| axis(b.lo.x, b.hi.x, self.origin.x, k)));
             gy.clear();
-            gy.extend((y0..=y1).map(|k| gap(c.y, self.origin.y, k)));
+            gy.extend((y0..=y1).map(|k| axis(b.lo.y, b.hi.y, self.origin.y, k)));
             gz.clear();
-            gz.extend((z0..=z1).map(|k| gap(c.z, self.origin.z, k)));
+            gz.extend((z0..=z1).map(|k| axis(b.lo.z, b.hi.z, self.origin.z, k)));
             let far = reach * reach;
+            // Ближе этого объект в списке клетки: то же сравнение, что в `lists`, теми же
+            // действиями над теми же числами, чтобы ответ совпадал до бита.
+            let listed = (r + self.margin) * (r + self.margin);
             for (z, &dz) in (z0..=z1).zip(&gz) {
                 for (y, &dy) in (y0..=y1).zip(&gy) {
-                    let dyz = dy + dz;
-                    // Вся строка дальше FREE_CAP от шара — её клетки он не меняет.
+                    let dyz = dz + dy;
+                    // Вся строка дальше FREE_CAP от границы — её клетки она не меняет.
                     if dyz >= far {
                         continue;
                     }
                     let row = (z * ny + y) * nx;
                     // Без ветвлений: цикл по строке складывается в векторные команды.
                     for (f, &dx) in free[row + x0..=row + x1].iter_mut().zip(&gx) {
-                        let d = (dx + dyz).sqrt() - r;
+                        let sum = dyz + dx;
+                        let d = sum.sqrt() - r;
                         // Не f32::min: сравнение складывается в одну команду minps.
-                        *f = if d < *f { d } else { *f };
+                        *f = if d < *f && sum >= listed { d } else { *f };
                     }
                 }
             }
@@ -494,8 +594,31 @@ mod tests {
             .fold(f32::INFINITY, f32::min)
     }
 
+    /// Как строится сетка: по коробкам (как сейчас) и по шарам (как до 8.8а).
+    const BOTH: [GridOptions; 2] = [
+        GridOptions {
+            free: true,
+            boxes: true,
+        },
+        GridOptions {
+            free: true,
+            boxes: false,
+        },
+    ];
+
+    fn build(objects: &[Program], options: GridOptions) -> Grid {
+        let field = crate::shape3d::level_field_object(objects).map(|i| i as u32);
+        Grid::build_with(objects, field, options)
+    }
+
     fn check(objects: &[Program]) {
-        let grid = Grid::build(objects);
+        for options in BOTH {
+            check_with(objects, options);
+        }
+    }
+
+    fn check_with(objects: &[Program], options: GridOptions) {
+        let grid = build(objects, options);
         assert!(grid.cells.len() <= MAX_CELLS);
         let mut seed = 12345u32;
         let mut rnd = || {
@@ -531,22 +654,42 @@ mod tests {
     }
 
     /// Свободное расстояние клетки (7.18д4) — точное расстояние от её коробки до
-    /// ближайшего шара-границы, округлённое вниз до миллиметра (и −1 мм), и не больше
-    /// FREE_CAP; в пустых местах шаг начинается заметно дальше клетки.
+    /// ближайшей границы объекта (коробки или шара, 8.8а), округлённое вниз до миллиметра
+    /// (и −1 мм), и не больше FREE_CAP; в пустых местах шаг начинается заметно дальше клетки.
     fn free_matches_brute(objects: &[Program]) {
-        let grid = Grid::build(objects);
+        for options in BOTH {
+            let (longer, cells) = free_matches_brute_with(objects, options);
+            assert!(
+                longer * 4 > cells,
+                "{options:?}: дальше двух клеток шаг начинается в {longer} из {cells}"
+            );
+        }
+    }
+
+    /// Сверка с перебором; ответ — в скольких клетках шаг начинается дальше двух клеток
+    /// и сколько клеток всего.
+    fn free_matches_brute_with(objects: &[Program], options: GridOptions) -> (usize, usize) {
+        let grid = build(objects, options);
         let [nx, ny, _] = grid.dims.map(|d| d as usize);
         let mut longer = 0;
         for (k, c) in grid.cells.iter().enumerate() {
             let (x, y, z) = (k % nx, (k / nx) % ny, k / (nx * ny));
             let lo = grid.origin + Vec3::new(x as f32, y as f32, z as f32) * grid.cell;
             let hi = lo + grid.cell;
+            let free = f32::from(c.free_mm) * 0.001;
+            let listed = &grid.items[c.start as usize..(c.start + c.count) as usize];
             let brute = objects
                 .iter()
-                .filter_map(|o| o.bounds)
-                .map(|(cc, r)| (cc.distance(cc.clamp(lo, hi)) - r.max(0.0)).max(0.0))
+                .enumerate()
+                .filter(|(i, o)| o.bounds.is_some() && !listed.contains(&(*i as u32)))
+                .map(|(_, o)| match (o.bounds_box, o.bounds) {
+                    (Some((blo, bhi)), _) if options.boxes => {
+                        (blo - hi).max(lo - bhi).max(Vec3::ZERO).length()
+                    }
+                    (_, Some((cc, r))) => (cc.distance(cc.clamp(lo, hi)) - r.max(0.0)).max(0.0),
+                    _ => unreachable!(),
+                })
                 .fold(FREE_CAP, f32::min);
-            let free = f32::from(c.free_mm) * 0.001;
             assert!(
                 free <= (brute - 0.0009).max(0.0),
                 "клетка {k}: {free} > {brute}"
@@ -558,11 +701,7 @@ mod tests {
             assert!(grid.start(k) >= grid.margin);
             longer += usize::from(grid.start(k) > 2.0 * grid.margin);
         }
-        assert!(
-            longer * 4 > grid.cells.len(),
-            "дальше двух клеток шаг начинается в {longer} из {}",
-            grid.cells.len()
-        );
+        (longer, grid.cells.len())
     }
 
     #[test]
@@ -600,6 +739,59 @@ mod tests {
             longer += usize::from(d > d0);
         }
         assert!(longer > 2000, "длиннее в {longer} точках");
+    }
+
+    /// Цех на тысячу предметов (8.7): по шарам 60-метровые стены попадали почти в каждую
+    /// клетку, а клетка росла до 3 м (до 63 объектов в списке). По коробкам (8.8а) клетка
+    /// мельче, а списки короче; сетка по-прежнему честная.
+    #[test]
+    fn factory_grid_lists_are_short() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/factory.ron");
+        let frame = crate::SpaceScene::parse_in(text, Some(dir))
+            .unwrap()
+            .frame(1.3);
+        // Как на видеокарте: предметы, потом невидимые заменители станков.
+        let objects: Vec<Program> = frame
+            .shapes
+            .iter()
+            .chain(&frame.proxies)
+            .map(|s| compile(s).unwrap())
+            .collect();
+        let stats = |options| {
+            let grid = build(&objects, options);
+            let longest = grid.cells.iter().map(|c| c.count).max().unwrap();
+            let filled: Vec<u32> = grid
+                .cells
+                .iter()
+                .map(|c| c.count)
+                .filter(|&c| c > 0)
+                .collect();
+            let mean = filled.iter().sum::<u32>() as f32 / filled.len() as f32;
+            (grid.cell, grid.dims, longest, mean, grid.words())
+        };
+        let boxes = stats(BOTH[0]);
+        let spheres = stats(BOTH[1]);
+        println!("коробки {boxes:?}, шары {spheres:?}");
+        assert!(
+            boxes.0 < spheres.0 * 0.5,
+            "клетка {} и {}",
+            boxes.0,
+            spheres.0
+        );
+        assert!(boxes.2 <= 24, "в клетке {} объектов", boxes.2);
+        assert!(
+            boxes.2 * 2 < spheres.2,
+            "списки {} и {}",
+            boxes.2,
+            spheres.2
+        );
+        // Сетка не съедает буфер кадра (MAX_WORDS = 1М слов).
+        assert!(boxes.4 < 400_000, "сетка {} слов", boxes.4);
+        check(&objects);
+        for options in BOTH {
+            free_matches_brute_with(&objects, options);
+        }
     }
 
     #[test]
