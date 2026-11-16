@@ -2548,12 +2548,14 @@ pub(crate) mod tests {
             "без опыта 8.11б — четыре луча у всех"
         );
 
-        // «Края: два луча вдали» (8.11б) с разными порогами: чем больше порог, тем меньше
-        // краёв с двумя лучами; лучей краёв меньше, картинка отличается только на этих
-        // краях.
+        // «Края: два луча вдали» (8.11б) с разными порогами (метров при высоте 1080): чем
+        // больше порог, тем меньше краёв с двумя лучами; лучей краёв меньше, картинка
+        // отличается только на этих краях. С порогом по умолчанию — часть краёв, не все.
+        // Замер 960×540 (порог при этой высоте вдвое больше): 2.5 см — 77 % краёв с
+        // двумя лучами, 5 см — 13 %, 10 см и больше — ни одного.
         let edge_rays = |s: &crate::demo::SpaceStats| s.rays.map(|r| r[4].rays);
         let mut last = u64::MAX;
-        for meters in [crate::demo::EDGE_FAR_METERS, 0.05, 0.1, 0.2, 0.4] {
+        for meters in [0.025, crate::demo::EDGE_FAR_METERS, 0.1] {
             EDGE_FAR.set(meters);
             SPACE_COUNTERS.set(true);
             let far = render_headless(&options, &scene);
@@ -2573,13 +2575,15 @@ pub(crate) mod tests {
                 edge_rays(&far_stats),
             );
             assert!(pairs <= last, "{pairs} > {last}");
+            if meters == crate::demo::EDGE_FAR_METERS {
+                assert!(pairs > 0 && pairs < edge_pixels, "{pairs} из {edge_pixels}");
+            }
             last = pairs;
             assert!(changed as u64 <= pairs, "{changed} > {pairs}");
             if let (Some(a), Some(b)) = (edge_rays(&stats), edge_rays(&far_stats)) {
                 assert!(pairs == 0 || b < a, "{a} → {b}");
             }
         }
-        panic!("ВРЕМЕННО: напечатать пороги в CI");
     }
 
     /// Поле уровня до перебора объектов (7.18д3): та же картинка до байта и те же шаги и
