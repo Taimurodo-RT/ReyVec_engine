@@ -236,7 +236,7 @@ pub(crate) fn pack_with(
 pub(crate) struct PackCache {
     pub grid: reyvec_sdf::grid3d::GridCache,
     meshes: Vec<(reyvec_sdf::space_file::MeshFrame, Vec<u32>)>,
-    programs: Vec<(Shape3, Result<Program, reyvec_sdf::shape3d::CompileError>)>,
+    programs: Vec<CachedProgram>,
 }
 
 /// То же, что [`pack_with`], с готовым из `cache`; слова те же.
@@ -344,11 +344,14 @@ pub(crate) fn programs(frame: &SpaceFrame) -> Vec<Program> {
     programs_cached(frame, None)
 }
 
+/// Запомненная программа формы (8.8б): форма и что из неё вышло; `None` — не запоминается.
+type CachedProgram = Option<(Shape3, Result<Program, reyvec_sdf::shape3d::CompileError>)>;
+
 /// То же; форма, такая же, как на том же месте в прошлом кадре, берёт готовую программу
 /// из `cache` (8.8б: неподвижные предметы не превращаются в программу каждый кадр).
 pub(crate) fn programs_cached(
     frame: &SpaceFrame,
-    mut cache: Option<&mut Vec<(Shape3, Result<Program, reyvec_sdf::shape3d::CompileError>)>>,
+    mut cache: Option<&mut Vec<CachedProgram>>,
 ) -> Vec<Program> {
     let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
     if let Some(cache) = cache.as_mut() {
@@ -361,13 +364,16 @@ pub(crate) fn programs_cached(
         let Some(cache) = cache.as_mut() else {
             return compile(s);
         };
-        if let Some((source, program)) = cache.get(n)
+        if let Some(Some((source, program))) = cache.get(n)
             && source == s
         {
             return program.clone();
         }
         let program = compile(s);
-        let entry = (s.clone(), program.clone());
+        // Формы с полем слоя (и с ошибкой) не запоминаются: копия держала бы поле, и уровень не смог бы
+        // перепечь его на месте (`Arc::get_mut`, «поле занято прошлым кадром»).
+        let holds_field = program.as_ref().map_or(true, |p| !p.fields.is_empty());
+        let entry = (!holds_field).then(|| (s.clone(), program.clone()));
         if n < cache.len() {
             cache[n] = entry;
         } else {
