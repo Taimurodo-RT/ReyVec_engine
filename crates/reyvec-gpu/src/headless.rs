@@ -1093,6 +1093,57 @@ pub(crate) mod tests {
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
+    /// Сцена завода (8.7): больше 1000 объектов, те, что в кадре, помещаются в предел шейдера
+    /// и буфер, кадр рисуется без ошибок проверки Vulkan. Время здесь не меряется
+    /// (программная видеокарта) — его меряем на ПК.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn factory_scene_fits() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 320,
+            height: 180,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/factory.ron").into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let frame = render_headless(&options, &scene).expect("кадр");
+        let stats = frame.space_stats.expect("числа сцены 3D");
+        eprintln!(
+            "завод: в кадре объектов {}, слов {}, {:?}, движется {}, процессор {:.2} + {:.2} мс",
+            stats.objects, stats.words, stats.frame, stats.moving, stats.build_ms, stats.pack_ms
+        );
+        assert!(stats.objects > 500, "объектов в кадре {}", stats.objects);
+        assert_eq!(stats.dropped, 0);
+        assert!(stats.overflow.is_none());
+        assert_eq!(stats.frame.proxies, 96);
+        // Не пустой кадр: пол, станки и ящики дают разные цвета.
+        let mut colors: Vec<[u8; 3]> = frame
+            .image
+            .rgba
+            .chunks_exact(4)
+            .map(|p| [p[0] / 32, p[1] / 32, p[2] / 32])
+            .collect();
+        colors.sort_unstable();
+        colors.dedup();
+        assert!(colors.len() > 20, "цветов {}", colors.len());
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
     /// Тени моделей от кирпичей поля (8.15) — почти те же, что от прежних заменителей из
     /// плоскостей граней: сцена моделей рисуется с кирпичами, с плоскостями и совсем без
     /// теней моделей. Кирпичи от плоскостей отличаются намного меньше, чем «без теней»

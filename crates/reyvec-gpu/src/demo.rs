@@ -81,6 +81,20 @@ pub struct SpaceStats {
     /// Счётчики лучей по проходам (7.18д2) последнего законченного кадра этой ячейки, если
     /// он считал (флажок «Счётчики лучей 3D»); `None` — не считал.
     pub rays: Option<[crate::counters::RayCounts; crate::counters::RAY_PASSES]>,
+    /// Кадр сцены до отсева по взгляду (8.7): предметов (формы и светящиеся), заменителей
+    /// моделей для теней, частей моделей и их граней.
+    pub frame: FrameCounts,
+    /// Сколько предметов и моделей сцены движется (8.7; у 2.5D-вида 0).
+    pub moving: usize,
+}
+
+/// Из чего состоит кадр сцены «3D» до отсева по взгляду (8.7).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameCounts {
+    pub shapes: usize,
+    pub proxies: usize,
+    pub mesh_parts: usize,
+    pub triangles: usize,
 }
 
 /// Конвейеры проходов лучей 3D со счётчиками (7.18д2, шейдеры `*_counted.slang`).
@@ -3498,6 +3512,12 @@ impl Demo {
                 self.swap_extrudes(ctx, res, &mut frame);
             }
             let built = std::time::Instant::now();
+            let frame_counts = FrameCounts {
+                shapes: frame.shapes.len() + frame.glows.len(),
+                proxies: frame.proxies.len(),
+                mesh_parts: frame.meshes.len(),
+                triangles: frame.meshes.iter().map(|m| m.triangles.len()).sum(),
+            };
             // Поле расстояний — только у сцены «3D»: у уровня почти всё движется вместе
             // с камерой и героем, пересчёт стоил бы дороже, чем экономит (7.12).
             if level {
@@ -3598,6 +3618,8 @@ impl Demo {
                 edge_unreliable,
                 pixels: space_extent.width * space_extent.height,
                 rays,
+                frame: frame_counts,
+                moving: if level { 0 } else { self.space.moving_count() },
             });
         } else {
             self.space_field.skip();

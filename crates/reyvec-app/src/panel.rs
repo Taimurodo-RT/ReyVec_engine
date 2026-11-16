@@ -1148,6 +1148,8 @@ const RAYMARCH_PASSES: [&str; 5] = [
     "края 3D",
 ];
 const RAYMARCH_BUDGET_MS: f64 = 2.0;
+/// Бюджет подготовки кадра 3D на процессоре (цель этапа 8: 1000+ объектов, ≤ 1 мс).
+const CPU_BUDGET_MS: f64 = 1.0;
 
 /// Строка сетки отсева и отсева по взгляду объёмного кадра (сцена «3D» и 2.5D-вид).
 fn grid_text(info: &PanelInfo) -> String {
@@ -1252,10 +1254,20 @@ fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats, counting: bo
         None => "Края 3D: число пикселей неизвестно (сглаживание выключено)".to_string(),
     };
     ui.label(mono(edges));
+    let f = &s.frame;
     ui.label(mono(format!(
-        "Процессор: сборка форм 3D {:.2} мс, отсев, упаковка и запись {:.2} мс",
-        s.build_ms, s.pack_ms
+        "Кадр 3D до отсева: предметов {}, движется {}, моделей {} частей ({} граней), \
+         заменителей для теней {}",
+        f.shapes, s.moving, f.mesh_parts, f.triangles, f.proxies
     )));
+    ui.label(
+        mono(format!(
+            "Процессор: сборка форм 3D {:.2} мс, отсев, упаковка и запись {:.2} мс \
+             (бюджет {CPU_BUDGET_MS} мс)",
+            s.build_ms, s.pack_ms
+        ))
+        .color(budget_color(s.build_ms + s.pack_ms, CPU_BUDGET_MS)),
+    );
     let (max_objects, max_words) = (reyvec_gpu::MAX_SCENE_OBJECTS, reyvec_gpu::MAX_SCENE_WORDS);
     let share = (f64::from(s.objects) / max_objects as f64).max(s.words as f64 / max_words as f64);
     ui.label(
@@ -1538,6 +1550,13 @@ mod tests {
                 edge_pixels: Some(61_200),
                 edge_unreliable: Some(25_100),
                 pixels: 1280 * 720,
+                frame: reyvec_gpu::FrameCounts {
+                    shapes: 150,
+                    proxies: 4,
+                    mesh_parts: 10,
+                    triangles: 800,
+                },
+                moving: 12,
                 rays: Some(
                     [reyvec_gpu::RayCounts {
                         rays: 2_073_600,
