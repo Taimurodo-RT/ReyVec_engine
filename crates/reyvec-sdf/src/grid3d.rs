@@ -235,10 +235,13 @@ impl Grid {
         // в списке, если сумма зазоров меньше reach². Одни и те же для счёта и раскладки.
         let touched = |b: &Bound, f: &mut dyn FnMut(usize)| {
             let reach = b.r + margin;
-            let first = ((b.lo - reach - origin) / cell)
+            // На клетку шире с каждой стороны: на самой границе округление в делении
+            // могло бы потерять клетку, которую сравнение ниже (и свободное расстояние,
+            // `fill_free`) считает близкой. Лишние клетки отсеет сравнение.
+            let first = ((b.lo - reach - origin) / cell - 1.0)
                 .floor()
                 .clamp(Vec3::ZERO, top);
-            let last = ((b.hi + reach - origin) / cell)
+            let last = ((b.hi + reach - origin) / cell + 1.0)
                 .floor()
                 .clamp(Vec3::ZERO, top);
             let axis = |k: usize, o: f32, b0: f32, b1: f32| {
@@ -296,7 +299,10 @@ impl Grid {
     }
 
     /// Свободное расстояние клеток (7.18д4): для клетки — наименьшее по конечным объектам
-    /// расстояние от её коробки до шара-границы, но не больше [`FREE_CAP`]. Каждый объект
+    /// не из её списка расстояние от её коробки до границы, но не больше [`FREE_CAP`]
+    /// (объекты списка шаг считает точно, им оценка не нужна; до 8.8а они тоже входили, и
+    /// у клетки рядом с предметом оценка была почти 0 — углы в открытых местах чуть
+    /// темнели). Каждый объект
     /// метит только клетки ближе [`FREE_CAP`] к себе (у остальных до него не меньше
     /// FREE_CAP), квадрат расстояния до коробки — сумма трёх заранее посчитанных по осям.
     /// Округление вниз до миллиметра и ещё −1 мм: шейдер находит клетку точки с ошибкой
@@ -341,9 +347,12 @@ impl Grid {
             gz.clear();
             gz.extend((z0..=z1).map(|k| axis(b.lo.z, b.hi.z, self.origin.z, k)));
             let far = reach * reach;
+            // Ближе этого объект в списке клетки: то же сравнение, что в `lists`, теми же
+            // действиями над теми же числами, чтобы ответ совпадал до бита.
+            let listed = (r + self.margin) * (r + self.margin);
             for (z, &dz) in (z0..=z1).zip(&gz) {
                 for (y, &dy) in (y0..=y1).zip(&gy) {
-                    let dyz = dy + dz;
+                    let dyz = dz + dy;
                     // Вся строка дальше FREE_CAP от границы — её клетки она не меняет.
                     if dyz >= far {
                         continue;
@@ -351,9 +360,10 @@ impl Grid {
                     let row = (z * ny + y) * nx;
                     // Без ветвлений: цикл по строке складывается в векторные команды.
                     for (f, &dx) in free[row + x0..=row + x1].iter_mut().zip(&gx) {
-                        let d = (dx + dyz).sqrt() - r;
+                        let sum = dyz + dx;
+                        let d = sum.sqrt() - r;
                         // Не f32::min: сравнение складывается в одну команду minps.
-                        *f = if d < *f { d } else { *f };
+                        *f = if d < *f && sum >= listed { d } else { *f };
                     }
                 }
             }
@@ -666,19 +676,20 @@ mod tests {
             let (x, y, z) = (k % nx, (k / nx) % ny, k / (nx * ny));
             let lo = grid.origin + Vec3::new(x as f32, y as f32, z as f32) * grid.cell;
             let hi = lo + grid.cell;
+            let free = f32::from(c.free_mm) * 0.001;
+            let listed = &grid.items[c.start as usize..(c.start + c.count) as usize];
             let brute = objects
                 .iter()
-                .filter(|o| o.bounds.is_some())
-                .map(|o| match (o.bounds_box, o.bounds) {
+                .enumerate()
+                .filter(|(i, o)| o.bounds.is_some() && !listed.contains(&(*i as u32)))
+                .map(|(_, o)| match (o.bounds_box, o.bounds) {
                     (Some((blo, bhi)), _) if options.boxes => {
-                        let g = (blo - hi).max(lo - bhi).max(Vec3::ZERO);
-                        g.length()
+                        (blo - hi).max(lo - bhi).max(Vec3::ZERO).length()
                     }
                     (_, Some((cc, r))) => (cc.distance(cc.clamp(lo, hi)) - r.max(0.0)).max(0.0),
                     _ => unreachable!(),
                 })
                 .fold(FREE_CAP, f32::min);
-            let free = f32::from(c.free_mm) * 0.001;
             assert!(
                 free <= (brute - 0.0009).max(0.0),
                 "клетка {k}: {free} > {brute}"
