@@ -393,6 +393,17 @@ impl App {
                 r.set_space_free(on);
                 tracing::info!("Длинный шаг в пустоте: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::SpaceBoxes(on) => {
+                r.set_space_boxes(on);
+                tracing::info!(
+                    "Сетка отсева 3D: {}",
+                    if on {
+                        "по коробкам"
+                    } else {
+                        "по шарам"
+                    }
+                );
+            }
             PanelAction::EdgeCreases(on) => {
                 r.set_edge_creases(on);
                 tracing::info!(
@@ -652,6 +663,7 @@ impl App {
                 space_smooth: renderer.space_smooth(),
                 space_counters: renderer.space_counters(),
                 space_free: renderer.space_free(),
+                space_boxes: renderer.space_boxes(),
                 edge_probe: renderer.edge_probe(),
                 edge_creases: renderer.edge_creases(),
                 edge_shadow_reuse: renderer.edge_shadow_reuse(),

@@ -704,6 +704,8 @@ pub(crate) struct Demo {
     level_field_apart: bool,
     /// Длинный шаг в пустоте (7.18д4, флажок на панели).
     space_free: bool,
+    /// Сетка отсева по плотным коробкам (8.8а, флажок на панели).
+    space_boxes: bool,
     /// Замер «краёв 3D» по частям (8.1).
     edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2; `false` — как до 8.2, для сравнения).
@@ -1069,6 +1071,7 @@ impl Demo {
             space_counters_on: false,
             level_field_apart: true,
             space_free: true,
+            space_boxes: true,
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,
@@ -1859,6 +1862,16 @@ impl Demo {
     /// сравнения картинки и времени).
     pub fn set_space_free(&mut self, on: bool) {
         self.space_free = on;
+    }
+
+    /// Сетка отсева по плотным коробкам предметов (8.8а).
+    pub fn space_boxes(&self) -> bool {
+        self.space_boxes
+    }
+
+    /// Сетка по коробкам или по шарам, как до 8.8а (для сравнения времени).
+    pub fn set_space_boxes(&mut self, on: bool) {
+        self.space_boxes = on;
     }
 
     /// Замер «краёв 3D» по частям (8.1).
@@ -3549,7 +3562,10 @@ impl Demo {
                 materials,
                 culling,
                 self.level_field_apart,
-                self.space_free,
+                reyvec_sdf::grid3d::GridOptions {
+                    free: self.space_free,
+                    boxes: self.space_boxes,
+                },
             );
             self.space_grid = packed.grid;
             crate::space::set_view_proj(&mut packed.words, view_proj);

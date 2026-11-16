@@ -38,6 +38,8 @@ pub(crate) enum PanelAction {
     SpaceCounters(bool),
     /// Длинный шаг в пустоте (7.18д4).
     SpaceFree(bool),
+    /// Сетка отсева по плотным коробкам предметов (8.8а; выкл — по шарам, как раньше).
+    SpaceBoxes(bool),
     /// Замер «краёв 3D» по частям (8.1).
     EdgeProbe(EdgeProbe),
     EdgeCreases(bool),
@@ -148,6 +150,7 @@ pub(crate) struct PanelInfo<'a> {
     pub space_counters: (bool, bool),
     /// Длинный шаг в пустоте (7.18д4): включён ли.
     pub space_free: bool,
+    pub space_boxes: bool,
     /// Замер «краёв 3D» по частям (8.1).
     pub edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2).
@@ -794,6 +797,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             .changed()
         {
             actions.push(PanelAction::SpaceFree(free));
+        }
+        let mut boxes = info.space_boxes;
+        if ui
+            .checkbox(&mut boxes, "Сетка отсева по коробкам")
+            .on_hover_text(
+                "Сетка, по которой луч узнаёт, какие предметы рядом, строится по плотным \
+                 коробкам предметов, а не по шарам вокруг них: длинная стена больше не \
+                 попадает в каждую клетку, и в сцене на тысячу предметов клетки мельче. \
+                 Выключите, чтобы сравнить время с тем, как было",
+            )
+            .changed()
+        {
+            actions.push(PanelAction::SpaceBoxes(boxes));
         }
         if info.space_smooth.0 {
             let mut creases = info.edge_creases;
@@ -1574,6 +1590,7 @@ mod tests {
             space_smooth: (true, true),
             space_counters: (true, true),
             space_free: true,
+            space_boxes: true,
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,

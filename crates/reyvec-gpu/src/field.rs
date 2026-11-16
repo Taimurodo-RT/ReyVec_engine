@@ -11,6 +11,7 @@
 use ash::vk;
 use reyvec_sdf::Program;
 use reyvec_sdf::field3d::{BrickJob, FIELD_LEVELS, FieldWindow, brick_objects, changed_bounds};
+use reyvec_sdf::grid3d::GridOptions;
 use reyvec_sdf::shape3d::pack_scene_with;
 
 use crate::bindless::Bindless;
@@ -46,7 +47,16 @@ pub(crate) fn pack_jobs(programs: &[Program], jobs: &[BrickJob], size: i32) -> V
         out.extend(list);
     }
     // Сетку отсева запекание не читает: свободное расстояние ей не нужно.
-    out.extend(pack_scene_with(programs, &[], &[], true, false));
+    out.extend(pack_scene_with(
+        programs,
+        &[],
+        &[],
+        true,
+        GridOptions {
+            free: false,
+            boxes: true,
+        },
+    ));
     out
 }
 
