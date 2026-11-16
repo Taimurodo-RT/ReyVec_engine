@@ -60,8 +60,8 @@ pub use context::{GpuOptions, list_adapters, validation_error_count};
 pub use counters::{RAY_PASS_NAMES, RAY_PASSES, RayCounts};
 pub use cull::CullStats;
 pub use demo::{
-    DemoScene, EdgeProbe, MAX_EDGE_PIXELS, MAX_SCENE_OBJECTS, MAX_SCENE_WORDS, Msaa, PlayerStats,
-    SpaceScale, SpaceStats, UserFiles, VectorCpu,
+    DemoScene, EdgeProbe, FrameCounts, MAX_EDGE_PIXELS, MAX_SCENE_OBJECTS, MAX_SCENE_WORDS, Msaa,
+    PlayerStats, SpaceScale, SpaceStats, UserFiles, VectorCpu,
 };
 pub use demo_load::{LastLoad, LoadStats, ShapeMemory};
 pub use demo_vector::LIGHT_VECTOR_TOP;

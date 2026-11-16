@@ -80,7 +80,7 @@ Ray screen_ray(float2 s)
     return r;
 }
 
-static const uint MAX_OBJECTS = 1024;
+static const uint MAX_OBJECTS = 4096;
 static const uint MAX_PROGRAM_WORDS = 16384;
 
 static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS

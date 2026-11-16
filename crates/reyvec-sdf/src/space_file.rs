@@ -509,6 +509,26 @@ impl SpaceScene {
         })
     }
 
+    /// Сколько предметов и моделей движется (покачивание, круг, вращение; 8.7).
+    pub fn moving_count(&self) -> usize {
+        let moves = |bob: &Bob, circle: &Circle, spin: &[f32; 3]| {
+            bob.period != 0.0 && bob.by != [0.0; 3]
+                || circle.period != 0.0 && circle.radius != [0.0; 2]
+                || spin.iter().any(|&s| s != 0.0)
+        };
+        self.objects
+            .iter()
+            .filter(|o| {
+                moves(&o.bob, &o.circle, &o.spin) || matches!(o.shape, Shape3::Animate { .. })
+            })
+            .count()
+            + self
+                .meshes
+                .iter()
+                .filter(|m| moves(&m.entry.bob, &m.entry.circle, &m.entry.spin))
+                .count()
+    }
+
     /// Сколько полигональных моделей в сцене.
     pub fn mesh_count(&self) -> usize {
         self.meshes.len()
@@ -761,6 +781,31 @@ mod tests {
             .fold(0.0, f32::max);
         assert!((top - 0.75).abs() < 1e-4, "{top}");
         assert!(scene.notes.is_empty(), "{:?}", scene.notes);
+    }
+
+    #[test]
+    fn factory_scene_has_thousand_objects() {
+        // Сцена-нагрузка 8.7: больше 1000 предметов, 96 станков с одним общим кирпичом
+        // поля, часть движется; в кадре все объекты помещаются в предел шейдера.
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/factory.ron");
+        let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
+        assert!(scene.object_count() >= 1000, "{}", scene.object_count());
+        assert_eq!(scene.mesh_count(), 96);
+        assert_eq!(
+            scene.bricks.len(),
+            1,
+            "одна модель одного размера — один кирпич"
+        );
+        assert!(scene.moving_count() > 300, "{}", scene.moving_count());
+        assert!(scene.notes.is_empty(), "{:?}", scene.notes);
+        let frame = scene.frame(1.0);
+        assert_eq!(frame.proxies.len(), 96);
+        let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
+        assert!(
+            total > 1000 && total <= crate::shape3d::MAX_OBJECTS,
+            "{total}"
+        );
     }
 
     #[test]
