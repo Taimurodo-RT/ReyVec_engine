@@ -81,6 +81,9 @@ pub struct SpaceStats {
     /// Счётчики лучей по проходам (7.18д2) последнего законченного кадра этой ячейки, если
     /// он считал (флажок «Счётчики лучей 3D»); `None` — не считал.
     pub rays: Option<[crate::counters::RayCounts; crate::counters::RAY_PASSES]>,
+    /// Счётчики краёв по причине (8.11а) того же кадра; `None` — как у `rays` или
+    /// сглаживание краёв выключено.
+    pub edge_kinds: Option<crate::counters::EdgeCounts>,
     /// Кадр сцены до отсева по взгляду (8.7): предметов (формы и светящиеся), заменителей
     /// моделей для теней, частей моделей и их граней.
     pub frame: FrameCounts,
@@ -107,6 +110,7 @@ struct CountedPipelines {
     march_compute: vk::Pipeline,
     shadow: vk::Pipeline,
     edges: vk::Pipeline,
+    edge_find: vk::Pipeline,
 }
 
 impl CountedPipelines {
@@ -121,6 +125,7 @@ impl CountedPipelines {
             march_compute: vk::Pipeline::null(),
             shadow: vk::Pipeline::null(),
             edges: vk::Pipeline::null(),
+            edge_find: vk::Pipeline::null(),
         };
         let result = (|| {
             made.cone = build(
@@ -162,6 +167,11 @@ impl CountedPipelines {
                     layout,
                     shaders.compute("raymarch_edges_counted"),
                 )?;
+                made.edge_find = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_edge_find_counted"),
+                )?;
             }
             Ok(())
         })();
@@ -184,6 +194,7 @@ impl CountedPipelines {
                 self.march_compute,
                 self.shadow,
                 self.edges,
+                self.edge_find,
             ] {
                 ctx.device.destroy_pipeline(p, None);
             }
@@ -2015,7 +2026,10 @@ impl Demo {
         &self,
         res: &GpuResources,
         slot: usize,
-    ) -> Option<[crate::counters::RayCounts; crate::counters::RAY_PASSES]> {
+    ) -> Option<(
+        [crate::counters::RayCounts; crate::counters::RAY_PASSES],
+        crate::counters::EdgeCounts,
+    )> {
         if !self.space_counted_slots.get(slot).copied().unwrap_or(false) {
             return None;
         }
@@ -3499,7 +3513,10 @@ impl Demo {
             // (он закончен: его забор дождались перед подготовкой), времена — отсюда.
             let edge_pixels = space_edges.and_then(|_| self.edge_pixels(res, slot));
             let edge_unreliable = space_edges.and_then(|_| self.edge_unreliable(res, slot));
-            let rays = self.ray_counts(res, slot);
+            let (rays, edge_kinds) = match self.ray_counts(res, slot) {
+                Some((rays, edges)) => (Some(rays), space_edges.map(|_| edges)),
+                None => (None, None),
+            };
             let started = std::time::Instant::now();
             let mut baked_inline = std::time::Duration::ZERO;
             let (mut frame, level_materials) = if level {
@@ -3637,6 +3654,7 @@ impl Demo {
                 edge_unreliable,
                 pixels: space_extent.width * space_extent.height,
                 rays,
+                edge_kinds,
                 frame: frame_counts,
                 moving: if level { 0 } else { self.space.moving_count() },
             });
@@ -4526,8 +4544,11 @@ impl Demo {
                 | if self.edge_shadow_reuse { 0x200 } else { 0 };
             // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
             // расходятся, — край, даже если буфер геометрии у соседей одинаков.
+            // Тени — для счётчиков краёв (8.11а): вариант со счётчиками освещает пиксель
+            // и соседа за краем, чтобы узнать, виден ли край глазом.
             let mut find_uses = vec![
                 (gbuffer, Access::ComputeSampled),
+                (shadows, Access::ComputeSampled),
                 (edges, Access::ComputeWrite),
             ];
             if let Some(m) = meshes {
@@ -4541,6 +4562,7 @@ impl Demo {
                     frame.space_address,
                     SpaceSlots {
                         gbuffer: p.texture(gbuffer),
+                        shadows: p.texture(shadows),
                         target: p.storage(edges),
                         meshes: meshes.map_or(0, |m| p.texture(m)),
                         edges: list,
@@ -4619,7 +4641,10 @@ impl Demo {
                         &vk::DependencyInfo::default().memory_barriers(&after_reset),
                     );
                     bindless.bind_compute(d, cmd);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.space_edge_find);
+                    let pipeline = frame
+                        .space_counters
+                        .map_or(self.space_edge_find, |c| c.0.edge_find);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
                     d.cmd_pipeline_barrier2(

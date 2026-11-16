@@ -39,40 +39,90 @@ float2 pixel_screen(int2 px, float2 size)
 // списка дают до ⌈U/16⌉ + ⌈R/16⌉ групп: на одну больше, чем один, поэтому 65534.
 static const uint MAX_EDGES = 65534 * 16;
 
-// `g0` — буфер геометрии в `px`.
-bool is_edge(int2 px, int2 size, float4 g0)
+// Почему пиксель — край (8.11а, счётчики краёв по причине): 0 — не край.
+static const uint EDGE_NONE = 0;
+static const uint EDGE_MESH = 1;     // образцы полигонов в пикселе расходятся
+static const uint EDGE_SKY = 2;      // небо против формы
+static const uint EDGE_MATERIAL = 3; // другой материал
+static const uint EDGE_NORMAL = 4;   // резкий поворот нормали (складка или силуэт)
+static const uint EDGE_DEPTH = 5;    // разрыв по глубине (силуэт на фоне той же стороны)
+
+// Причина края у пикселя `px` с буфером геометрии `g0` и сосед `q`, у которого она
+// найдена (для EDGE_MESH и EDGE_NONE — сам `px`).
+uint edge_reason(int2 px, int2 size, float4 g0, out int2 q)
 {
+    q = px;
     // Полигоны с образцами MSAA (7.18е2): пиксель, где образцы расходятся, — край, даже
     // если соседи по буферу геометрии одинаковы (щель уже пикселя).
     if (mesh_mixed(px, g0.x))
-        return true;
+        return EDGE_MESH;
     Ray r0 = screen_ray(pixel_screen(px, float2(size)));
     float3 n0 = oct_decode(g0.zw);
     float3 p0 = r0.origin + r0.dir * g0.x;
     for (uint k = 0; k < 4; k++)
     {
         int2 o = k < 2 ? int2(int(k) * 2 - 1, 0) : int2(0, int(k) * 2 - 5);
-        int2 q = px + o;
+        q = px + o;
         if (any(q < 0) || any(q >= size))
             continue;
         float4 g1 = gbuffer_load(q);
         if ((g0.x < 0.0) != (g1.x < 0.0))
-            return true;
+            return EDGE_SKY;
         if (g0.x < 0.0)
             continue;
         if (abs(g0.y - g1.y) > 0.5)
-            return true;
+            return EDGE_MATERIAL;
         if (dot(n0, oct_decode(g1.zw)) < 0.9)
-            return true;
+            return EDGE_NORMAL;
         // Где сосед был бы, лежи он на плоскости этой точки: на ровном полу и гранях
         // (даже под острым углом к лучу) совпадает, на крае формы — нет.
         Ray r1 = screen_ray(pixel_screen(q, float2(size)));
         float facing = dot(r1.dir, n0);
         float expected = abs(facing) > 1e-4 ? dot(p0 - r1.origin, n0) / facing : 1e30;
         if (abs(g1.x - expected) > 0.01 * g0.x + 0.01)
-            return true;
+            return EDGE_DEPTH;
     }
-    return false;
+    q = px;
+    return EDGE_NONE;
+}
+
+#ifdef SPACE_COUNTERS
+// Счётчики краёв (8.11а): у прохода PASS_EDGE_FIND свои значения в тех же восьми словах,
+// что у лучей (раскладка — EdgeCounts в crates/reyvec-gpu/src/counters.rs): пикселей края,
+// по причине (образцы полигонов, небо, материал, нормаль, глубина) и сколько из них
+// почти не видно глазом: цвет пикселя и соседа за краем после перевода в 8 бит экрана
+// различается не больше чем на 2 и на 8 ступеней. Цвет — как у «сцены» без сглаживания
+// (тени из картинки половинного размера, текстура полигонов не учитывается), перевод в
+// экран — степенью 1/2.2 без мягкого перехода к белому: для отбора идей, не для картинки.
+void count_edge(int2 px, int2 size, float4 g0, uint reason, int2 q)
+{
+    uint differs = 255;
+    if (reason != EDGE_NONE && reason != EDGE_MESH)
+    {
+        float3 a = shade_point(pixel_screen(px, float2(size)), g0, px);
+        float3 b = shade_point(pixel_screen(q, float2(size)), gbuffer_load(q), q);
+        float3 d = abs(pow(saturate(a), 1.0 / 2.2) - pow(saturate(b), 1.0 / 2.2)) * 255.0;
+        differs = uint(ceil(max(d.r, max(d.g, d.b))));
+    }
+    // Вычисления сцены внутри освещения не считаются: только числа краёв.
+    counters_reset();
+    bool edge = reason != EDGE_NONE;
+    counted_rays = edge ? 1 : 0;
+    counted_steps = reason == EDGE_MESH ? 1 : 0;
+    counted_scene = reason == EDGE_SKY ? 1 : 0;
+    counted_normal = reason == EDGE_MATERIAL ? 1 : 0;
+    counted_objects = reason == EDGE_NORMAL ? 1 : 0;
+    counted_forms = reason == EDGE_DEPTH ? 1 : 0;
+    counted_field = edge && differs <= 2 ? 1 : 0;
+    counted_material = edge && differs <= 8 ? 1 : 0;
+}
+#endif
+
+// `g0` — буфер геометрии в `px`.
+bool is_edge(int2 px, int2 size, float4 g0)
+{
+    int2 q;
+    return edge_reason(px, size, g0, q) != EDGE_NONE;
 }
 
 // Файл обязан иметь пару для рисования (build.rs собирает её у всех шейдеров); здесь
@@ -113,7 +163,14 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     int2 px = int2(id.xy);
     bool inside = id.x < w && id.y < h;
     float4 g0 = inside ? gbuffer_load(px) : float4(-1.0, 0.0, 0.0, 0.0);
-    bool edge = inside && is_edge(px, int2(w, h), g0);
+    int2 across;
+    uint reason = inside ? edge_reason(px, int2(w, h), g0, across) : EDGE_NONE;
+    bool edge = reason != EDGE_NONE;
+#ifdef SPACE_COUNTERS
+    if (inside)
+        count_edge(px, int2(w, h), g0, reason, across);
+    counters_flush(PASS_EDGE_FIND, counter_spread(px));
+#endif
     if (edge)
     {
         // Картинка теней — половина кадра с округлением вверх (как в demo.rs).

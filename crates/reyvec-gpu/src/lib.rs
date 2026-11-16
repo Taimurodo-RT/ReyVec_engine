@@ -57,7 +57,7 @@ mod window;
 pub use adapter::{AdapterInfo, AdapterKind, pick_adapter};
 pub use bindless::{MAX_TEXTURES, SamplerKind};
 pub use context::{GpuOptions, list_adapters, validation_error_count};
-pub use counters::{RAY_PASS_NAMES, RAY_PASSES, RayCounts};
+pub use counters::{EdgeCounts, RAY_PASS_NAMES, RAY_PASSES, RayCounts};
 pub use cull::CullStats;
 pub use demo::{
     DemoScene, EdgeProbe, FrameCounts, MAX_EDGE_PIXELS, MAX_SCENE_OBJECTS, MAX_SCENE_WORDS, Msaa,

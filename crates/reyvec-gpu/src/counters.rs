@@ -6,7 +6,8 @@
 //! Раскладка буфера — как в `counters_flush` (`include/space.slang`): на каждый проход
 //! [`COUNTERS`] счётчиков, у каждого [`COUNTER_SPREAD`] копий (разные волны кадра
 //! складывают в разные слова, а не все в одно по очереди), копия — 64 бита парой слов
-//! (младшее, старшее).
+//! (младшее, старшее). После проходов лучей — проход «края 3D: поиск» (8.11а): в его
+//! словах счётчики краёв ([`EdgeCounts`]).
 
 use ash::vk;
 
@@ -38,8 +39,12 @@ pub const PASS_EDGE_SHADOWS: usize = 5;
 const COUNTERS: usize = 8;
 /// Копий каждого счётчика.
 const COUNTER_SPREAD: usize = 32;
+/// Номер прохода «края 3D: поиск» (PASS_EDGE_FIND, 8.11а): в его словах — [`EdgeCounts`].
+pub const PASS_EDGE_FIND: usize = RAY_PASSES;
+/// Проходов в буфере: лучи и поиск краёв.
+const ALL_PASSES: usize = RAY_PASSES + 1;
 /// Размер буфера счётчиков, байт.
-pub(crate) const COUNTER_BYTES: u64 = (RAY_PASSES * COUNTERS * COUNTER_SPREAD * 2 * 4) as u64;
+pub(crate) const COUNTER_BYTES: u64 = (ALL_PASSES * COUNTERS * COUNTER_SPREAD * 2 * 4) as u64;
 
 /// Счётчики одного прохода за кадр.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,29 +83,90 @@ impl RayCounts {
     }
 }
 
-/// Складывает копии счётчиков из слов буфера (как их пишет `counters_flush`).
+/// Счётчики краёв за кадр (8.11а, проход «края 3D: поиск» со счётчиками): сколько
+/// пикселей края и почему они край. Каждый пиксель края — ровно одна причина (первая
+/// найденная, в порядке полей).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeCounts {
+    /// Пикселей края.
+    pub pixels: u64,
+    /// Образцы полигонов в пикселе расходятся (модели, MSAA).
+    pub mesh: u64,
+    /// Небо против формы.
+    pub sky: u64,
+    /// Другой материал у соседа.
+    pub material: u64,
+    /// Резкий поворот нормали: складка (ребро коробки) или силуэт на фоне.
+    pub normal: u64,
+    /// Разрыв по глубине: сосед не лежит на плоскости пикселя (силуэт).
+    pub depth: u64,
+    /// Почти не видно глазом: цвет пикселя и соседа за краем на экране различается не
+    /// больше чем на 2 ступени из 255 (без краёв моделей — у них соседа нет).
+    pub faint2: u64,
+    /// То же, не больше 8 ступеней (включает `faint2`).
+    pub faint8: u64,
+}
+
+impl EdgeCounts {
+    fn add(&mut self, counter: usize, value: u64) {
+        let slot = match counter {
+            0 => &mut self.pixels,
+            1 => &mut self.mesh,
+            2 => &mut self.sky,
+            3 => &mut self.material,
+            4 => &mut self.normal,
+            5 => &mut self.depth,
+            6 => &mut self.faint2,
+            _ => &mut self.faint8,
+        };
+        *slot = slot.wrapping_add(value);
+    }
+}
+
+/// Счётчик `counter` прохода `pass`: сумма копий (как их пишет `counters_flush`).
+fn total(words: &[u32], pass: usize, counter: usize) -> u64 {
+    (0..COUNTER_SPREAD)
+        .map(|spread| {
+            let at = ((pass * COUNTERS + counter) * COUNTER_SPREAD + spread) * 2;
+            let lo = words.get(at).copied().unwrap_or(0);
+            let hi = words.get(at + 1).copied().unwrap_or(0);
+            u64::from(lo) | (u64::from(hi) << 32)
+        })
+        .fold(0u64, u64::wrapping_add)
+}
+
+/// Складывает копии счётчиков лучей из слов буфера.
 pub(crate) fn sum(words: &[u32]) -> [RayCounts; RAY_PASSES] {
     let mut out = [RayCounts::default(); RAY_PASSES];
     for (pass, counts) in out.iter_mut().enumerate() {
         for counter in 0..COUNTERS {
-            for spread in 0..COUNTER_SPREAD {
-                let at = ((pass * COUNTERS + counter) * COUNTER_SPREAD + spread) * 2;
-                let lo = words.get(at).copied().unwrap_or(0);
-                let hi = words.get(at + 1).copied().unwrap_or(0);
-                counts.add(counter, u64::from(lo) | (u64::from(hi) << 32));
-            }
+            counts.add(counter, total(words, pass, counter));
         }
     }
     out
 }
 
-/// Складывает счётчики из байтов буфера, скопированного для процессора.
-pub(crate) fn sum_bytes(bytes: &[u8]) -> [RayCounts; RAY_PASSES] {
-    let words: Vec<u32> = bytes
+/// Счётчики краёв (8.11а) из слов буфера.
+pub(crate) fn edges(words: &[u32]) -> EdgeCounts {
+    let mut out = EdgeCounts::default();
+    for counter in 0..COUNTERS {
+        out.add(counter, total(words, PASS_EDGE_FIND, counter));
+    }
+    out
+}
+
+/// Слова буфера, скопированного для процессора.
+fn words(bytes: &[u8]) -> Vec<u32> {
+    bytes
         .chunks_exact(4)
         .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
-    sum(&words)
+        .collect()
+}
+
+/// Складывает счётчики лучей и краёв из байтов буфера, скопированного для процессора.
+pub(crate) fn sum_bytes(bytes: &[u8]) -> ([RayCounts; RAY_PASSES], EdgeCounts) {
+    let words = words(bytes);
+    (sum(&words), edges(&words))
 }
 
 /// Обнуляет буфер счётчиков перед первым проходом лучей кадра.
@@ -201,6 +267,8 @@ mod tests {
         words[at(PASS_MARCH, 1, 31) + 1] = 1;
         words[at(PASS_AO, 0, 5)] = 7;
         words[at(PASS_EDGE_SHADOWS, 7, 3)] = 9;
+        words[at(PASS_EDGE_FIND, 0, 2)] = 40;
+        words[at(PASS_EDGE_FIND, 4, 30)] = 11;
         let counts = sum(&words);
         assert_eq!(
             counts[PASS_MARCH].steps,
@@ -210,7 +278,9 @@ mod tests {
         assert_eq!(counts[PASS_AO].rays, 7);
         assert_eq!(counts[PASS_EDGE_SHADOWS].material, 9);
         assert_eq!(counts[PASS_CONE], RayCounts::default());
+        let found = edges(&words);
+        assert_eq!((found.pixels, found.normal, found.sky), (40, 11, 0));
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-        assert_eq!(sum_bytes(&bytes), counts);
+        assert_eq!(sum_bytes(&bytes), (counts, found));
     }
 }
