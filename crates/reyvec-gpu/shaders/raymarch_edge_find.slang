@@ -13,18 +13,14 @@
 // «надёжные». Так в группе прохода «края
 // 3D» пиксели только одного вида, и лучи тени не ждут в ней пикселей, которым они не нужны.
 //
-// Список (`uint`): [0] — сколько групп по 64 потока запустить (16 пикселей на группу,
-// 32 при SPACE_FLAG_EDGE_PAIRS; сначала группы ненадёжных, потом надёжных),
-// [1], [2] — 1 (размеры запуска), [3] — сколько пикселей всего (его читает панель),
-// [4] — сколько ненадёжных, [5] — сколько надёжных (только вошедших в список, вместе
-// не больше MAX_EDGES), [6], [7] — не заняты. Дальше место
-// на w·h пикселей (x | y << 16): ненадёжные от начала (`pc.edges[8 + j]`), надёжные от
-// конца (`pc.edges[8 + w·h − 1 − j]`). Начало [0, 1, 1, 0, 0, 0, 0, 0] пишет процессор
-// перед проходом.
+// Список (`uint`, раскладка — include/edges.slang): заголовок из EDGE_HEADER слов, потом
+// четыре части списка (8.11б): ненадёжные и надёжные, с четырьмя и двумя лучами. Начало
+// заголовка пишет процессор перед проходом.
 
 #include "include/space.slang"
 #include "include/mesh.slang"
 #include "include/shade3d.slang"
+#include "include/edges.slang"
 
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
 
@@ -35,9 +31,10 @@ float2 pixel_screen(int2 px, float2 size)
     return float2(c.x / size.x * 2.0 - 1.0, 1.0 - c.y / size.y * 2.0);
 }
 
-// Больше групп одной командой видеокарта может не запустить (гарантировано 65535). Два
-// списка дают до ⌈U/16⌉ + ⌈R/16⌉ групп: на одну больше, чем один, поэтому 65534.
-static const uint MAX_EDGES = 65534 * 16;
+// Больше групп одной командой видеокарта может не запустить (гарантировано 65535). Четыре
+// части списка (include/edges.slang) дают до ⌈U4/16⌉ + ⌈U2/32⌉ + ⌈R4/16⌉ + ⌈R2/32⌉ групп:
+// на три больше, чем один список, поэтому 65532.
+static const uint MAX_EDGES = 65532 * 16;
 
 // Почему пиксель — край (8.11а, счётчики краёв по причине): 0 — не край.
 static const uint EDGE_NONE = 0;
@@ -135,11 +132,12 @@ float4 fs_main(VertexOut input) : SV_Target
 
 // Края группы 8×8: сначала собираются здесь, потом группа одним сложением берёт место в
 // общем списке (7.15). Сложение в общий счётчик от каждого пикселя края по отдельности
-// на встроенной видеокарте стоило почти миллисекунду.
-groupshared uint group_count[2];
-groupshared uint group_base[2];
-groupshared uint group_keep[2];
-groupshared uint group_pixels[2][64];
+// на встроенной видеокарте стоило почти миллисекунду. Четыре части списка (8.11б):
+// ненадёжные и надёжные, каждые с четырьмя или двумя лучами.
+groupshared uint group_count[EDGE_LISTS];
+groupshared uint group_base[EDGE_LISTS];
+groupshared uint group_keep[EDGE_LISTS];
+groupshared uint group_pixels[EDGE_LISTS][64];
 
 // Сколько новых границ групп прохода «края 3D» (по `per` пикселей; номера 0, per, 2·per…)
 // переходит часть списка с `base` длиной `count`.
@@ -148,11 +146,20 @@ uint groups_crossed(uint base, uint count, uint per)
     return (base + count + per - 1) / per - (base + per - 1) / per;
 }
 
+// Сколько метров сцены накрывает пиксель `px` на глубине `t` (8.11б): расстояние между
+// точками соседних лучей на этой глубине.
+float pixel_footprint(int2 px, int2 size, float t)
+{
+    Ray a = screen_ray(pixel_screen(px, float2(size)));
+    Ray b = screen_ray(pixel_screen(px + int2(1, 0), float2(size)));
+    return length((b.origin + b.dir * t) - (a.origin + a.dir * t));
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
 {
-    if (lane < 2)
+    if (lane < EDGE_LISTS)
     {
         group_count[lane] = 0;
         group_keep[lane] = 0;
@@ -176,51 +183,58 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         // Картинка теней — половина кадра с округлением вверх (как в demo.rs).
         bool unreliable = g0.x >= 0.0
             && shadow_similarity(px, g0.x, oct_decode(g0.zw), (size + 1) >> 1) < 0.5;
-        uint list = unreliable ? 0 : 1;
+        // Два луча вместо четырёх (8.11б): при уменьшенном разрешении — у всех, а с
+        // включённым «края: два луча вдали» — там, где пиксель накрывает больше порога
+        // (дальние края; у неба порога нет).
+        float far = asfloat(pc.edges[EDGE_FAR_WORD]);
+        bool pair = (pc.flags & SPACE_FLAG_EDGE_PAIRS) != 0
+            || (far > 0.0 && g0.x >= 0.0 && pixel_footprint(px, int2(w, h), g0.x) > far);
+        uint list = (unreliable ? EDGE_U4 : EDGE_R4) + (pair ? 2 : 0);
         uint slot;
         InterlockedAdd(group_count[list], 1u, slot);
         group_pixels[list][slot] = id.x | (id.y << 16);
     }
     GroupMemoryBarrierWithGroupSync();
-    uint count_u = group_count[0];
-    uint count_r = group_count[1];
-    if (lane == 0 && count_u + count_r > 0)
+    if (lane == 0)
     {
-        // Место в общем счёте: что за MAX_EDGES, остаётся с одним лучом (внутри группы
-        // сначала отбрасываются надёжные; какие группы опоздали — как придётся).
-        uint total;
-        InterlockedAdd(pc.edges[3], count_u + count_r, total);
-        uint room = total < MAX_EDGES ? MAX_EDGES - total : 0;
-        uint keep_u = min(count_u, room);
-        uint keep_r = min(count_r, room - keep_u);
-        group_keep[0] = keep_u;
-        group_keep[1] = keep_r;
-        uint per = (pc.flags & SPACE_FLAG_EDGE_PAIRS) != 0 ? 32 : 16;
-        uint groups = 0;
-        if (keep_u > 0)
+        uint all = 0;
+        for (uint k = 0; k < EDGE_LISTS; k++)
+            all += group_count[k];
+        if (all > 0)
         {
-            uint base;
-            InterlockedAdd(pc.edges[4], keep_u, base);
-            group_base[0] = base;
-            groups += groups_crossed(base, keep_u, per);
+            // Место в общем счёте: что за MAX_EDGES, остаётся с одним лучом (внутри группы
+            // сначала отбрасываются надёжные; какие группы опоздали — как придётся).
+            uint total;
+            InterlockedAdd(pc.edges[3], all, total);
+            uint room = total < MAX_EDGES ? MAX_EDGES - total : 0;
+            uint groups = 0;
+            // Порядок: ненадёжные (4 и 2 луча), потом надёжные.
+            for (uint o = 0; o < EDGE_LISTS; o++)
+            {
+                uint k = EDGE_ORDER[o];
+                uint keep = min(group_count[k], room);
+                room -= keep;
+                group_keep[k] = keep;
+                if (keep > 0)
+                {
+                    uint base;
+                    InterlockedAdd(pc.edges[EDGE_COUNT_WORD[k]], keep, base);
+                    group_base[k] = base;
+                    groups += groups_crossed(base, keep, edge_list_per(k));
+                }
+            }
+            if (groups > 0)
+                InterlockedAdd(pc.edges[0], groups);
         }
-        if (keep_r > 0)
-        {
-            uint base;
-            InterlockedAdd(pc.edges[5], keep_r, base);
-            group_base[1] = base;
-            groups += groups_crossed(base, keep_r, per);
-        }
-        if (groups > 0)
-            InterlockedAdd(pc.edges[0], groups);
     }
     GroupMemoryBarrierWithGroupSync();
     // Края группы — в списки по местам от начала группы (пишет поток с тем же номером,
     // какой бы пиксель он ни смотрел).
-    if (lane < group_keep[0])
-        pc.edges[8 + group_base[0] + lane] = group_pixels[0][lane];
-    if (lane < group_keep[1])
-        pc.edges[8 + w * h - 1 - (group_base[1] + lane)] = group_pixels[1][lane];
+    for (uint k = 0; k < EDGE_LISTS; k++)
+    {
+        if (lane < group_keep[k])
+            pc.edges[edge_list_at(k, group_base[k] + lane, w * h)] = group_pixels[k][lane];
+    }
     if (inside)
         images[pc.target][px] = float4(0.0, 0.0, 0.0, 0.0);
 }

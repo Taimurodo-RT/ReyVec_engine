@@ -76,6 +76,8 @@ pub struct SpaceStats {
     /// Из них «ненадёжных» (7.19а): тени из половинного размера для них не подходят, и
     /// проход «края 3D» считает им свои лучи тени. `None` — как у `edge_pixels`.
     pub edge_unreliable: Option<u32>,
+    /// Из них с двумя лучами вместо четырёх (8.11б). `None` — как у `edge_pixels`.
+    pub edge_pairs: Option<u32>,
     /// Пикселей в кадре 3D (с учётом «Разрешения 3D»): для доли краёв.
     pub pixels: u32,
     /// Счётчики лучей по проходам (7.18д2) последнего законченного кадра этой ячейки, если
@@ -208,7 +210,14 @@ pub const MAX_SCENE_OBJECTS: usize = reyvec_sdf::shape3d::MAX_OBJECTS;
 pub const MAX_SCENE_WORDS: usize = crate::space::MAX_WORDS;
 /// Больше пикселей края в список не входит (`MAX_EDGES` в `raymarch_edge_find.slang`);
 /// остальные рисуются одним лучом.
-pub const MAX_EDGE_PIXELS: u32 = 65534 * 16;
+pub const MAX_EDGE_PIXELS: u32 = 65532 * 16;
+/// Слов в заголовке списка краёв (`EDGE_HEADER` в `include/edges.slang`).
+const EDGE_HEADER: usize = 16;
+/// «Края: два луча вдали» (8.11б): с какого размера пикселя на поверхности (метров, при
+/// высоте кадра 1080; при другой высоте порог меняется так же, как размер пикселя) край
+/// получает два луча вместо четырёх. На заводе при виде сверху пиксель накрывает от 1 до
+/// 10 см: с порогом 4 см два луча получает дальняя часть цеха.
+pub const EDGE_FAR_METERS: f32 = 0.04;
 /// Полоса `B` поля слоя у выдавливания через поле (опыт 7.18б), м: как у поля уровня в
 /// `docs/decisions/0020-level-field.md`. На собственной сетке профиля значения до неё не
 /// доходят; в заголовке примитива она нужна порогу «только оценка».
@@ -725,6 +734,10 @@ pub(crate) struct Demo {
     edge_creases: bool,
     /// Точные тени краёв только у границы тени (8.2б; `false` — как до 8.2б).
     edge_shadow_reuse: bool,
+    /// Края: два луча вместо четырёх там, где пиксель накрывает больше
+    /// этого числа метров (8.11б, опыт; 0 — выключено, как по умолчанию; во включённом
+    /// виде — [`EDGE_FAR_METERS`]).
+    edge_far: f32,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -1089,6 +1102,7 @@ impl Demo {
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,
+            edge_far: 0.0,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -1604,7 +1618,9 @@ impl Demo {
         slot: usize,
         extent: vk::Extent2D,
     ) -> Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)> {
-        let size = 32 + u64::from(extent.width) * u64::from(extent.height) * 4;
+        // Заголовок и две половины по пикселю кадра (include/edges.slang, 8.11б).
+        let size =
+            EDGE_HEADER as u64 * 4 + 2 * u64::from(extent.width) * u64::from(extent.height) * 4;
         let entry = self.space_edge_lists.get_mut(slot)?;
         if entry.is_some_and(|(_, have)| have < size)
             && let Some((id, _)) = entry.take()
@@ -1634,7 +1650,7 @@ impl Demo {
         if count.is_none() {
             match res.create_buffer(
                 ctx,
-                32,
+                EDGE_HEADER as u64 * 4,
                 vk::BufferUsageFlags::TRANSFER_DST,
                 BufferMemory::GpuToCpu,
                 &format!("число краёв 3D, кадр {slot}"),
@@ -1642,7 +1658,7 @@ impl Demo {
                 Ok(id) => {
                     // Панель читает буфер до первого кадра ячейки: пусть там будет 0, а не
                     // старая память (память видна процессору сразу, HOST_COHERENT).
-                    res.write_buffer(id, 0, &[0; 32]);
+                    res.write_buffer(id, 0, &[0; EDGE_HEADER * 4]);
                     *count = Some(id);
                 }
                 Err(e) => {
@@ -1669,13 +1685,20 @@ impl Demo {
     /// Сколько из них «ненадёжных» (7.19а, проход «края 3D» считает им свои лучи тени);
     /// условия — как у [`Self::edge_pixels`].
     pub fn edge_unreliable(&self, res: &GpuResources, slot: usize) -> Option<u32> {
-        self.edge_word(res, slot, 4)
+        // С четырьмя и с двумя лучами (8.11б).
+        Some(self.edge_word(res, slot, 4)? + self.edge_word(res, slot, 7)?)
+    }
+
+    /// Сколько пикселей края получили два луча вместо четырёх (8.11б: уменьшенное
+    /// разрешение или «края: два луча вдали»); условия — как у [`Self::edge_pixels`].
+    pub fn edge_pairs(&self, res: &GpuResources, slot: usize) -> Option<u32> {
+        Some(self.edge_word(res, slot, 7)? + self.edge_word(res, slot, 8)?)
     }
 
     /// Слово `index` начала списка краёв, скопированного для процессора.
     fn edge_word(&self, res: &GpuResources, slot: usize, index: usize) -> Option<u32> {
         let id = (*self.space_edge_counts.get(slot)?)?;
-        let bytes = res.read_buffer(id, 32)?;
+        let bytes = res.read_buffer(id, EDGE_HEADER * 4)?;
         Some(u32::from_ne_bytes(
             bytes.get(index * 4..index * 4 + 4)?.try_into().ok()?,
         ))
@@ -1916,6 +1939,22 @@ impl Demo {
     /// Включает и выключает 8.2б (выключено — точные тени у всех ненадёжных краёв).
     pub fn set_edge_shadow_reuse(&mut self, on: bool) {
         self.edge_shadow_reuse = on;
+    }
+
+    /// Края: два луча вдали (8.11б).
+    pub fn edge_far(&self) -> bool {
+        self.edge_far > 0.0
+    }
+
+    /// Включает и выключает 8.11б.
+    pub fn set_edge_far(&mut self, on: bool) {
+        self.edge_far = if on { EDGE_FAR_METERS } else { 0.0 };
+    }
+
+    /// 8.11б с другим порогом (метров; 0 — выключено), для подбора порога в тестах.
+    #[cfg(test)]
+    pub fn set_edge_far_meters(&mut self, meters: f32) {
+        self.edge_far = meters;
     }
 
     /// Нормаль всегда по всей сцене (7.18д5) — для сравнения с обычной.
@@ -3513,6 +3552,7 @@ impl Demo {
             // (он закончен: его забор дождались перед подготовкой), времена — отсюда.
             let edge_pixels = space_edges.and_then(|_| self.edge_pixels(res, slot));
             let edge_unreliable = space_edges.and_then(|_| self.edge_unreliable(res, slot));
+            let edge_pairs = space_edges.and_then(|_| self.edge_pairs(res, slot));
             let (rays, edge_kinds) = match self.ray_counts(res, slot) {
                 Some((rays, edges)) => (Some(rays), space_edges.map(|_| edges)),
                 None => (None, None),
@@ -3652,6 +3692,7 @@ impl Demo {
                 overflow: packed.overflow,
                 edge_pixels,
                 edge_unreliable,
+                edge_pairs,
                 pixels: space_extent.width * space_extent.height,
                 rays,
                 edge_kinds,
@@ -4542,6 +4583,7 @@ impl Demo {
             let probe = self.edge_probe.word()
                 | if self.edge_creases { 0x100 } else { 0 }
                 | if self.edge_shadow_reuse { 0x200 } else { 0 };
+            let far = self.edge_far;
             // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
             // расходятся, — край, даже если буфер геометрии у соседей одинаков.
             // Тени — для счётчиков краёв (8.11а): вариант со счётчиками освещает пиксель
@@ -4573,10 +4615,14 @@ impl Demo {
                 // Начало списка: 0 групп, размеры запуска 1 и 1, 0 пикселей всего, 0
                 // ненадёжных и 0 надёжных (7.19а), замер краёв по частям (8.1), одно слово
                 // не занято.
-                let start: Vec<u8> = [0u32, 1, 1, 0, 0, 0, probe, 0]
-                    .iter()
-                    .flat_map(|w| w.to_ne_bytes())
-                    .collect();
+                let mut header = [0u32; EDGE_HEADER];
+                header[1] = 1;
+                header[2] = 1;
+                header[6] = probe;
+                // Порог «края: два луча вдали» (8.11б), 0 — выключено. Порог задан для
+                // высоты 1080: при меньшей пиксель накрывает больше, порог растёт так же.
+                header[9] = (far * 1080.0 / ext.height.max(1) as f32).to_bits();
+                let start: Vec<u8> = header.iter().flat_map(|w| w.to_ne_bytes()).collect();
                 // Список этого кадра в прошлый раз читали проход «края 3D» и копия
                 // счётчика для процессора.
                 let before_reset = [vk::MemoryBarrier2::default()
@@ -4615,7 +4661,7 @@ impl Demo {
                     )];
                 // Начало списка (со счётчиками пикселей) — процессору, для панели
                 // (7.18б); читается, когда кадр закончен.
-                let count_copy = [vk::BufferCopy::default().size(32)];
+                let count_copy = [vk::BufferCopy::default().size(EDGE_HEADER as u64 * 4)];
                 let to_host = [vk::BufferMemoryBarrier2::default()
                     .buffer(count_buffer)
                     .size(vk::WHOLE_SIZE)

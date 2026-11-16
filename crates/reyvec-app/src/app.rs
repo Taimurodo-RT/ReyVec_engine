@@ -425,6 +425,13 @@ impl App {
                     if on { "вкл" } else { "выкл" }
                 );
             }
+            PanelAction::EdgeFar(on) => {
+                r.set_edge_far(on);
+                tracing::info!(
+                    "Края 3D: два луча вдали {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::EdgeProbe(probe) => {
                 r.set_edge_probe(probe);
                 tracing::info!("Замер краёв 3D: {}", probe.title());
@@ -667,6 +674,7 @@ impl App {
                 edge_probe: renderer.edge_probe(),
                 edge_creases: renderer.edge_creases(),
                 edge_shadow_reuse: renderer.edge_shadow_reuse(),
+                edge_far: renderer.edge_far(),
                 brick_shadows: renderer.brick_shadows(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),

@@ -522,6 +522,7 @@ fn render(
             demo.set_edge_probe(tests::EDGE_PROBE.get());
             demo.set_edge_creases(tests::EDGE_CREASES.get());
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
+            demo.set_edge_far_meters(tests::EDGE_FAR.get());
             demo.set_plane_shadows(tests::PLANE_SHADOWS.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -668,6 +669,7 @@ fn render(
             (Some(gpu), Some(demo)) => demo.space_stats().map(|mut s| {
                 s.edge_pixels = demo.edge_pixels(gpu, 0);
                 s.edge_unreliable = demo.edge_unreliable(gpu, 0);
+                s.edge_pairs = demo.edge_pairs(gpu, 0);
                 if let Some((rays, edges)) = demo.ray_counts(gpu, 0) {
                     s.rays = Some(rays);
                     s.edge_kinds = s.edge_pixels.map(|_| edges);
@@ -812,6 +814,9 @@ pub(crate) mod tests {
         /// Точные тени краёв только у границы тени (8.2б); по умолчанию включены.
         pub(super) static EDGE_SHADOW_REUSE: std::cell::Cell<bool> =
             const { std::cell::Cell::new(true) };
+        /// Края: два луча вдали (8.11б), порог в метрах; как в песочнице, по умолчанию 0 —
+        /// выключено.
+        pub(super) static EDGE_FAR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
         /// Тени моделей от плоскостей граней, как до 8.15 (обычно — от кирпичей поля).
         pub(super) static PLANE_SHADOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Мусором залиты только картинки с этим именем (8.0).
@@ -2522,6 +2527,63 @@ pub(crate) mod tests {
         );
         assert_edge_kinds(&k, edge_pixels, "завод");
         assert!(k.pixels > 1000, "{k:?}");
+        if let Some(rays) = stats.rays {
+            for (pass, c) in rays.iter().enumerate() {
+                let per = |a: u64| a as f64 / c.rays.max(1) as f64;
+                eprintln!(
+                    "завод, {}: лучей {}, шаг/луч {:.1}, сцена/луч {:.1}, объект/сцена {:.2}, форма/сцена {:.2}",
+                    crate::counters::RAY_PASS_NAMES[pass],
+                    c.rays,
+                    per(c.steps),
+                    per(c.scene),
+                    c.objects as f64 / c.scene.max(1) as f64,
+                    c.forms as f64 / c.scene.max(1) as f64,
+                );
+            }
+        }
+        eprintln!("ненадёжных краёв {:?}", stats.edge_unreliable);
+        assert_eq!(
+            stats.edge_pairs,
+            Some(0),
+            "без опыта 8.11б — четыре луча у всех"
+        );
+
+        // «Края: два луча вдали» (8.11б) с разными порогами (метров при высоте 1080): чем
+        // больше порог, тем меньше краёв с двумя лучами; лучей краёв меньше, картинка
+        // отличается только на этих краях. С порогом по умолчанию — часть краёв, не все.
+        // Замер 960×540 (порог при этой высоте вдвое больше): 2.5 см — 77 % краёв с
+        // двумя лучами, 5 см — 13 %, 10 см и больше — ни одного.
+        let edge_rays = |s: &crate::demo::SpaceStats| s.rays.map(|r| r[4].rays);
+        let mut last = u64::MAX;
+        for meters in [0.025, crate::demo::EDGE_FAR_METERS, 0.1] {
+            EDGE_FAR.set(meters);
+            SPACE_COUNTERS.set(true);
+            let far = render_headless(&options, &scene);
+            SPACE_COUNTERS.set(false);
+            EDGE_FAR.set(0.0);
+            let far = far.expect("кадр с двумя лучами вдали");
+            assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+            let far_stats = far.space_stats.expect("числа сцены 3D");
+            let pairs = u64::from(far_stats.edge_pairs.expect("края посчитаны"));
+            assert_eq!(far_stats.edge_pixels, stats.edge_pixels, "те же края");
+            let (changed, worst, mean) = image_diff(&plain.image, &far.image);
+            eprintln!(
+                "два луча дальше {meters} м: {pairs} из {edge_pixels} краёв, лучей краёв \
+                 {:?} → {:?}; картинка: отличается {changed} пикселей, худшее {worst}, \
+                 среднее {mean:.4}",
+                edge_rays(&stats),
+                edge_rays(&far_stats),
+            );
+            assert!(pairs <= last, "{pairs} > {last}");
+            if meters == crate::demo::EDGE_FAR_METERS {
+                assert!(pairs > 0 && pairs < edge_pixels, "{pairs} из {edge_pixels}");
+            }
+            last = pairs;
+            assert!(changed as u64 <= pairs, "{changed} > {pairs}");
+            if let (Some(a), Some(b)) = (edge_rays(&stats), edge_rays(&far_stats)) {
+                assert!(pairs == 0 || b < a, "{a} → {b}");
+            }
+        }
     }
 
     /// Поле уровня до перебора объектов (7.18д3): та же картинка до байта и те же шаги и

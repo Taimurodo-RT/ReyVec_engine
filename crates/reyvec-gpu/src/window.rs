@@ -736,6 +736,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Края: два луча вдали (8.11б).
+    pub fn edge_far(&self) -> bool {
+        self.demo.as_ref().is_some_and(|d| d.edge_far())
+    }
+
+    /// Включает и выключает 8.11б.
+    pub fn set_edge_far(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_edge_far(on);
+        }
+    }
+
     /// Тени моделей от кирпичей поля (8.15): включено ли.
     pub fn brick_shadows(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| !d.plane_shadows())

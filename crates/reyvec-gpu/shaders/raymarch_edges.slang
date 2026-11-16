@@ -21,6 +21,7 @@
 #include "include/march.slang"
 #include "include/shade3d.slang"
 #include "include/shadow3d.slang"
+#include "include/edges.slang"
 
 // Файл обязан иметь пару для рисования (build.rs собирает её у всех шейдеров); здесь
 // она не используется.
@@ -244,29 +245,46 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     bool creases = (pc.edges[6] & EDGE_CREASES) != 0;
     if (probe == EDGE_PROBE_EMPTY)
         return;
-    bool pairs = (pc.flags & SPACE_FLAG_EDGE_PAIRS) != 0;
+    uint w, h;
+    images[pc.target].GetDimensions(w, h);
+    // Четыре части списка (include/edges.slang, 8.11б): группы идут в порядке EDGE_ORDER,
+    // у каждой группы одна часть — ненадёжные или надёжные, четыре или два луча.
+    uint group = id.x >> 6;
+    uint list = EDGE_ORDER[EDGE_LISTS - 1];
+    uint first_j = 0;
+    uint count = 0;
+    {
+        uint before = 0;
+        for (uint o = 0; o < EDGE_LISTS; o++)
+        {
+            uint k = EDGE_ORDER[o];
+            uint n = pc.edges[EDGE_COUNT_WORD[k]];
+            uint per_k = edge_list_per(k);
+            uint groups_k = (n + per_k - 1) / per_k;
+            if (group < before + groups_k || o == EDGE_LISTS - 1)
+            {
+                list = k;
+                first_j = (group - before) * per_k;
+                count = n;
+                break;
+            }
+            before += groups_k;
+        }
+    }
+    bool pairs = list >= EDGE_U2;
     uint shift = pairs ? 1 : 2;
     uint rays = 1u << shift;
     uint per = 64u >> shift;
     uint sub = id.x & (rays - 1);
-    uint w, h;
-    images[pc.target].GetDimensions(w, h);
-    // Два списка (raymarch_edge_find.slang, 7.19а): сначала группы ненадёжных пикселей,
-    // потом надёжных. Вид у всей группы один.
-    uint count_u = pc.edges[4];
-    uint count_r = pc.edges[5];
-    uint groups_u = (count_u + per - 1) / per;
-    uint group = id.x >> 6;
-    bool unreliable = group < groups_u;
-    uint first_j = (unreliable ? group : group - groups_u) * per;
+    bool unreliable = list == EDGE_U4 || list == EDGE_U2;
     uint pixel = lane >> shift;
     uint j = first_j + pixel;
-    bool valid = j < (unreliable ? count_u : count_r);
+    bool valid = j < count;
     int2 px = int2(0, 0);
     float4 g0 = float4(-1.0, 0.0, 0.0, 0.0);
     if (valid)
     {
-        uint packed = pc.edges[8 + (unreliable ? j : w * h - 1 - j)];
+        uint packed = pc.edges[edge_list_at(list, j, w * h)];
         px = int2(packed & 0xffff, packed >> 16);
         g0 = gbuffer_load(px);
     }
@@ -294,12 +312,12 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         GroupMemoryBarrierWithGroupSync();
         if (lane < per)
         {
-            bool has = first_j + lane < count_u;
+            bool has = first_j + lane < count;
             float4 g = float4(-1.0, 0.0, 0.0, 0.0);
             int2 at = int2(0, 0);
             if (has)
             {
-                uint packed = pc.edges[8 + first_j + lane];
+                uint packed = pc.edges[edge_list_at(list, first_j + lane, w * h)];
                 at = int2(packed & 0xffff, packed >> 16);
                 g = gbuffer_load(at);
             }
@@ -336,7 +354,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
             }
             uint mine = need_pixel[s][index];
             uint part = PART_ORDER[s];
-            uint packed = pc.edges[8 + first_j + mine];
+            uint packed = pc.edges[edge_list_at(list, first_j + mine, w * h)];
             int2 at = int2(packed & 0xffff, packed >> 16);
             float4 g = gbuffer_load(at);
             float3 n = oct_decode(g.zw);
