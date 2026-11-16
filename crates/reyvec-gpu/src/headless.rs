@@ -2522,6 +2522,22 @@ pub(crate) mod tests {
         );
         assert_edge_kinds(&k, edge_pixels, "завод");
         assert!(k.pixels > 1000, "{k:?}");
+        if let Some(rays) = stats.rays {
+            for (pass, c) in rays.iter().enumerate() {
+                let per = |a: u64| a as f64 / c.rays.max(1) as f64;
+                eprintln!(
+                    "завод, {}: лучей {}, шаг/луч {:.1}, сцена/луч {:.1}, объект/сцена {:.2}, форма/сцена {:.2}",
+                    crate::counters::RAY_PASS_NAMES[pass],
+                    c.rays,
+                    per(c.steps),
+                    per(c.scene),
+                    c.objects as f64 / c.scene.max(1) as f64,
+                    c.forms as f64 / c.scene.max(1) as f64,
+                );
+            }
+        }
+        eprintln!("ненадёжных краёв {:?}", stats.edge_unreliable);
+        panic!("ВРЕМЕННО: напечатать числа в CI");
     }
 
     /// Поле уровня до перебора объектов (7.18д3): та же картинка до байта и те же шаги и
