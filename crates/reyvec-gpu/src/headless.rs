@@ -1717,6 +1717,22 @@ pub(crate) mod tests {
                     "через сцену"
                 },
             );
+            // ВРЕМЕННО: кадры в target/reference-failures (артефакт CI), чтобы посмотреть.
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/reference-failures");
+            std::fs::create_dir_all(&dir).expect("папка");
+            let tag = format!("{}-{direct}", scale.title()).replace(' ', "");
+            for (name, img) in [
+                ("rays", &rays.image),
+                ("rough", &rough.image),
+                ("post", &post.image),
+            ] {
+                let mut ppm = format!("P6 {} {} 255\n", img.width, img.height).into_bytes();
+                for px in img.rgba.chunks(4) {
+                    ppm.extend_from_slice(&px[..3]);
+                }
+                std::fs::write(dir.join(format!("post-aa-{tag}-{name}.ppm")), ppm).expect("запись");
+            }
             assert!(smoothed > 0, "сглаживание по картинке ничего не изменило");
             assert!(
                 post_mean < rough_mean,
