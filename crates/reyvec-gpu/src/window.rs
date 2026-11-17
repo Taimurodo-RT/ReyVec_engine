@@ -691,6 +691,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Сглаживание 3D по картинке вместо лучей краёв (8.12а).
+    pub fn post_aa(&self) -> bool {
+        self.demo.as_ref().is_some_and(|d| d.post_aa())
+    }
+
+    /// Включает и выключает сглаживание 3D по картинке со следующего кадра.
+    pub fn set_post_aa(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_post_aa(on);
+        }
+    }
+
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
     pub fn space_counters(&self) -> (bool, bool) {
         self.demo

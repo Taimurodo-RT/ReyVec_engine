@@ -717,6 +717,11 @@ pub(crate) struct Demo {
     space_edge_counts: Vec<Option<BufferId>>,
     /// Включено ли сглаживание краёв (настройка, X).
     space_smooth: bool,
+    /// Сглаживание 3D по готовой картинке вместо лучей краёв (8.12а, для слабых видеокарт;
+    /// действует, только если сглаживание включено).
+    post_aa: bool,
+    /// Шейдер этого сглаживания (raymarch_post_aa.slang) в картинку «цвет 3D».
+    space_post_aa: vk::Pipeline,
     /// Счётчики лучей 3D включены (флажок на панели, 7.18д2).
     space_counters_on: bool,
     /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
@@ -1094,6 +1099,8 @@ impl Demo {
             space_edge_lists: vec![None; frames_in_flight],
             space_edge_counts: vec![None; frames_in_flight],
             space_smooth: true,
+            post_aa: false,
+            space_post_aa: vk::Pipeline::null(),
             space_counters_on: false,
             level_field_apart: true,
             space_free: true,
@@ -1267,6 +1274,15 @@ impl Demo {
                 res,
                 shaders,
                 "raymarch_shade",
+                SPACE_COLOR_FORMAT,
+                Msaa::Off,
+                None,
+            )?;
+            demo.space_post_aa = build(
+                ctx,
+                res,
+                shaders,
+                "raymarch_post_aa",
                 SPACE_COLOR_FORMAT,
                 Msaa::Off,
                 None,
@@ -1882,6 +1898,21 @@ impl Demo {
     /// Включает или выключает сглаживание краёв форм сцены «3D».
     pub fn set_space_smooth(&mut self, on: bool) {
         self.space_smooth = on;
+    }
+
+    /// Сглаживание 3D по картинке вместо лучей краёв (8.12а).
+    pub fn post_aa(&self) -> bool {
+        self.post_aa
+    }
+
+    /// Включает и выключает 8.12а.
+    pub fn set_post_aa(&mut self, on: bool) {
+        self.post_aa = on;
+    }
+
+    /// Идёт ли в кадре сглаживание по картинке: включено и шейдер собран.
+    fn post_aa_on(&self) -> bool {
+        self.space_smooth && self.post_aa && self.space_post_aa != vk::Pipeline::null()
     }
 
     /// Поле уровня до перебора объектов (7.18д3) или, для сравнения, в общем переборе.
@@ -3116,6 +3147,9 @@ impl Demo {
                     )
                 }
                 "raymarch" => (&mut self.space_march, GBUFFER_FORMAT, Msaa::Off, None),
+                "raymarch_post_aa" => {
+                    (&mut self.space_post_aa, SPACE_COLOR_FORMAT, Msaa::Off, None)
+                }
                 "raymarch_cone" => (&mut self.space_cone, CONE_FORMAT, Msaa::Off, None),
                 "mesh3d" => {
                     // Варианты с образцами MSAA (7.18е2) — те же шейдеры.
@@ -3537,8 +3571,10 @@ impl Demo {
         if scene == DemoScene::Space {
             self.space_compute_running = space_compute;
         }
+        // Со сглаживанием по картинке (8.12а) лучей краёв нет.
         let space_edges = if scene == DemoScene::Space
             && self.space_smooth
+            && !self.post_aa_on()
             && self.space_edges != vk::Pipeline::null()
         {
             self.edge_list(ctx, res, slot, self.space_scale.apply(extent))
@@ -4763,8 +4799,11 @@ impl Demo {
         // размера; «сцена» растянет её на весь кадр. При прямом выводе (7.20а) — всегда:
         // при разрешении 100 % освещение красит само окно, иначе «вывод» растянет картинку
         // прямо в окно.
-        let window = direct.filter(|_| ext == frame.extent);
-        let lit = (direct.is_some() || ext != frame.extent).then(|| {
+        // Сглаживание по картинке (8.12а) читает освещённую картинку, поэтому освещение
+        // тогда всегда красит «цвет 3D», а не окно.
+        let post_aa = frame.scene == DemoScene::Space && self.post_aa_on();
+        let window = direct.filter(|_| ext == frame.extent && !post_aa);
+        let lit = (direct.is_some() || ext != frame.extent || post_aa).then(|| {
             let color = window.unwrap_or_else(|| graph.create("цвет 3D", ext, SPACE_COLOR_FORMAT));
             let mut uses = vec![
                 (gbuffer, Access::Sampled),
@@ -4814,6 +4853,39 @@ impl Demo {
             });
             color
         });
+        let lit = match lit {
+            Some(lit) if post_aa => {
+                let smooth = graph.create("цвет 3D сглаженный", ext, SPACE_COLOR_FORMAT);
+                let uses = [(lit, Access::Sampled), (smooth, Access::ColorAttachment)];
+                let pipeline = self.space_post_aa;
+                graph.add_pass("сглаживание 3D", &uses, move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            target: p.texture(lit),
+                            ..SpaceSlots::default()
+                        },
+                        0,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл освещённую картинку в чтение, а сглаженную в
+                    // цель рисования; конвейер жив, пока кадр рисуется.
+                    unsafe {
+                        begin_color_pass(d, cmd, p.view(smooth), ext);
+                        bindless.bind(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                });
+                Some(smooth)
+            }
+            other => other,
+        };
         let color = lit.filter(|_| window.is_none());
         (gbuffer, shadows, edges, color, tint.map(|t| (t, tint_bits)))
     }
@@ -5221,6 +5293,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_field_bake, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.space_shade_small, None);
+            ctx.device.destroy_pipeline(self.space_post_aa, None);
             ctx.device.destroy_pipeline(self.space_upscale, None);
             ctx.device.destroy_pipeline(self.space_present, None);
             ctx.device.destroy_pipeline(self.space_shade_present, None);
@@ -5256,6 +5329,7 @@ impl Demo {
         self.space_field_bake = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.space_shade_small = vk::Pipeline::null();
+        self.space_post_aa = vk::Pipeline::null();
         self.space_upscale = vk::Pipeline::null();
         self.space_present = vk::Pipeline::null();
         self.space_shade_present = vk::Pipeline::null();

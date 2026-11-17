@@ -389,6 +389,17 @@ impl App {
                 r.set_space_smooth(on);
                 tracing::info!("Сглаживание 3D: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::PostAa(on) => {
+                r.set_post_aa(on);
+                tracing::info!(
+                    "Сглаживание 3D: {}",
+                    if on {
+                        "по картинке"
+                    } else {
+                        "лучами"
+                    }
+                );
+            }
             PanelAction::SpaceFree(on) => {
                 r.set_space_free(on);
                 tracing::info!("Длинный шаг в пустоте: {}", if on { "вкл" } else { "выкл" });
@@ -668,6 +679,7 @@ impl App {
                 space_stats: renderer.space_stats(),
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
+                post_aa: renderer.post_aa(),
                 space_counters: renderer.space_counters(),
                 space_free: renderer.space_free(),
                 space_boxes: renderer.space_boxes(),

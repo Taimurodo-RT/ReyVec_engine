@@ -34,6 +34,8 @@ pub(crate) enum PanelAction {
     Dither(bool),
     /// Сглаживание краёв форм сцены «3D» (7.6о).
     SpaceSmooth(bool),
+    /// Сглаживание 3D по картинке вместо лучей краёв (8.12а).
+    PostAa(bool),
     /// Счётчики лучей 3D (7.18д2).
     SpaceCounters(bool),
     /// Длинный шаг в пустоте (7.18д4).
@@ -148,6 +150,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_compute: (bool, bool),
     /// Сглаживание краёв форм «3D» (7.6о): включено ли и умеет ли видеокарта.
     pub space_smooth: (bool, bool),
+    /// Сглаживание 3D по картинке вместо лучей краёв (8.12а).
+    pub post_aa: bool,
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
     pub space_counters: (bool, bool),
     /// Длинный шаг в пустоте (7.18д4): включён ли.
@@ -895,6 +899,22 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::SpaceSmooth(smooth));
+            }
+            let mut post = info.post_aa;
+            if ui
+                .add_enabled(
+                    can && smooth,
+                    egui::Checkbox::new(&mut post, "Сглаживание 3D по картинке (быстро)"),
+                )
+                .on_hover_text(
+                    "8.12а: вместо доп. лучей на краях — один проход по готовой картинке \
+                 кадра: находит ступеньки по перепаду яркости и смягчает их. Только этот \
+                 кадр, без прошлых. Намного дешевле лучей, но края мягче и менее точные. \
+                 Для слабых видеокарт; сравните вид и время «сглаживание 3D» с «краями 3D»",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::PostAa(post));
             }
             ui.label("Разрешение 3D").on_hover_text(
                 "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
@@ -1809,6 +1829,7 @@ mod tests {
             }),
             space_compute: (false, false),
             space_smooth: (true, true),
+            post_aa: false,
             space_counters: (true, true),
             space_free: true,
             space_boxes: true,
