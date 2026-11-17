@@ -4856,7 +4856,11 @@ impl Demo {
         let lit = match lit {
             Some(lit) if post_aa => {
                 let smooth = graph.create("цвет 3D сглаженный", ext, SPACE_COLOR_FORMAT);
-                let uses = [(lit, Access::Sampled), (smooth, Access::ColorAttachment)];
+                let uses = [
+                    (lit, Access::Sampled),
+                    (gbuffer, Access::Sampled),
+                    (smooth, Access::ColorAttachment),
+                ];
                 let pipeline = self.space_post_aa;
                 graph.add_pass("сглаживание 3D", &uses, move |p| {
                     let push = space_push(
@@ -4866,6 +4870,7 @@ impl Demo {
                         frame.space_address,
                         SpaceSlots {
                             target: p.texture(lit),
+                            gbuffer: p.texture(gbuffer),
                             ..SpaceSlots::default()
                         },
                         0,

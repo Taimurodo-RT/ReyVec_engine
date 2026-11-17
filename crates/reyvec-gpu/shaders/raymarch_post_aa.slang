@@ -10,7 +10,12 @@
 // в пиксель шириной. Края без перепада яркости (одинаковый цвет по обе стороны) не
 // трогаются: их и не видно.
 //
-// Картинка — pc.target; пишет в свою картинку того же размера (SPACE_COLOR_FORMAT).
+// Трогаются только края форм — те же, что сглаживают лучи краёв: по буферу геометрии у
+// соседа небо против формы, другой материал, другая нормаль или скачок глубины. Границы
+// теней, линии пола и блики остаются резкими, как и со сглаживанием лучами.
+//
+// Картинка — pc.target, буфер геометрии — pc.gbuffer того же размера; пишет в свою
+// картинку того же размера (SPACE_COLOR_FORMAT).
 
 #include "include/space.slang"
 
@@ -29,6 +34,28 @@ static const float SEARCH_STRIDE[SEARCH_STEPS] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.5,
 // Сила мягкости для деталей в пиксель шириной (0 — нет, 1 — полное среднее).
 static const float SUBPIXEL = 0.75;
 
+// Край формы у пикселя `p` (с буфером геометрии `g0`): у одного из четырёх соседей —
+// небо против формы, другой материал, поворот нормали или скачок глубины. Проще, чем
+// поиск краёв для лучей (raymarch_edge_find.slang): лишний край тут ничего не портит —
+// без перепада яркости он не сглаживается.
+bool shape_edge(int2 p, int2 last, float4 g0)
+{
+    float3 n0 = oct_decode(g0.zw);
+    for (uint k = 0; k < 4; k++)
+    {
+        int2 o = k < 2 ? int2(int(k) * 2 - 1, 0) : int2(0, int(k) * 2 - 5);
+        float4 g1 = gbuffer_load(clamp(p + o, int2(0, 0), last));
+        if ((g0.x < 0.0) != (g1.x < 0.0))
+            return true;
+        if (g0.x < 0.0)
+            continue;
+        if (abs(g0.y - g1.y) > 0.5 || dot(n0, oct_decode(g1.zw)) < 0.9
+            || abs(g1.x - g0.x) > 0.05 * g0.x + 0.05)
+            return true;
+    }
+    return false;
+}
+
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
@@ -40,6 +67,8 @@ float4 fs_main(VertexOut input) : SV_Target
     float2 inv = 1.0 / float2(w, h);
     int2 p = int2(input.position.xy);
     float3 center = img.Load(int3(p, 0)).rgb;
+    if (!shape_edge(p, last, gbuffer_load(p)))
+        return float4(center, 1.0);
 
     // Яркость пикселя и соседей крестом.
     float lc = luma(center);
