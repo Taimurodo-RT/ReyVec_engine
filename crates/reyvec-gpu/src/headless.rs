@@ -523,6 +523,7 @@ fn render(
             demo.set_edge_creases(tests::EDGE_CREASES.get());
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
             demo.set_edge_far_meters(tests::EDGE_FAR.get());
+            demo.set_post_aa(tests::POST_AA.get());
             demo.set_plane_shadows(tests::PLANE_SHADOWS.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -817,6 +818,8 @@ pub(crate) mod tests {
         /// Края: два луча вдали (8.11б), порог в метрах; как в песочнице, по умолчанию 0 —
         /// выключено.
         pub(super) static EDGE_FAR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+        /// Сглаживание 3D по картинке вместо лучей краёв (8.12а); по умолчанию выключено.
+        pub(super) static POST_AA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Тени моделей от плоскостей граней, как до 8.15 (обычно — от кирпичей поля).
         pub(super) static PLANE_SHADOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Мусором залиты только картинки с этим именем (8.0).
@@ -1663,6 +1666,103 @@ pub(crate) mod tests {
             );
             assert!(mean < 3.0, "{}: средняя разница {mean:.2}", scale.title());
             assert!(share < 0.25, "{}: отличается {share:.3}", scale.title());
+        }
+    }
+
+    /// Сглаживание 3D по картинке (8.12а): без ошибок Vulkan в полном и половинном
+    /// разрешении, прямо в окно и через кадр сцены; у большинства пикселей, где лучи краёв
+    /// меняют кадр (против кадра, где лучи краёв берут середину пикселя), сглаживание по
+    /// картинке сдвигает цвет к лучам, а меняет оно не намного больше пикселей, чем лучи.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn post_aa_is_closer_to_ray_edges() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let mut scene = hollow_side();
+        (scene.width, scene.height) = (641, 361);
+        for (scale, direct) in [
+            (crate::SpaceScale::Full, true),
+            (crate::SpaceScale::Full, false),
+            (crate::SpaceScale::Half, true),
+        ] {
+            SPACE_SCALE.set(scale);
+            NO_DIRECT.set(!direct);
+            let errors = validation_error_count();
+            let rays = render_headless(&options, &scene);
+            EDGE_PROBE.set(crate::EdgeProbe::NoSubRays);
+            let rough = render_headless(&options, &scene);
+            EDGE_PROBE.set(crate::EdgeProbe::Off);
+            POST_AA.set(true);
+            let post = render_headless(&options, &scene);
+            POST_AA.set(false);
+            NO_DIRECT.set(false);
+            SPACE_SCALE.set(crate::SpaceScale::Full);
+            let rays = rays.expect("кадр с лучами краёв");
+            let rough = rough.expect("кадр без доп. лучей");
+            let post = post.expect("кадр со сглаживанием по картинке");
+            assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+            let (rough_changed, _, rough_mean) = image_diff(&rays.image, &rough.image);
+            let (post_changed, post_worst, post_mean) = image_diff(&rays.image, &post.image);
+            let (smoothed, _, _) = image_diff(&rough.image, &post.image);
+            eprintln!(
+                "{}, {}: без сглаживания — отличается {rough_changed} пикселей, средняя \
+                 {rough_mean:.3}; по картинке — {post_changed}, средняя {post_mean:.3}, \
+                 худшая {post_worst}; по картинке изменено {smoothed}",
+                scale.title(),
+                if direct {
+                    "прямо в окно"
+                } else {
+                    "через сцену"
+                },
+            );
+            assert!(smoothed > 0, "сглаживание по картинке ничего не изменило");
+            // Средняя разница — плохая мера: сглаживание по картинке смешивает цвет иначе,
+            // чем лучи (на глаз ступеньки так же сглажены, но смесь у края другая). Мера —
+            // доля пикселей, где лучи меняют кадр, а сглаживание по картинке сдвигает цвет к
+            // лучам.
+            let toward = rough
+                .image
+                .rgba
+                .chunks(4)
+                .zip(post.image.rgba.chunks(4))
+                .zip(rays.image.rgba.chunks(4))
+                .filter(|((r, p), t)| {
+                    let d = |a: &[u8]| -> u32 {
+                        a.iter()
+                            .zip(t.iter())
+                            .take(3)
+                            .map(|(x, y)| u32::from(x.abs_diff(*y)))
+                            .sum()
+                    };
+                    d(r) > 6 && d(p) < d(r)
+                })
+                .count();
+            let rough_edges = rough
+                .image
+                .rgba
+                .chunks(4)
+                .zip(rays.image.rgba.chunks(4))
+                .filter(|(r, t)| {
+                    r.iter()
+                        .zip(t.iter())
+                        .take(3)
+                        .map(|(x, y)| u32::from(x.abs_diff(*y)))
+                        .sum::<u32>()
+                        > 6
+                })
+                .count();
+            eprintln!("ближе к лучам {toward} из {rough_edges} пикселей, где лучи меняют кадр");
+            assert!(toward * 2 > rough_edges, "{toward} из {rough_edges}");
+            if scale == crate::SpaceScale::Full {
+                // Меняются только пиксели у краёв: их не больше, чем пикселей, где лучи
+                // краёв что-то меняют, с запасом на соседей ступенек.
+                assert!(
+                    smoothed <= rough_changed * 3,
+                    "{smoothed} > 3 × {rough_changed}"
+                );
+            }
         }
     }
 
