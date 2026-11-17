@@ -34,23 +34,39 @@ static const float SEARCH_STRIDE[SEARCH_STEPS] = { 1.0, 1.0, 1.0, 1.0, 1.0, 1.5,
 // Сила мягкости для деталей в пиксель шириной (0 — нет, 1 — полное среднее).
 static const float SUBPIXEL = 0.75;
 
-// Край формы у пикселя `p` (с буфером геометрии `g0`): у одного из четырёх соседей —
-// небо против формы, другой материал, поворот нормали или скачок глубины. Проще, чем
-// поиск краёв для лучей (raymarch_edge_find.slang): лишний край тут ничего не портит —
-// без перепада яркости он не сглаживается.
-bool shape_edge(int2 p, int2 last, float4 g0)
+// Точка экрана центра пикселя `px` кадра размером `size` (как в raymarch_edge_find.slang).
+float2 pixel_screen(int2 px, float2 size)
 {
+    float2 c = float2(px) + 0.5;
+    return float2(c.x / size.x * 2.0 - 1.0, 1.0 - c.y / size.y * 2.0);
+}
+
+// Край формы у пикселя `p` (с буфером геометрии `g0`) — те же правила, что у поиска
+// краёв для лучей (edge_reason в raymarch_edge_find.slang): у одного из четырёх соседей
+// небо против формы, другой материал, поворот нормали или сосед не лежит на плоскости
+// этой точки. Ровный пол под острым углом — не край, его линии не размываются.
+bool shape_edge(int2 p, int2 size, float4 g0)
+{
+    Ray r0 = screen_ray(pixel_screen(p, float2(size)));
     float3 n0 = oct_decode(g0.zw);
+    float3 p0 = r0.origin + r0.dir * g0.x;
     for (uint k = 0; k < 4; k++)
     {
         int2 o = k < 2 ? int2(int(k) * 2 - 1, 0) : int2(0, int(k) * 2 - 5);
-        float4 g1 = gbuffer_load(clamp(p + o, int2(0, 0), last));
+        int2 q = p + o;
+        if (any(q < 0) || any(q >= size))
+            continue;
+        float4 g1 = gbuffer_load(q);
         if ((g0.x < 0.0) != (g1.x < 0.0))
             return true;
         if (g0.x < 0.0)
             continue;
-        if (abs(g0.y - g1.y) > 0.5 || dot(n0, oct_decode(g1.zw)) < 0.9
-            || abs(g1.x - g0.x) > 0.05 * g0.x + 0.05)
+        if (abs(g0.y - g1.y) > 0.5 || dot(n0, oct_decode(g1.zw)) < 0.9)
+            return true;
+        Ray r1 = screen_ray(pixel_screen(q, float2(size)));
+        float facing = dot(r1.dir, n0);
+        float expected = abs(facing) > 1e-4 ? dot(p0 - r1.origin, n0) / facing : 1e30;
+        if (abs(g1.x - expected) > 0.01 * g0.x + 0.01)
             return true;
     }
     return false;
@@ -67,7 +83,7 @@ float4 fs_main(VertexOut input) : SV_Target
     float2 inv = 1.0 / float2(w, h);
     int2 p = int2(input.position.xy);
     float3 center = img.Load(int3(p, 0)).rgb;
-    if (!shape_edge(p, last, gbuffer_load(p)))
+    if (!shape_edge(p, last + 1, gbuffer_load(p)))
         return float4(center, 1.0);
 
     // Яркость пикселя и соседей крестом.

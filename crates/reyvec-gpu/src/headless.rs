@@ -1717,21 +1717,42 @@ pub(crate) mod tests {
                     "через сцену"
                 },
             );
-            // ВРЕМЕННО: кадры в target/reference-failures (артефакт CI), чтобы посмотреть.
-            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/reference-failures");
-            std::fs::create_dir_all(&dir).expect("папка");
-            let tag = format!("{}-{direct}", scale.title()).replace(' ', "");
-            for (name, img) in [
-                ("rays", &rays.image),
-                ("rough", &rough.image),
-                ("post", &post.image),
-            ] {
-                let mut ppm = format!("P6 {} {} 255\n", img.width, img.height).into_bytes();
-                for px in img.rgba.chunks(4) {
-                    ppm.extend_from_slice(&px[..3]);
+            // ВРЕМЕННО: кусок кадров в журнал (PPM в base64), чтобы посмотреть глазами.
+            if scale == crate::SpaceScale::Full && direct {
+                const B64: &[u8] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                for (name, img) in [
+                    ("rays", &rays.image),
+                    ("rough", &rough.image),
+                    ("post", &post.image),
+                ] {
+                    let (x0, y0, cw, ch) = (220u32, 120u32, 200u32, 120u32);
+                    let mut ppm = format!("P6 {cw} {ch} 255\n").into_bytes();
+                    for y in y0..y0 + ch {
+                        for x in x0..x0 + cw {
+                            let i = ((y * img.width + x) * 4) as usize;
+                            ppm.extend_from_slice(&img.rgba[i..i + 3]);
+                        }
+                    }
+                    let mut out = String::new();
+                    for c in ppm.chunks(3) {
+                        let n = (u32::from(c[0]) << 16)
+                            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                            | u32::from(*c.get(2).unwrap_or(&0));
+                        for k in 0..4 {
+                            if k <= c.len() {
+                                out.push(B64[((n >> (18 - 6 * k)) & 63) as usize] as char);
+                            } else {
+                                out.push('=');
+                            }
+                        }
+                    }
+                    eprintln!("--- {name} ---");
+                    for line in out.as_bytes().chunks(4000) {
+                        eprintln!("{}", std::str::from_utf8(line).expect("ASCII"));
+                    }
+                    eprintln!("--- конец ---");
                 }
-                std::fs::write(dir.join(format!("post-aa-{tag}-{name}.ppm")), ppm).expect("запись");
             }
             assert!(smoothed > 0, "сглаживание по картинке ничего не изменило");
             assert!(
