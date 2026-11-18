@@ -91,6 +91,9 @@ pub struct SpaceStats {
     pub frame: FrameCounts,
     /// Сколько предметов и моделей сцены движется (8.7; у 2.5D-вида 0).
     pub moving: usize,
+    /// Сетки из форм сцены из файла (8.20а): разных сеток и треугольников в них; `None` —
+    /// ещё строятся или сцена не из файла.
+    pub shape_meshes: Option<(usize, usize)>,
 }
 
 /// Из чего состоит кадр сцены «3D» до отсева по взгляду (8.7).
@@ -769,6 +772,10 @@ pub(crate) struct Demo {
         std::collections::HashMap<(String, u32), (TextureId, reyvec_sdf::shape3d::FieldRef)>,
     /// Сбросить поля слоя при следующей подготовке кадра (сменился файл сцены).
     field_textures_stale: bool,
+    /// Сетки форм сцены «3D» из файла (8.20а, режим «треугольники»): строятся в фоне
+    /// после чтения файла; пока только считаются и пишутся в журнал.
+    space_meshes: Option<reyvec_sdf::shape_mesh::SceneMeshes>,
+    space_meshes_job: Option<std::thread::JoinHandle<reyvec_sdf::shape_mesh::SceneMeshes>>,
     /// Сколько фигур последнего кадра сцены «3D» нарисовано через поле слоя и сколько
     /// выдавленных фигур верхнего уровня в кадре было.
     field_shapes: (usize, usize),
@@ -1124,6 +1131,8 @@ impl Demo {
             space_extrude_field: false,
             field_textures: std::collections::HashMap::new(),
             field_textures_stale: false,
+            space_meshes: None,
+            space_meshes_job: None,
             field_shapes: (0, 0),
             space_field: crate::field::SpaceField::new(
                 frames_in_flight,
@@ -1489,6 +1498,7 @@ impl Demo {
                 if space.camera != self.space.camera {
                     self.space_camera = space.home_camera();
                 }
+                self.start_space_meshes(&space);
                 self.space = space;
                 self.space_error = None;
                 self.field_textures_stale = true;
@@ -1498,6 +1508,51 @@ impl Demo {
                 self.space_error = Some(e);
             }
         }
+    }
+
+    /// Запускает в фоне постройку сеток форм сцены (8.20а). Прежняя постройка, если не
+    /// закончилась, просто досчитает и будет забыта.
+    fn start_space_meshes(&mut self, space: &reyvec_sdf::SpaceScene) {
+        let shapes = space.frame(0.0).shapes;
+        self.space_meshes = None;
+        self.space_meshes_job = std::thread::Builder::new()
+            .name("сетки 3D".into())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let settings = reyvec_sdf::shape_mesh::MeshSettings::default();
+                let meshes = reyvec_sdf::shape_mesh::mesh_shapes(&shapes, &settings);
+                tracing::info!(
+                    "Сетки 3D: форм {}, с сеткой {}, разных сеток {}, треугольников {} ({:.0} мс)",
+                    shapes.len(),
+                    meshes.instances.iter().flatten().count(),
+                    meshes.unique,
+                    meshes.triangles,
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                meshes
+            })
+            .map_err(|e| tracing::warn!("Сетки 3D: поток не запустился: {e}"))
+            .ok();
+    }
+
+    /// Забирает готовые сетки форм сцены, если фоновая постройка закончилась.
+    fn poll_space_meshes(&mut self) {
+        if self
+            .space_meshes_job
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+            && let Some(job) = self.space_meshes_job.take()
+        {
+            match job.join() {
+                Ok(meshes) => self.space_meshes = Some(meshes),
+                Err(_) => tracing::warn!("Сетки 3D: постройка упала"),
+            }
+        }
+    }
+
+    /// Сетки форм сцены «3D», если уже построены.
+    pub fn space_meshes(&self) -> Option<&reyvec_sdf::shape_mesh::SceneMeshes> {
+        self.space_meshes.as_ref()
     }
 
     /// Загружает текстуры моделей сцены «3D» (8.14б2), если сцена сменилась, и убирает
@@ -3612,6 +3667,7 @@ impl Demo {
             } else {
                 // Кирпичи поля (8.15) — до сборки кадра: их программы берут номера картинок.
                 self.sync_space_bricks(ctx, res);
+                self.poll_space_meshes();
                 self.space.plane_shadows = self.space_plane_shadows;
                 (self.space.frame(time), None)
             };
@@ -3734,6 +3790,7 @@ impl Demo {
                 edge_kinds,
                 frame: frame_counts,
                 moving: if level { 0 } else { self.space.moving_count() },
+                shape_meshes: self.space_meshes().map(|m| (m.unique, m.triangles)),
             });
         } else {
             self.space_field.skip();
