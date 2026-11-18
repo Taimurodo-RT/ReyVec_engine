@@ -1684,7 +1684,11 @@ pub(crate) mod tests {
             validation: true,
             gpu: None,
         };
-        let scene = hollow_side();
+        // Как на ПК: с MSAA (без него края полигонов «лесенкой», а у лучей сглажены).
+        let scene = HeadlessScene {
+            msaa: Msaa::X4,
+            ..hollow_side()
+        };
         let errors = validation_error_count();
         let rays = render_headless(&options, &scene).expect("кадр лучами");
         TRIANGLES.set(true);
