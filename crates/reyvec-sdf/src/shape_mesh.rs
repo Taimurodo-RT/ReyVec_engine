@@ -269,11 +269,18 @@ fn contour(program: &Program, grid: &Grid, values: &[f32]) -> ShapeMesh {
                 } else {
                     center
                 };
-                // Точка не выходит из своей клетки: иначе соседние грани заворачиваются.
-                p = p.clamp(base, base + Vec3::splat(grid.cell));
                 if !p.is_finite() {
                     p = center;
                 }
+                // На поверхность: точка QEF у скруглённого ребра — там, где сошлись бы
+                // плоскости без скругления, на миллиметры снаружи формы, и ребро сетки
+                // выходило острым. У острого угла расстояние и так ноль.
+                for _ in 0..2 {
+                    let d = program.distance(p).0;
+                    p -= normal_at(program, p, h) * d;
+                }
+                // Точка не выходит из своей клетки: иначе соседние грани заворачиваются.
+                p = p.clamp(base, base + Vec3::splat(grid.cell));
                 vertex_of[cell_index(x, y, z)] = mesh.positions.len() as u32;
                 let (_, material) = program.distance(p);
                 mesh.positions.push(p);
