@@ -524,6 +524,10 @@ fn render(
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
             demo.set_edge_far_meters(tests::EDGE_FAR.get());
             demo.set_post_aa(tests::POST_AA.get());
+            demo.set_space_triangles(tests::TRIANGLES.get());
+            if tests::TRIANGLES.get() {
+                demo.wait_space_meshes();
+            }
             demo.set_plane_shadows(tests::PLANE_SHADOWS.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -820,6 +824,8 @@ pub(crate) mod tests {
         pub(super) static EDGE_FAR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
         /// Сглаживание 3D по картинке вместо лучей краёв (8.12а); по умолчанию выключено.
         pub(super) static POST_AA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Режим «треугольники» для 3D (8.20б).
+        pub(super) static TRIANGLES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Тени моделей от плоскостей граней, как до 8.15 (обычно — от кирпичей поля).
         pub(super) static PLANE_SHADOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Мусором залиты только картинки с этим именем (8.0).
@@ -1667,6 +1673,61 @@ pub(crate) mod tests {
             assert!(mean < 3.0, "{}: средняя разница {mean:.2}", scale.title());
             assert!(share < 0.25, "{}: отличается {share:.3}", scale.title());
         }
+    }
+
+    /// Режим «треугольники» (8.20б): формы рисуются сетками, кадр почти тот же, что лучами,
+    /// без ошибок Vulkan; формы с сетками уходят из лучей глаза в заменители для теней.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn triangles_look_like_rays() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let scene = hollow_side();
+        let errors = validation_error_count();
+        let rays = render_headless(&options, &scene).expect("кадр лучами");
+        TRIANGLES.set(true);
+        let triangles = render_headless(&options, &scene);
+        TRIANGLES.set(false);
+        let triangles = triangles.expect("кадр треугольниками");
+        assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+        let stats = triangles.space_stats.expect("числа кадра 3D");
+        let (unique, count) = stats.shape_meshes.expect("сетки построены");
+        // Формы ушли из лучей глаза в заменители (только тени).
+        let ray_stats = rays.space_stats.expect("числа кадра 3D лучами");
+        let (changed, worst, mean) = image_diff(&rays.image, &triangles.image);
+        let pixels = (scene.width * scene.height) as usize;
+        let strong = rays
+            .image
+            .rgba
+            .chunks(4)
+            .zip(triangles.image.rgba.chunks(4))
+            .filter(|(a, b)| {
+                a.iter()
+                    .zip(b.iter())
+                    .take(3)
+                    .map(|(x, y)| u32::from(x.abs_diff(*y)))
+                    .sum::<u32>()
+                    > 48
+            })
+            .count();
+        eprintln!(
+            "сеток {unique}, треугольников {count}; заменителей лучами {}, треугольниками {}; \
+             отличается {changed} пикселей из {pixels} (сильно {strong}), средняя {mean:.3}, \
+             худшая {worst}",
+            ray_stats.frame.proxies, stats.frame.proxies,
+        );
+        assert!(unique > 0 && count > 0);
+        assert!(stats.frame.proxies > ray_stats.frame.proxies);
+        assert!(
+            changed > 0,
+            "кадр треугольниками совпал с лучами: сетки не рисуются?"
+        );
+        assert!(
+            strong * 50 < pixels,
+            "сильно отличается {strong} пикселей из {pixels}"
+        );
     }
 
     /// Сглаживание 3D по картинке (8.12а): без ошибок Vulkan в полном и половинном

@@ -430,7 +430,9 @@ pub fn split_rigid(shape: &Shape3) -> (Rigid, Shape3) {
 #[derive(Default)]
 pub struct MeshCache {
     settings: MeshSettings,
-    meshes: HashMap<Vec<u32>, Option<Arc<ShapeMesh>>>,
+    /// Номер сетки в `list` (`None` — у формы сетки нет).
+    keys: HashMap<Vec<u32>, Option<usize>>,
+    list: Vec<Arc<ShapeMesh>>,
     /// Сколько раз сетка нашлась готовой.
     pub hits: usize,
 }
@@ -439,6 +441,8 @@ pub struct MeshCache {
 #[derive(Clone, Debug)]
 pub struct MeshInstance {
     pub mesh: Arc<ShapeMesh>,
+    /// Номер сетки среди разных ([`SceneMeshes::meshes`]).
+    pub index: usize,
     pub place: Rigid,
 }
 
@@ -452,33 +456,41 @@ impl MeshCache {
 
     /// Сколько разных сеток построено (без пустых и бесконечных форм).
     pub fn len(&self) -> usize {
-        self.meshes.values().filter(|m| m.is_some()).count()
+        self.list.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.list.is_empty()
     }
 
     /// Все треугольники разных сеток.
     pub fn triangle_count(&self) -> usize {
-        self.meshes
-            .values()
-            .flatten()
-            .map(|m| m.triangle_count())
-            .sum()
+        self.list.iter().map(|m| m.triangle_count()).sum()
     }
 
     /// Сетка формы и где она стоит; `None` — форма бесконечна или пуста.
     pub fn get(&mut self, shape: &Shape3) -> Result<Option<MeshInstance>, CompileError> {
         let (place, local) = split_rigid(shape);
         let program = compile(&local)?;
-        if let Some(found) = self.meshes.get(&program.words) {
-            self.hits += 1;
-            return Ok(found.clone().map(|mesh| MeshInstance { mesh, place }));
-        }
-        let mesh = mesh_program(&program, &self.settings).map(Arc::new);
-        self.meshes.insert(program.words, mesh.clone());
-        Ok(mesh.map(|mesh| MeshInstance { mesh, place }))
+        let index = match self.keys.get(&program.words) {
+            Some(&found) => {
+                self.hits += 1;
+                found
+            }
+            None => {
+                let index = mesh_program(&program, &self.settings).map(|mesh| {
+                    self.list.push(Arc::new(mesh));
+                    self.list.len() - 1
+                });
+                self.keys.insert(program.words, index);
+                index
+            }
+        };
+        Ok(index.map(|index| MeshInstance {
+            mesh: self.list[index].clone(),
+            index,
+            place,
+        }))
     }
 }
 
@@ -486,6 +498,8 @@ impl MeshCache {
 #[derive(Debug, Default)]
 pub struct SceneMeshes {
     pub instances: Vec<Option<MeshInstance>>,
+    /// Разные сетки по номерам [`MeshInstance::index`].
+    pub meshes: Vec<Arc<ShapeMesh>>,
     /// Разных сеток.
     pub unique: usize,
     /// Треугольников во всех разных сетках.
@@ -501,6 +515,7 @@ pub fn mesh_shapes(shapes: &[Shape3], settings: &MeshSettings) -> SceneMeshes {
         instances,
         unique: cache.len(),
         triangles: cache.triangle_count(),
+        meshes: cache.list,
     }
 }
 

@@ -389,6 +389,17 @@ impl App {
                 r.set_space_smooth(on);
                 tracing::info!("Сглаживание 3D: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::SpaceTriangles(on) => {
+                r.set_space_triangles(on);
+                tracing::info!(
+                    "Режим 3D: {}",
+                    if on {
+                        "треугольники (сетки из форм)"
+                    } else {
+                        "лучи"
+                    }
+                );
+            }
             PanelAction::PostAa(on) => {
                 r.set_post_aa(on);
                 tracing::info!(
@@ -680,6 +691,7 @@ impl App {
                 space_compute: renderer.space_compute(),
                 space_smooth: renderer.space_smooth(),
                 post_aa: renderer.post_aa(),
+                space_triangles: renderer.space_triangles(),
                 space_counters: renderer.space_counters(),
                 space_free: renderer.space_free(),
                 space_boxes: renderer.space_boxes(),

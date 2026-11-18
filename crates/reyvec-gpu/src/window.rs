@@ -691,6 +691,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Режим 3D «треугольники» (8.20б).
+    pub fn space_triangles(&self) -> bool {
+        self.demo.as_ref().is_some_and(|d| d.space_triangles())
+    }
+
+    /// Включает и выключает режим «треугольники» со следующего кадра.
+    pub fn set_space_triangles(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_triangles(on);
+        }
+    }
+
     /// Сглаживание 3D по картинке вместо лучей краёв (8.12а).
     pub fn post_aa(&self) -> bool {
         self.demo.as_ref().is_some_and(|d| d.post_aa())

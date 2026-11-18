@@ -36,6 +36,8 @@ pub(crate) enum PanelAction {
     SpaceSmooth(bool),
     /// Сглаживание 3D по картинке вместо лучей краёв (8.12а).
     PostAa(bool),
+    /// Режим 3D «треугольники» (8.20б): формы с сетками рисуются растром.
+    SpaceTriangles(bool),
     /// Счётчики лучей 3D (7.18д2).
     SpaceCounters(bool),
     /// Длинный шаг в пустоте (7.18д4).
@@ -152,6 +154,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_smooth: (bool, bool),
     /// Сглаживание 3D по картинке вместо лучей краёв (8.12а).
     pub post_aa: bool,
+    /// Режим 3D «треугольники» (8.20б).
+    pub space_triangles: bool,
     /// Счётчики лучей 3D (7.18д2): включены ли и умеет ли видеокарта.
     pub space_counters: (bool, bool),
     /// Длинный шаг в пустоте (7.18д4): включён ли.
@@ -915,6 +919,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::PostAa(post));
+            }
+            let mut triangles = info.space_triangles;
+            if ui
+                .checkbox(&mut triangles, "Режим «треугольники» (опыт)")
+                .on_hover_text(
+                    "8.20б: формы сцены из файла рисуются сетками треугольников (их строит \
+                 движок при открытии сцены), а не лучами. Тени и затенение в углах пока \
+                 считаются лучами по формам. Для слабых видеокарт: сравните вид и время \
+                 «лучей 3D»",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::SpaceTriangles(triangles));
             }
             ui.label("Разрешение 3D").on_hover_text(
                 "В какой доле кадра по каждой стороне идут лучи, тени, края и освещение. \
@@ -1836,6 +1853,7 @@ mod tests {
             space_compute: (false, false),
             space_smooth: (true, true),
             post_aa: false,
+            space_triangles: false,
             space_counters: (true, true),
             space_free: true,
             space_boxes: true,
