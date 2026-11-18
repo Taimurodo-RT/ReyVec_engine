@@ -18,8 +18,11 @@ use crate::shape3d::Program;
 
 /// Новый треугольник не поворачивается сильнее этого против прежнего (косинус угла).
 const MAX_TURN_COS: f32 = 0.2;
-/// Треугольник смотрит туда же, куда наклон поля в его середине (косинус угла).
-const MIN_FACING_COS: f32 = 0.5;
+/// Треугольник смотрит туда же, куда наклон поля внутри него (косинус угла, около 20°):
+/// иначе большой плоский треугольник ложится на плавный изгиб (в пределах допуска по
+/// расстоянию) и освещается гранью — на снимке это ломаная складка там, где у лучей
+/// гладкая поверхность (8.20б).
+const MIN_FACING_COS: f32 = 0.94;
 
 /// Убирает вершины, пока поверхность остаётся ближе `tolerance` к форме `program`.
 /// Сетка остаётся замкнутой; материалы не смешиваются (сливаются только вершины одного
@@ -107,21 +110,21 @@ pub fn simplify(mesh: &mut ShapeMesh, program: &Program, tolerance: f32) {
                 }
                 let [a, b, c] = new;
                 let center = (a + b + c) / 3.0;
-                let slope = gradient(program, center, h).normalize_or_zero();
-                if n_new.dot(slope) < MIN_FACING_COS {
-                    return false;
-                }
-                [
+                let inner = [
                     center,
-                    (a + b) * 0.5,
-                    (b + c) * 0.5,
-                    (c + a) * 0.5,
                     (a * 2.0 + b + c) * 0.25,
                     (a + b * 2.0 + c) * 0.25,
                     (a + b + c * 2.0) * 0.25,
-                ]
-                .into_iter()
-                .all(close)
+                ];
+                // Наклон — только внутри: середины сторон могут лежать на остром ребре.
+                let facing = inner.iter().all(|&p| {
+                    n_new.dot(gradient(program, p, h).normalize_or_zero()) >= MIN_FACING_COS
+                });
+                facing
+                    && inner
+                        .into_iter()
+                        .chain([(a + b) * 0.5, (b + c) * 0.5, (c + a) * 0.5])
+                        .all(close)
             });
         if !ok {
             continue;
@@ -270,9 +273,12 @@ pub fn split_normals(mesh: &mut ShapeMesh, program: &Program) {
         let flat = face(p).normalize_or_zero();
         for k in 0..3 {
             let v = t[k] as usize;
-            // Точка на десятую пути от угла к середине — по ту же сторону ребра, что и
-            // треугольник; нормаль не уводится далеко от грани.
-            let at = p[k].lerp(center, 0.1);
+            // Точка чуть в сторону середины — по ту же сторону ребра, что и треугольник,
+            // но рядом с углом: у большого треугольника на изгибе десятая пути к середине
+            // уводила нормаль, и соседние углы одной вершины расходились в складку.
+            let to = center - p[k];
+            let step = (mesh.cell * 0.3).min(to.length() * 0.5);
+            let at = p[k] + to.normalize_or_zero() * step;
             let mut n = gradient(program, at, h).normalize_or_zero();
             if n.dot(flat) < 0.0 || n == Vec3::ZERO {
                 n = flat;
