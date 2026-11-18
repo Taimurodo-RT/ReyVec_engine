@@ -1730,6 +1730,7 @@ pub(crate) mod tests {
         );
         if strong * 50 >= pixels {
             dump_ppm("rays", &rays.image, scene.width, scene.height);
+            dump_ppm("tri", &triangles.image, scene.width, scene.height);
             dump_diff(&rays.image, &triangles.image, scene.width, scene.height);
         }
         assert!(
@@ -3017,7 +3018,27 @@ pub(crate) mod tests {
     /// Временно: карта отличий в журнал (клетка 10×10): яркость кадра лучами и где
     /// треугольники темнее (`d`/`D`) или светлее (`b`/`B`).
     fn dump_ppm(name: &str, img: &FrameImage, width: u32, height: u32) {
-        let _ = (name, img, width, height);
+        // Вырезка 180×100 с x = 280, y = 30, серым, base64.
+        let _ = height;
+        let mut bytes = Vec::new();
+        for y in 30..130u32 {
+            for x in 280..460u32 {
+                let i = ((y * width + x) * 4) as usize;
+                let sum: u32 = img.rgba[i..i + 3].iter().map(|&c| u32::from(c)).sum();
+                bytes.push((sum / 3) as u8);
+            }
+        }
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
+            for k in 0..4 {
+                b64.push(T[((n >> (18 - 6 * k)) & 63) as usize] as char);
+            }
+        }
+        for line in b64.as_bytes().chunks(6000) {
+            eprintln!("PPM-{name} {}", std::str::from_utf8(line).unwrap_or(""));
+        }
     }
 
     fn dump_diff(a: &FrameImage, b: &FrameImage, width: u32, height: u32) {
