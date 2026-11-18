@@ -1726,7 +1726,7 @@ pub(crate) mod tests {
         );
         if strong * 50 >= pixels {
             dump_ppm("rays", &rays.image, scene.width, scene.height);
-            dump_ppm("tri", &triangles.image, scene.width, scene.height);
+            dump_diff(&rays.image, &triangles.image, scene.width, scene.height);
         }
         assert!(
             strong * 50 < pixels,
@@ -3010,32 +3010,52 @@ pub(crate) mod tests {
 
     /// Пикселей, отличающихся больше чем на 2 ступени, наибольшая разница канала и
     /// средняя разница.
-    /// Временно: кадр в журнал (PPM вполовину, base64), чтобы посмотреть его из CI.
+    /// Временно: карта отличий в журнал (клетка 10×10): яркость кадра лучами и где
+    /// треугольники темнее (`d`/`D`) или светлее (`b`/`B`).
     fn dump_ppm(name: &str, img: &FrameImage, width: u32, height: u32) {
-        let (w, h) = (width / 2, height / 2);
-        let mut ppm = format!("P6 {w} {h} 255\n").into_bytes();
-        for y in 0..h {
-            for x in 0..w {
-                let i = (((y * 2) * width + x * 2) * 4) as usize;
-                ppm.extend_from_slice(&img.rgba[i..i + 3]);
-            }
-        }
-        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut b64 = String::new();
-        for c in ppm.chunks(3) {
-            let n = (u32::from(c[0]) << 16)
-                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
-                | u32::from(*c.get(2).unwrap_or(&0));
-            for k in 0..4 {
-                if k <= c.len() {
-                    b64.push(T[((n >> (18 - 6 * k)) & 63) as usize] as char);
-                } else {
-                    b64.push('=');
+        let _ = (name, img, width, height);
+    }
+
+    fn dump_diff(a: &FrameImage, b: &FrameImage, width: u32, height: u32) {
+        const RAMP: &[u8] = b" .:-=+*#%@";
+        for by in 0..height / 10 {
+            let mut lum = String::new();
+            let mut diff = String::new();
+            for bx in 0..width / 10 {
+                let (mut l, mut dark, mut bright) = (0u32, 0u32, 0u32);
+                for y in by * 10..by * 10 + 10 {
+                    for x in bx * 10..bx * 10 + 10 {
+                        let i = ((y * width + x) * 4) as usize;
+                        let sa: i32 = a.rgba[i..i + 3].iter().map(|&c| i32::from(c)).sum();
+                        let sb: i32 = b.rgba[i..i + 3].iter().map(|&c| i32::from(c)).sum();
+                        l += sa as u32;
+                        if sb - sa > 48 {
+                            bright += 1;
+                        } else if sa - sb > 48 {
+                            dark += 1;
+                        }
+                    }
                 }
+                lum.push(RAMP[((l / 100 / 3) * 10 / 256).min(9) as usize] as char);
+                diff.push(match (dark, bright) {
+                    (d, br) if d + br < 3 => '.',
+                    (d, br) if d >= br => {
+                        if d > 30 {
+                            'D'
+                        } else {
+                            'd'
+                        }
+                    }
+                    (_, br) => {
+                        if br > 30 {
+                            'B'
+                        } else {
+                            'b'
+                        }
+                    }
+                });
             }
-        }
-        for line in b64.as_bytes().chunks(4000) {
-            eprintln!("PPM-{name} {}", std::str::from_utf8(line).unwrap_or(""));
+            eprintln!("MAP {lum} | {diff}");
         }
     }
 
