@@ -36,6 +36,9 @@ pub struct MeshSettings {
     /// `max_cell`. Считается по объёму коробки, поэтому длинная тонкая стена остаётся с
     /// мелкой клеткой и не теряет толщину.
     pub max_samples: u32,
+    /// Упрощение (8.20а2, [`crate::mesh_simplify`]): поверхность сетки не дальше этого от
+    /// формы (метры; не больше четверти клетки). 0 — не упрощать.
+    pub max_error: f32,
 }
 
 impl Default for MeshSettings {
@@ -44,6 +47,7 @@ impl Default for MeshSettings {
             max_cell: 0.05,
             min_cells: 24,
             max_samples: 2_000_000,
+            max_error: 0.004,
         }
     }
 }
@@ -123,7 +127,12 @@ pub fn mesh_program(program: &Program, settings: &MeshSettings) -> Option<ShapeM
         n: [n.x as usize, n.y as usize, n.z as usize],
     };
     let values = sample(program, &grid);
-    let mesh = contour(program, &grid, &values);
+    let mut mesh = contour(program, &grid, &values);
+    if settings.max_error > 0.0 {
+        let tolerance = settings.max_error.min(0.25 * cell);
+        crate::mesh_simplify::simplify(&mut mesh, program, tolerance);
+        crate::mesh_simplify::split_normals(&mut mesh, program);
+    }
     (!mesh.indices.is_empty()).then_some(mesh)
 }
 
@@ -506,12 +515,15 @@ mod tests {
         (program, mesh)
     }
 
-    /// Каждое ребро сетки — у двух треугольников с встречным обходом: сетка замкнута и
+    /// Каждое ребро сетки (по месту вершин) — у двух треугольников с встречным обходом: сетка замкнута и
     /// смотрит наружу одинаково.
     fn assert_closed(mesh: &ShapeMesh) {
-        let mut edges: HashMap<(u32, u32), i32> = HashMap::new();
+        // Вершины на острых рёбрах поделены по нормалям: рёбра сравниваются по месту.
+        let key = |i: u32| mesh.positions[i as usize].to_array().map(f32::to_bits);
+        let mut edges: HashMap<([u32; 3], [u32; 3]), i32> = HashMap::new();
         for t in mesh.indices.chunks_exact(3) {
             for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (a, b) = (key(a), key(b));
                 *edges.entry((a.min(b), a.max(b))).or_default() += if a < b { 1 } else { -1 };
             }
         }
@@ -639,6 +651,31 @@ mod tests {
         }
     }
 
+    /// Упрощение: у коробки без скруглений остаётся по паре треугольников на стенку, у
+    /// цилиндра со скруглениями — немного; сетки завода в кадре — меньше миллиона.
+    #[test]
+    fn simplified_meshes_are_small() {
+        let (_, plain) = mesh(&Shape3::Box {
+            size: [0.5, 1.2, 0.4],
+            round: 0.0,
+        });
+        assert!(
+            plain.triangle_count() <= 24,
+            "коробка: {}",
+            plain.triangle_count()
+        );
+        let (_, barrel) = mesh(&Shape3::Cylinder {
+            height: 0.9,
+            radius: 0.28,
+            round: 0.03,
+        });
+        assert!(
+            barrel.triangle_count() <= 1500,
+            "бочка: {}",
+            barrel.triangle_count()
+        );
+    }
+
     /// Материал вершин — материал ближайшей части.
     #[test]
     fn vertices_carry_materials() {
@@ -719,13 +756,20 @@ mod tests {
         let meshes = mesh_shapes(&frame.shapes, &MeshSettings::default());
         let took = started.elapsed();
         let with = meshes.instances.iter().flatten().count();
+        let drawn: usize = meshes
+            .instances
+            .iter()
+            .flatten()
+            .map(|i| i.mesh.triangle_count())
+            .sum();
         eprintln!(
-            "завод: форм {}, с сеткой {with}, разных сеток {}, треугольников {}, {:.0} мс",
+            "завод: форм {}, с сеткой {with}, разных сеток {}, треугольников {}, в кадре {drawn}, {:.0} мс",
             frame.shapes.len(),
             meshes.unique,
             meshes.triangles,
             took.as_secs_f64() * 1000.0
         );
+        assert!(drawn < 1_000_000, "треугольников в кадре {drawn}");
         // Всё, кроме пола, получает сетку; станков, ящиков и конвейеров много одинаковых.
         assert_eq!(with + 1, frame.shapes.len());
         assert!(meshes.unique * 10 < with, "разных сеток {}", meshes.unique);
