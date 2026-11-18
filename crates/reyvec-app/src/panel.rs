@@ -1453,6 +1453,11 @@ fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
          заменителей для теней {}",
         f.shapes, s.moving, f.mesh_parts, f.triangles, f.proxies
     )));
+    if let Some((unique, triangles)) = s.shape_meshes {
+        ui.label(mono(format!(
+            "Сетки из форм (для режима «треугольники»): разных {unique}, треугольников {triangles}"
+        )));
+    }
     ui.label(
         mono(format!(
             "Процессор: сборка форм 3D {:.2} мс, отсев, упаковка и запись {:.2} мс \
@@ -1804,6 +1809,7 @@ mod tests {
                     triangles: 800,
                 },
                 moving: 12,
+                shape_meshes: Some((16, 393_968)),
                 rays: Some(
                     [reyvec_gpu::RayCounts {
                         rays: 2_073_600,
