@@ -41,6 +41,39 @@ float3 normal_at(float3 p, float t)
     return normalize(n);
 }
 
+// Сетки из форм (8.20б, режим «треугольники»): точка сетки лежит на форме с точностью до
+// миллиметров, а сама форма осталась в сцене заменителем (только тени). Нормаль точки
+// берётся по наклону формы, а не по углам треугольников: свет ложится так же гладко,
+// как у лучей, и большие плоские треугольники на изгибах не видны гранями. Точки
+// моделей (их в поле нет) и точки, где наклон формы с гранью не сходится (модель
+// касается формы), остаются со своей нормалью.
+static const float SHAPE_MESH_NEAR = 0.006;
+
+float4 shape_mesh_point(Ray ray, float4 mesh)
+{
+    if (mesh.x < 0.0)
+        return mesh;
+    uint at = pc.scene[7];
+    if (at == 0 || pc.scene[at + MESH_SHAPES + 3] == 0)
+        return mesh;
+    float3 p = ray.origin + ray.dir * mesh.x;
+    if (abs(scene_near(p, 0.02, true, false).x) > SHAPE_MESH_NEAR)
+        return mesh;
+    const float e = 0.001;
+    float3 n = float3(0.0, 0.0, 0.0);
+    for (uint k = 0; k < 4; k++)
+    {
+        float3 dir = float3(float(((k + 3) >> 1) & 1), float((k >> 1) & 1), float(k & 1)) * 2.0 - 1.0;
+        n += dir * scene_near(p + dir * e, 0.02, true, false).x;
+    }
+    if (dot(n, n) < 1e-12)
+        return mesh;
+    n = normalize(n);
+    if (dot(n, oct_decode(mesh.zw)) < 0.5)
+        return mesh;
+    return float4(mesh.x, mesh.y, oct_encode(n));
+}
+
 // Точка буфера геометрии для пикселя `px` (точка экрана `screen`). Общая для
 // пиксельного шейдера и вычислительного (опыт 7.6м). Лучи краёв (raymarch_edges.slang)
 // передают свой номер `sub` и середину пикселя `center` на экране, луч середины — −1.
@@ -136,7 +169,7 @@ float4 march_pixel(int2 px, float2 screen, int sub, float2 center)
     {
         if (plane_first)
             return float4(plane.x, plane.y, oct_encode(plane_normal));
-        return mesh;
+        return shape_mesh_point(ray, mesh);
     }
     // Материал первого слоя поля уровня — один раз, в точке попадания (7.18д3).
     if (hit.y == LAYER_MATERIAL_LOOKUP)

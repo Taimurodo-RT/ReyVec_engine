@@ -44,7 +44,7 @@ pub struct MeshSettings {
 impl Default for MeshSettings {
     fn default() -> Self {
         Self {
-            max_cell: 0.05,
+            max_cell: 0.025,
             min_cells: 24,
             max_samples: 2_000_000,
             max_error: 0.004,
@@ -333,8 +333,11 @@ fn contour(program: &Program, grid: &Grid, values: &[f32]) -> ShapeMesh {
 fn push_quad(mesh: &mut ShapeMesh, q: [u32; 4], outward: Vec3) {
     let p = q.map(|i| mesh.positions[i as usize]);
     let n = q.map(|i| mesh.normals[i as usize]);
-    // Обход (0, 1, 2, 3) смотрит в сторону `outward` или против неё: сразу разворачиваем.
-    let flip = (p[2] - p[0]).cross(p[3] - p[1]).dot(outward) < 0.0;
+    // Обход (0, 1, 2, 3) вокруг ребра оси смотрит вдоль оси (клетки идут против часовой
+    // стрелки в плоскости двух других осей): разворачиваем, если наружу — против оси.
+    // По числам, а не по месту вершин: у сложенного четырёхугольника (вершины прижаты к
+    // стенкам клеток) место давало не тот обход, и в сетке оставалась дыра.
+    let flip = outward.x + outward.y + outward.z < 0.0;
     let orient = |t: [usize; 3]| if flip { [t[0], t[2], t[1]] } else { t };
     let score = |t: [usize; 3]| {
         let face = (p[t[1]] - p[t[0]]).cross(p[t[2]] - p[t[0]]);
@@ -351,11 +354,10 @@ fn push_quad(mesh: &mut ShapeMesh, q: [u32; 4], outward: Vec3) {
     } else {
         splits[1]
     };
+    // Треугольник нулевой площади (вершины на одной прямой) тоже остаётся: без него в
+    // сетке дыра. Упрощение уберёт его вместе с вершиной.
     for t in best {
-        let face = (p[t[1]] - p[t[0]]).cross(p[t[2]] - p[t[0]]);
-        if face.length_squared() > 0.0 {
-            mesh.indices.extend(t.map(|k| q[k]));
-        }
+        mesh.indices.extend(t.map(|k| q[k]));
     }
 }
 
