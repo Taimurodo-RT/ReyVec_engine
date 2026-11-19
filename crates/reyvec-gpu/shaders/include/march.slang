@@ -57,14 +57,20 @@ float4 shape_mesh_point(Ray ray, float4 mesh)
     if (at == 0 || pc.scene[at + MESH_SHAPES + 3] == 0)
         return mesh;
     float3 p = ray.origin + ray.dir * mesh.x;
-    if (abs(scene_near(p, 0.02, true, false).x) > SHAPE_MESH_NEAR)
-        return mesh;
     const float e = 0.001;
     float3 n = float3(0.0, 0.0, 0.0);
-    for (uint k = 0; k < 4; k++)
+    // Сначала сама точка (далеко от форм — модель), потом четыре точки тетраэдра. Одним
+    // циклом: scene_near встраивается в шейдер один раз (lavapipe собирает его быстро).
+    for (uint k = 0; k < 5; k++)
     {
-        float3 dir = float3(float(((k + 3) >> 1) & 1), float((k >> 1) & 1), float(k & 1)) * 2.0 - 1.0;
-        n += dir * scene_near(p + dir * e, 0.02, true, false).x;
+        uint j = k - 1;
+        float3 dir = k == 0
+            ? float3(0.0, 0.0, 0.0)
+            : float3(float(((j + 3) >> 1) & 1), float((j >> 1) & 1), float(j & 1)) * 2.0 - 1.0;
+        float d = scene_near(p + dir * e, 0.02, true, false).x;
+        if (k == 0 && abs(d) > SHAPE_MESH_NEAR)
+            return mesh;
+        n += dir * d;
     }
     if (dot(n, n) < 1e-12)
         return mesh;
