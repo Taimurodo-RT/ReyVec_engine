@@ -17,7 +17,10 @@ static const float NORMAL_GAP = 0.024;
 // Бит 2 слова 11 заголовка: нормаль всегда по всей сцене (сравнение в тестах).
 static const uint SCENE_FULL_NORMAL = 4;
 
-float3 normal_at(float3 p, float t)
+// `shapes` — точка сетки из форм (8.20б): наклон по заменителям и без плоскостей; `mean` —
+// среднее расстояние в четырёх точках (почти расстояние до форм в самой точке). Флаг —
+// не постоянная, а значение: вызов один, и сцена встраивается в шейдер один раз.
+float3 normal_at(float3 p, float t, bool shapes, out float mean)
 {
     // Наклон поля по четырём точкам тетраэдра: дешевле шести и без перекоса. Точки
     // перебираются циклом, а не четырьмя вызовами подряд: так scene() встраивается в
@@ -26,6 +29,7 @@ float3 normal_at(float3 p, float t)
     float near = 0.0005 * max(t, 1.0) + NORMAL_NEAR;
     bool full = (pc.scene[11] & SCENE_FULL_NORMAL) != 0;
     float3 n = float3(0.0, 0.0, 0.0);
+    mean = 0.0;
     uint only = SCENE_ALL;
     for (uint k = 0; k < 4; k++)
     {
@@ -33,52 +37,22 @@ float3 normal_at(float3 p, float t)
         count_normal();
         uint winner;
         float second;
-        float d = scene_pick(p + dir * e, full || only != SCENE_ALL ? 1e9 : near, false, true, only, winner, second).x;
+        float d = scene_pick(p + dir * e, full || only != SCENE_ALL ? 1e9 : near, shapes, !shapes, only, winner, second).x;
         if (k == 0 && !full && winner != SCENE_ALL && second - d > NORMAL_GAP)
             only = winner;
         n += dir * d;
+        mean += 0.25 * d;
     }
     return normalize(n);
 }
 
 // Сетки из форм (8.20б, режим «треугольники»): точка сетки лежит на форме с точностью до
 // миллиметров, а сама форма осталась в сцене заменителем (только тени). Нормаль точки
-// берётся по наклону формы, а не по углам треугольников: свет ложится так же гладко,
-// как у лучей, и большие плоские треугольники на изгибах не видны гранями. Точки
-// моделей (их в поле нет) и точки, где наклон формы с гранью не сходится (модель
-// касается формы), остаются со своей нормалью.
+// берётся по наклону формы (normal_at с заменителями), а не по углам треугольников: свет
+// ложится так же гладко, как у лучей, и большие плоские треугольники на изгибах не видны
+// гранями. Точки моделей (их в поле нет — далеко от форм) и точки, где наклон формы с
+// гранью не сходится (модель касается формы), остаются со своей нормалью.
 static const float SHAPE_MESH_NEAR = 0.006;
-
-float4 shape_mesh_point(Ray ray, float4 mesh)
-{
-    if (mesh.x < 0.0)
-        return mesh;
-    uint at = pc.scene[7];
-    if (at == 0 || pc.scene[at + MESH_SHAPES + 3] == 0)
-        return mesh;
-    float3 p = ray.origin + ray.dir * mesh.x;
-    const float e = 0.001;
-    float3 n = float3(0.0, 0.0, 0.0);
-    // Сначала сама точка (далеко от форм — модель), потом четыре точки тетраэдра. Одним
-    // циклом: scene_near встраивается в шейдер один раз (lavapipe собирает его быстро).
-    for (uint k = 0; k < 5; k++)
-    {
-        uint j = k - 1;
-        float3 dir = k == 0
-            ? float3(0.0, 0.0, 0.0)
-            : float3(float(((j + 3) >> 1) & 1), float((j >> 1) & 1), float(j & 1)) * 2.0 - 1.0;
-        float d = scene_near(p + dir * e, 0.02, true, false).x;
-        if (k == 0 && abs(d) > SHAPE_MESH_NEAR)
-            return mesh;
-        n += dir * d;
-    }
-    if (dot(n, n) < 1e-12)
-        return mesh;
-    n = normalize(n);
-    if (dot(n, oct_decode(mesh.zw)) < 0.5)
-        return mesh;
-    return float4(mesh.x, mesh.y, oct_encode(n));
-}
 
 // Точка буфера геометрии для пикселя `px` (точка экрана `screen`). Общая для
 // пиксельного шейдера и вычислительного (опыт 7.6м). Лучи краёв (raymarch_edges.slang)
@@ -119,6 +93,7 @@ float4 march_pixel(int2 px, float2 screen, int sub, float2 center)
     limit = min(limit, plane.x);
     float t = min(textures[pc.cone].Load(int3(px / 8, 0)).x, limit);
     float2 hit = float2(-1.0, 0.0);
+    bool shape_point = false;
     // Шаг с «перелётом» (over-relaxation, Keinert и др., «Enhanced Sphere Tracing»,
     // 2014): шагаем в 1.6 раза дальше безопасного. Пока шары пустоты соседних точек
     // перекрываются, между ними точно пусто и перелёт законен. Если не перекрылись —
@@ -175,12 +150,20 @@ float4 march_pixel(int2 px, float2 screen, int sub, float2 center)
     {
         if (plane_first)
             return float4(plane.x, plane.y, oct_encode(plane_normal));
-        return shape_mesh_point(ray, mesh);
+        // Без сеток из форм в кадре — точка полигонов как есть.
+        uint at = pc.scene[7];
+        if (mesh.x < 0.0 || at == 0 || pc.scene[at + MESH_SHAPES + 3] == 0)
+            return mesh;
+        shape_point = true;
+        hit = mesh.xy;
     }
     // Материал первого слоя поля уровня — один раз, в точке попадания (7.18д3).
     if (hit.y == LAYER_MATERIAL_LOOKUP)
         hit.y = level_field_material(pc.scene, pc.scene[13], hit_at);
-    float3 n = normal_at(ray.origin + ray.dir * hit.x, hit.x);
+    float mean;
+    float3 n = normal_at(ray.origin + ray.dir * hit.x, hit.x, shape_point, mean);
+    if (shape_point && (abs(mean) > SHAPE_MESH_NEAR || dot(n, oct_decode(mesh.zw)) < 0.5))
+        return mesh;
     return float4(hit.x, hit.y, oct_encode(n));
 }
 
