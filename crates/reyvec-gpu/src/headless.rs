@@ -1693,33 +1693,43 @@ pub(crate) mod tests {
         let rays = render_headless(&options, &scene).expect("кадр лучами");
         TRIANGLES.set(true);
         let triangles = render_headless(&options, &scene);
+        // Без карты теней солнца (8.20в): тени солнца лучами по заменителям.
+        NO_SHADOW_MAPS.set(true);
+        let traced = render_headless(&options, &scene);
+        NO_SHADOW_MAPS.set(false);
         TRIANGLES.set(false);
         let triangles = triangles.expect("кадр треугольниками");
+        let traced = traced.expect("кадр треугольниками без карты солнца");
         assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
         let stats = triangles.space_stats.expect("числа кадра 3D");
         let (unique, count) = stats.shape_meshes.expect("сетки построены");
         // Формы ушли из лучей глаза в заменители (только тени).
         let ray_stats = rays.space_stats.expect("числа кадра 3D лучами");
-        let (changed, worst, mean) = image_diff(&rays.image, &triangles.image);
         let pixels = (scene.width * scene.height) as usize;
-        let strong = rays
-            .image
-            .rgba
-            .chunks(4)
-            .zip(triangles.image.rgba.chunks(4))
-            .filter(|(a, b)| {
-                a.iter()
-                    .zip(b.iter())
-                    .take(3)
-                    .map(|(x, y)| u32::from(x.abs_diff(*y)))
-                    .sum::<u32>()
-                    > 48
-            })
-            .count();
+        let strong = |a: &FrameImage, b: &FrameImage| {
+            a.rgba
+                .chunks(4)
+                .zip(b.rgba.chunks(4))
+                .filter(|(a, b)| {
+                    a.iter()
+                        .zip(b.iter())
+                        .take(3)
+                        .map(|(x, y)| u32::from(x.abs_diff(*y)))
+                        .sum::<u32>()
+                        > 48
+                })
+                .count()
+        };
+        // Сетки сравниваются с лучами при тенях лучами: так видна разница самих форм.
+        let (changed, worst, mean) = image_diff(&rays.image, &traced.image);
+        let shapes_strong = strong(&rays.image, &traced.image);
+        let (by_map, _, map_mean) = image_diff(&traced.image, &triangles.image);
+        let map_strong = strong(&traced.image, &triangles.image);
         eprintln!(
             "сеток {unique}, треугольников {count}; заменителей лучами {}, треугольниками {}; \
-             отличается {changed} пикселей из {pixels} (сильно {strong}), средняя {mean:.3}, \
-             худшая {worst}",
+             отличается {changed} пикселей из {pixels} (сильно {shapes_strong}), средняя \
+             {mean:.3}, худшая {worst}; карта солнца меняет {by_map} (сильно {map_strong}), \
+             средняя {map_mean:.3}",
             ray_stats.frame.proxies, stats.frame.proxies,
         );
         assert!(unique > 0 && count > 0);
@@ -1731,8 +1741,17 @@ pub(crate) mod tests {
         // Сильно отличаются только края: сетка отходит от формы до 4 мм, и силуэты дыр
         // полой коробки сдвигаются на пиксель (на этом виде около 2 %).
         assert!(
-            strong * 33 < pixels,
-            "сильно отличается {strong} пикселей из {pixels}"
+            shapes_strong * 33 < pixels,
+            "сильно отличается {shapes_strong} пикселей из {pixels}"
+        );
+        // Карта солнца (8.20в) действует, но кадр не ломает. Тени по ней жёсткие там, где
+        // свет и правда проходит: мягкие тени лучами (SDF) темнят и точки рядом с
+        // заслоняющим, поэтому внутри полой коробки по карте светлее (проверено на
+        // процессоре жёсткими лучами по формам: там светло). На этом виде около 6 %.
+        assert!(by_map > 0, "карта теней солнца не действует");
+        assert!(
+            map_strong * 10 < pixels,
+            "карта солнца сильно меняет {map_strong} пикселей из {pixels}"
         );
     }
 

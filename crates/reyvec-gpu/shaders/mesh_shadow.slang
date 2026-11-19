@@ -4,6 +4,8 @@
 // Карты лежат рядом в одной картинке: лампа k — квадрат k по горизонтали, рисуется с
 // экземпляром k. В точке — расстояние от лампы до ближней поверхности (R32F); «тени 3D»
 // (include/shadow3d.slang, map_shadow) сравнивают с ним расстояние до своей точки.
+// Солнце (8.20в, режим «треугольники» 3D) — квадрат сразу после ламп, прямоугольная
+// проекция вдоль солнца; в точке — глубина от солнца, −(точка · SUN).
 
 #define SPACE_OWN_VERTEX
 #include "include/space.slang"
@@ -16,22 +18,43 @@ struct ShadowOut
     nointerpolation uint lamp : LAMP;
 };
 
+ShadowOut hidden(uint lamp)
+{
+    ShadowOut o;
+    o.position = float4(0.0, 0.0, -1.0, 1.0);
+    o.world = float3(0.0, 0.0, 0.0);
+    o.lamp = lamp;
+    return o;
+}
+
+// Экземпляр: старшие биты (с 20-го) — квадрат карты (лампа; квадрат после ламп — солнце,
+// 8.20в), младшие — место сетки из формы (0 — модели, вершины из раздела моделей).
 [shader("vertex")]
-ShadowOut vs_main(uint vertex : SV_VulkanVertexID, uint lamp : SV_VulkanInstanceID)
+ShadowOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInstanceID)
 {
     uint at = pc.scene[7];
-    uint count = pc.scene[at];
-    ShadowOut o;
-    o.lamp = lamp;
-    if (vertex >= count || lamp >= min(pc.scene[at + 1], SHADOW_LAMPS))
+    uint lamp = instance >> 20;
+    uint shape = instance & 0xfffffu;
+    uint lamps = min(pc.scene[at + 1], SHADOW_LAMPS);
+    bool sun = lamp >= lamps;
+    if (sun && (lamp != lamps || pc.scene[at + MESH_SUN] == 0))
+        return hidden(lamp);
+    float3 p;
+    if (shape > 0)
     {
-        o.position = float4(0.0, 0.0, -1.0, 1.0);
-        o.world = float3(0.0, 0.0, 0.0);
-        return o;
+        float3 normal;
+        uint material;
+        if (!shape_point(at, vertex, shape, p, normal, material))
+            return hidden(lamp);
     }
-    uint v = at + MESH_HEADER_WORDS + vertex * MESH_VERTEX_WORDS;
-    float3 p = float3(asfloat(pc.scene[v]), asfloat(pc.scene[v + 1]), asfloat(pc.scene[v + 2]));
-    uint m = at + MESH_SHADOW_PROJ + lamp * 16;
+    else
+    {
+        if (vertex >= pc.scene[at])
+            return hidden(lamp);
+        uint v = at + MESH_HEADER_WORDS + vertex * MESH_VERTEX_WORDS;
+        p = float3(asfloat(pc.scene[v]), asfloat(pc.scene[v + 1]), asfloat(pc.scene[v + 2]));
+    }
+    uint m = sun ? at + MESH_SUN_PROJ : at + MESH_SHADOW_PROJ + lamp * 16;
     float4 clip = float4(0.0, 0.0, 0.0, 0.0);
     for (uint c = 0; c < 4; c++)
     {
@@ -39,14 +62,21 @@ ShadowOut vs_main(uint vertex : SV_VulkanVertexID, uint lamp : SV_VulkanInstance
                                asfloat(pc.scene[m + 4 * c + 2]), asfloat(pc.scene[m + 4 * c + 3]));
         clip += column * (c < 3 ? p[c] : 1.0);
     }
+    ShadowOut o;
     o.position = float4(clip.x, -clip.y, clip.z, clip.w);
     o.world = p;
+    o.lamp = lamp;
     return o;
 }
 
+// Лампа — расстояние от неё; солнце — глубина от солнца −(точка · SUN): у обоих меньше —
+// ближе к свету, пустое место карты — 1e9.
 [shader("fragment")]
 float4 fs_main(ShadowOut input) : SV_Target
 {
+    uint at = pc.scene[7];
+    if (input.lamp >= min(pc.scene[at + 1], SHADOW_LAMPS))
+        return float4(-dot(input.world, SUN), 0.0, 0.0, 0.0);
     Lamp l = read_lamp(input.lamp);
     return float4(length(input.world - l.at), 0.0, 0.0, 0.0);
 }

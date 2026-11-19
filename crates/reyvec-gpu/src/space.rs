@@ -36,10 +36,13 @@ fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
 /// счётчиков лучей (2 слова, пишет [`set_counters`]; 0 — не считать), матрица «мир → экран» (16 чисел, столбцами; пишет [`set_view_proj`]) и матрицы двух
 /// ламп для карт теней (пишет [`set_shadow_maps`]), потом сетки из форм (8.20б, пишет
 /// [`set_shape_meshes`]): адрес их буфера (2 слова), где в сцене их места и сколько
-/// мест. Как в `include/space.slang`.
-const MESH_HEADER_WORDS: usize = 56;
+/// мест, потом карта теней солнца (8.20в, пишет [`set_sun_map`]): 1 — есть, и её матрица.
+/// Как в `include/space.slang`.
+const MESH_HEADER_WORDS: usize = 76;
 /// Где в разделе моделей запись сеток из форм.
 const MESH_SHAPES: usize = 52;
+/// Где в разделе моделей карта теней солнца: слово «есть», потом матрица.
+const MESH_SUN: usize = 56;
 /// Слов на место сетки из формы: столбцы матрицы (поворот с увеличением) и сдвиг.
 pub(crate) const SHAPE_INSTANCE_WORDS: usize = 12;
 /// Где в разделе моделей матрица камеры и матрицы ламп.
@@ -562,6 +565,41 @@ pub(crate) fn set_shadow_maps(words: &mut [u32], maps: &[glam::Mat4]) {
     }
 }
 
+/// Карта теней солнца (8.20в) накрывает шар такого радиуса (метры) перед камерой: ближние
+/// тени по карте, дальше — лучами.
+pub(crate) const SUN_MAP_RADIUS: f32 = 12.0;
+/// Середина шара карты солнца — столько перед камерой.
+const SUN_MAP_AHEAD: f32 = 9.0;
+
+/// Матрица карты солнца для камеры `eye`, `forward` и карты `side` точек: прямоугольная
+/// проекция вдоль солнца на шар перед камерой. Середина сдвигается целыми точками карты:
+/// при движении камеры края теней не дрожат. Глубина обратная (ближе к солнцу — 1), как у
+/// карт ламп.
+pub(crate) fn sun_view_proj(eye: glam::Vec3, forward: glam::Vec3, side: u32) -> glam::Mat4 {
+    use glam::{Mat4, Vec3};
+    let sun = reyvec_sdf::view3d::SUN;
+    let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let view = Mat4::look_at_rh(Vec3::ZERO, -sun, up);
+    let r = SUN_MAP_RADIUS;
+    let texel = 2.0 * r / side.max(1) as f32;
+    let c = view.transform_point3(eye + forward * SUN_MAP_AHEAD);
+    let (x, y) = ((c.x / texel).round() * texel, (c.y / texel).round() * texel);
+    // Заслоняющие — до 60 м выше середины к солнцу, принимающие — до 40 м ниже (по целым
+    // метрам: глубина карты тоже не дрожит).
+    let z = c.z.round();
+    let (near, far) = (-z - 60.0, -z + 40.0);
+    Mat4::orthographic_rh(x - r, x + r, y - r, y + r, far, near) * view
+}
+
+/// Карта теней солнца (8.20в, режим «треугольники» 3D): матрица «мир → карта»
+/// (прямоугольная проекция вдоль солнца). Без раздела моделей не пишется ничего.
+pub(crate) fn set_sun_map(words: &mut [u32], view_proj: glam::Mat4) {
+    if let Some(at) = mesh_section(words) {
+        words[at + MESH_SUN] = 1;
+        write_matrix(words, at + MESH_SUN + 1, view_proj);
+    }
+}
+
 /// Солнца нет (2.5D-вид: уровень в помещении).
 pub(crate) fn set_no_sun(words: &mut [u32]) {
     words[11] |= SCENE_NO_SUN;
@@ -587,6 +625,28 @@ mod tests {
     use super::*;
 
     /// Адрес счётчиков ложится в слова 2 и 3 раздела моделей и больше ничего не трогает; у
+    /// Карта солнца: точка перед камерой — внутри карты, точка ближе к солнцу — с большей
+    /// глубиной (обратная глубина), сдвиг камеры меньше точки карты карту не двигает.
+    #[test]
+    fn sun_map_covers_view_and_snaps() {
+        use glam::Vec3;
+        let (eye, forward) = (
+            Vec3::new(3.0, 1.5, 4.0),
+            Vec3::new(0.0, -0.3, -1.0).normalize(),
+        );
+        let m = sun_view_proj(eye, forward, 1024);
+        let ahead = eye + forward * 9.0;
+        let p = m.project_point3(ahead);
+        assert!(p.x.abs() < 0.1 && p.y.abs() < 0.1, "{p}");
+        let above = m.project_point3(ahead + reyvec_sdf::view3d::SUN * 5.0);
+        assert!(
+            above.z > p.z && (0.0..=1.0).contains(&above.z),
+            "{above} {p}"
+        );
+        let moved = sun_view_proj(eye + Vec3::X * 0.001, forward, 1024);
+        assert_eq!(m, moved);
+    }
+
     /// сцены, которая не поместилась (раздела нет), не пишется ничего — ни он, ни матрицы.
     #[test]
     fn counters_address_goes_to_mesh_header() {
@@ -608,6 +668,7 @@ mod tests {
         assert!(!set_counters(&mut set, 0x1234_5678_9abc_def0));
         set_view_proj(&mut set, glam::Mat4::IDENTITY);
         set_shadow_maps(&mut set, &[glam::Mat4::IDENTITY]);
+        set_sun_map(&mut set, glam::Mat4::IDENTITY);
         assert_eq!(set, empty, "без раздела моделей заголовок цел");
     }
 
