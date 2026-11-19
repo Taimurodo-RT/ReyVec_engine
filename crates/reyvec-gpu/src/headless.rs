@@ -1727,6 +1727,25 @@ pub(crate) mod tests {
              худшая {worst}",
             ray_stats.frame.proxies, stats.frame.proxies,
         );
+        // ВРЕМЕННО: кадры в журнал (серые, 160×90).
+        for (name, img) in [("rays", &rays.image), ("tri", &triangles.image), ("traced", &traced.image)] {
+            let mut hex = String::new();
+            for y in 0..90u32 {
+                for x in 0..160u32 {
+                    let mut sum = 0u32;
+                    for dy in 0..4 {
+                        for dx in 0..4 {
+                            let i = (((y * 4 + dy) * img.width + x * 4 + dx) * 4) as usize;
+                            sum += u32::from(img.rgba[i]) + u32::from(img.rgba[i + 1]) + u32::from(img.rgba[i + 2]);
+                        }
+                    }
+                    hex.push_str(&format!("{:02x}", sum / 48));
+                }
+            }
+            for chunk in hex.as_bytes().chunks(2000) {
+                eprintln!("HEX-{name} {}", std::str::from_utf8(chunk).unwrap());
+            }
+        }
         let (by_map, _, map_mean) = image_diff(&traced.image, &triangles.image);
         eprintln!("карта солнца меняет {by_map} пикселей, средняя {map_mean:.3}");
         assert!(by_map > 0, "карта теней солнца не действует");
