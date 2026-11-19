@@ -309,7 +309,7 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
         count += dot(shut, float4(1.0, 1.0, 1.0, 1.0));
     }
     if (count <= 0.0)
-        return 1.0;
+        return sun ? 0.5 : 1.0; // ВРЕМЕННО
     float blocker = blockers / count;
     float world = sun ? max(here - blocker, 0.0) * SUN_MAP_SOFT
                       : (here - blocker) / max(blocker, 0.05) * here * MAP_PENUMBRA;

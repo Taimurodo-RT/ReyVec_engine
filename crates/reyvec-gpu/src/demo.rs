@@ -3946,6 +3946,13 @@ impl Demo {
                     self.shape_draws = draws;
                     if let Some(m) = sun_map.filter(|_| !sun_draws.is_empty()) {
                         crate::space::set_sun_map(&mut packed.words, m);
+                        #[cfg(test)]
+                        eprintln!(
+                            "ВРЕМЕННО солнце: вызовов {:?}, глаз {:?}, середина коробки {}",
+                            sun_draws,
+                            self.shape_draws,
+                            m.project_point3(glam::Vec3::new(3.4, 0.6, 2.6))
+                        );
                         self.sun_draws = sun_draws;
                     }
                 }
