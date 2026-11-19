@@ -206,21 +206,44 @@ float4 map_gather(Texture2D map, float2 q, float2 lo, float side, float2 inv, ou
     return map.GatherRed(samplers[1], (lo + corner + 1.0) * inv);
 }
 
-// Карта тени лампы `lamp` (7.9б): доля света точки `p` (нормаль `n`) от треугольников.
-// Сравнивает расстояние до лампы с картой (mesh_shadow.slang) в точках вокруг: край тени
-// мягкий. Точка вне карты (вбок от лампы шире её угла) — без тени.
+// Карта тени (7.9б): доля света точки `p` (нормаль `n`) от треугольников. Лампа `square`
+// (`sun` = false) — расстояние до лампы по её карте (перспектива, mesh_shadow.slang);
+// солнце (`sun`, 8.20в, режим «треугольники» 3D) — квадрат после ламп, прямоугольная
+// проекция вдоль солнца, в карте — глубина от солнца −(точка · SUN). Обе — одной функцией
+// с одними циклами: каждый лишний цикл проб в шейдере «теней 3D» и «краёв 3D» сильно
+// удлиняет их сборку (на lavapipe в CI — за предел времени). `inside` — точка на карте;
+// вне её — без тени (лампа) или тень лучами (солнце).
 //
 // Без ступеней в полутени (7.18е): прежние 25 проб стояли квадратом вдоль осей карты, и
 // прямой край тени вдоль строки (столбца) карты переключал всю строку проб разом — скачки
 // по 1/5 (по 1/25 только у косого края). Теперь пробы стоят по повёрнутой решётке (у всех
 // разные x и y, поэтому и такой край проходит через них по одной), а каждая проба — четыре
 // точки карты одним Gather со смесью по положению между ними: доля света меняется плавно.
-float map_shadow(float3 p, float3 n, uint lamp)
+//
+// Полутень как у теней SDF: свет — диск (лампа — радиуса d/10, солнце — угла 1/12),
+// полутень на точке шире во столько раз, во сколько заслоняющее ближе к свету, чем к
+// точке. Сначала среднее заслоняющих в округе (9 проб, 36 точек карты), потом 25 проб в
+// повёрнутом квадрате такого размера. Сравнение — с плоскостью точки на месте пробы
+// (map_reference у лампы, наклон `slope` у солнца): плоская поверхность сама себя не
+// заслоняет.
+// Глубина (солнце) или расстояние (лампа) плоскости точки на месте карты `q`.
+float map_plane(bool sun, float2 q, float2 uv, float side, float2 slope, float here, float f,
+                float3 rel, float3 n)
 {
+    if (sun)
+        return here + dot(clamp(q, 0.5, side - 0.5) - uv, slope);
+    return map_reference(q, side, f, rel, n, here);
+}
+
+static const float SUN_MAP_SOFT = 1.0 / 12.0;
+
+float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
+{
+    inside = false;
     uint at = pc.scene[7];
-    if (lamp >= pc.scene[at + 1])
+    if (!sun && square >= pc.scene[at + 1])
         return 1.0;
-    uint m = at + MESH_SHADOW_PROJ + lamp * 16;
+    uint m = sun ? at + MESH_SUN_PROJ : at + MESH_SHADOW_PROJ + square * 16;
     float4 clip = float4(0.0, 0.0, 0.0, 0.0);
     for (uint c = 0; c < 4; c++)
     {
@@ -231,77 +254,7 @@ float map_shadow(float3 p, float3 n, uint lamp)
     if (clip.w <= 1e-4)
         return 1.0;
     float2 ndc = clip.xy / clip.w;
-    if (any(abs(ndc) > 0.995))
-        return 1.0;
-    Texture2D map = textures[pc.flags >> 16];
-    uint w, h;
-    map.GetDimensions(w, h);
-    float side = float(h);
-    float2 inv = 1.0 / float2(float(w), float(h));
-    float2 lo = float2(float(lamp) * side, 0.0);
-    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * side;
-    float3 rel = p - read_lamp(lamp).at;
-    float d = length(rel);
-    float bias = 0.02 + 0.01 * d;
-    // Камера лампы смотрит вдоль −Z без поворота (level3d.rs, lamp_view_proj): первый
-    // элемент матрицы — 1 / tan половины угла.
-    float f = asfloat(pc.scene[m]);
-    // Полутень как у теней SDF с k = 10: лампа как диск радиуса d/k, полутень на точке
-    // шире во столько раз, во сколько заслоняющее ближе к лампе, чем к точке. Сначала
-    // среднее расстояние заслоняющих в округе (9 проб, 36 точек карты), потом 25 проб в
-    // повёрнутом квадрате такого размера.
-    float blockers = 0.0;
-    float count = 0.0;
-    for (int k = 0; k < 9; k++)
-    {
-        float2 g = float2(float(k % 3), float(k / 3)) - 1.0;
-        float2 q = uv + float2(3.0 * g.x - g.y, g.x + 3.0 * g.y) * (MAP_SEARCH * 0.25);
-        float2 between;
-        float4 depth = map_gather(map, q, lo, side, inv, between);
-        float4 shut = 1.0 - step(map_reference(q, side, f, rel, n, d) - bias, depth);
-        blockers += dot(shut, depth);
-        count += dot(shut, float4(1.0, 1.0, 1.0, 1.0));
-    }
-    if (count <= 0.0)
-        return 1.0;
-    float blocker = blockers / count;
-    // Мир на карте у точки: 2·d·tan 70° на сторону.
-    float texel = 5.5 * d / side;
-    float world = (d - blocker) / max(blocker, 0.05) * d * MAP_PENUMBRA;
-    float radius = clamp(world / texel, 1.0, MAP_SEARCH);
-    float lit = 0.0;
-    for (int k = 0; k < 25; k++)
-    {
-        float2 g = float2(float(k % 5), float(k / 5)) - 2.0;
-        float2 q = uv + float2(5.0 * g.x - g.y, g.x + 5.0 * g.y) * (radius / 12.0);
-        float2 between;
-        float4 depth = map_gather(map, q, lo, side, inv, between);
-        float4 open = step(map_reference(q, side, f, rel, n, d) - bias, depth);
-        lit += lerp(lerp(open.w, open.z, between.x), lerp(open.x, open.y, between.x),
-                    between.y);
-    }
-    return lit / 25.0;
-}
-
-// Карта теней солнца (8.20в, режим «треугольники» 3D): доля солнечного света точки `p`
-// (нормаль `n`) от сеток. Как map_shadow у ламп: поиск заслоняющих в округе, полутень по
-// их расстоянию (солнце — диск 1/12, как k теней SDF), 25 проб по повёрнутой решётке, по
-// Gather со смесью. Проекция прямоугольная вдоль солнца, в карте — глубина от солнца
-// −(точка · SUN). Сравнение — с плоскостью точки на месте пробы (как map_reference):
-// наклонная поверхность сама себя не заслоняет. `inside` — точка на карте; вне её тень
-// считают лучи.
-static const float SUN_MAP_SOFT = 1.0 / 12.0;
-
-float sun_map_shadow(float3 p, float3 n, out bool inside)
-{
-    inside = false;
-    uint at = pc.scene[7];
-    uint m = at + MESH_SUN_PROJ;
-    float3 row0 = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 4]), asfloat(pc.scene[m + 8]));
-    float3 row1 = float3(asfloat(pc.scene[m + 1]), asfloat(pc.scene[m + 5]), asfloat(pc.scene[m + 9]));
-    float2 ndc = float2(dot(row0, p) + asfloat(pc.scene[m + 12]),
-                        dot(row1, p) + asfloat(pc.scene[m + 13]));
-    if (any(abs(ndc) > 0.98))
+    if (any(abs(ndc) > (sun ? 0.98 : 0.995)))
         return 1.0;
     inside = true;
     Texture2D map = textures[pc.flags >> 16];
@@ -309,21 +262,39 @@ float sun_map_shadow(float3 p, float3 n, out bool inside)
     map.GetDimensions(w, h);
     float side = float(h);
     float2 inv = 1.0 / float2(float(w), float(h));
-    float2 lo = float2(float(min(pc.scene[at + 1], SHADOW_LAMPS)) * side, 0.0);
+    float2 lo = float2(float(square) * side, 0.0);
     float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * side;
-    // Мир на точку карты: сторона карты — 2 / |строки матрицы|.
-    float scale = length(row0);
-    float texel = 2.0 / (scale * side);
-    float3 right = row0 / scale;
-    float3 up = row1 / scale;
-    float depth_here = -dot(p, SUN);
-    // Плоскость точки: на сдвиг (a, b) по карте глубина меняется на (a·right + b·up)·n / (SUN·n).
-    float facing = dot(SUN, n);
-    float2 slope = facing > 0.05
-        ? float2(dot(right, n), -dot(up, n)) * texel / facing
-        : float2(0.0, 0.0);
-    slope = clamp(slope, -2.0 * texel, 2.0 * texel);
-    float bias = 0.01 + 1.5 * texel;
+    // Лампа: камера смотрит вдоль −Z без поворота (level3d.rs, lamp_view_proj), первый
+    // элемент матрицы — 1 / tan половины угла; мир на точку карты — 2·d·tan 70° / side.
+    float3 rel = float3(0.0, 0.0, 0.0);
+    float f = asfloat(pc.scene[m]);
+    float here;
+    float texel;
+    float bias;
+    float2 slope = float2(0.0, 0.0);
+    if (sun)
+    {
+        // Строки матрицы — оси карты в мире, сторона карты — 2 / |строки|.
+        float3 row0 = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 4]), asfloat(pc.scene[m + 8]));
+        float3 row1 = float3(asfloat(pc.scene[m + 1]), asfloat(pc.scene[m + 5]), asfloat(pc.scene[m + 9]));
+        float scale = length(row0);
+        texel = 2.0 / (scale * side);
+        here = -dot(p, SUN);
+        // Плоскость точки: на сдвиг (a, b) по карте глубина меняется на
+        // (a·right − b·up)·n · texel / (SUN·n).
+        float facing = dot(SUN, n);
+        if (facing > 0.05)
+            slope = float2(dot(row0, n), -dot(row1, n)) / scale * texel / facing;
+        slope = clamp(slope, -2.0 * texel, 2.0 * texel);
+        bias = 0.01 + 1.5 * texel;
+    }
+    else
+    {
+        rel = p - read_lamp(square).at;
+        here = length(rel);
+        texel = 5.5 * here / side;
+        bias = 0.02 + 0.01 * here;
+    }
     float blockers = 0.0;
     float count = 0.0;
     for (int k = 0; k < 9; k++)
@@ -332,7 +303,7 @@ float sun_map_shadow(float3 p, float3 n, out bool inside)
         float2 q = uv + float2(3.0 * g.x - g.y, g.x + 3.0 * g.y) * (MAP_SEARCH * 0.25);
         float2 between;
         float4 depth = map_gather(map, q, lo, side, inv, between);
-        float reference = depth_here + dot(clamp(q, 0.5, side - 0.5) - uv, slope);
+        float reference = map_plane(sun, q, uv, side, slope, here, f, rel, n);
         float4 shut = 1.0 - step(reference - bias, depth);
         blockers += dot(shut, depth);
         count += dot(shut, float4(1.0, 1.0, 1.0, 1.0));
@@ -340,7 +311,8 @@ float sun_map_shadow(float3 p, float3 n, out bool inside)
     if (count <= 0.0)
         return 1.0;
     float blocker = blockers / count;
-    float world = max(depth_here - blocker, 0.0) * SUN_MAP_SOFT;
+    float world = sun ? max(here - blocker, 0.0) * SUN_MAP_SOFT
+                      : (here - blocker) / max(blocker, 0.05) * here * MAP_PENUMBRA;
     float radius = clamp(world / texel, 1.0, MAP_SEARCH);
     float lit = 0.0;
     for (int k = 0; k < 25; k++)
@@ -349,7 +321,7 @@ float sun_map_shadow(float3 p, float3 n, out bool inside)
         float2 q = uv + float2(5.0 * g.x - g.y, g.x + 5.0 * g.y) * (radius / 12.0);
         float2 between;
         float4 depth = map_gather(map, q, lo, side, inv, between);
-        float reference = depth_here + dot(clamp(q, 0.5, side - 0.5) - uv, slope);
+        float reference = map_plane(sun, q, uv, side, slope, here, f, rel, n);
         float4 open = step(reference - bias, depth);
         lit += lerp(lerp(open.w, open.z, between.x), lerp(open.x, open.y, between.x),
                     between.y);
@@ -395,21 +367,20 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
     // Только там, куда свет падает: обратная сторона и так тёмная.
     if (dot(n, dir) <= 0.0 || far <= 0.0)
         return 1.0;
-    // Режим «треугольники» 3D (8.20в): солнце — по его карте, лучи только вне неё.
+    // Треугольники заслоняют по картам: лампу (7.9б) — по её карте, и формы SDF как
+    // обычно; солнце в режиме «треугольники» 3D (8.20в) — по его карте, лучи только вне
+    // неё. Вызов один на обе: шейдер не растёт.
     uint mesh_at = pc.scene[7];
-    if (part == 0 && (pc.flags & SPACE_FLAG_SHADOW_MAP) != 0 && mesh_at != 0
-        && pc.scene[mesh_at + MESH_SUN] != 0)
+    bool sun = part == 0;
+    float by_map = 1.0;
+    if ((pc.flags & SPACE_FLAG_SHADOW_MAP) != 0
+        && (!sun || (mesh_at != 0 && pc.scene[mesh_at + MESH_SUN] != 0)))
     {
         bool inside;
-        float sun = sun_map_shadow(p, n, inside);
-        if (inside)
-            return sun;
-    }
-    // Треугольники (7.9б) заслоняют лампу по её карте; формы SDF — как обычно.
-    float by_map = 1.0;
-    if (part >= 2 && (pc.flags & SPACE_FLAG_SHADOW_MAP) != 0)
-    {
-        by_map = map_shadow(p, n, part - 2);
+        uint square = sun ? min(pc.scene[mesh_at + 1], SHADOW_LAMPS) : part - 2;
+        by_map = map_shadow(p, n, square, sun, inside);
+        if (sun && inside)
+            return by_map;
         if (by_map <= 0.0)
             return 0.0;
     }
