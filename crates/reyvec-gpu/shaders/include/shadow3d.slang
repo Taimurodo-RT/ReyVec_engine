@@ -283,6 +283,80 @@ float map_shadow(float3 p, float3 n, uint lamp)
     return lit / 25.0;
 }
 
+// Карта теней солнца (8.20в, режим «треугольники» 3D): доля солнечного света точки `p`
+// (нормаль `n`) от сеток. Как map_shadow у ламп: поиск заслоняющих в округе, полутень по
+// их расстоянию (солнце — диск 1/12, как k теней SDF), 25 проб по повёрнутой решётке, по
+// Gather со смесью. Проекция прямоугольная вдоль солнца, в карте — глубина от солнца
+// −(точка · SUN). Сравнение — с плоскостью точки на месте пробы (как map_reference):
+// наклонная поверхность сама себя не заслоняет. `inside` — точка на карте; вне её тень
+// считают лучи.
+static const float SUN_MAP_SOFT = 1.0 / 12.0;
+
+float sun_map_shadow(float3 p, float3 n, out bool inside)
+{
+    inside = false;
+    uint at = pc.scene[7];
+    uint m = at + MESH_SUN_PROJ;
+    float3 row0 = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 4]), asfloat(pc.scene[m + 8]));
+    float3 row1 = float3(asfloat(pc.scene[m + 1]), asfloat(pc.scene[m + 5]), asfloat(pc.scene[m + 9]));
+    float2 ndc = float2(dot(row0, p) + asfloat(pc.scene[m + 12]),
+                        dot(row1, p) + asfloat(pc.scene[m + 13]));
+    if (any(abs(ndc) > 0.98))
+        return 1.0;
+    inside = true;
+    Texture2D map = textures[pc.flags >> 16];
+    uint w, h;
+    map.GetDimensions(w, h);
+    float side = float(h);
+    float2 inv = 1.0 / float2(float(w), float(h));
+    float2 lo = float2(float(min(pc.scene[at + 1], SHADOW_LAMPS)) * side, 0.0);
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * side;
+    // Мир на точку карты: сторона карты — 2 / |строки матрицы|.
+    float scale = length(row0);
+    float texel = 2.0 / (scale * side);
+    float3 right = row0 / scale;
+    float3 up = row1 / scale;
+    float depth_here = -dot(p, SUN);
+    // Плоскость точки: на сдвиг (a, b) по карте глубина меняется на (a·right + b·up)·n / (SUN·n).
+    float facing = dot(SUN, n);
+    float2 slope = facing > 0.05
+        ? float2(dot(right, n), -dot(up, n)) * texel / facing
+        : float2(0.0, 0.0);
+    slope = clamp(slope, -2.0 * texel, 2.0 * texel);
+    float bias = 0.01 + 1.5 * texel;
+    float blockers = 0.0;
+    float count = 0.0;
+    for (int k = 0; k < 9; k++)
+    {
+        float2 g = float2(float(k % 3), float(k / 3)) - 1.0;
+        float2 q = uv + float2(3.0 * g.x - g.y, g.x + 3.0 * g.y) * (MAP_SEARCH * 0.25);
+        float2 between;
+        float4 depth = map_gather(map, q, lo, side, inv, between);
+        float reference = depth_here + dot(clamp(q, 0.5, side - 0.5) - uv, slope);
+        float4 shut = 1.0 - step(reference - bias, depth);
+        blockers += dot(shut, depth);
+        count += dot(shut, float4(1.0, 1.0, 1.0, 1.0));
+    }
+    if (count <= 0.0)
+        return 1.0;
+    float blocker = blockers / count;
+    float world = max(depth_here - blocker, 0.0) * SUN_MAP_SOFT;
+    float radius = clamp(world / texel, 1.0, MAP_SEARCH);
+    float lit = 0.0;
+    for (int k = 0; k < 25; k++)
+    {
+        float2 g = float2(float(k % 5), float(k / 5)) - 2.0;
+        float2 q = uv + float2(5.0 * g.x - g.y, g.x + 5.0 * g.y) * (radius / 12.0);
+        float2 between;
+        float4 depth = map_gather(map, q, lo, side, inv, between);
+        float reference = depth_here + dot(clamp(q, 0.5, side - 0.5) - uv, slope);
+        float4 open = step(reference - bias, depth);
+        lit += lerp(lerp(open.w, open.z, between.x), lerp(open.x, open.y, between.x),
+                    between.y);
+    }
+    return lit / 25.0;
+}
+
 // Одна из четырёх долей света точки `surface` (на поверхности, нормаль `n`, `t` —
 // расстояние вдоль луча глаза): 0 — солнце, 1 — затенение в углах, 2 и 3 — две первые
 // лампы. Порядок — как в картинке теней (x, y, z, w).
@@ -321,6 +395,16 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
     // Только там, куда свет падает: обратная сторона и так тёмная.
     if (dot(n, dir) <= 0.0 || far <= 0.0)
         return 1.0;
+    // Режим «треугольники» 3D (8.20в): солнце — по его карте, лучи только вне неё.
+    uint mesh_at = pc.scene[7];
+    if (part == 0 && (pc.flags & SPACE_FLAG_SHADOW_MAP) != 0 && mesh_at != 0
+        && pc.scene[mesh_at + MESH_SUN] != 0)
+    {
+        bool inside;
+        float sun = sun_map_shadow(p, n, inside);
+        if (inside)
+            return sun;
+    }
     // Треугольники (7.9б) заслоняют лампу по её карте; формы SDF — как обычно.
     float by_map = 1.0;
     if (part >= 2 && (pc.flags & SPACE_FLAG_SHADOW_MAP) != 0)

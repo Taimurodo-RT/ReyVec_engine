@@ -646,6 +646,8 @@ pub(crate) struct FrameData {
     space_shapes: bool,
     /// Карт теней ламп от треугольников (7.9б; 0 — тени ламп только по формам SDF).
     space_shadow_maps: u32,
+    /// Карта теней солнца по сеткам из форм (8.20в): квадрат сразу после карт ламп.
+    space_sun_map: bool,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
@@ -799,6 +801,8 @@ pub(crate) struct Demo {
     /// Вызовы рисования сеток этого кадра: первый номер, число номеров, мест, первое
     /// место (+1: место 0 — модели).
     shape_draws: Vec<[u32; 4]>,
+    /// Те же вызовы для карты теней солнца (8.20в): места, видимые солнцу.
+    sun_draws: Vec<[u32; 4]>,
     /// Сколько фигур последнего кадра сцены «3D» нарисовано через поле слоя и сколько
     /// выдавленных фигур верхнего уровня в кадре было.
     field_shapes: (usize, usize),
@@ -1160,6 +1164,7 @@ impl Demo {
             space_meshes_generation: 0,
             shape_buffer: None,
             shape_draws: Vec::new(),
+            sun_draws: Vec::new(),
             field_shapes: (0, 0),
             space_field: crate::field::SpaceField::new(
                 frames_in_flight,
@@ -3869,38 +3874,66 @@ impl Demo {
             );
             space_vertices = packed.vertices;
             self.shape_draws.clear();
+            self.sun_draws.clear();
+            // Карта теней солнца (8.20в): в режиме «треугольники» тени солнца вблизи — по
+            // сеткам, растеризацией.
+            #[cfg(not(test))]
+            let sun_on = true;
+            #[cfg(test)]
+            let sun_on = !self.no_shadow_maps;
+            let sun_map = (!level
+                && sun_on
+                && !shape_places.is_empty()
+                && self.space_mesh_shadow != vk::Pipeline::null())
+            .then(|| {
+                crate::space::sun_view_proj(
+                    space_camera.eye,
+                    space_camera.forward(),
+                    SHADOW_MAP_SIZE,
+                )
+            });
             if let Some(buffer) = self
                 .shape_buffer
                 .as_ref()
                 .filter(|_| !shape_places.is_empty())
             {
-                let frustum = reyvec_sdf::view3d::Frustum::new(view_proj);
-                let mut by_mesh = vec![Vec::new(); buffer.ranges.len()];
-                for (index, place) in &shape_places {
-                    let Some(&(c, r)) = buffer.bounds.get(*index) else {
-                        continue;
-                    };
-                    if frustum.sphere(place.apply(c), r * place.scale.abs()) {
-                        by_mesh[*index].push(crate::space::shape_instance(place));
-                    }
-                }
+                // Места сеток: сначала видимые глазу, за ними — видимые солнцу.
                 let mut words = Vec::new();
-                let mut draws = Vec::new();
-                for (k, list) in by_mesh.iter().enumerate() {
-                    if list.is_empty() {
-                        continue;
+                let mut lists = |view: glam::Mat4| {
+                    let frustum = reyvec_sdf::view3d::Frustum::new(view);
+                    let mut by_mesh = vec![Vec::new(); buffer.ranges.len()];
+                    for (index, place) in &shape_places {
+                        let Some(&(c, r)) = buffer.bounds.get(*index) else {
+                            continue;
+                        };
+                        if frustum.sphere(place.apply(c), r * place.scale.abs()) {
+                            by_mesh[*index].push(crate::space::shape_instance(place));
+                        }
                     }
-                    let (first, count) = buffer.ranges[k];
-                    let at = (words.len() / crate::space::SHAPE_INSTANCE_WORDS) as u32;
-                    draws.push([first, count, list.len() as u32, 1 + at]);
-                    words.extend(list.iter().flatten());
-                }
+                    let mut draws = Vec::new();
+                    for (k, list) in by_mesh.iter().enumerate() {
+                        if list.is_empty() {
+                            continue;
+                        }
+                        let (first, count) = buffer.ranges[k];
+                        let at = (words.len() / crate::space::SHAPE_INSTANCE_WORDS) as u32;
+                        draws.push([first, count, list.len() as u32, 1 + at]);
+                        words.extend(list.iter().flatten());
+                    }
+                    draws
+                };
+                let draws = lists(view_proj);
+                let sun_draws = sun_map.map(&mut lists).unwrap_or_default();
                 if crate::space::set_shape_meshes(
                     &mut packed.words,
                     res.buffer_address(buffer.id),
                     &words,
                 ) {
                     self.shape_draws = draws;
+                    if let Some(m) = sun_map.filter(|_| !sun_draws.is_empty()) {
+                        crate::space::set_sun_map(&mut packed.words, m);
+                        self.sun_draws = sun_draws;
+                    }
                 }
             }
             // Текстуры моделей (8.14б2): номера их картинок — в записи материалов.
@@ -3986,6 +4019,7 @@ impl Demo {
             space_textured,
             space_shapes: scene == DemoScene::Space && !self.shape_draws.is_empty(),
             space_shadow_maps,
+            space_sun_map: scene == DemoScene::Space && !self.sun_draws.is_empty(),
             space_compute,
             space_edges,
             space_counters,
@@ -4753,8 +4787,14 @@ impl Demo {
             height: ext.height.div_ceil(2),
         };
         // Карты теней ламп от треугольников (7.9б): квадраты рядом в одной картинке.
-        let shadow_maps = (frame.space_shadow_maps > 0).then(|| {
-            let count = frame.space_shadow_maps;
+        let sun_draws = if frame.space_sun_map {
+            self.sun_draws.clone()
+        } else {
+            Vec::new()
+        };
+        let shadow_maps = (frame.space_shadow_maps > 0 || frame.space_sun_map).then(|| {
+            let lamps = frame.space_shadow_maps;
+            let count = lamps + u32::from(frame.space_sun_map);
             let size = vk::Extent2D {
                 width: SHADOW_MAP_SIZE * count,
                 height: SHADOW_MAP_SIZE,
@@ -4795,6 +4835,8 @@ impl Demo {
                             self.space_mesh_shadow,
                         );
                         d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        // Экземпляр: квадрат карты — с 20-го бита, место сетки — ниже
+                        // (mesh_shadow.slang).
                         for k in 0..count {
                             let viewport = vk::Viewport::default()
                                 .x((k * SHADOW_MAP_SIZE) as f32)
@@ -4802,7 +4844,20 @@ impl Demo {
                                 .height(SHADOW_MAP_SIZE as f32)
                                 .max_depth(1.0);
                             d.cmd_set_viewport(cmd, 0, &[viewport]);
-                            d.cmd_draw(cmd, frame.space_vertices, 1, 0, k);
+                            if frame.space_vertices > 0 {
+                                d.cmd_draw(cmd, frame.space_vertices, 1, 0, k << 20);
+                            }
+                            if k == lamps {
+                                for &[first, count, instances, first_instance] in &sun_draws {
+                                    d.cmd_draw(
+                                        cmd,
+                                        count,
+                                        instances,
+                                        first,
+                                        (k << 20) | first_instance,
+                                    );
+                                }
+                            }
                         }
                         d.cmd_end_rendering(cmd);
                     }

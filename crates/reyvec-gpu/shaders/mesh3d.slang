@@ -82,27 +82,16 @@ MeshOut nothing()
 // материала с нормалью, раскладка pack_mesh).
 MeshOut shape_vertex(uint at, uint vertex, uint instance)
 {
-    uint2 a = uint2(pc.scene[at + MESH_SHAPES], pc.scene[at + MESH_SHAPES + 1]);
-    uint count = pc.scene[at + MESH_SHAPES + 3];
-    if (all(a == 0) || instance > count)
+    float3 p;
+    float3 normal;
+    uint material;
+    if (!shape_point(at, vertex, instance, p, normal, material))
         return nothing();
-    uint* shapes = bit_cast<uint*>(a);
-    uint v = shapes[0] + shapes[1 + vertex] * 4;
-    float3 local = float3(asfloat(shapes[v]), asfloat(shapes[v + 1]), asfloat(shapes[v + 2]));
-    uint i = pc.scene[at + MESH_SHAPES + 2] + (instance - 1) * SHAPE_INSTANCE_WORDS;
-    float3 c0 = float3(asfloat(pc.scene[i]), asfloat(pc.scene[i + 1]), asfloat(pc.scene[i + 2]));
-    float3 c1 = float3(asfloat(pc.scene[i + 3]), asfloat(pc.scene[i + 4]), asfloat(pc.scene[i + 5]));
-    float3 c2 = float3(asfloat(pc.scene[i + 6]), asfloat(pc.scene[i + 7]), asfloat(pc.scene[i + 8]));
-    float3 shift = float3(asfloat(pc.scene[i + 9]), asfloat(pc.scene[i + 10]), asfloat(pc.scene[i + 11]));
-    float3 p = c0 * local.x + c1 * local.y + c2 * local.z + shift;
-    float4 m = unpack_mesh(uint2(0u, shapes[v + 3]));
-    float3 n = oct_decode(m.zw);
     MeshOut o;
     o.position = to_clip(at, p);
     o.world = p;
-    o.material = uint(m.y);
-    // Увеличение у форм одинаково по осям: нормаль поворачивается той же матрицей.
-    o.normal = c0 * n.x + c1 * n.y + c2 * n.z;
+    o.material = material;
+    o.normal = normal;
     o.uv = float2(0.0, 0.0);
     return o;
 }

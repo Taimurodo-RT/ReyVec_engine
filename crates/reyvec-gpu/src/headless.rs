@@ -1693,8 +1693,13 @@ pub(crate) mod tests {
         let rays = render_headless(&options, &scene).expect("кадр лучами");
         TRIANGLES.set(true);
         let triangles = render_headless(&options, &scene);
+        // Без карты теней солнца (8.20в): тени солнца лучами по заменителям.
+        NO_SHADOW_MAPS.set(true);
+        let traced = render_headless(&options, &scene);
+        NO_SHADOW_MAPS.set(false);
         TRIANGLES.set(false);
         let triangles = triangles.expect("кадр треугольниками");
+        let traced = traced.expect("кадр треугольниками без карты солнца");
         assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
         let stats = triangles.space_stats.expect("числа кадра 3D");
         let (unique, count) = stats.shape_meshes.expect("сетки построены");
@@ -1722,6 +1727,9 @@ pub(crate) mod tests {
              худшая {worst}",
             ray_stats.frame.proxies, stats.frame.proxies,
         );
+        let (by_map, _, map_mean) = image_diff(&traced.image, &triangles.image);
+        eprintln!("карта солнца меняет {by_map} пикселей, средняя {map_mean:.3}");
+        assert!(by_map > 0, "карта теней солнца не действует");
         assert!(unique > 0 && count > 0);
         assert!(stats.frame.proxies > ray_stats.frame.proxies);
         assert!(
@@ -1729,7 +1737,8 @@ pub(crate) mod tests {
             "кадр треугольниками совпал с лучами: сетки не рисуются?"
         );
         // Сильно отличаются только края: сетка отходит от формы до 4 мм, и силуэты дыр
-        // полой коробки сдвигаются на пиксель (на этом виде около 2 %).
+        // полой коробки сдвигаются на пиксель (на этом виде около 2 %); тени солнца по
+        // карте (8.20в) — те же, что лучами, с точностью до полутени.
         assert!(
             strong * 33 < pixels,
             "сильно отличается {strong} пикселей из {pixels}"

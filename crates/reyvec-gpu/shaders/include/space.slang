@@ -116,9 +116,11 @@ static const uint MATERIAL_TEXTURED = 2;
 // Раздел полигонов (слово 7 заголовка сцены): число вершин, число карт теней, адрес
 // счётчиков (2 слова), матрица камеры, матрицы ламп для карт теней (по 16 чисел,
 // столбцами), сетки из форм (8.20б: адрес их буфера — 2 слова, где их места в сцене и
-// сколько мест), потом вершины.
-static const uint MESH_HEADER_WORDS = 56;
+// сколько мест), карта теней солнца (8.20в: 1 — есть, и её матрица), потом вершины.
+static const uint MESH_HEADER_WORDS = 76;
 static const uint MESH_SHAPES = 52;
+static const uint MESH_SUN = 56;
+static const uint MESH_SUN_PROJ = 57;
 // Слов на место сетки из формы (как SHAPE_INSTANCE_WORDS в space.rs): столбцы матрицы
 // (поворот с увеличением) и сдвиг.
 static const uint SHAPE_INSTANCE_WORDS = 12;
@@ -604,3 +606,33 @@ float lamp_falloff(Lamp l, float distance)
 
 // Солнце: сбоку сверху.
 static const float3 SUN = float3(0.4969, 0.7950, 0.3478); // normalize(0.5, 0.8, 0.35); как view3d::SUN
+
+// Точка сетки из формы (8.20б): номер `vertex` — место в списке номеров вершин буфера
+// сеток, место сетки — `instance` − 1. Общая для «полигонов 3D» и карт теней (8.20в).
+// Нет буфера или место за списком — false.
+bool shape_point(uint at, uint vertex, uint instance, out float3 p, out float3 normal,
+                 out uint material)
+{
+    p = float3(0.0, 0.0, 0.0);
+    normal = float3(0.0, 0.0, 0.0);
+    material = 0;
+    uint2 a = uint2(pc.scene[at + MESH_SHAPES], pc.scene[at + MESH_SHAPES + 1]);
+    uint count = pc.scene[at + MESH_SHAPES + 3];
+    if (all(a == 0) || instance == 0 || instance > count)
+        return false;
+    uint* shapes = bit_cast<uint*>(a);
+    uint v = shapes[0] + shapes[1 + vertex] * 4;
+    float3 local = float3(asfloat(shapes[v]), asfloat(shapes[v + 1]), asfloat(shapes[v + 2]));
+    uint i = pc.scene[at + MESH_SHAPES + 2] + (instance - 1) * SHAPE_INSTANCE_WORDS;
+    float3 c0 = float3(asfloat(pc.scene[i]), asfloat(pc.scene[i + 1]), asfloat(pc.scene[i + 2]));
+    float3 c1 = float3(asfloat(pc.scene[i + 3]), asfloat(pc.scene[i + 4]), asfloat(pc.scene[i + 5]));
+    float3 c2 = float3(asfloat(pc.scene[i + 6]), asfloat(pc.scene[i + 7]), asfloat(pc.scene[i + 8]));
+    float3 shift = float3(asfloat(pc.scene[i + 9]), asfloat(pc.scene[i + 10]), asfloat(pc.scene[i + 11]));
+    p = c0 * local.x + c1 * local.y + c2 * local.z + shift;
+    float4 m = unpack_mesh(uint2(0u, shapes[v + 3]));
+    float3 n = oct_decode(m.zw);
+    material = uint(m.y);
+    // Увеличение у форм одинаково по осям: нормаль поворачивается той же матрицей.
+    normal = c0 * n.x + c1 * n.y + c2 * n.z;
+    return true;
+}
