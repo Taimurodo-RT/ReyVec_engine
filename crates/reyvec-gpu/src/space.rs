@@ -34,8 +34,14 @@ fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
 
 /// Слов в заголовке раздела моделей: число вершин, число карт теней ламп, адрес буфера
 /// счётчиков лучей (2 слова, пишет [`set_counters`]; 0 — не считать), матрица «мир → экран» (16 чисел, столбцами; пишет [`set_view_proj`]) и матрицы двух
-/// ламп для карт теней (пишет [`set_shadow_maps`]), как в `include/space.slang`.
-const MESH_HEADER_WORDS: usize = 52;
+/// ламп для карт теней (пишет [`set_shadow_maps`]), потом сетки из форм (8.20б, пишет
+/// [`set_shape_meshes`]): адрес их буфера (2 слова), где в сцене их места и сколько
+/// мест. Как в `include/space.slang`.
+const MESH_HEADER_WORDS: usize = 56;
+/// Где в разделе моделей запись сеток из форм.
+const MESH_SHAPES: usize = 52;
+/// Слов на место сетки из формы: столбцы матрицы (поворот с увеличением) и сдвиг.
+pub(crate) const SHAPE_INSTANCE_WORDS: usize = 12;
 /// Где в разделе моделей матрица камеры и матрицы ламп.
 const MESH_VIEW_PROJ: usize = 4;
 const MESH_SHADOW_PROJ: usize = 20;
@@ -450,6 +456,68 @@ pub(crate) fn set_field(
     for c in window.corners {
         words.extend(c.to_array().map(|v| v as u32));
     }
+}
+
+/// Буфер сеток из форм (8.20б) для видеокарты: слово 0 — где начинаются вершины, потом
+/// номера вершин всех сеток подряд (по 3 на треугольник, номера общие для буфера), потом
+/// вершины по 4 слова: место и слово материала с нормалью ([`vertex_word`]). Ответ —
+/// слова и для каждой сетки её первый номер и число номеров (для `cmd_draw`).
+pub(crate) fn shape_mesh_words(
+    meshes: &[std::sync::Arc<reyvec_sdf::shape_mesh::ShapeMesh>],
+) -> (Vec<u32>, Vec<(u32, u32)>) {
+    let indices: usize = meshes.iter().map(|m| m.indices.len()).sum();
+    let vertices: usize = meshes.iter().map(|m| m.positions.len()).sum();
+    let mut words = Vec::with_capacity(1 + indices + vertices * 4);
+    words.push((1 + indices) as u32);
+    let mut ranges = Vec::with_capacity(meshes.len());
+    let mut base = 0u32;
+    for m in meshes {
+        ranges.push(((words.len() - 1) as u32, m.indices.len() as u32));
+        words.extend(m.indices.iter().map(|&i| base + i));
+        base += m.positions.len() as u32;
+    }
+    for m in meshes {
+        for ((p, n), &material) in m.positions.iter().zip(&m.normals).zip(&m.materials) {
+            words.extend(p.to_array().map(f32::to_bits));
+            words.push(vertex_word(material, Some(*n)));
+        }
+    }
+    (words, ranges)
+}
+
+/// Место сетки из формы: столбцы `rot · scale` и сдвиг (12 чисел, как читает
+/// `mesh3d.slang`).
+pub(crate) fn shape_instance(place: &reyvec_sdf::shape_mesh::Rigid) -> [u32; SHAPE_INSTANCE_WORDS] {
+    let m = place.rot * place.scale;
+    let mut out = [0u32; SHAPE_INSTANCE_WORDS];
+    for (k, v) in m
+        .to_cols_array()
+        .into_iter()
+        .chain(place.at.to_array())
+        .enumerate()
+    {
+        out[k] = v.to_bits();
+    }
+    out
+}
+
+/// Сетки из форм (8.20б) в раздел моделей: адрес их буфера и места (`instances`, по
+/// [`SHAPE_INSTANCE_WORDS`] слов) в конец слов сцены. `false` — раздела нет или места в
+/// буфере сцены не хватило: сеток в кадре не будет.
+pub(crate) fn set_shape_meshes(words: &mut Vec<u32>, address: u64, instances: &[u32]) -> bool {
+    let Some(at) = mesh_section(words) else {
+        return false;
+    };
+    if words.len() + instances.len() > MAX_WORDS {
+        return false;
+    }
+    let start = words.len() as u32;
+    words.extend_from_slice(instances);
+    words[at + MESH_SHAPES] = address as u32;
+    words[at + MESH_SHAPES + 1] = (address >> 32) as u32;
+    words[at + MESH_SHAPES + 2] = start;
+    words[at + MESH_SHAPES + 3] = (instances.len() / SHAPE_INSTANCE_WORDS) as u32;
+    true
 }
 
 /// Где раздел моделей; `None` — его нет (сцена не поместилась и рисуется пустой, слово 7

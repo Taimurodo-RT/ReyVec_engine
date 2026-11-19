@@ -620,6 +620,42 @@ impl SpaceScene {
     }
 }
 
+impl SpaceFrame {
+    /// Формы с `hide[i] == true` глаз больше не видит (8.20б): их рисуют сетки, а тени и
+    /// затенение в углах по-прежнему считаются по формам — они переходят в заменители
+    /// (`proxies`, только тени). Флаги неподвижности переезжают вместе с ними.
+    pub fn hide_from_eye(&mut self, hide: &[bool]) {
+        if !hide.iter().any(|&h| h) {
+            return;
+        }
+        let hidden = |i: usize| hide.get(i).copied().unwrap_or(false);
+        let with_still = self.still.len() == self.shapes.len() + self.proxies.len();
+        let (shapes, proxies) = (self.shapes.len(), self.proxies.len());
+        let mut kept = Vec::with_capacity(shapes);
+        let mut moved = Vec::new();
+        let mut still_kept = Vec::new();
+        let mut still_moved = Vec::new();
+        for (i, shape) in std::mem::take(&mut self.shapes).into_iter().enumerate() {
+            let still = with_still && self.still[i];
+            if hidden(i) {
+                moved.push(shape);
+                still_moved.push(still);
+            } else {
+                kept.push(shape);
+                still_kept.push(still);
+            }
+        }
+        self.shapes = kept;
+        self.proxies.extend(moved);
+        if with_still {
+            let old_proxies = self.still[shapes..shapes + proxies].to_vec();
+            self.still = still_kept;
+            self.still.extend(old_proxies);
+            self.still.extend(still_moved);
+        }
+    }
+}
+
 fn object_label(o: &ObjectEntry, i: usize) -> String {
     if o.name.is_empty() {
         format!("предмет {}", i + 1)
@@ -843,5 +879,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("модель «нет»") && e.contains("нет.glb"), "{e}");
+    }
+
+    /// Спрятанные от глаза формы переходят в заменители вместе со своими флагами
+    /// неподвижности; остальное — на месте и по порядку.
+    #[test]
+    fn hidden_shapes_become_proxies() {
+        let ball = |r: f32| Shape3::Sphere { radius: r };
+        let mut frame = SpaceFrame {
+            shapes: vec![ball(1.0), ball(2.0), ball(3.0)],
+            lamps: Vec::new(),
+            meshes: Vec::new(),
+            proxies: vec![ball(9.0)],
+            glows: Vec::new(),
+            still: vec![true, false, true, false],
+        };
+        frame.hide_from_eye(&[false, true, true]);
+        assert_eq!(frame.shapes, vec![ball(1.0)]);
+        assert_eq!(frame.proxies, vec![ball(9.0), ball(2.0), ball(3.0)]);
+        assert_eq!(frame.still, vec![true, false, false, true]);
     }
 }

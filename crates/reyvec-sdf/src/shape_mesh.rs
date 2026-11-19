@@ -44,7 +44,7 @@ pub struct MeshSettings {
 impl Default for MeshSettings {
     fn default() -> Self {
         Self {
-            max_cell: 0.05,
+            max_cell: 0.025,
             min_cells: 24,
             max_samples: 2_000_000,
             max_error: 0.004,
@@ -269,11 +269,18 @@ fn contour(program: &Program, grid: &Grid, values: &[f32]) -> ShapeMesh {
                 } else {
                     center
                 };
-                // Точка не выходит из своей клетки: иначе соседние грани заворачиваются.
-                p = p.clamp(base, base + Vec3::splat(grid.cell));
                 if !p.is_finite() {
                     p = center;
                 }
+                // На поверхность: точка QEF у скруглённого ребра — там, где сошлись бы
+                // плоскости без скругления, на миллиметры снаружи формы, и ребро сетки
+                // выходило острым. У острого угла расстояние и так ноль.
+                for _ in 0..2 {
+                    let d = program.distance(p).0;
+                    p -= normal_at(program, p, h) * d;
+                }
+                // Точка не выходит из своей клетки: иначе соседние грани заворачиваются.
+                p = p.clamp(base, base + Vec3::splat(grid.cell));
                 vertex_of[cell_index(x, y, z)] = mesh.positions.len() as u32;
                 let (_, material) = program.distance(p);
                 mesh.positions.push(p);
@@ -333,8 +340,11 @@ fn contour(program: &Program, grid: &Grid, values: &[f32]) -> ShapeMesh {
 fn push_quad(mesh: &mut ShapeMesh, q: [u32; 4], outward: Vec3) {
     let p = q.map(|i| mesh.positions[i as usize]);
     let n = q.map(|i| mesh.normals[i as usize]);
-    // Обход (0, 1, 2, 3) смотрит в сторону `outward` или против неё: сразу разворачиваем.
-    let flip = (p[2] - p[0]).cross(p[3] - p[1]).dot(outward) < 0.0;
+    // Обход (0, 1, 2, 3) вокруг ребра оси смотрит вдоль оси (клетки идут против часовой
+    // стрелки в плоскости двух других осей): разворачиваем, если наружу — против оси.
+    // По числам, а не по месту вершин: у сложенного четырёхугольника (вершины прижаты к
+    // стенкам клеток) место давало не тот обход, и в сетке оставалась дыра.
+    let flip = outward.x + outward.y + outward.z < 0.0;
     let orient = |t: [usize; 3]| if flip { [t[0], t[2], t[1]] } else { t };
     let score = |t: [usize; 3]| {
         let face = (p[t[1]] - p[t[0]]).cross(p[t[2]] - p[t[0]]);
@@ -351,11 +361,10 @@ fn push_quad(mesh: &mut ShapeMesh, q: [u32; 4], outward: Vec3) {
     } else {
         splits[1]
     };
+    // Треугольник нулевой площади (вершины на одной прямой) тоже остаётся: без него в
+    // сетке дыра. Упрощение уберёт его вместе с вершиной.
     for t in best {
-        let face = (p[t[1]] - p[t[0]]).cross(p[t[2]] - p[t[0]]);
-        if face.length_squared() > 0.0 {
-            mesh.indices.extend(t.map(|k| q[k]));
-        }
+        mesh.indices.extend(t.map(|k| q[k]));
     }
 }
 
@@ -430,7 +439,9 @@ pub fn split_rigid(shape: &Shape3) -> (Rigid, Shape3) {
 #[derive(Default)]
 pub struct MeshCache {
     settings: MeshSettings,
-    meshes: HashMap<Vec<u32>, Option<Arc<ShapeMesh>>>,
+    /// Номер сетки в `list` (`None` — у формы сетки нет).
+    keys: HashMap<Vec<u32>, Option<usize>>,
+    list: Vec<Arc<ShapeMesh>>,
     /// Сколько раз сетка нашлась готовой.
     pub hits: usize,
 }
@@ -439,6 +450,8 @@ pub struct MeshCache {
 #[derive(Clone, Debug)]
 pub struct MeshInstance {
     pub mesh: Arc<ShapeMesh>,
+    /// Номер сетки среди разных ([`SceneMeshes::meshes`]).
+    pub index: usize,
     pub place: Rigid,
 }
 
@@ -452,33 +465,41 @@ impl MeshCache {
 
     /// Сколько разных сеток построено (без пустых и бесконечных форм).
     pub fn len(&self) -> usize {
-        self.meshes.values().filter(|m| m.is_some()).count()
+        self.list.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.list.is_empty()
     }
 
     /// Все треугольники разных сеток.
     pub fn triangle_count(&self) -> usize {
-        self.meshes
-            .values()
-            .flatten()
-            .map(|m| m.triangle_count())
-            .sum()
+        self.list.iter().map(|m| m.triangle_count()).sum()
     }
 
     /// Сетка формы и где она стоит; `None` — форма бесконечна или пуста.
     pub fn get(&mut self, shape: &Shape3) -> Result<Option<MeshInstance>, CompileError> {
         let (place, local) = split_rigid(shape);
         let program = compile(&local)?;
-        if let Some(found) = self.meshes.get(&program.words) {
-            self.hits += 1;
-            return Ok(found.clone().map(|mesh| MeshInstance { mesh, place }));
-        }
-        let mesh = mesh_program(&program, &self.settings).map(Arc::new);
-        self.meshes.insert(program.words, mesh.clone());
-        Ok(mesh.map(|mesh| MeshInstance { mesh, place }))
+        let index = match self.keys.get(&program.words) {
+            Some(&found) => {
+                self.hits += 1;
+                found
+            }
+            None => {
+                let index = mesh_program(&program, &self.settings).map(|mesh| {
+                    self.list.push(Arc::new(mesh));
+                    self.list.len() - 1
+                });
+                self.keys.insert(program.words, index);
+                index
+            }
+        };
+        Ok(index.map(|index| MeshInstance {
+            mesh: self.list[index].clone(),
+            index,
+            place,
+        }))
     }
 }
 
@@ -486,6 +507,8 @@ impl MeshCache {
 #[derive(Debug, Default)]
 pub struct SceneMeshes {
     pub instances: Vec<Option<MeshInstance>>,
+    /// Разные сетки по номерам [`MeshInstance::index`].
+    pub meshes: Vec<Arc<ShapeMesh>>,
     /// Разных сеток.
     pub unique: usize,
     /// Треугольников во всех разных сетках.
@@ -501,6 +524,7 @@ pub fn mesh_shapes(shapes: &[Shape3], settings: &MeshSettings) -> SceneMeshes {
         instances,
         unique: cache.len(),
         triangles: cache.triangle_count(),
+        meshes: cache.list,
     }
 }
 

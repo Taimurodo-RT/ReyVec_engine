@@ -614,6 +614,17 @@ impl Sprite {
     }
 }
 
+/// Сетки из форм сцены на видеокарте (8.20б).
+struct ShapeBuffer {
+    id: BufferId,
+    /// У каждой сетки: первый номер и число номеров вершин в буфере.
+    ranges: Vec<(u32, u32)>,
+    /// Шар каждой сетки в её координатах (середина, радиус): отсев мест по взгляду.
+    bounds: Vec<(glam::Vec3, f32)>,
+    /// Для каких сеток собран (`Demo::space_meshes_generation`).
+    source: u64,
+}
+
 /// Всё, что проходам кадра нужно знать о сцене. Готовится до сборки графа.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameData {
@@ -631,6 +642,8 @@ pub(crate) struct FrameData {
     /// В кадре есть полигоны с текстурой цвета (8.14б2): «полигоны 3D» пишут ещё
     /// картинку «цвет полигонов 3D», освещение умножает на неё цвет материала.
     space_textured: bool,
+    /// Есть ли в кадре сетки из форм (8.20б): проход «полигоны 3D» нужен и без моделей.
+    space_shapes: bool,
     /// Карт теней ламп от треугольников (7.9б; 0 — тени ламп только по формам SDF).
     space_shadow_maps: u32,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
@@ -776,6 +789,16 @@ pub(crate) struct Demo {
     /// после чтения файла; пока только считаются и пишутся в журнал.
     space_meshes: Option<reyvec_sdf::shape_mesh::SceneMeshes>,
     space_meshes_job: Option<std::thread::JoinHandle<reyvec_sdf::shape_mesh::SceneMeshes>>,
+    /// Режим «треугольники» для 3D (8.20б, флажок на панели): формы с сетками рисует
+    /// проход «полигоны 3D», лучи глаза их не видят (тени — по формам).
+    space_triangles: bool,
+    /// Номер последних построенных сеток: буфер на видеокарте знает, для каких он.
+    space_meshes_generation: u64,
+    /// Буфер сеток из форм на видеокарте (`space::shape_mesh_words`) для `space_meshes`.
+    shape_buffer: Option<ShapeBuffer>,
+    /// Вызовы рисования сеток этого кадра: первый номер, число номеров, мест, первое
+    /// место (+1: место 0 — модели).
+    shape_draws: Vec<[u32; 4]>,
     /// Сколько фигур последнего кадра сцены «3D» нарисовано через поле слоя и сколько
     /// выдавленных фигур верхнего уровня в кадре было.
     field_shapes: (usize, usize),
@@ -1133,6 +1156,10 @@ impl Demo {
             field_textures_stale: false,
             space_meshes: None,
             space_meshes_job: None,
+            space_triangles: false,
+            space_meshes_generation: 0,
+            shape_buffer: None,
+            shape_draws: Vec::new(),
             field_shapes: (0, 0),
             space_field: crate::field::SpaceField::new(
                 frames_in_flight,
@@ -1544,9 +1571,104 @@ impl Demo {
             && let Some(job) = self.space_meshes_job.take()
         {
             match job.join() {
-                Ok(meshes) => self.space_meshes = Some(meshes),
+                Ok(meshes) => {
+                    self.space_meshes = Some(meshes);
+                    self.space_meshes_generation += 1;
+                }
                 Err(_) => tracing::warn!("Сетки 3D: постройка упала"),
             }
+        }
+    }
+
+    /// Режим «треугольники» для 3D (8.20б).
+    pub fn space_triangles(&self) -> bool {
+        self.space_triangles
+    }
+
+    /// Включает и выключает режим «треугольники» со следующего кадра.
+    pub fn set_space_triangles(&mut self, on: bool) {
+        self.space_triangles = on;
+    }
+
+    /// Буфер сеток из форм на видеокарте: убирает прежний, если сетки сменились, и
+    /// грузит новые, когда они построены.
+    fn sync_shape_buffer(&mut self, ctx: &GpuContext, res: &mut GpuResources) {
+        let current = self
+            .space_meshes
+            .as_ref()
+            .map(|_| self.space_meshes_generation);
+        if self.shape_buffer.as_ref().map(|b| b.source) != current
+            && let Some(old) = self.shape_buffer.take()
+        {
+            res.destroy_buffer(old.id);
+        }
+        let Some(meshes) = self.space_meshes.as_ref() else {
+            return;
+        };
+        if self.shape_buffer.is_some() || meshes.meshes.is_empty() {
+            return;
+        }
+        let (words, ranges) = crate::space::shape_mesh_words(&meshes.meshes);
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let made = res
+            .create_buffer(
+                ctx,
+                bytes.len() as u64,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                BufferMemory::GpuOnly,
+                "сетки из форм 3D",
+            )
+            .and_then(|id| match res.upload_buffer(ctx, id, &bytes) {
+                Ok(()) => Ok(id),
+                Err(e) => {
+                    res.destroy_buffer(id);
+                    Err(e)
+                }
+            });
+        match made {
+            Ok(id) => {
+                let bounds = meshes
+                    .meshes
+                    .iter()
+                    .map(|m| {
+                        let (lo, hi) = m.positions.iter().fold(
+                            (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN)),
+                            |(lo, hi), &p| (lo.min(p), hi.max(p)),
+                        );
+                        let c = (lo + hi) * 0.5;
+                        (c, (hi - c).length())
+                    })
+                    .collect();
+                self.shape_buffer = Some(ShapeBuffer {
+                    id,
+                    ranges,
+                    bounds,
+                    source: current.unwrap_or(0),
+                });
+            }
+            Err(e) => {
+                tracing::warn!("Сетки 3D: буфер не создан: {e}");
+                // Не пытаться каждый кадр: сетки забываются до следующей сцены.
+                self.space_meshes = None;
+            }
+        }
+    }
+
+    /// Идёт ли режим «треугольники»: включён и сетки сцены на видеокарте.
+    fn triangles_on(&self) -> bool {
+        self.space_triangles && self.shape_buffer.is_some()
+    }
+
+    /// Ждёт фоновую постройку сеток (тесты: кадр снимается сразу после чтения файла).
+    #[cfg(test)]
+    pub(crate) fn wait_space_meshes(&mut self) {
+        if let Some(job) = self.space_meshes_job.take()
+            && let Ok(meshes) = job.join()
+        {
+            self.space_meshes = Some(meshes);
+            self.space_meshes_generation += 1;
         }
     }
 
@@ -3668,6 +3790,7 @@ impl Demo {
                 // Кирпичи поля (8.15) — до сборки кадра: их программы берут номера картинок.
                 self.sync_space_bricks(ctx, res);
                 self.poll_space_meshes();
+                self.sync_shape_buffer(ctx, res);
                 self.space.plane_shadows = self.space_plane_shadows;
                 (self.space.frame(time), None)
             };
@@ -3675,6 +3798,23 @@ impl Demo {
                 self.field_shapes = (0, 0);
             } else {
                 self.swap_extrudes(ctx, res, &mut frame);
+            }
+            // Режим «треугольники» (8.20б): формы с сетками глаз не видит, их места —
+            // для прохода «полигоны 3D».
+            let mut shape_places = Vec::new();
+            if !level
+                && self.triangles_on()
+                && let Some(meshes) = self.space_meshes.as_ref()
+                && meshes.instances.len() == frame.shapes.len()
+            {
+                let hide: Vec<bool> = meshes.instances.iter().map(Option::is_some).collect();
+                for (shape, instance) in frame.shapes.iter().zip(&meshes.instances) {
+                    if let Some(instance) = instance {
+                        let (place, _) = reyvec_sdf::shape_mesh::split_rigid(shape);
+                        shape_places.push((instance.index, place));
+                    }
+                }
+                frame.hide_from_eye(&hide);
             }
             let built = std::time::Instant::now();
             let frame_counts = FrameCounts {
@@ -3728,6 +3868,41 @@ impl Demo {
                 self.space_field.ao_from_field,
             );
             space_vertices = packed.vertices;
+            self.shape_draws.clear();
+            if let Some(buffer) = self
+                .shape_buffer
+                .as_ref()
+                .filter(|_| !shape_places.is_empty())
+            {
+                let frustum = reyvec_sdf::view3d::Frustum::new(view_proj);
+                let mut by_mesh = vec![Vec::new(); buffer.ranges.len()];
+                for (index, place) in &shape_places {
+                    let Some(&(c, r)) = buffer.bounds.get(*index) else {
+                        continue;
+                    };
+                    if frustum.sphere(place.apply(c), r * place.scale.abs()) {
+                        by_mesh[*index].push(crate::space::shape_instance(place));
+                    }
+                }
+                let mut words = Vec::new();
+                let mut draws = Vec::new();
+                for (k, list) in by_mesh.iter().enumerate() {
+                    if list.is_empty() {
+                        continue;
+                    }
+                    let (first, count) = buffer.ranges[k];
+                    let at = (words.len() / crate::space::SHAPE_INSTANCE_WORDS) as u32;
+                    draws.push([first, count, list.len() as u32, 1 + at]);
+                    words.extend(list.iter().flatten());
+                }
+                if crate::space::set_shape_meshes(
+                    &mut packed.words,
+                    res.buffer_address(buffer.id),
+                    &words,
+                ) {
+                    self.shape_draws = draws;
+                }
+            }
             // Текстуры моделей (8.14б2): номера их картинок — в записи материалов.
             if !level {
                 let slots = self.sync_space_textures(ctx, res);
@@ -3809,6 +3984,7 @@ impl Demo {
             space_address: res.buffer_address(space_buffer),
             space_vertices,
             space_textured,
+            space_shapes: scene == DemoScene::Space && !self.shape_draws.is_empty(),
             space_shadow_maps,
             space_compute,
             space_edges,
@@ -4410,7 +4586,12 @@ impl Demo {
             _ => self.space_mesh_color[0],
         };
         let textured = frame.space_textured && color_pipeline != vk::Pipeline::null();
-        let meshes = (frame.space_vertices > 0).then(|| {
+        let shape_draws = if frame.scene == DemoScene::Space {
+            self.shape_draws.clone()
+        } else {
+            Vec::new()
+        };
+        let meshes = (frame.space_vertices > 0 || frame.space_shapes).then(|| {
             let samples = mesh_msaa.samples();
             let meshes = graph.create_multisampled("полигоны 3D", ext, MESH_FORMAT, samples);
             let colors = textured.then(|| {
@@ -4466,7 +4647,13 @@ impl Demo {
                     bindless.bind(d, cmd);
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, mesh_pipeline);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                    d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
+                    if frame.space_vertices > 0 {
+                        d.cmd_draw(cmd, frame.space_vertices, 1, 0, 0);
+                    }
+                    // Сетки из форм (8.20б): место 0 — модели, у сеток места с 1.
+                    for &[first, count, instances, first_instance] in &shape_draws {
+                        d.cmd_draw(cmd, count, instances, first, first_instance);
+                    }
                     d.cmd_end_rendering(cmd);
                 }
             });
