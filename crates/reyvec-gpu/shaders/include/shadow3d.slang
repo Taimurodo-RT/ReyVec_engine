@@ -295,6 +295,13 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
         texel = 5.5 * here / side;
         bias = 0.02 + 0.01 * here;
     }
+    // ВРЕМЕННО: разница глубин в самой точке.
+    if (sun)
+    {
+        float2 between0;
+        float4 d0 = map_gather(map, uv, lo, side, inv, between0);
+        return d0.x > 1e8 ? 1.0 : saturate(0.5 - (here - d0.x) * 0.5);
+    }
     float blockers = 0.0;
     float count = 0.0;
     for (int k = 0; k < 9; k++)
