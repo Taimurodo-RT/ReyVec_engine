@@ -791,6 +791,8 @@ pub(crate) struct Demo {
     /// после чтения файла; пока только считаются и пишутся в журнал.
     space_meshes: Option<reyvec_sdf::shape_mesh::SceneMeshes>,
     space_meshes_job: Option<std::thread::JoinHandle<reyvec_sdf::shape_mesh::SceneMeshes>>,
+    /// Сцена сменилась, а сетки для неё не строились: построятся при режиме «треугольники».
+    space_meshes_stale: bool,
     /// Режим «треугольники» для 3D (8.20б, флажок на панели): формы с сетками рисует
     /// проход «полигоны 3D», лучи глаза их не видят (тени — по формам).
     space_triangles: bool,
@@ -1160,6 +1162,7 @@ impl Demo {
             field_textures_stale: false,
             space_meshes: None,
             space_meshes_job: None,
+            space_meshes_stale: false,
             space_triangles: false,
             space_meshes_generation: 0,
             shape_buffer: None,
@@ -1530,8 +1533,11 @@ impl Demo {
                 if space.camera != self.space.camera {
                     self.space_camera = space.home_camera();
                 }
-                self.start_space_meshes(&space);
                 self.space = space;
+                // Сетки форм — заново, когда понадобятся (режим «треугольники»).
+                self.space_meshes = None;
+                self.space_meshes_job = None;
+                self.space_meshes_stale = true;
                 self.space_error = None;
                 self.field_textures_stale = true;
             }
@@ -1542,10 +1548,16 @@ impl Demo {
         }
     }
 
-    /// Запускает в фоне постройку сеток форм сцены (8.20а). Прежняя постройка, если не
-    /// закончилась, просто досчитает и будет забыта.
-    fn start_space_meshes(&mut self, space: &reyvec_sdf::SpaceScene) {
-        let shapes = space.frame(0.0).shapes;
+    /// Запускает в фоне постройку сеток форм сцены (8.20а), если они нужны (включён режим
+    /// «треугольники») и ещё не строились для этой сцены. Без режима не строятся: это
+    /// секунды работы всех ядер процессора. Прежняя постройка, если не закончилась, просто
+    /// досчитает и будет забыта.
+    fn start_space_meshes(&mut self) {
+        if !self.space_triangles || !self.space_meshes_stale {
+            return;
+        }
+        self.space_meshes_stale = false;
+        let shapes = self.space.frame(0.0).shapes;
         self.space_meshes = None;
         self.space_meshes_job = std::thread::Builder::new()
             .name("сетки 3D".into())
@@ -1569,6 +1581,7 @@ impl Demo {
 
     /// Забирает готовые сетки форм сцены, если фоновая постройка закончилась.
     fn poll_space_meshes(&mut self) {
+        self.start_space_meshes();
         if self
             .space_meshes_job
             .as_ref()
@@ -1669,6 +1682,7 @@ impl Demo {
     /// Ждёт фоновую постройку сеток (тесты: кадр снимается сразу после чтения файла).
     #[cfg(test)]
     pub(crate) fn wait_space_meshes(&mut self) {
+        self.start_space_meshes();
         if let Some(job) = self.space_meshes_job.take()
             && let Ok(meshes) = job.join()
         {
