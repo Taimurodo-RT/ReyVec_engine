@@ -36,12 +36,12 @@ fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
 /// счётчиков лучей (2 слова, пишет [`set_counters`]; 0 — не считать), матрица «мир → экран» (16 чисел, столбцами; пишет [`set_view_proj`]) и матрицы двух
 /// ламп для карт теней (пишет [`set_shadow_maps`]), потом сетки из форм (8.20б, пишет
 /// [`set_shape_meshes`]): адрес их буфера (2 слова), где в сцене их места и сколько
-/// мест, потом карта теней солнца (8.20в, пишет [`set_sun_map`]): 1 — есть, и её матрица.
-/// Как в `include/space.slang`.
-const MESH_HEADER_WORDS: usize = 76;
+/// мест, потом карты теней солнца (8.20в, пишет [`set_sun_maps`]): сколько их (0 — нет) и
+/// их матрицы ([`SUN_CASCADES`] по 16 чисел). Как в `include/space.slang`.
+const MESH_HEADER_WORDS: usize = 57 + 16 * SUN_CASCADES;
 /// Где в разделе моделей запись сеток из форм.
 const MESH_SHAPES: usize = 52;
-/// Где в разделе моделей карта теней солнца: слово «есть», потом матрица.
+/// Где в разделе моделей карты теней солнца: их число, потом матрицы.
 const MESH_SUN: usize = 56;
 /// Слов на место сетки из формы: столбцы матрицы (поворот с увеличением) и сдвиг.
 pub(crate) const SHAPE_INSTANCE_WORDS: usize = 12;
@@ -565,38 +565,66 @@ pub(crate) fn set_shadow_maps(words: &mut [u32], maps: &[glam::Mat4]) {
     }
 }
 
-/// Карта теней солнца (8.20в) накрывает шар такого радиуса (метры) перед камерой: ближние
-/// тени по карте, дальше — лучами.
-pub(crate) const SUN_MAP_RADIUS: f32 = 12.0;
-/// Середина шара карты солнца — столько перед камерой.
-const SUN_MAP_AHEAD: f32 = 9.0;
+/// Карт теней солнца (8.20в): ближняя подробная и дальняя грубая (cascaded shadow maps).
+pub(crate) const SUN_CASCADES: usize = 2;
+/// Границы карт солнца по расстоянию от камеры вдоль взгляда, метры: первая — до 16 м,
+/// вторая — до 80 м, дальше тени лучами. Камера над заводом (22 м) видит пол в 25–80 м.
+pub(crate) const SUN_SPLITS: [f32; SUN_CASCADES + 1] = [0.0, 16.0, 80.0];
 
-/// Матрица карты солнца для камеры `eye`, `forward` и карты `side` точек: прямоугольная
-/// проекция вдоль солнца на шар перед камерой. Середина сдвигается целыми точками карты:
-/// при движении камеры края теней не дрожат. Глубина обратная (ближе к солнцу — 1), как у
-/// карт ламп.
-pub(crate) fn sun_view_proj(eye: glam::Vec3, forward: glam::Vec3, side: u32) -> glam::Mat4 {
+/// Матрица карты солнца для куска взгляда камеры от `from` до `to` метров вдоль взгляда
+/// (`aspect` — ширина / высота кадра) на карте в `side` точек: прямоугольная проекция
+/// вдоль солнца на шар вокруг этого куска. Радиус шара — целые метры, середина сдвигается
+/// целыми точками карты: при движении и повороте камеры размер точки карты не меняется, а
+/// края теней не дрожат. Глубина обратная (ближе к солнцу — 1), как у карт ламп.
+pub(crate) fn sun_view_proj(
+    camera: &reyvec_sdf::Camera3D,
+    aspect: f32,
+    from: f32,
+    to: f32,
+    side: u32,
+) -> glam::Mat4 {
     use glam::{Mat4, Vec3};
     let sun = reyvec_sdf::view3d::SUN;
     let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
     let view = Mat4::look_at_rh(Vec3::ZERO, -sun, up);
-    let r = SUN_MAP_RADIUS;
-    let texel = 2.0 * r / side.max(1) as f32;
-    let c = view.transform_point3(eye + forward * SUN_MAP_AHEAD);
+    let (f, r, u) = (camera.forward(), camera.right(), camera.up());
+    let half = |d: f32| match camera.projection {
+        reyvec_sdf::camera3d::Projection::Perspective { fov_y } => (fov_y * 0.5).tan() * d,
+        reyvec_sdf::camera3d::Projection::Orthographic { height } => height * 0.5,
+    };
+    let mut corners = Vec::with_capacity(8);
+    for d in [from.max(camera.near), to] {
+        let (hy, hx) = (half(d), half(d) * aspect);
+        for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            corners.push(camera.eye + f * d + r * (sx * hx) + u * (sy * hy));
+        }
+    }
+    let center = corners.iter().copied().sum::<Vec3>() / corners.len() as f32;
+    let radius = corners
+        .iter()
+        .map(|p| p.distance(center))
+        .fold(0.0, f32::max)
+        .ceil()
+        .max(1.0);
+    let texel = 2.0 * radius / side.max(1) as f32;
+    let c = view.transform_point3(center);
     let (x, y) = ((c.x / texel).round() * texel, (c.y / texel).round() * texel);
-    // Заслоняющие — до 60 м выше середины к солнцу, принимающие — до 40 м ниже (по целым
-    // метрам: глубина карты тоже не дрожит).
+    // Принимающие — в шаре, заслоняющие — ещё до 50 м выше к солнцу (по целым метрам:
+    // глубина карты тоже не дрожит).
     let z = c.z.round();
-    let (near, far) = (-z - 60.0, -z + 40.0);
-    Mat4::orthographic_rh(x - r, x + r, y - r, y + r, far, near) * view
+    let (near, far) = (-z - radius - 50.0, -z + radius + 1.0);
+    Mat4::orthographic_rh(x - radius, x + radius, y - radius, y + radius, far, near) * view
 }
 
-/// Карта теней солнца (8.20в, режим «треугольники» 3D): матрица «мир → карта»
-/// (прямоугольная проекция вдоль солнца). Без раздела моделей не пишется ничего.
-pub(crate) fn set_sun_map(words: &mut [u32], view_proj: glam::Mat4) {
+/// Карты теней солнца (8.20в, режим «треугольники» 3D): матрицы «мир → карта», по одной на
+/// кусок взгляда (не больше [`SUN_CASCADES`]). Без раздела моделей не пишется ничего.
+pub(crate) fn set_sun_maps(words: &mut [u32], maps: &[glam::Mat4]) {
     if let Some(at) = mesh_section(words) {
-        words[at + MESH_SUN] = 1;
-        write_matrix(words, at + MESH_SUN + 1, view_proj);
+        let count = maps.len().min(SUN_CASCADES);
+        words[at + MESH_SUN] = count as u32;
+        for (k, m) in maps.iter().take(count).enumerate() {
+            write_matrix(words, at + MESH_SUN + 1 + 16 * k, *m);
+        }
     }
 }
 
@@ -630,21 +658,26 @@ mod tests {
     #[test]
     fn sun_map_covers_view_and_snaps() {
         use glam::Vec3;
-        let (eye, forward) = (
-            Vec3::new(3.0, 1.5, 4.0),
-            Vec3::new(0.0, -0.3, -1.0).normalize(),
-        );
-        let m = sun_view_proj(eye, forward, 1024);
-        let ahead = eye + forward * 9.0;
-        let p = m.project_point3(ahead);
-        assert!(p.x.abs() < 0.1 && p.y.abs() < 0.1, "{p}");
-        let above = m.project_point3(ahead + reyvec_sdf::view3d::SUN * 5.0);
-        assert!(
-            above.z > p.z && (0.0..=1.0).contains(&above.z),
-            "{above} {p}"
-        );
-        let moved = sun_view_proj(eye + Vec3::X * 0.001, forward, 1024);
-        assert_eq!(m, moved);
+        let camera = reyvec_sdf::Camera3D::looking_at(Vec3::new(0.0, 22.0, 30.0), Vec3::ZERO);
+        let aspect = 1.9;
+        for k in 0..SUN_CASCADES {
+            let (from, to) = (SUN_SPLITS[k], SUN_SPLITS[k + 1]);
+            let m = sun_view_proj(&camera, aspect, from, to, 1024);
+            // Середина куска взгляда — на карте, точка выше к солнцу — ближе (глубина
+            // больше) и тоже в пределах глубины.
+            let mid = camera.eye + camera.forward() * (from + to) * 0.5;
+            let p = m.project_point3(mid);
+            assert!(
+                p.x.abs() < 0.9 && p.y.abs() < 0.9 && (0.0..=1.0).contains(&p.z),
+                "{p}"
+            );
+            let above = m.project_point3(mid + reyvec_sdf::view3d::SUN * 20.0);
+            assert!(above.z > p.z && above.z <= 1.0, "{above} {p}");
+            // Сдвиг камеры меньше точки карты матрицу не меняет.
+            let mut moved = camera;
+            moved.eye += Vec3::X * 0.001;
+            assert_eq!(m, sun_view_proj(&moved, aspect, from, to, 1024));
+        }
     }
 
     /// сцены, которая не поместилась (раздела нет), не пишется ничего — ни он, ни матрицы.
@@ -668,7 +701,7 @@ mod tests {
         assert!(!set_counters(&mut set, 0x1234_5678_9abc_def0));
         set_view_proj(&mut set, glam::Mat4::IDENTITY);
         set_shadow_maps(&mut set, &[glam::Mat4::IDENTITY]);
-        set_sun_map(&mut set, glam::Mat4::IDENTITY);
+        set_sun_maps(&mut set, &[glam::Mat4::IDENTITY]);
         assert_eq!(set, empty, "без раздела моделей заголовок цел");
     }
 

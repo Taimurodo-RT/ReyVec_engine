@@ -116,8 +116,10 @@ static const uint MATERIAL_TEXTURED = 2;
 // Раздел полигонов (слово 7 заголовка сцены): число вершин, число карт теней, адрес
 // счётчиков (2 слова), матрица камеры, матрицы ламп для карт теней (по 16 чисел,
 // столбцами), сетки из форм (8.20б: адрес их буфера — 2 слова, где их места в сцене и
-// сколько мест), карта теней солнца (8.20в: 1 — есть, и её матрица), потом вершины.
-static const uint MESH_HEADER_WORDS = 76;
+// сколько мест), карты теней солнца (8.20в: сколько их, 0 — нет, и их матрицы — по
+// SUN_CASCADES, ближняя первой), потом вершины.
+static const uint SUN_CASCADES = 2;
+static const uint MESH_HEADER_WORDS = 57 + 16 * SUN_CASCADES;
 static const uint MESH_SHAPES = 52;
 static const uint MESH_SUN = 56;
 static const uint MESH_SUN_PROJ = 57;

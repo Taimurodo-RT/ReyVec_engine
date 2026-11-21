@@ -4,8 +4,9 @@
 // Карты лежат рядом в одной картинке: лампа k — квадрат k по горизонтали, рисуется с
 // экземпляром k. В точке — расстояние от лампы до ближней поверхности (R32F); «тени 3D»
 // (include/shadow3d.slang, map_shadow) сравнивают с ним расстояние до своей точки.
-// Солнце (8.20в, режим «треугольники» 3D) — квадрат сразу после ламп, прямоугольная
-// проекция вдоль солнца; в точке — глубина от солнца, −(точка · SUN).
+// Солнце (8.20в, режим «треугольники» 3D) — квадраты сразу после ламп (ближний кусок
+// взгляда и дальний), прямоугольная проекция вдоль солнца; в точке — глубина от солнца,
+// −(точка · SUN).
 
 #define SPACE_OWN_VERTEX
 #include "include/space.slang"
@@ -37,7 +38,9 @@ ShadowOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
     uint shape = instance & 0xfffffu;
     uint lamps = min(pc.scene[at + 1], SHADOW_LAMPS);
     bool sun = lamp >= lamps;
-    if (sun && (lamp != lamps || pc.scene[at + MESH_SUN] == 0))
+    // Карты солнца — квадраты сразу после ламп, по одной на кусок взгляда (ближняя первой).
+    uint cascade = lamp - lamps;
+    if (sun && cascade >= min(pc.scene[at + MESH_SUN], SUN_CASCADES))
         return hidden(lamp);
     float3 p;
     if (shape > 0)
@@ -54,7 +57,7 @@ ShadowOut vs_main(uint vertex : SV_VulkanVertexID, uint instance : SV_VulkanInst
         uint v = at + MESH_HEADER_WORDS + vertex * MESH_VERTEX_WORDS;
         p = float3(asfloat(pc.scene[v]), asfloat(pc.scene[v + 1]), asfloat(pc.scene[v + 2]));
     }
-    uint m = sun ? at + MESH_SUN_PROJ : at + MESH_SHADOW_PROJ + lamp * 16;
+    uint m = sun ? at + MESH_SUN_PROJ + cascade * 16 : at + MESH_SHADOW_PROJ + lamp * 16;
     float4 clip = float4(0.0, 0.0, 0.0, 0.0);
     for (uint c = 0; c < 4; c++)
     {
