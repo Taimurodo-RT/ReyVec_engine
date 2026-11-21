@@ -81,5 +81,11 @@ float4 fs_main(ShadowOut input) : SV_Target
     if (input.lamp >= min(pc.scene[at + 1], SHADOW_LAMPS))
         return float4(-dot(input.world, SUN), 0.0, 0.0, 0.0);
     Lamp l = read_lamp(input.lamp);
-    return float4(length(input.world - l.at), 0.0, 0.0, 0.0);
+    float d = length(input.world - l.at);
+    // Сцена «3D» (8.20в2): шарик-лампочка вокруг лампы (форма с сеткой) не заслоняет свою
+    // же лампу — ближе 35 см к ней ничего не рисуется, как луч тени не доходит до лампы
+    // 35 см (shadow_part). Иначе вся карта — шарик, и в ней всё в тени.
+    if ((pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0 && d < LAMP_SHADOW_GAP)
+        discard;
+    return float4(d, 0.0, 0.0, 0.0);
 }

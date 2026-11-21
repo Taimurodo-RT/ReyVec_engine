@@ -805,6 +805,8 @@ pub(crate) struct Demo {
     shape_draws: Vec<[u32; 4]>,
     /// Те же вызовы для карты теней солнца (8.20в): места, видимые солнцу.
     sun_draws: Vec<Vec<[u32; 4]>>,
+    /// Те же вызовы для карт ламп сцены «3D» (8.20в2), по лампе.
+    lamp_draws: Vec<Vec<[u32; 4]>>,
     /// Сколько фигур последнего кадра сцены «3D» нарисовано через поле слоя и сколько
     /// выдавленных фигур верхнего уровня в кадре было.
     field_shapes: (usize, usize),
@@ -1168,6 +1170,7 @@ impl Demo {
             shape_buffer: None,
             shape_draws: Vec::new(),
             sun_draws: Vec::new(),
+            lamp_draws: Vec::new(),
             field_shapes: (0, 0),
             space_field: crate::field::SpaceField::new(
                 frames_in_flight,
@@ -3889,6 +3892,7 @@ impl Demo {
             space_vertices = packed.vertices;
             self.shape_draws.clear();
             self.sun_draws.clear();
+            self.lamp_draws.clear();
             // Карта теней солнца (8.20в): в режиме «треугольники» тени солнца вблизи — по
             // сеткам, растеризацией.
             #[cfg(not(test))]
@@ -3916,12 +3920,23 @@ impl Demo {
             } else {
                 Vec::new()
             };
+            // Карты двух первых ламп (8.20в2): лампы смотрят вниз.
+            let lamp_maps: Vec<glam::Mat4> = if sun_maps.is_empty() {
+                Vec::new()
+            } else {
+                frame
+                    .lamps
+                    .iter()
+                    .take(crate::space::MAX_SHADOW_MAPS)
+                    .map(crate::space::lamp_down_view_proj)
+                    .collect()
+            };
             if let Some(buffer) = self
                 .shape_buffer
                 .as_ref()
                 .filter(|_| !shape_places.is_empty())
             {
-                // Места сеток: сначала видимые глазу, за ними — видимые солнцу.
+                // Места сеток: сначала видимые глазу, за ними — видимые солнцу и лампам.
                 let mut words = Vec::new();
                 let mut lists = |view: glam::Mat4| {
                     let frustum = reyvec_sdf::view3d::Frustum::new(view);
@@ -3948,6 +3963,7 @@ impl Demo {
                 };
                 let draws = lists(view_proj);
                 let sun_draws: Vec<Vec<[u32; 4]>> = sun_maps.iter().map(|&m| lists(m)).collect();
+                let lamp_draws: Vec<Vec<[u32; 4]>> = lamp_maps.iter().map(|&m| lists(m)).collect();
                 if crate::space::set_shape_meshes(
                     &mut packed.words,
                     res.buffer_address(buffer.id),
@@ -3957,6 +3973,12 @@ impl Demo {
                     if sun_draws.iter().any(|d| !d.is_empty()) {
                         crate::space::set_sun_maps(&mut packed.words, &sun_maps);
                         self.sun_draws = sun_draws;
+                        if !lamp_maps.is_empty() {
+                            crate::space::set_shadow_maps(&mut packed.words, &lamp_maps);
+                            crate::space::set_lamp_maps_down(&mut packed.words);
+                            space_shadow_maps = lamp_maps.len() as u32;
+                            self.lamp_draws = lamp_draws;
+                        }
                     }
                 }
             }
@@ -4815,10 +4837,10 @@ impl Demo {
             height: ext.height.div_ceil(2),
         };
         // Карты теней ламп от треугольников (7.9б): квадраты рядом в одной картинке.
-        let sun_draws = if frame.space_sun_maps > 0 {
-            self.sun_draws.clone()
+        let (sun_draws, lamp_draws) = if frame.space_sun_maps > 0 {
+            (self.sun_draws.clone(), self.lamp_draws.clone())
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let shadow_maps = (frame.space_shadow_maps > 0 || frame.space_sun_maps > 0).then(|| {
             let lamps = frame.space_shadow_maps;
@@ -4875,9 +4897,12 @@ impl Demo {
                             if frame.space_vertices > 0 {
                                 d.cmd_draw(cmd, frame.space_vertices, 1, 0, k << 20);
                             }
-                            if let Some(draws) =
-                                k.checked_sub(lamps).and_then(|c| sun_draws.get(c as usize))
-                            {
+                            // Сетки из форм: в квадраты ламп сцены «3D» и солнца.
+                            let draws = match k.checked_sub(lamps) {
+                                Some(c) => sun_draws.get(c as usize),
+                                None => lamp_draws.get(k as usize),
+                            };
+                            if let Some(draws) = draws {
                                 for &[first, count, instances, first_instance] in draws {
                                     d.cmd_draw(
                                         cmd,

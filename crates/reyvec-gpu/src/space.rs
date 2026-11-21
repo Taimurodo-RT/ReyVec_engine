@@ -52,6 +52,10 @@ const MESH_SHADOW_PROJ: usize = 20;
 pub(crate) const MAX_SHADOW_MAPS: usize = 2;
 /// Слово 11 заголовка сцены, бит 1: солнца нет (как SCENE_NO_SUN в `space.slang`).
 const SCENE_NO_SUN: u32 = 2;
+/// Слово 11, бит 3: карты ламп смотрят вниз (сцена «3D», режим «треугольники», 8.20в2;
+/// [`lamp_down_view_proj`]), и внутри карты тень лампы — только по ней, без лучей. Как
+/// SCENE_LAMP_MAPS_DOWN в `space.slang`.
+const SCENE_LAMP_MAPS_DOWN: u32 = 8;
 /// Бит 2 слова 11: нормаль по всей сцене (как SCENE_FULL_NORMAL в `include/march.slang`).
 #[cfg(test)]
 const SCENE_FULL_NORMAL: u32 = 4;
@@ -628,6 +632,27 @@ pub(crate) fn set_sun_maps(words: &mut [u32], maps: &[glam::Mat4]) {
     }
 }
 
+/// Угол карты тени лампы сцены «3D» (8.20в2), градусы: лампы висят под потолком и светят
+/// вниз, широкий угол накрывает почти всё, что они освещают; выше лампы — тень лучами.
+const LAMP_DOWN_FOV_DEG: f32 = 140.0;
+
+/// Матрица «мир → карта тени» лампы сцены «3D» (8.20в2): лампа смотрит вниз (вдоль −Y,
+/// «верх» карты — −Z), глубина обратная, как у карт ламп уровня. Оси вида: x — X, y — −Z,
+/// z — Y (так `shadow3d.slang` поворачивает нормаль в карту).
+pub(crate) fn lamp_down_view_proj(lamp: &reyvec_sdf::Lamp3) -> glam::Mat4 {
+    use glam::{Mat4, Vec3};
+    let at = Vec3::from(lamp.at);
+    let view = Mat4::look_at_rh(at, at - Vec3::Y, -Vec3::Z);
+    let far = lamp.range.max(1.0) + 1.0;
+    let proj = Mat4::perspective_rh(LAMP_DOWN_FOV_DEG.to_radians(), 1.0, far, 0.05);
+    proj * view
+}
+
+/// Карты ламп смотрят вниз (8.20в2, см. [`lamp_down_view_proj`]).
+pub(crate) fn set_lamp_maps_down(words: &mut [u32]) {
+    words[11] |= SCENE_LAMP_MAPS_DOWN;
+}
+
 /// Солнца нет (2.5D-вид: уровень в помещении).
 pub(crate) fn set_no_sun(words: &mut [u32]) {
     words[11] |= SCENE_NO_SUN;
@@ -652,8 +677,30 @@ fn write_matrix(words: &mut [u32], at: usize, m: glam::Mat4) {
 mod tests {
     use super::*;
 
-    /// Адрес счётчиков ложится в слова 2 и 3 раздела моделей и больше ничего не трогает; у
-    /// Карта солнца: точка перед камерой — внутри карты, точка ближе к солнцу — с большей
+    /// Карта лампы сцены «3D» смотрит вниз, оси вида — как поворачивает нормаль шейдер.
+    #[test]
+    fn lamp_down_view_axes_match_shader() {
+        use glam::Vec3;
+        let lamp = reyvec_sdf::Lamp3 {
+            at: [1.0, 5.0, 2.0],
+            color: [1.0; 3],
+            power: 1.0,
+            range: 10.0,
+        };
+        let m = lamp_down_view_proj(&lamp);
+        // Прямо под лампой — середина карты, ближе к лампе — глубина больше.
+        let below = m.project_point3(Vec3::new(1.0, 0.0, 2.0));
+        assert!(below.x.abs() < 1e-4 && below.y.abs() < 1e-4, "{below}");
+        let higher = m.project_point3(Vec3::new(1.0, 3.0, 2.0));
+        assert!(higher.z > below.z);
+        // Оси вида, как в shadow3d.slang: x — X, y — −Z.
+        let east = m.project_point3(Vec3::new(2.0, 0.0, 2.0));
+        let south = m.project_point3(Vec3::new(1.0, 0.0, 3.0));
+        assert!(east.x > 0.0 && east.y.abs() < 1e-4, "{east}");
+        assert!(south.y < 0.0 && south.x.abs() < 1e-4, "{south}");
+    }
+
+    /// Карты солнца: середина куска взгляда — внутри карты, точка ближе к солнцу — с большей
     /// глубиной (обратная глубина), сдвиг камеры меньше точки карты карту не двигает.
     #[test]
     fn sun_map_covers_view_and_snaps() {
@@ -680,6 +727,7 @@ mod tests {
         }
     }
 
+    /// Адрес счётчиков ложится в слова 2 и 3 раздела моделей и больше ничего не трогает; у
     /// сцены, которая не поместилась (раздела нет), не пишется ничего — ни он, ни матрицы.
     #[test]
     fn counters_address_goes_to_mesh_header() {
