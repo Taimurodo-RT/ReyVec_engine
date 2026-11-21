@@ -646,8 +646,8 @@ pub(crate) struct FrameData {
     space_shapes: bool,
     /// Карт теней ламп от треугольников (7.9б; 0 — тени ламп только по формам SDF).
     space_shadow_maps: u32,
-    /// Карта теней солнца по сеткам из форм (8.20в): квадрат сразу после карт ламп.
-    space_sun_map: bool,
+    /// Карт теней солнца по сеткам из форм (8.20в): квадраты сразу после карт ламп.
+    space_sun_maps: u32,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
@@ -804,7 +804,7 @@ pub(crate) struct Demo {
     /// место (+1: место 0 — модели).
     shape_draws: Vec<[u32; 4]>,
     /// Те же вызовы для карты теней солнца (8.20в): места, видимые солнцу.
-    sun_draws: Vec<[u32; 4]>,
+    sun_draws: Vec<Vec<[u32; 4]>>,
     /// Сколько фигур последнего кадра сцены «3D» нарисовано через поле слоя и сколько
     /// выдавленных фигур верхнего уровня в кадре было.
     field_shapes: (usize, usize),
@@ -3895,17 +3895,27 @@ impl Demo {
             let sun_on = true;
             #[cfg(test)]
             let sun_on = !self.no_shadow_maps;
-            let sun_map = (!level
+            // Карты по кускам взгляда: ближняя подробная, дальняя грубая.
+            let sun_maps: Vec<glam::Mat4> = if !level
                 && sun_on
                 && !shape_places.is_empty()
-                && self.space_mesh_shadow != vk::Pipeline::null())
-            .then(|| {
-                crate::space::sun_view_proj(
-                    space_camera.eye,
-                    space_camera.forward(),
-                    SHADOW_MAP_SIZE,
-                )
-            });
+                && self.space_mesh_shadow != vk::Pipeline::null()
+            {
+                crate::space::SUN_SPLITS
+                    .windows(2)
+                    .map(|w| {
+                        crate::space::sun_view_proj(
+                            &space_camera,
+                            ray_aspect,
+                            w[0],
+                            w[1],
+                            SHADOW_MAP_SIZE,
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if let Some(buffer) = self
                 .shape_buffer
                 .as_ref()
@@ -3937,15 +3947,15 @@ impl Demo {
                     draws
                 };
                 let draws = lists(view_proj);
-                let sun_draws = sun_map.map(&mut lists).unwrap_or_default();
+                let sun_draws: Vec<Vec<[u32; 4]>> = sun_maps.iter().map(|&m| lists(m)).collect();
                 if crate::space::set_shape_meshes(
                     &mut packed.words,
                     res.buffer_address(buffer.id),
                     &words,
                 ) {
                     self.shape_draws = draws;
-                    if let Some(m) = sun_map.filter(|_| !sun_draws.is_empty()) {
-                        crate::space::set_sun_map(&mut packed.words, m);
+                    if sun_draws.iter().any(|d| !d.is_empty()) {
+                        crate::space::set_sun_maps(&mut packed.words, &sun_maps);
                         self.sun_draws = sun_draws;
                     }
                 }
@@ -4033,7 +4043,11 @@ impl Demo {
             space_textured,
             space_shapes: scene == DemoScene::Space && !self.shape_draws.is_empty(),
             space_shadow_maps,
-            space_sun_map: scene == DemoScene::Space && !self.sun_draws.is_empty(),
+            space_sun_maps: if scene == DemoScene::Space {
+                self.sun_draws.len() as u32
+            } else {
+                0
+            },
             space_compute,
             space_edges,
             space_counters,
@@ -4801,14 +4815,14 @@ impl Demo {
             height: ext.height.div_ceil(2),
         };
         // Карты теней ламп от треугольников (7.9б): квадраты рядом в одной картинке.
-        let sun_draws = if frame.space_sun_map {
+        let sun_draws = if frame.space_sun_maps > 0 {
             self.sun_draws.clone()
         } else {
             Vec::new()
         };
-        let shadow_maps = (frame.space_shadow_maps > 0 || frame.space_sun_map).then(|| {
+        let shadow_maps = (frame.space_shadow_maps > 0 || frame.space_sun_maps > 0).then(|| {
             let lamps = frame.space_shadow_maps;
-            let count = lamps + u32::from(frame.space_sun_map);
+            let count = lamps + frame.space_sun_maps;
             let size = vk::Extent2D {
                 width: SHADOW_MAP_SIZE * count,
                 height: SHADOW_MAP_SIZE,
@@ -4861,8 +4875,10 @@ impl Demo {
                             if frame.space_vertices > 0 {
                                 d.cmd_draw(cmd, frame.space_vertices, 1, 0, k << 20);
                             }
-                            if k == lamps {
-                                for &[first, count, instances, first_instance] in &sun_draws {
+                            if let Some(draws) =
+                                k.checked_sub(lamps).and_then(|c| sun_draws.get(c as usize))
+                            {
+                                for &[first, count, instances, first_instance] in draws {
                                     d.cmd_draw(
                                         cmd,
                                         count,

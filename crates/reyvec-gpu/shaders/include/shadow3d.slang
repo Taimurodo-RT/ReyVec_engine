@@ -208,7 +208,8 @@ float4 map_gather(Texture2D map, float2 q, float2 lo, float side, float2 inv, ou
 
 // Карта тени (7.9б): доля света точки `p` (нормаль `n`) от треугольников. Лампа `square`
 // (`sun` = false) — расстояние до лампы по её карте (перспектива, mesh_shadow.slang);
-// солнце (`sun`, 8.20в, режим «треугольники» 3D) — квадрат после ламп, прямоугольная
+// солнце (`sun`, 8.20в, режим «треугольники» 3D) — квадраты с `square` (сразу после ламп):
+// ближняя карта, а где точки на ней нет — дальняя; прямоугольная
 // проекция вдоль солнца, в карте — глубина от солнца −(точка · SUN). Обе — одной функцией
 // с одними циклами: каждый лишний цикл проб в шейдере «теней 3D» и «краёв 3D» сильно
 // удлиняет их сборку (на lavapipe в CI — за предел времени). `inside` — точка на карте;
@@ -243,17 +244,30 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
     uint at = pc.scene[7];
     if (!sun && square >= pc.scene[at + 1])
         return 1.0;
-    uint m = sun ? at + MESH_SUN_PROJ : at + MESH_SHADOW_PROJ + square * 16;
-    float4 clip = float4(0.0, 0.0, 0.0, 0.0);
-    for (uint c = 0; c < 4; c++)
+    // Солнце: ближняя карта, если точка на ней, иначе дальняя (квадраты после ламп).
+    uint cascades = sun ? min(pc.scene[at + MESH_SUN], SUN_CASCADES) : 1;
+    uint m = at + MESH_SHADOW_PROJ + square * 16;
+    float2 ndc = float2(2.0, 2.0);
+    for (uint k = 0; k < cascades; k++)
     {
-        float4 column = float4(asfloat(pc.scene[m + 4 * c]), asfloat(pc.scene[m + 4 * c + 1]),
-                               asfloat(pc.scene[m + 4 * c + 2]), asfloat(pc.scene[m + 4 * c + 3]));
-        clip += column * (c < 3 ? p[c] : 1.0);
+        if (sun)
+            m = at + MESH_SUN_PROJ + k * 16;
+        float4 clip = float4(0.0, 0.0, 0.0, 0.0);
+        for (uint c = 0; c < 4; c++)
+        {
+            float4 column = float4(asfloat(pc.scene[m + 4 * c]), asfloat(pc.scene[m + 4 * c + 1]),
+                                   asfloat(pc.scene[m + 4 * c + 2]), asfloat(pc.scene[m + 4 * c + 3]));
+            clip += column * (c < 3 ? p[c] : 1.0);
+        }
+        if (clip.w <= 1e-4)
+            return 1.0;
+        ndc = clip.xy / clip.w;
+        if (all(abs(ndc) <= (sun ? 0.98 : 0.995)))
+        {
+            square += sun ? k : 0;
+            break;
+        }
     }
-    if (clip.w <= 1e-4)
-        return 1.0;
-    float2 ndc = clip.xy / clip.w;
     if (any(abs(ndc) > (sun ? 0.98 : 0.995)))
         return 1.0;
     inside = true;
