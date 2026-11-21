@@ -139,9 +139,13 @@ float ambient_occlusion(float3 p, float3 n)
         float probe = 0.0;
         if (min(lower, planes_d) < plane)
         {
-            // «Углы из поля»: дальние пробы берут само число поля вместо расчёта форм.
+            // «Углы из поля»: дальние пробы берут само число поля вместо расчёта форм. В
+            // режиме «треугольники» (8.20г) — и ближняя: поле с шагом 3 см почти не
+            // отличается от форм уже в 4 см от стенки, а программы форм там самые дорогие.
             float d;
-            if (i > 0 && (pc.scene[11] & 1) != 0 && estimate > -1e29)
+            bool from_field = (pc.scene[11] & SCENE_AO_FIELD_ONLY) != 0
+                || (i > 0 && (pc.scene[11] & 1) != 0);
+            if (from_field && estimate > -1e29)
                 d = estimate;
             else
                 // Порог `plane`: форма дальше него пробу не закрывает (by_shapes = 0),

@@ -767,6 +767,9 @@ pub(crate) struct Demo {
     /// Без карт теней ламп в режиме треугольников (7.18е; только для тестов).
     #[cfg(test)]
     no_shadow_maps: bool,
+    /// Ближняя проба затенения в углах по формам и в режиме «треугольники» (для сравнения).
+    #[cfg(test)]
+    exact_near_ao: bool,
     /// Картинка полигонов без образцов MSAA (7.18е2; только для тестов).
     #[cfg(test)]
     no_mesh_msaa: bool,
@@ -1152,6 +1155,8 @@ impl Demo {
             full_normal: false,
             #[cfg(test)]
             no_shadow_maps: false,
+            #[cfg(test)]
+            exact_near_ao: false,
             #[cfg(test)]
             no_mesh_msaa: false,
             #[cfg(test)]
@@ -2197,6 +2202,12 @@ impl Demo {
     #[cfg(test)]
     pub(crate) fn set_no_shadow_maps(&mut self, on: bool) {
         self.no_shadow_maps = on;
+    }
+
+    /// Ближняя проба затенения в углах по формам и треугольниками (8.20г) — для сравнения.
+    #[cfg(test)]
+    pub(crate) fn set_exact_near_ao(&mut self, on: bool) {
+        self.exact_near_ao = on;
     }
 
     /// Картинка полигонов без образцов MSAA (7.18е2) — для сравнения.
@@ -3970,6 +3981,15 @@ impl Demo {
                     &words,
                 ) {
                     self.shape_draws = draws;
+                    // Затенение в углах без расчёта форм (8.20г): формы видны сетками, и
+                    // ближняя проба тоже берётся из поля.
+                    #[cfg(not(test))]
+                    let field_ao = true;
+                    #[cfg(test)]
+                    let field_ao = !self.exact_near_ao;
+                    if field_ao {
+                        crate::space::set_ao_field_only(&mut packed.words);
+                    }
                     if sun_draws.iter().any(|d| !d.is_empty()) {
                         crate::space::set_sun_maps(&mut packed.words, &sun_maps);
                         self.sun_draws = sun_draws;

@@ -56,6 +56,9 @@ const SCENE_NO_SUN: u32 = 2;
 /// [`lamp_down_view_proj`]), и внутри карты тень лампы — только по ней, без лучей. Как
 /// SCENE_LAMP_MAPS_DOWN в `space.slang`.
 const SCENE_LAMP_MAPS_DOWN: u32 = 8;
+/// Слово 11, бит 4: затенение в углах только по полю, с ближней пробой (8.20г, режим
+/// «треугольники»). Как SCENE_AO_FIELD_ONLY в `space.slang`.
+const SCENE_AO_FIELD_ONLY: u32 = 16;
 /// Бит 2 слова 11: нормаль по всей сцене (как SCENE_FULL_NORMAL в `include/march.slang`).
 #[cfg(test)]
 const SCENE_FULL_NORMAL: u32 = 4;
@@ -651,6 +654,11 @@ pub(crate) fn lamp_down_view_proj(lamp: &reyvec_sdf::Lamp3) -> glam::Mat4 {
 /// Карты ламп смотрят вниз (8.20в2, см. [`lamp_down_view_proj`]).
 pub(crate) fn set_lamp_maps_down(words: &mut [u32]) {
     words[11] |= SCENE_LAMP_MAPS_DOWN;
+}
+
+/// Все пробы затенения в углах — по полю, где оно есть (8.20г).
+pub(crate) fn set_ao_field_only(words: &mut [u32]) {
+    words[11] |= SCENE_AO_FIELD_ONLY;
 }
 
 /// Солнца нет (2.5D-вид: уровень в помещении).
