@@ -36,7 +36,7 @@ pub(crate) const MAX_KEYS: usize = 4;
 
 /// Кнопка мыши, которую можно назначить.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum MouseKey {
+pub enum MouseKey {
     Left,
     Right,
     Middle,
@@ -87,14 +87,14 @@ impl MouseKey {
 
 /// Щелчок колеса.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Wheel {
+pub enum Wheel {
     Up,
     Down,
 }
 
 /// Источник ввода: клавиша (по месту на клавиатуре), кнопка мыши или щелчок колеса.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Input {
+pub enum Input {
     Key(KeyCode),
     Mouse(MouseKey),
     Wheel(Wheel),
@@ -134,7 +134,7 @@ impl Input {
     }
 
     /// Мышь (кнопка или колесо): по ней удар может быть «к курсору».
-    pub(crate) fn is_mouse(self) -> bool {
+    pub fn is_mouse(self) -> bool {
         !matches!(self, Self::Key(_))
     }
 }
@@ -285,7 +285,7 @@ pub(crate) enum Route {
 
 /// Привязки и поведение.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Controls {
+pub struct Controls {
     binds: BTreeMap<ActionKey, Vec<Input>>,
     options: Vec<usize>,
 }
@@ -354,7 +354,7 @@ impl Default for Controls {
 
 impl Controls {
     /// Действие источника `input` в игре.
-    pub(crate) fn action_of(&self, input: Input) -> Option<Action> {
+    pub fn action_of(&self, input: Input) -> Option<Action> {
         self.binds
             .iter()
             .find(|(_, inputs)| inputs.contains(&input))
@@ -428,7 +428,7 @@ impl Controls {
     }
 
     /// Удар мышью — в сторону курсора.
-    pub(crate) fn attack_toward_cursor(&self) -> bool {
+    pub fn attack_toward_cursor(&self) -> bool {
         self.option(ATTACK_AIM) == 0
     }
 
@@ -546,7 +546,7 @@ impl Controls {
     }
     /// Читает настройки из `path`. Нет файла — клавиши по умолчанию, файл с ошибкой —
     /// тоже, с записью в журнал.
-    pub(crate) fn load(path: &Path) -> Self {
+    pub fn load(path: &Path) -> Self {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(_) => return Self::default(),
@@ -579,7 +579,7 @@ impl Controls {
 }
 
 /// Где лежит файл настроек: `settings/controls.ron` рядом с программой.
-pub(crate) fn controls_path() -> PathBuf {
+pub fn controls_path() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))

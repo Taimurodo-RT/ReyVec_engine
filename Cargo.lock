@@ -3341,8 +3341,14 @@ dependencies = [
 name = "reyvec-editor"
 version = "0.1.0"
 dependencies = [
+ "egui",
+ "egui-winit",
  "reyvec-app",
+ "reyvec-gpu",
+ "reyvec-scene",
+ "reyvec-vector",
  "tracing",
+ "winit",
 ]
 
 [[package]]

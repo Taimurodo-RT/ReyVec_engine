@@ -22,8 +22,8 @@ const LINES: usize = 300;
 /// Сколько команд помнит история (стрелки вверх и вниз).
 const HISTORY: usize = 50;
 
-pub(crate) const GOLD: Color32 = Color32::from_rgb(255, 205, 70);
-pub(crate) const RED: Color32 = Color32::from_rgb(240, 90, 80);
+pub const GOLD: Color32 = Color32::from_rgb(255, 205, 70);
+pub const RED: Color32 = Color32::from_rgb(240, 90, 80);
 const GREY: Color32 = Color32::from_rgb(170, 170, 170);
 const GREEN: Color32 = Color32::from_rgb(110, 220, 120);
 const BLUE: Color32 = Color32::from_rgb(120, 180, 255);
@@ -201,7 +201,7 @@ static LOG: Mutex<VecDeque<(Kind, String)>> = Mutex::new(VecDeque::new());
 
 /// Забирает строки логов программы, ещё не взятые консолью, с цветом их уровня
 /// (для консоли редактора).
-pub(crate) fn take_log() -> Vec<(Color32, String)> {
+pub fn take_log() -> Vec<(Color32, String)> {
     LOG.lock()
         .map(|mut log| log.drain(..).map(|(k, t)| (k.color(), t)).collect())
         .unwrap_or_default()

@@ -1,5 +1,6 @@
 ﻿# Обновляет локальную версию ReyVec: скачивает свежий код с GitHub,
-# собирает песочницу и кладёт готовую программу в папку dist.
+# собирает песочницу и редактор и кладёт готовые программы в папку dist.
+# Если не собрался только редактор, песочница всё равно обновляется.
 #
 # Обычно запускается двойным щелчком по update.bat в корне репозитория.
 # Параметры:
@@ -97,14 +98,32 @@ $commit = (git rev-parse --short=9 HEAD).Trim()
 $branchNow = (git rev-parse --abbrev-ref HEAD).Trim()
 Write-Ok "Ветка $branchNow, коммит $commit"
 
-Write-Step "Собираю песочницу и редактор (первый раз это может занять несколько минут)"
-Invoke-Checked "cargo" @("build", "--release", "-p", "reyvec-sandbox", "-p", "reyvec-editor") "сборка не удалась. Пришли этот текст разработчику"
+# Песочница и редактор собираются по очереди: ошибка в редакторе не должна мешать
+# обновить песочницу (редактор и графику делают разные потоки работы, decisions/0021).
+Write-Step "Собираю песочницу (первый раз это может занять несколько минут)"
+Invoke-Checked "cargo" @("build", "--release", "-p", "reyvec-sandbox") "сборка песочницы не удалась. Пришли этот текст разработчику"
+
+Write-Step "Собираю редактор"
+$saved = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & cargo build --release -p reyvec-editor
+    $editorCode = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $saved
+}
+$editorBuilt = ($editorCode -eq 0)
+if (-not $editorBuilt) {
+    Write-Warn "Редактор не собрался (код $editorCode). Песочница обновлена, а в dist остаётся прошлый редактор, если он там был. Пришли этот текст разработчику."
+}
 
 Write-Step "Копирую программу в папку dist"
 $dist = Join-Path $Root "dist"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Copy-Item -Force (Join-Path $Root "target\release\reyvec-sandbox.exe") (Join-Path $dist "reyvec-sandbox.exe")
-Copy-Item -Force (Join-Path $Root "target\release\reyvec-editor.exe") (Join-Path $dist "reyvec-editor.exe")
+if ($editorBuilt) {
+    Copy-Item -Force (Join-Path $Root "target\release\reyvec-editor.exe") (Join-Path $dist "reyvec-editor.exe")
+}
 $stamp = Get-Date -Format "yyyy-MM-dd HH:mm"
 @(
     "ReyVec sandbox",
@@ -112,7 +131,12 @@ $stamp = Get-Date -Format "yyyy-MM-dd HH:mm"
     "commit: $commit",
     "built:  $stamp"
 ) | Set-Content -Encoding UTF8 (Join-Path $dist "version.txt")
-Write-Ok "Готово: dist\reyvec-sandbox.exe и dist\reyvec-editor.exe"
+if ($editorBuilt) {
+    Write-Ok "Готово: dist\reyvec-sandbox.exe и dist\reyvec-editor.exe"
+} else {
+    Write-Ok "Готово: dist\reyvec-sandbox.exe"
+    Write-Warn "Редактор в этот раз не обновлён (см. выше)."
+}
 
 Write-Host "`nОбновление завершено. Запусти run.bat, чтобы открыть песочницу, или editor.bat, чтобы открыть редактор." -ForegroundColor Green
 exit 0
