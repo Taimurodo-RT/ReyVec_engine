@@ -1725,6 +1725,26 @@ pub(crate) mod tests {
         let shapes_strong = strong(&rays.image, &traced.image);
         let (by_map, _, map_mean) = image_diff(&traced.image, &triangles.image);
         let map_strong = strong(&traced.image, &triangles.image);
+        for (name, img) in [
+            ("rays", &rays.image),
+            ("tri", &triangles.image),
+            ("traced", &traced.image),
+        ] {
+            let mut g = Vec::new();
+            for y in 0..90usize {
+                for x in 0..160usize {
+                    let i = ((y * 4 + 2) * 640 + x * 4 + 2) * 4;
+                    let v = (u32::from(img.rgba[i])
+                        + u32::from(img.rgba[i + 1])
+                        + u32::from(img.rgba[i + 2]))
+                        / 3;
+                    g.push(format!("{v:02x}"));
+                }
+            }
+            for c in g.chunks(1600) {
+                eprintln!("HEX-{name} {}", c.concat());
+            }
+        }
         eprintln!(
             "сеток {unique}, треугольников {count}; заменителей лучами {}, треугольниками {}; \
              отличается {changed} пикселей из {pixels} (сильно {shapes_strong}), средняя \
