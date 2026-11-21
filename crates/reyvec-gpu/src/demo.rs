@@ -458,6 +458,14 @@ impl Msaa {
     }
 }
 
+/// Режим «треугольники» для сцены «3D» по умолчанию (8.20д): на встроенной видеокарте —
+/// да (Radeon на заводе: кадр 43,5 → около 28 мс уже с первыми шагами 8.20), на отдельной —
+/// нет (RTX 5080 и так в бюджете, а лучи точнее), на программной и виртуальной — нет, как
+/// в тестах. Переключить можно на панели; пока сетки строятся, кадр рисуется лучами.
+pub fn space_triangles_for_adapter(kind: AdapterKind) -> bool {
+    kind == AdapterKind::Integrated
+}
+
 /// Разрешение сцены «3D» (7.14): в какой доле кадра по каждой стороне шагают лучи,
 /// считаются тени, края и освещение. Меньше — вчетверо меньше лучей на половине, а
 /// картинка растягивается на весь кадр одним проходом без накопления по кадрам (без
@@ -1170,7 +1178,7 @@ impl Demo {
             space_meshes: None,
             space_meshes_job: None,
             space_meshes_stale: false,
-            space_triangles: false,
+            space_triangles: space_triangles_for_adapter(ctx.adapter.kind),
             space_meshes_generation: 0,
             shape_buffer: None,
             shape_draws: Vec::new(),
@@ -1606,7 +1614,8 @@ impl Demo {
         }
     }
 
-    /// Режим «треугольники» для 3D (8.20б).
+    /// Режим «треугольники» для 3D (8.20б). По умолчанию — по видеокарте
+    /// ([`space_triangles_for_adapter`], 8.20д).
     pub fn space_triangles(&self) -> bool {
         self.space_triangles
     }
@@ -6563,6 +6572,14 @@ mod tests {
         assert_eq!(Msaa::X2.supported(no_x2), Msaa::Off);
         assert_eq!(Msaa::X8.supported(no_x2), Msaa::X4);
         assert_eq!(Msaa::from_name("2"), Some(Msaa::X2));
+    }
+
+    /// Режим «треугольники» сам (8.20д): только на встроенной видеокарте.
+    #[test]
+    fn space_triangles_by_adapter() {
+        assert!(space_triangles_for_adapter(AdapterKind::Integrated));
+        assert!(!space_triangles_for_adapter(AdapterKind::Discrete));
+        assert!(!space_triangles_for_adapter(AdapterKind::Cpu));
     }
 
     /// Разрешение 3D (7.14): на встроенной половина, у нечётных сторон с запасом.
