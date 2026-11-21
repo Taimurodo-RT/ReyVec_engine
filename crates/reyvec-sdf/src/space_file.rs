@@ -540,13 +540,25 @@ impl SpaceScene {
         self.meshes.len()
     }
 
+    /// Меняются ли формы кадра ([`SpaceFrame::shapes`]) во времени сами
+    /// ([`Shape3::morphs`], 8.20е): по одному на форму, шарики ламп — нет. Сетки для
+    /// режима «треугольники» строятся один раз, поэтому такие формы остаются лучам.
+    pub fn morphing(&self) -> Vec<bool> {
+        let mut out: Vec<bool> = self.objects.iter().map(|o| o.shape.morphs()).collect();
+        out.extend(self.bulbs.iter().flatten().map(|_| false));
+        out
+    }
+
     /// Предметы и лампы в момент `time` (секунды).
     pub fn frame(&self, time: f32) -> SpaceFrame {
         let mut still: Vec<bool> = self
             .objects
             .iter()
             .map(|o| {
-                !moves(&o.bob, &o.circle, &o.spin) && !matches!(o.shape, Shape3::Animate { .. })
+                // Форма, части которой движутся внутри (8.20е), тоже не неподвижна.
+                !moves(&o.bob, &o.circle, &o.spin)
+                    && !matches!(o.shape, Shape3::Animate { .. })
+                    && !o.shape.morphs()
             })
             .collect();
         let mut shapes: Vec<Shape3> = self
@@ -784,6 +796,41 @@ mod tests {
             s.distance(Vec3::new(0.0, 3.0, 0.0)) < -0.49,
             "без времени — момент 0"
         );
+    }
+
+    /// Меняется во времени (8.20е) только форма, у которой часть движется внутри операции:
+    /// в примере сцены «3D» — слизь. Движение целиком (`bob`, `spin`) — не меняется.
+    #[test]
+    fn only_shapes_with_moving_parts_morph() {
+        let text = include_str!("../../../scenes/3d/space.ron");
+        let scene = SpaceScene::parse_in(text, None).expect("сцена");
+        let morphing = scene.morphing();
+        let frame = scene.frame(0.0);
+        assert_eq!(morphing.len(), frame.shapes.len());
+        let names: Vec<&str> = scene
+            .objects
+            .iter()
+            .zip(&morphing)
+            .filter(|(_, m)| **m)
+            .map(|(o, _)| o.name.as_str())
+            .collect();
+        assert_eq!(names, ["слизь"]);
+        let lone = Shape3::Animate {
+            bob: Bob {
+                by: [1.0, 0.0, 0.0],
+                period: 2.0,
+            },
+            circle: Circle::default(),
+            spin: [0.0; 3],
+            shape: Box::new(Shape3::Sphere { radius: 0.5 }),
+        };
+        assert!(!lone.morphs(), "движение целиком");
+        let cut = Shape3::Subtract {
+            base: Box::new(Shape3::Sphere { radius: 1.0 }),
+            cut: vec![lone],
+            smooth: 0.0,
+        };
+        assert!(cut.morphs(), "движется вырез");
     }
 
     #[test]

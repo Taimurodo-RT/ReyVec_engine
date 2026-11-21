@@ -1574,13 +1574,15 @@ impl Demo {
         }
         self.space_meshes_stale = false;
         let shapes = self.space.frame(0.0).shapes;
+        // Меняющиеся во времени формы (8.20е) остаются лучам: сетка строится один раз.
+        let skip = self.space.morphing();
         self.space_meshes = None;
         self.space_meshes_job = std::thread::Builder::new()
             .name("сетки 3D".into())
             .spawn(move || {
                 let started = std::time::Instant::now();
                 let settings = reyvec_sdf::shape_mesh::MeshSettings::default();
-                let meshes = reyvec_sdf::shape_mesh::mesh_shapes(&shapes, &settings);
+                let meshes = reyvec_sdf::shape_mesh::mesh_shapes_except(&shapes, &settings, &skip);
                 tracing::info!(
                     "Сетки 3D: форм {}, с сеткой {}, разных сеток {}, треугольников {} ({:.0} мс)",
                     shapes.len(),

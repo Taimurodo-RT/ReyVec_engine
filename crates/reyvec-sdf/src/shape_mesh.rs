@@ -518,8 +518,27 @@ pub struct SceneMeshes {
 /// Строит сетки для форм `shapes` (обычно [`crate::SpaceFrame::shapes`]). Формы, которые
 /// не собираются в программу, остаются без сетки.
 pub fn mesh_shapes(shapes: &[Shape3], settings: &MeshSettings) -> SceneMeshes {
+    mesh_shapes_except(shapes, settings, &[])
+}
+
+/// То же, но формы с `skip[i] == true` остаются без сетки (меняющиеся во времени, 8.20е).
+pub fn mesh_shapes_except(
+    shapes: &[Shape3],
+    settings: &MeshSettings,
+    skip: &[bool],
+) -> SceneMeshes {
     let mut cache = MeshCache::new(*settings);
-    let instances = shapes.iter().map(|s| cache.get(s).ok().flatten()).collect();
+    let instances = shapes
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            if skip.get(i).copied().unwrap_or(false) {
+                None
+            } else {
+                cache.get(s).ok().flatten()
+            }
+        })
+        .collect();
     SceneMeshes {
         instances,
         unique: cache.len(),
@@ -760,6 +779,19 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!(error <= 0.5 * instance.mesh.cell, "ошибка на месте {error}");
         }
+    }
+
+    /// Пропущенные формы (меняющиеся во времени, 8.20е) остаются без сетки, остальные — нет.
+    #[test]
+    fn skipped_shapes_get_no_mesh() {
+        let shapes = [
+            Shape3::Sphere { radius: 0.5 },
+            Shape3::Sphere { radius: 0.4 }.at([2.0, 0.0, 0.0]),
+        ];
+        let meshes = mesh_shapes_except(&shapes, &MeshSettings::default(), &[true, false]);
+        assert!(meshes.instances[0].is_none());
+        assert!(meshes.instances[1].is_some());
+        assert_eq!(meshes.unique, 1);
     }
 
     /// Все разные формы сцены завода превращаются в сетки рядом с формой. Сколько их и

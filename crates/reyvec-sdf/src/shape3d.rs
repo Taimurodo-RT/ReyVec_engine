@@ -277,6 +277,39 @@ impl Shape3 {
         }
     }
 
+    /// Меняется ли форма во времени сама, а не только едет целиком (8.20е): внутри
+    /// объединения, вычитания или пересечения есть [`Shape3::Animate`] — части движутся
+    /// друг относительно друга. `Animate` снаружи всех операций — движение целиком.
+    pub fn morphs(&self) -> bool {
+        match self {
+            Self::Move { shape, .. } | Self::Paint { shape, .. } | Self::Animate { shape, .. } => {
+                shape.morphs()
+            }
+            Self::Union { shapes, .. } | Self::Intersect { shapes, .. } => {
+                shapes.iter().any(Self::has_animate)
+            }
+            Self::Subtract { base, cut, .. } => {
+                base.has_animate() || cut.iter().any(Self::has_animate)
+            }
+            _ => false,
+        }
+    }
+
+    /// Есть ли в форме [`Shape3::Animate`] на любой глубине.
+    fn has_animate(&self) -> bool {
+        match self {
+            Self::Animate { .. } => true,
+            Self::Move { shape, .. } | Self::Paint { shape, .. } => shape.has_animate(),
+            Self::Union { shapes, .. } | Self::Intersect { shapes, .. } => {
+                shapes.iter().any(Self::has_animate)
+            }
+            Self::Subtract { base, cut, .. } => {
+                base.has_animate() || cut.iter().any(Self::has_animate)
+            }
+            _ => false,
+        }
+    }
+
     /// Форма в момент `time` (секунды): движения [`Shape3::Animate`] заменены сдвигами
     /// и поворотами на этот момент.
     pub fn at_time(&self, time: f32) -> Self {
