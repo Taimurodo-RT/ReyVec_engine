@@ -468,6 +468,9 @@ fn render(
             // Без карт теней ламп (7.18е): где они затеняют.
             #[cfg(test)]
             demo.set_no_shadow_maps(tests::NO_SHADOW_MAPS.get());
+            // Ближняя проба углов по формам и треугольниками (8.20г).
+            #[cfg(test)]
+            demo.set_exact_near_ao(tests::EXACT_NEAR_AO.get());
             // Полигоны без образцов MSAA (7.18е2): края призм как до него.
             #[cfg(test)]
             demo.set_no_mesh_msaa(tests::NO_MESH_MSAA.get());
@@ -789,6 +792,8 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(ash::vk::SampleCountFlags::empty()) };
         /// Треугольники без карт теней ламп (7.18е).
         pub(super) static NO_SHADOW_MAPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Треугольники с ближней пробой затенения в углах по формам (8.20г).
+        pub(super) static EXACT_NEAR_AO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Как рисуется 2.5D-вид (7.9б).
         pub(super) static LEVEL_RENDER: std::cell::Cell<crate::LevelRender> =
             const { std::cell::Cell::new(crate::LevelRender::Sdf) };
@@ -1692,11 +1697,15 @@ pub(crate) mod tests {
         let errors = validation_error_count();
         let rays = render_headless(&options, &scene).expect("кадр лучами");
         TRIANGLES.set(true);
+        // Углы по формам, как у лучей: углы из поля проверяет
+        // `triangles_ao_from_field_stays_close`.
+        EXACT_NEAR_AO.set(true);
         let triangles = render_headless(&options, &scene);
         // Без карты теней солнца (8.20в): тени солнца лучами по заменителям.
         NO_SHADOW_MAPS.set(true);
         let traced = render_headless(&options, &scene);
         NO_SHADOW_MAPS.set(false);
+        EXACT_NEAR_AO.set(false);
         TRIANGLES.set(false);
         let triangles = triangles.expect("кадр треугольниками");
         let traced = traced.expect("кадр треугольниками без карты солнца");
@@ -1753,6 +1762,36 @@ pub(crate) mod tests {
             map_strong * 10 < pixels,
             "карта солнца сильно меняет {map_strong} пикселей из {pixels}"
         );
+    }
+
+    /// Затенение в углах только по полю в режиме «треугольники» (8.20г) меняет картинку
+    /// чуть-чуть, как «углы из поля» у лучей (`ao_from_field_stays_close`).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn triangles_ao_from_field_stays_close() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        TRIANGLES.set(true);
+        let field = render_headless(&options, &hollow_side());
+        EXACT_NEAR_AO.set(true);
+        let exact = render_headless(&options, &hollow_side());
+        EXACT_NEAR_AO.set(false);
+        TRIANGLES.set(false);
+        let field = field.expect("кадр с углами из поля");
+        let exact = exact.expect("кадр с углами по формам");
+        let (changed, worst, mean) = image_diff(&exact.image, &field.image);
+        eprintln!(
+            "углы треугольниками из поля: {changed} пикселей, наибольшая {worst}, средняя {mean:.3}"
+        );
+        let total = exact.image.rgba.len() / 4;
+        assert!(changed > 0, "углы из поля не действуют");
+        assert!(
+            changed * 20 < total,
+            "отличаются {changed} пикселей из {total}"
+        );
+        assert!(mean < 1.0, "средняя разница {mean}");
     }
 
     /// Сглаживание 3D по картинке (8.12а): без ошибок Vulkan в полном и половинном
