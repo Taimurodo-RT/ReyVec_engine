@@ -930,6 +930,24 @@ mod tests {
     }
 
     #[test]
+    fn forge_scene_reads_shape_models() {
+        // М.0б: кузница из моделей форм с конусом, зеркалом и повтором.
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/forge.ron");
+        let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
+        assert_eq!(scene.model_files.len(), 5, "{:?}", scene.model_files);
+        assert!(
+            scene
+                .material_names
+                .iter()
+                .any(|n| n == "кузница/наковальня/железо")
+        );
+        for shape in &scene.frame(0.0).shapes {
+            crate::shape3d::compile(shape).unwrap();
+        }
+    }
+
+    #[test]
     fn model_errors_say_what_is_wrong() {
         let scene = |meshes: &str| {
             format!(

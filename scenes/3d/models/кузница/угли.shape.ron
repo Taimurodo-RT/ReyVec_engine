@@ -1,0 +1,11 @@
+// Угли в горне (М.0б): сетка 4×3 шаров двумя повторами. Цвет и свечение — у предмета
+// сцены. Своя работа, CC0.
+(
+    format: "reyvec-shape",
+    version: 1,
+    shape: Union(smooth: 0.03, shapes: [
+        Repeat(count: 4, step: (0.14, 0.0, 0.0), shape:
+            Repeat(count: 3, step: (0.0, 0.0, 0.14), shape:
+                Move(at: (-0.21, 0.0, -0.14), shape: Sphere(radius: 0.07)))),
+    ]),
+)

@@ -51,6 +51,16 @@ pub enum Shape3 {
     },
     /// Тор в плоскости XZ: радиус кольца `radius`, толщина `thickness` (радиус трубки).
     Torus { radius: f32, thickness: f32 },
+    /// Усечённый конус вдоль Y (М.0б): высота `height`, радиус внизу `bottom` и вверху
+    /// `top` (0 — острая вершина), края скруглены на `round`.
+    Cone {
+        height: f32,
+        bottom: f32,
+        #[serde(default)]
+        top: f32,
+        #[serde(default)]
+        round: f32,
+    },
     /// Плоскость: всё по ту сторону от `normal` дальше `offset` от начала — внутри.
     /// `normal: (0, 1, 0), offset: 0` — пол на высоте 0.
     Plane { normal: [f32; 3], offset: f32 },
@@ -131,6 +141,25 @@ pub enum Shape3 {
         spin: [f32; 3],
         shape: Box<Shape3>,
     },
+    /// Зеркало (М.0б): форма и её отражение через плоскость `axis = 0` (у `X` — через
+    /// плоскость YZ), сложенные с плавным швом `smooth`. Половина станка — весь станок.
+    /// Видеокарте это две копии частей формы, вторая с отражённой матрицей.
+    Mirror {
+        axis: Axis,
+        #[serde(default)]
+        smooth: f32,
+        shape: Box<Shape3>,
+    },
+    /// Повтор (М.0б): `count` копий формы, каждая следующая сдвинута на `step` (ножки,
+    /// зубья, болты), сложенные с плавным швом `smooth`. Видеокарте это `count` копий
+    /// частей формы, поэтому `count` не больше [`MAX_REPEAT`].
+    Repeat {
+        count: u32,
+        step: [f32; 3],
+        #[serde(default)]
+        smooth: f32,
+        shape: Box<Shape3>,
+    },
     /// Модель из своего файла (М.0, [`crate::shape_model`]): `models/<model>.shape.ron`
     /// рядом с файлом сцены. Раскрывается в дерево модели при чтении сцены; до этого у
     /// неё нет формы, и программа из неё не собирается.
@@ -139,6 +168,49 @@ pub enum Shape3 {
 
 fn one() -> f32 {
     1.0
+}
+
+/// Ось зеркала [`Shape3::Mirror`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    /// Отражение точки через плоскость `axis = 0`.
+    pub fn reflect(self, p: Vec3) -> Vec3 {
+        match self {
+            Self::X => Vec3::new(-p.x, p.y, p.z),
+            Self::Y => Vec3::new(p.x, -p.y, p.z),
+            Self::Z => Vec3::new(p.x, p.y, -p.z),
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Больше копий у [`Shape3::Repeat`] не бывает.
+pub const MAX_REPEAT: u32 = 64;
+
+impl Shape3 {
+    /// Копии формы у [`Shape3::Repeat`]: объединение сдвинутых форм.
+    fn repeat_union(count: u32, step: [f32; 3], smooth: f32, shape: &Shape3) -> Shape3 {
+        Shape3::Union {
+            shapes: (0..count.clamp(1, MAX_REPEAT))
+                .map(|k| Shape3::Move {
+                    at: (Vec3::from(step) * k as f32).to_array(),
+                    turn: [0.0; 3],
+                    scale: 1.0,
+                    shape: Box::new(shape.clone()),
+                })
+                .collect(),
+            smooth,
+        }
+    }
 }
 
 /// Поле слоя, общее для формы и её программы: программа держит его, чтобы расчёт на
@@ -236,6 +308,12 @@ impl Shape3 {
                 round,
             } => sd_cylinder(p, *height * 0.5, *radius, *round),
             Self::Torus { radius, thickness } => sd_torus(p, *radius, *thickness),
+            Self::Cone {
+                height,
+                bottom,
+                top,
+                round,
+            } => sd_cone(p, *height * 0.5, *bottom, *top, *round),
             Self::Plane { normal, offset } => sd_plane(p, Vec3::from(*normal), *offset),
             Self::Extrude {
                 profile,
@@ -278,6 +356,17 @@ impl Shape3 {
             }
             Self::Paint { shape, .. } => shape.distance(p),
             Self::Animate { .. } => self.at_time(0.0).distance(p),
+            Self::Mirror {
+                axis,
+                smooth,
+                shape,
+            } => op_union(shape.distance(p), shape.distance(axis.reflect(p)), *smooth),
+            Self::Repeat {
+                count,
+                step,
+                smooth,
+                shape,
+            } => Self::repeat_union(*count, *step, *smooth, shape).distance(p),
             Self::Use { .. } => f32::MAX,
         }
     }
@@ -348,6 +437,26 @@ impl Shape3 {
                 material: *material,
                 shape: Box::new(shape.at_time(time)),
             },
+            Self::Mirror {
+                axis,
+                smooth,
+                shape,
+            } => Self::Mirror {
+                axis: *axis,
+                smooth: *smooth,
+                shape: Box::new(shape.at_time(time)),
+            },
+            Self::Repeat {
+                count,
+                step,
+                smooth,
+                shape,
+            } => Self::Repeat {
+                count: *count,
+                step: *step,
+                smooth: *smooth,
+                shape: Box::new(shape.at_time(time)),
+            },
             Self::Animate {
                 bob,
                 circle,
@@ -380,6 +489,15 @@ impl Shape3 {
                 (height * height * 0.25 + radius * radius).sqrt(),
             )),
             Self::Torus { radius, thickness } => Some((Vec3::ZERO, radius.abs() + thickness.abs())),
+            Self::Cone {
+                height,
+                bottom,
+                top,
+                ..
+            } => {
+                let r = bottom.abs().max(top.abs());
+                Some((Vec3::ZERO, (height * height * 0.25 + r * r).sqrt()))
+            }
             Self::Plane { .. } => None,
             // Поле фигуры с прямоугольником — шар как у выдавливания: за сеткой расстояние
             // не меньше, чем до прямоугольника. Поле слоя без него бесконечно: за сеткой
@@ -434,6 +552,20 @@ impl Shape3 {
             }
             Self::Paint { shape, .. } => shape.bounds(),
             Self::Animate { .. } => self.at_time(0.0).bounds(),
+            Self::Mirror {
+                axis,
+                smooth,
+                shape,
+            } => shape.bounds().map(|(c, r)| {
+                let (c, r) = enclose((c, r), (axis.reflect(c), r));
+                (c, r + smooth.abs() * 0.5)
+            }),
+            Self::Repeat {
+                count,
+                step,
+                smooth,
+                shape,
+            } => Self::repeat_union(*count, *step, *smooth, shape).bounds(),
             Self::Use { .. } => Some((Vec3::ZERO, 0.0)),
         }
     }
@@ -461,6 +593,15 @@ impl Shape3 {
                 let t = thickness.abs();
                 let r = radius.abs() + t;
                 centered(Vec3::new(r, t, r))
+            }
+            Self::Cone {
+                height,
+                bottom,
+                top,
+                ..
+            } => {
+                let r = bottom.abs().max(top.abs());
+                centered(Vec3::new(r, height * 0.5, r))
             }
             Self::Plane { .. } => None,
             Self::Field { field, depth, .. } => field.0.rect().map(|(lo, hi)| {
@@ -518,6 +659,27 @@ impl Shape3 {
             }
             Self::Paint { shape, .. } => shape.bounds_box(),
             Self::Animate { .. } => self.at_time(0.0).bounds_box(),
+            Self::Mirror {
+                axis,
+                smooth,
+                shape,
+            } => {
+                let (mut lo, mut hi) = shape.bounds_box()?;
+                // Отражённая коробка по оси — от −hi до −lo: вместе с исходной она
+                // симметрична, от −max(|lo|, |hi|) до того же со знаком плюс.
+                let i = axis.index();
+                let m = lo[i].abs().max(hi[i].abs());
+                lo[i] = -m;
+                hi[i] = m;
+                let pad = Vec3::splat(smooth.abs() * 0.5);
+                Some((lo - pad, hi + pad))
+            }
+            Self::Repeat {
+                count,
+                step,
+                smooth,
+                shape,
+            } => Self::repeat_union(*count, *step, *smooth, shape).bounds_box(),
             Self::Use { .. } => Some((Vec3::ZERO, Vec3::ZERO)),
         }
     }
@@ -575,6 +737,25 @@ pub fn sd_cylinder(p: Vec3, half_height: f32, r: f32, round: f32) -> f32 {
 
 pub fn sd_torus(p: Vec3, big: f32, small: f32) -> f32 {
     glam::Vec2::new(glam::Vec2::new(p.x, p.z).length() - big, p.y).length() - small
+}
+
+/// Усечённый конус вдоль Y: половина высоты `half`, радиусы внизу `r1` и вверху `r2`,
+/// края скруглены на `round` (формула Иниго Килеса `sdCappedCone`, конус уменьшен на
+/// `round` и раздут обратно).
+pub fn sd_cone(p: Vec3, half: f32, r1: f32, r2: f32, round: f32) -> f32 {
+    let h = (half - round).max(0.0);
+    let (r1, r2) = ((r1 - round).max(0.0), (r2 - round).max(0.0));
+    let q = Vec2::new(Vec2::new(p.x, p.z).length(), p.y);
+    let k1 = Vec2::new(r2, h);
+    let k2 = Vec2::new(r2 - r1, 2.0 * h);
+    let ca = Vec2::new(
+        q.x - q.x.min(if q.y < 0.0 { r1 } else { r2 }),
+        q.y.abs() - h,
+    );
+    let t = ((k1 - q).dot(k2) / k2.dot(k2).max(1e-12)).clamp(0.0, 1.0);
+    let cb = q - k1 + k2 * t;
+    let s = if cb.x < 0.0 && ca.y < 0.0 { -1.0 } else { 1.0 };
+    s * ca.dot(ca).min(cb.dot(cb)).sqrt() - round
 }
 
 pub fn sd_plane(p: Vec3, normal: Vec3, offset: f32) -> f32 {
@@ -639,6 +820,8 @@ pub mod prim {
     pub const FIELD: u32 = 8;
     /// «Кирпич поля» (8.15): объёмная сетка расстояний модели в картинке.
     pub const BRICK: u32 = 9;
+    /// Усечённый конус (М.0б).
+    pub const CONE: u32 = 10;
 }
 
 /// Слов на примитив: команда, материал, 12 матрицы, масштаб, 4 параметра (без данных
@@ -700,6 +883,8 @@ pub enum CompileError {
     TooLong,
     #[error("модель «{0}» не подставлена: ссылки Use раскрывает чтение файла сцены")]
     Unresolved(String),
+    #[error("повтор на {0} копий, больше {MAX_REPEAT} не бывает")]
+    TooManyCopies(u32),
 }
 
 /// Преобразование «мир → форма» для примитива: матрица поворота, сдвиг и масштаб.
@@ -814,6 +999,12 @@ fn emit(
         Shape3::Torus { radius, thickness } => {
             prim(prim::TORUS, [*radius, *thickness, 0.0, 0.0], out)
         }
+        Shape3::Cone {
+            height,
+            bottom,
+            top,
+            round,
+        } => prim(prim::CONE, [*height * 0.5, *bottom, *top, *round], out),
         Shape3::Plane { normal, offset } => {
             let n = Vec3::from(*normal).normalize_or(Vec3::Y);
             prim(prim::PLANE, [n.x, n.y, n.z, *offset], out)
@@ -900,6 +1091,41 @@ fn emit(
         ),
         Shape3::Paint { material, shape } => emit(shape, at, *material, base, out),
         Shape3::Animate { .. } => emit(&shape.at_time(0.0), at, material, base, out),
+        Shape3::Mirror {
+            axis,
+            smooth,
+            shape,
+        } => {
+            // Отражённая копия: точка мира сначала переводится в систему формы, потом
+            // отражается (отражение — тоже движение без растяжения, расстояние то же).
+            let s = Mat3::from_diagonal(axis.reflect(Vec3::ONE));
+            let mirrored = Placement {
+                rot: s * at.rot,
+                shift: s * at.shift,
+                scale: at.scale,
+            };
+            let need = emit(shape, at, material, base, out)?;
+            let need = need.max(1 + emit(shape, mirrored, material, base + 1, out)?);
+            out.words.extend([op::UNION, smooth.to_bits()]);
+            Ok(need)
+        }
+        Shape3::Repeat {
+            count,
+            step,
+            smooth,
+            shape,
+        } => {
+            if *count > MAX_REPEAT {
+                return Err(CompileError::TooManyCopies(*count));
+            }
+            emit(
+                &Shape3::repeat_union(*count, *step, *smooth, shape),
+                at,
+                material,
+                base,
+                out,
+            )
+        }
         Shape3::Use { model } => Err(CompileError::Unresolved(model.clone())),
     }
 }
@@ -1026,6 +1252,7 @@ impl Program {
                     prim::CAPSULE => sd_capsule(local, a[0], a[1]),
                     prim::CYLINDER => sd_cylinder(local, a[0], a[1], a[2]),
                     prim::TORUS => sd_torus(local, a[0], a[1]),
+                    prim::CONE => sd_cone(local, a[0], a[1], a[2], a[3]),
                     prim::EXTRUDE if data >= FIELD_HEADER_WORDS => sd_extrude(
                         local,
                         field_distance(field, Vec2::new(local.x, local.y)),
@@ -1324,6 +1551,185 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Формы М.0б: конус, зеркало, повтор — в том числе внутри сдвига с поворотом.
+    fn m0b_shapes() -> Vec<Shape3> {
+        let cone = Shape3::Cone {
+            height: 1.2,
+            bottom: 0.6,
+            top: 0.15,
+            round: 0.05,
+        };
+        let leg = Shape3::Move {
+            at: [0.7, 0.2, -0.3],
+            turn: [10.0, 25.0, -15.0],
+            scale: 1.0,
+            shape: Box::new(Shape3::Box {
+                size: [0.2, 0.9, 0.3],
+                round: 0.02,
+            }),
+        };
+        vec![
+            cone.clone(),
+            Shape3::Cone {
+                height: 0.8,
+                bottom: 0.5,
+                top: 0.0,
+                round: 0.0,
+            },
+            Shape3::Mirror {
+                axis: Axis::X,
+                smooth: 0.1,
+                shape: Box::new(leg.clone()),
+            },
+            Shape3::Move {
+                at: [0.3, -0.4, 0.5],
+                turn: [0.0, 40.0, 20.0],
+                // Масштаб 1: плавный шов под масштабом дерево и программа и до М.0б
+                // считают чуть по-разному (ширина шва в программе не масштабируется).
+                scale: 1.0,
+                shape: Box::new(Shape3::Mirror {
+                    axis: Axis::Z,
+                    smooth: 0.0,
+                    shape: Box::new(Shape3::Union {
+                        shapes: vec![leg.clone(), cone.clone()],
+                        smooth: 0.05,
+                    }),
+                }),
+            },
+            Shape3::Repeat {
+                count: 5,
+                step: [0.45, 0.0, 0.1],
+                smooth: 0.0,
+                shape: Box::new(Shape3::Move {
+                    at: [-1.0, 0.0, 0.0],
+                    turn: [0.0; 3],
+                    scale: 1.0,
+                    shape: Box::new(Shape3::Sphere { radius: 0.2 }),
+                }),
+            },
+            Shape3::Mirror {
+                axis: Axis::Y,
+                smooth: 0.0,
+                shape: Box::new(Shape3::Repeat {
+                    count: 3,
+                    step: [0.0, 0.0, 0.6],
+                    smooth: 0.08,
+                    shape: Box::new(leg),
+                }),
+            },
+        ]
+    }
+
+    #[test]
+    fn m0b_program_matches_tree() {
+        for shape in m0b_shapes() {
+            let program = compile(&shape).unwrap();
+            for p in points() {
+                let (a, b) = (shape.distance(p), program.distance(p).0);
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "{shape:?} в {p}: дерево {a}, программа {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn m0b_bounds_hold_the_shape() {
+        for shape in m0b_shapes() {
+            let (c, r) = shape.bounds().unwrap();
+            let (lo, hi) = shape.bounds_box().unwrap();
+            for x in -30..=30 {
+                for y in -30..=30 {
+                    for z in -30..=30 {
+                        let p = Vec3::new(x as f32, y as f32, z as f32) * 0.07;
+                        if shape.distance(p) < 0.0 {
+                            assert!((p - c).length() <= r + 1e-4, "{shape:?}: {p} вне шара");
+                            assert!(
+                                p.cmpge(lo - 1e-4).all() && p.cmple(hi + 1e-4).all(),
+                                "{shape:?}: {p} вне коробки {lo} {hi}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cone_formula() {
+        // Без скругления и с равными радиусами конус — цилиндр.
+        let cyl = Shape3::Cylinder {
+            height: 1.0,
+            radius: 0.4,
+            round: 0.0,
+        };
+        let same = Shape3::Cone {
+            height: 1.0,
+            bottom: 0.4,
+            top: 0.4,
+            round: 0.0,
+        };
+        for p in points() {
+            let (a, b) = (cyl.distance(p), same.distance(p));
+            assert!((a - b).abs() < 1e-4, "{p}: {a} {b}");
+        }
+        let cone = Shape3::Cone {
+            height: 2.0,
+            bottom: 1.0,
+            top: 0.0,
+            round: 0.0,
+        };
+        assert!((cone.distance(Vec3::new(0.0, 1.5, 0.0)) - 0.5).abs() < 1e-5);
+        assert!((cone.distance(Vec3::new(0.0, -1.5, 0.0)) - 0.5).abs() < 1e-5);
+        assert!((cone.distance(Vec3::new(2.0, -1.0, 0.0)) - 1.0).abs() < 1e-5);
+        assert!(cone.distance(Vec3::ZERO) < 0.0);
+        // Точка на боку: середина образующей.
+        assert!(cone.distance(Vec3::new(0.5, 0.0, 0.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mirror_and_repeat_are_copies() {
+        let ball = Shape3::Move {
+            at: [0.8, 0.1, 0.0],
+            turn: [0.0; 3],
+            scale: 1.0,
+            shape: Box::new(Shape3::Sphere { radius: 0.3 }),
+        };
+        let mirror = Shape3::Mirror {
+            axis: Axis::X,
+            smooth: 0.0,
+            shape: Box::new(ball.clone()),
+        };
+        assert!(mirror.distance(Vec3::new(-0.8, 0.1, 0.0)) < -0.29);
+        assert!(mirror.distance(Vec3::new(0.8, 0.1, 0.0)) < -0.29);
+        assert!(mirror.distance(Vec3::new(0.0, 0.1, 0.0)) > 0.4);
+        let repeat = Shape3::Repeat {
+            count: 4,
+            step: [0.0, 1.0, 0.0],
+            smooth: 0.0,
+            shape: Box::new(ball),
+        };
+        for k in 0..4 {
+            assert!(repeat.distance(Vec3::new(0.8, 0.1 + k as f32, 0.0)) < -0.29);
+        }
+        assert!(repeat.distance(Vec3::new(0.8, 4.1, 0.0)) > 0.6);
+        let too_many = Shape3::Repeat {
+            count: MAX_REPEAT + 1,
+            step: [1.0, 0.0, 0.0],
+            smooth: 0.0,
+            shape: Box::new(Shape3::Sphere { radius: 0.1 }),
+        };
+        assert_eq!(
+            compile(&too_many).unwrap_err(),
+            CompileError::TooManyCopies(MAX_REPEAT + 1)
+        );
+        let text = "Mirror(axis: Z, shape: Repeat(count: 3, step: (0, 0.5, 0), \
+            shape: Cone(height: 1, bottom: 0.3)))";
+        let read: Shape3 = ron::from_str(text).unwrap();
+        assert!(matches!(read, Shape3::Mirror { axis: Axis::Z, .. }));
     }
 
     #[test]
