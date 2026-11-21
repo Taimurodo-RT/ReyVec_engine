@@ -6,9 +6,9 @@
 mod app;
 mod console;
 mod controls;
-mod editor;
 mod field_bench;
 mod fly;
+pub mod for_editor;
 mod game_ui;
 mod gamepad;
 mod logging;
@@ -17,7 +17,6 @@ pub mod snapshot;
 mod sound;
 
 pub use app::{AppConfig, AppError, RunSummary, run};
-pub use editor::{EditorConfig, run_editor};
 pub use logging::{LogGuard, init_logging, init_logging_to};
 pub use reyvec_gpu::{
     AdapterInfo, CLEAR_COLOR, DemoScene, FillMode, FrameImage, GpuOptions, HeadlessImage,

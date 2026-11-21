@@ -50,10 +50,12 @@ jobs:
           & "$env:RUNNER_TEMP\slang\bin\slangc.exe" -v
       - name: Format
         run: cargo fmt --all --check
+      # Редактор проверяет своя задача «Editor» ниже (decisions/0021): по ней сразу видно,
+      # сломала ли правка редактор или движок.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets --exclude reyvec-editor
       - name: Tests
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude reyvec-editor
       # Проверяем тот же путь, которым Роман обновляет локальную версию,
       # причём в Windows PowerShell 5.1, как при запуске update.bat.
       # У машины CI нет видеокарты и Vulkan, поэтому окно здесь не открываем:
@@ -67,8 +69,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\scripts\run.ps1 --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\scripts\editor.ps1 --version
-          exit $LASTEXITCODE
+          # Редактор собирается отдельно и может не собраться, не ломая песочницу;
+          # его сборку проверяет задача «Editor».
+          if (Test-Path dist\reyvec-editor.exe) {
+            .\scripts\editor.ps1 --version
+            exit $LASTEXITCODE
+          }
+          exit 0
       # Обновление поверх ручной правки: файл заменяется версией из репозитория,
       # копия правки сохраняется в dist\local-changes.
       - name: Update over a locally edited file (Windows PowerShell)
@@ -187,6 +194,51 @@ jobs:
           xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/snapshot-check.sh ./target/debug/reyvec-sandbox
           # Камера мышью: колесо приближает, перетаскивание двигает (два снимка F12 разные).
           xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/camera-check.sh ./target/debug/reyvec-sandbox
+      # Окно всё время меняет размер: swapchain пересоздаётся без остановки видеокарты,
+      # старый удаляется по заборам показа. Второй прогон: запасной путь без заборов.
+      - name: Window resizing with validation (present fences and fallback)
+        run: |
+          xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 5
+          REYVEC_NO_PRESENT_FENCES=1 xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 3
+
+  # Редактор отдельно от движка (decisions/0021): своя задача, чтобы его ошибки
+  # не путались с ошибками графики.
+  editor:
+    name: Editor (clippy, test, window with validation)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install software Vulkan, validation layers, virtual display
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q mesa-vulkan-drivers vulkan-validationlayers vulkan-tools xvfb libxkbcommon-x11-0 libudev-dev libasound2-dev
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # Кэш и повторы — см. задание Windows.
+      - name: Cache Slang shader compiler
+        id: slang-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/slang
+          key: slang-${{ env.SLANG_VERSION }}-linux-x86_64
+      - name: Install Slang shader compiler
+        if: steps.slang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/slang"
+          # До 8 повторов скачивания с паузой 15 с. Сначала в файл, потом
+          # распаковка: повтор посреди потока сломал бы tar.
+          curl -sSfL --retry 8 --retry-all-errors --retry-delay 15 -o "$RUNNER_TEMP/slang.tar.gz" \
+            "https://github.com/shader-slang/slang/releases/download/v$SLANG_VERSION/slang-$SLANG_VERSION-linux-x86_64.tar.gz"
+          tar xzf "$RUNNER_TEMP/slang.tar.gz" -C "$RUNNER_TEMP/slang"
+      - name: Slang shader compiler on PATH
+        run: |
+          echo "REYVEC_SLANGC=$RUNNER_TEMP/slang/bin/slangc" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/slang/bin/slangc" -v
+      - name: Clippy (editor)
+        run: cargo clippy -p reyvec-editor --all-targets
+      - name: Tests (editor)
+        run: cargo test -p reyvec-editor
       # Редактор (Р.1): окно без рамки, панели и сцена из файла, снимок окна в лог
       # (собрать картинку: строки между метками PNG, base64 -d). Второй прогон — с рамкой
       # системы (--window-frame), запасной путь.
@@ -199,12 +251,6 @@ jobs:
           base64 -w 4000 "$RUNNER_TEMP/editor.png"
           echo "--- конец PNG ---"
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-editor --validation --window-frame --seconds 3
-      # Окно всё время меняет размер: swapchain пересоздаётся без остановки видеокарты,
-      # старый удаляется по заборам показа. Второй прогон: запасной путь без заборов.
-      - name: Window resizing with validation (present fences and fallback)
-        run: |
-          xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 5
-          REYVEC_NO_PRESENT_FENCES=1 xvfb-run -a -s "-screen 0 1920x1080x24" scripts/ci/resize-check.sh ./target/debug/reyvec-sandbox 3
 
   # Та же команда, что у EmbarkStudios/cargo-deny-action@v2, но без его
   # Docker-образа: тот скачивает cargo-deny с GitHub Releases без повторов и

@@ -2352,7 +2352,7 @@ fn console_bar(ui: &mut Ui, filter: &mut LogFilter, log: &mut VecDeque<(Color32,
 
 /// Подходит ли строка журнала под фильтр (важность видна по цвету строки).
 fn log_shown(filter: LogFilter, color: Color32) -> bool {
-    use crate::console::{GOLD, RED};
+    use reyvec_app::for_editor::{GOLD, RED};
     match filter {
         LogFilter::All => true,
         LogFilter::Warnings => color == GOLD || color == RED,
@@ -2858,7 +2858,7 @@ mod tests {
 
     fn new_ctx() -> egui::Context {
         let ctx = egui::Context::default();
-        ctx.set_fonts(crate::panel::fonts());
+        ctx.set_fonts(reyvec_app::for_editor::fonts());
         apply(&ctx);
         ctx
     }
@@ -3119,7 +3119,7 @@ mod tests {
         assert_eq!(ui.pinned, Some(vec![0]));
         ui.structure_changed();
         assert!(ui.pinned.is_none() && ui.more.is_empty());
-        assert!(log_shown(LogFilter::Errors, crate::console::RED));
+        assert!(log_shown(LogFilter::Errors, reyvec_app::for_editor::RED));
         assert!(!log_shown(LogFilter::Warnings, TEXT_DIM));
     }
 
@@ -3202,7 +3202,7 @@ mod tests {
     /// Картинка интерфейса без видеокарты: треугольники egui раскрашиваются на процессоре
     /// (примерно, без точной гаммы) и сохраняются в `target/editor-preview/*.png`. Нужна,
     /// чтобы посмотреть раскладку там, где нет видеокарты. Запуск:
-    /// `cargo test -p reyvec-app --lib editor_preview -- --ignored`.
+    /// `cargo test -p reyvec-editor editor_preview -- --ignored`.
     #[test]
     #[ignore = "пишет картинки для просмотра глазами"]
     fn editor_preview() {
@@ -3399,14 +3399,14 @@ mod tests {
                 .iter()
                 .flat_map(|p| [p[0], p[1], p[2], 1.0].map(|c| (c.clamp(0.0, 1.0) * 255.0) as u8))
                 .collect();
-            let image = crate::snapshot::FrameImage {
+            let image = reyvec_app::snapshot::FrameImage {
                 width: w as u32,
                 height: h as u32,
                 rgba,
             };
             let menu = if menu { "-меню" } else { "" };
             let name = format!("{}-{:?}{menu}.png", WORKSPACES[ws].name, play);
-            crate::snapshot::save_png(&out_dir.join(name), &image).unwrap();
+            reyvec_app::snapshot::save_png(&out_dir.join(name), &image).unwrap();
         }
     }
 }

@@ -12,6 +12,8 @@
 //!   (`--snapshot-after <S>`: через сколько секунд, по умолчанию 3);
 //! - `--version`, `--help`.
 
+mod editor;
+
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -151,7 +153,7 @@ fn main() -> ExitCode {
     }
     // В отладочной сборке валидация включена всегда: так ошибки ловятся сразу.
     let validation = args.validation || cfg!(debug_assertions);
-    let config = reyvec_app::EditorConfig {
+    let config = editor::EditorConfig {
         title: format!("{} — редактор", reyvec_app::engine_title()),
         gpu: reyvec_app::GpuOptions {
             validation,
@@ -169,7 +171,7 @@ fn main() -> ExitCode {
         }),
         snapshot_after: args.snapshot_after.unwrap_or(3.0),
     };
-    let result = reyvec_app::run_editor(config);
+    let result = editor::run_editor(config);
     let errors = reyvec_app::validation_error_count();
     match result {
         Ok(summary) => {

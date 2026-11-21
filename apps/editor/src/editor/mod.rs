@@ -42,9 +42,10 @@ use winit::event::{MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-use crate::app::{AppError, RunSummary, input_of, to_screen};
-use crate::controls::{Controls, Input, controls_path};
 use doc::SceneDoc;
+use reyvec_app::for_editor::{Controls, Input, controls_path};
+use reyvec_app::for_editor::{input_of, to_screen};
+use reyvec_app::{AppError, RunSummary};
 use ui::{Action, EditorUi, Info, PlayState};
 
 /// Как часто пересчитывать счётчик кадров.
@@ -343,7 +344,7 @@ impl Editor {
                 }
             }
         }
-        self.egui_ctx.set_fonts(crate::panel::fonts());
+        self.egui_ctx.set_fonts(reyvec_app::for_editor::fonts());
         theme::apply(&self.egui_ctx);
         self.egui_state = Some(egui_winit::State::new(
             self.egui_ctx.clone(),
@@ -933,7 +934,7 @@ impl Editor {
             self.center_on_viewport();
             self.centered = true;
         }
-        self.ui.push_log(crate::console::take_log());
+        self.ui.push_log(reyvec_app::for_editor::take_log());
 
         let view = self.view();
         let (Some(window), Some(renderer), Some(state)) =
@@ -1038,7 +1039,7 @@ impl Editor {
                 if let (Some(path), Some(image)) =
                     (self.config.snapshot.clone(), renderer.take_snapshot())
                 {
-                    match crate::snapshot::save_png(&path, &image) {
+                    match reyvec_app::snapshot::save_png(&path, &image) {
                         Ok(()) => tracing::info!(
                             "Снимок редактора {}×{} сохранён: {}",
                             image.width,
