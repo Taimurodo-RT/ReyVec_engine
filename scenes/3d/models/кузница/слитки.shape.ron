@@ -1,0 +1,14 @@
+// Стопка слитков (М.0б): ряд из четырёх повтором, сверху ряд из трёх. Своя работа, CC0.
+(
+    format: "reyvec-shape",
+    version: 1,
+    materials: [
+        (name: "медь", color: "#b87333"),
+    ],
+    shape: Paint(material: 0, shape: Union(shapes: [
+        Repeat(count: 4, step: (0.12, 0.0, 0.0), shape: Move(at: (-0.18, 0.02, 0.0),
+            shape: Box(size: (0.10, 0.04, 0.22), round: 0.008))),
+        Repeat(count: 3, step: (0.12, 0.0, 0.0), shape: Move(at: (-0.12, 0.06, 0.0),
+            shape: Box(size: (0.10, 0.04, 0.22), round: 0.008))),
+    ])),
+)

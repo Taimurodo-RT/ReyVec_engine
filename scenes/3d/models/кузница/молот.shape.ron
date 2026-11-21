@@ -1,0 +1,18 @@
+// Молот (М.0б): боёк с конусом-клином и рукоять. Лежит на боку. Своя работа, CC0.
+(
+    format: "reyvec-shape",
+    version: 1,
+    materials: [
+        (name: "железо", color: "#55595f"),
+        (name: "дерево", color: "#8a5a32"),
+    ],
+    shape: Union(shapes: [
+        Paint(material: 0, shape: Union(smooth: 0.01, shapes: [
+            Box(size: (0.06, 0.06, 0.10), round: 0.006),
+            Move(at: (0.0, 0.0, -0.075), turn: (90.0, 0.0, 0.0),
+                shape: Cone(height: 0.05, bottom: 0.03, top: 0.018, round: 0.004)),
+        ])),
+        Paint(material: 1, shape: Move(at: (0.17, 0.0, 0.0), turn: (0.0, 0.0, 90.0),
+            shape: Capsule(height: 0.30, radius: 0.014))),
+    ]),
+)

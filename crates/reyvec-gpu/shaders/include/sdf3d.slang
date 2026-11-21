@@ -31,6 +31,7 @@ static const uint PRIM_EXTRUDE = 6;
 static const uint PRIM_REVOLVE = 7;
 static const uint PRIM_FIELD = 8;
 static const uint PRIM_BRICK = 9;
+static const uint PRIM_CONE = 10;
 
 static const uint PRIM_WORDS = 19;
 static const uint FIELD_HEADER_WORDS = 8;
@@ -69,6 +70,22 @@ float sd3_cylinder(float3 p, float half_height, float r, float round)
 float sd3_torus(float3 p, float big, float small)
 {
     return length(float2(length(p.xz) - big, p.y)) - small;
+}
+
+// Усечённый конус вдоль Y (М.0б): половина высоты, радиусы внизу и вверху, скругление.
+// Зеркало shape3d::sd_cone (sdCappedCone Иниго Килеса, уменьшен на round и раздут).
+float sd3_cone(float3 p, float half_height, float r1, float r2, float round)
+{
+    float h = max(half_height - round, 0.0);
+    r1 = max(r1 - round, 0.0);
+    r2 = max(r2 - round, 0.0);
+    float2 q = float2(length(p.xz), p.y);
+    float2 k1 = float2(r2, h);
+    float2 k2 = float2(r2 - r1, 2.0 * h);
+    float2 ca = float2(q.x - min(q.x, q.y < 0.0 ? r1 : r2), abs(q.y) - h);
+    float2 cb = q - k1 + k2 * clamp(dot(k1 - q, k2) / max(dot(k2, k2), 1e-12), 0.0, 1.0);
+    float s = (cb.x < 0.0 && ca.y < 0.0) ? -1.0 : 1.0;
+    return s * sqrt(min(dot(ca, ca), dot(cb, cb))) - round;
 }
 
 float sd3_plane(float3 p, float3 n, float offset)
@@ -289,6 +306,8 @@ float2 sdf_primitive(uint* code, uint i, float3 p)
     }
     else if (kind == PRIM_BRICK)
         d = sd3_brick(code, i + PRIM_WORDS, q) + a.x;
+    else if (kind == PRIM_CONE)
+        d = sd3_cone(q, a.x, a.y, a.z, a.w);
     else
         d = sd3_plane(q, a.xyz, a.w);
     return float2(d * scale, material);

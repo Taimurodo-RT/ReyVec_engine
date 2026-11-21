@@ -283,6 +283,19 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
+        // М.0б: кузница из моделей форм (`scenes/3d/forge.ron`): рог наковальни — конус,
+        // лапы — зеркало, слитки и угли — повтор.
+        Case {
+            name: "space-forge-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/forge.ron").into()),
+                    space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
         // 7.7: векторные контуры, выдавленные и повёрнутые в объёмные формы
         // (`scenes/3d/vector.ron`).
         Case {

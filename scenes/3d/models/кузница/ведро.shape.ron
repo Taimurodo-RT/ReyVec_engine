@@ -1,0 +1,17 @@
+// Ведро (М.0б): конус без верха — из конуса вырезан конус поменьше. Своя работа, CC0.
+(
+    format: "reyvec-shape",
+    version: 1,
+    materials: [
+        (name: "жесть", color: "#7d8288"),
+        (name: "вода", color: "#1d3a52"),
+    ],
+    shape: Union(shapes: [
+        Paint(material: 0, shape: Subtract(
+            base: Move(at: (0.0, 0.15, 0.0), shape: Cone(height: 0.30, bottom: 0.12, top: 0.15, round: 0.006)),
+            cut: [Move(at: (0.0, 0.17, 0.0), shape: Cone(height: 0.30, bottom: 0.11, top: 0.14))],
+        )),
+        Paint(material: 1, shape: Move(at: (0.0, 0.21, 0.0),
+            shape: Cylinder(height: 0.02, radius: 0.13))),
+    ]),
+)

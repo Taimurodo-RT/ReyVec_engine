@@ -136,7 +136,9 @@ impl<'a> Resolver<'a> {
             }
             Shape3::Move { shape, .. }
             | Shape3::Paint { shape, .. }
-            | Shape3::Animate { shape, .. } => self.walk(shape, chain),
+            | Shape3::Animate { shape, .. }
+            | Shape3::Mirror { shape, .. }
+            | Shape3::Repeat { shape, .. } => self.walk(shape, chain),
             _ => Ok(()),
         }
     }
@@ -194,7 +196,10 @@ fn shift_paint(shape: &mut Shape3, base: u32) {
             shift_paint(b, base);
             cut.iter_mut().for_each(|s| shift_paint(s, base));
         }
-        Shape3::Move { shape, .. } | Shape3::Animate { shape, .. } => shift_paint(shape, base),
+        Shape3::Move { shape, .. }
+        | Shape3::Animate { shape, .. }
+        | Shape3::Mirror { shape, .. }
+        | Shape3::Repeat { shape, .. } => shift_paint(shape, base),
         _ => {}
     }
 }
@@ -213,7 +218,10 @@ fn max_paint(shape: &Shape3, worst: &mut Option<u32>) {
             max_paint(base, worst);
             cut.iter().for_each(|s| max_paint(s, worst));
         }
-        Shape3::Move { shape, .. } | Shape3::Animate { shape, .. } => max_paint(shape, worst),
+        Shape3::Move { shape, .. }
+        | Shape3::Animate { shape, .. }
+        | Shape3::Mirror { shape, .. }
+        | Shape3::Repeat { shape, .. } => max_paint(shape, worst),
         _ => {}
     }
 }
