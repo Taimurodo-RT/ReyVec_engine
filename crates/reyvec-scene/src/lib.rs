@@ -2091,8 +2091,8 @@ impl SceneWatcher {
     }
 
     /// То же для файла сцены «3D» (8.14): сохранение модели glTF (`.glb`, `.gltf`,
-    /// `.bin`) в его папке или вложенных папках тоже считается сохранением сцены — сцена
-    /// перечитывается вместе с моделями.
+    /// `.bin`) или модели форм (`.shape.ron`, М.0) в его папке или вложенных папках тоже
+    /// считается сохранением сцены — сцена перечитывается вместе с моделями.
     pub fn with_models(path: &Path) -> Result<Self, notify::Error> {
         Self::watch(path, true)
     }
@@ -2115,9 +2115,12 @@ impl SceneWatcher {
                 }
                 let model = |p: &Path| {
                     models
-                        && p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                        && (p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
                             ["glb", "gltf", "bin"].contains(&e.to_lowercase().as_str())
-                        })
+                        }) || p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.to_lowercase().ends_with(".shape.ron")))
                 };
                 if event
                     .paths

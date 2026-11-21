@@ -41,6 +41,41 @@ def union(parts):
     return "Union(shapes: [" + ", ".join(parts) + "])"
 
 
+# Shape models (step M.0, docs/models-3d.md): a shape used by many objects is written once
+# to models/<name>.shape.ron and the scene refers to it with Use(model: "<name>").
+models = {}
+
+
+def model(name, shape, about):
+    models[name] = (shape, about)
+    return f'Use(model: "{name}")'
+
+
+CONVEYOR = model(
+    "завод/конвейер",
+    union([box((3.6, 0.12, 0.8), 0.02)]
+          + [move((dx, -0.33, dz), box((0.08, 0.6, 0.08))) for dx in (-1.6, 1.6) for dz in (-0.3, 0.3)]),
+    "Конвейер: лента 3,6 м и четыре ножки.",
+)
+FAN = model("завод/вентилятор", union([box((0.9, 0.04, 0.12)), box((0.12, 0.04, 0.9))]),
+            "Вентилятор: две лопасти крестом.")
+RACK = model(
+    "завод/стеллаж",
+    union([move((dx, 0.0, 0.0), box((0.06, 2.0, 0.8))) for dx in (-0.95, 0.95)]
+          + [move((0.0, dy, 0.0), box((1.96, 0.05, 0.8))) for dy in (-0.55, 0.15)]),
+    "Стеллаж: две стойки и две полки.",
+)
+FORKLIFT = model(
+    "завод/погрузчик",
+    union([
+        box((1.0, 0.5, 0.7), 0.05),
+        move((-0.15, 0.55, 0.0), box((0.5, 0.6, 0.6), 0.03)),
+        move((0.6, 0.6, 0.0), box((0.06, 1.2, 0.5))),
+    ]),
+    "Погрузчик: корпус, кабина и вилы.",
+)
+
+
 materials = """        (name: "пол", color: (0.20, 0.21, 0.22), grid: true),
         (name: "лента", color: (0.10, 0.10, 0.11)),
         (name: "сталь", color: (0.55, 0.57, 0.60)),
@@ -63,8 +98,7 @@ for line in range(LINES):
             f'mesh: Model(file: "models/machine.glb")),'
         )
         # Conveyor: belt and four legs, one object.
-        legs = [move((dx, -0.33, dz), box((0.08, 0.6, 0.08))) for dx in (-1.6, 1.6) for dz in (-0.3, 0.3)]
-        obj(f"конвейер {tag}", "лента", (x, 0.66, z), union([box((3.6, 0.12, 0.8), 0.02)] + legs))
+        obj(f"конвейер {tag}", "лента", (x, 0.66, z), CONVEYOR)
         # Two crates riding the belt back and forth (out of phase).
         for c, shift in enumerate((-0.8, 0.8)):
             period = 4.0 + (k % 5) * 0.37
@@ -77,7 +111,7 @@ for line in range(LINES):
         obj(f"бочка {tag}", "бочка", (x + 1.4, 0.45, z + 1.2), "Cylinder(height: 0.9, radius: 0.28, round: 0.03)")
         obj(
             f"вентилятор {tag}", "сталь", (x - 1.1, 1.75, z - 1.3),
-            union([box((0.9, 0.04, 0.12)), box((0.12, 0.04, 0.9))]),
+            FAN,
             f", spin: (0.0, {f(120.0 + (k % 7) * 25.0)}, 0.0)",
         )
         obj(
@@ -105,10 +139,7 @@ for name, at, size in (
 for side, z in (("север", -HALL_Z + 1.2), ("юг", HALL_Z - 1.2)):
     for i in range(26):
         x = -27.0 + i * 2.16
-        obj(f"стеллаж {side} {i + 1}", "сталь", (x, 1.0, z), union(
-            [move((dx, 0.0, 0.0), box((0.06, 2.0, 0.8))) for dx in (-0.95, 0.95)]
-            + [move((0.0, dy, 0.0), box((1.96, 0.05, 0.8))) for dy in (-0.55, 0.15)]
-        ))
+        obj(f"стеллаж {side} {i + 1}", "сталь", (x, 1.0, z), RACK)
         for lvl, y in enumerate((0.75, 1.45)):
             for b in range(2):
                 dx = -0.45 + b * 0.9
@@ -119,13 +150,8 @@ for side, z in (("север", -HALL_Z + 1.2), ("юг", HALL_Z - 1.2)):
 for i in range(20):
     x = -24.0 + (i % 10) * 5.3
     z = -22.0 if i < 10 else 22.0
-    body = union([
-        box((1.0, 0.5, 0.7), 0.05),
-        move((-0.15, 0.55, 0.0), box((0.5, 0.6, 0.6), 0.03)),
-        move((0.6, 0.6, 0.0), box((0.06, 1.2, 0.5))),
-    ])
     obj(
-        f"погрузчик {i + 1}", "жёлтый", (x, 0.35, z), body,
+        f"погрузчик {i + 1}", "жёлтый", (x, 0.35, z), FORKLIFT,
         f", circle: (radius: (1.4, 0.6), period: {f(9.0 + (i % 4) * 1.5)})",
     )
 
@@ -153,6 +179,9 @@ header = f"""// Сцена-нагрузка этапа 8 (задача 8.7): ц�
 // Вокруг колонны, стены, стеллажи с коробками, погрузчики ездят по кругу, плафоны.
 // Это точка отсчёта для ускорения масштаба (8.8, 8.9): на панели видно, сколько предметов
 // в кадре и сколько стоит подготовка кадра на процессоре. Править лучше скрипт.
+// Конвейер, вентилятор, стеллаж и погрузчик — модели форм (М.0): каждая записана один раз в
+// models/завод/*.shape.ron, а предметы ссылаются на неё через Use(model: "завод/…").
+// Правка файла модели сразу меняет все её копии в цеху.
 (
     format: "reyvec-space",
     version: 1,
@@ -170,6 +199,22 @@ header = f"""// Сцена-нагрузка этапа 8 (задача 8.7): ц�
         (name: "пол", material: "пол", shape: Plane(normal: (0.0, 1.0, 0.0), offset: 0.0)),
 """
 text = header + "\n".join(objects) + "\n    ],\n\n    meshes: [\n" + "\n".join(meshes) + "\n    ],\n)\n"
-with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "factory.ron"), "w", encoding="utf-8") as out:
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, "factory.ron"), "w", encoding="utf-8") as out:
     out.write(text)
+for name, (shape, about) in models.items():
+    path = os.path.join(here, "models", *name.split("/")) + ".shape.ron"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    assert shape.endswith("])")
+    pretty = shape[:-2].replace("Union(shapes: [", "Union(shapes: [\n        ").replace("), Move", "),\n        Move").replace("), Box", "),\n        Box")
+    with open(path, "w", encoding="utf-8") as out:
+        out.write(f"""// {about} Модель цеха factory.ron, собрана скриптом factory.py (CC0).
+// Цвет даёт предмет сцены (material), поэтому своих материалов у модели нет.
+(
+    format: "reyvec-shape",
+    version: 1,
+    shape: {pretty},
+    ]),
+)
+""")
 print(count, "objects,", len(meshes), "meshes")

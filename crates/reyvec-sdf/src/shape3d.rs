@@ -131,6 +131,10 @@ pub enum Shape3 {
         spin: [f32; 3],
         shape: Box<Shape3>,
     },
+    /// Модель из своего файла (М.0, [`crate::shape_model`]): `models/<model>.shape.ron`
+    /// рядом с файлом сцены. Раскрывается в дерево модели при чтении сцены; до этого у
+    /// неё нет формы, и программа из неё не собирается.
+    Use { model: String },
 }
 
 fn one() -> f32 {
@@ -274,6 +278,7 @@ impl Shape3 {
             }
             Self::Paint { shape, .. } => shape.distance(p),
             Self::Animate { .. } => self.at_time(0.0).distance(p),
+            Self::Use { .. } => f32::MAX,
         }
     }
 
@@ -396,6 +401,7 @@ impl Shape3 {
             }
             Self::Paint { shape, .. } => shape.bounds(),
             Self::Animate { .. } => self.at_time(0.0).bounds(),
+            Self::Use { .. } => Some((Vec3::ZERO, 0.0)),
         }
     }
 }
@@ -479,6 +485,7 @@ impl Shape3 {
             }
             Self::Paint { shape, .. } => shape.bounds_box(),
             Self::Animate { .. } => self.at_time(0.0).bounds_box(),
+            Self::Use { .. } => Some((Vec3::ZERO, Vec3::ZERO)),
         }
     }
 }
@@ -658,6 +665,8 @@ pub enum CompileError {
     Empty,
     #[error("форма слишком большая: больше {MAX_PROGRAM_WORDS} слов (много выдавленных фигур?)")]
     TooLong,
+    #[error("модель «{0}» не подставлена: ссылки Use раскрывает чтение файла сцены")]
+    Unresolved(String),
 }
 
 /// Преобразование «мир → форма» для примитива: матрица поворота, сдвиг и масштаб.
@@ -858,6 +867,7 @@ fn emit(
         ),
         Shape3::Paint { material, shape } => emit(shape, at, *material, base, out),
         Shape3::Animate { .. } => emit(&shape.at_time(0.0), at, material, base, out),
+        Shape3::Use { model } => Err(CompileError::Unresolved(model.clone())),
     }
 }
 

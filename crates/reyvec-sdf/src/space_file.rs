@@ -230,6 +230,11 @@ pub struct SpaceScene {
     pub view_culling_off: bool,
     /// Лучи глаза вычислительным шейдером (7.6м; `compute: false` — пиксельным).
     pub compute: bool,
+    /// Файлы моделей форм (М.0), которые сцена прочитала.
+    pub model_files: Vec<std::path::PathBuf>,
+    /// Имена материалов файла по номерам, вместе с материалами моделей форм
+    /// («модель/материал»); без материалов glTF и лампочек.
+    pub material_names: Vec<String>,
 }
 
 /// Что сцена «3D» рисует в один момент.
@@ -268,7 +273,7 @@ impl SpaceScene {
 
     /// Читает текст файла; пути к моделям glTF — от папки `dir` (папки файла сцены).
     pub fn parse_in(text: &str, dir: Option<&Path>) -> Result<Self, String> {
-        let file: SpaceFile = ron::from_str(text).map_err(|e| e.to_string())?;
+        let mut file: SpaceFile = ron::from_str(text).map_err(|e| e.to_string())?;
         if file.format != "reyvec-space" {
             return Err(format!(
                 "format: \"{}\", а нужен \"reyvec-space\"",
@@ -281,6 +286,17 @@ impl SpaceScene {
                 file.version
             ));
         }
+        // Модели (М.0): ссылки Use раскрываются в деревья, их материалы ложатся в конец
+        // списка материалов сцены.
+        let mut resolver = crate::shape_model::Resolver::new(dir, &mut file.materials);
+        for (i, o) in file.objects.iter_mut().enumerate() {
+            let label = object_label(o, i);
+            resolver
+                .resolve(&mut o.shape)
+                .map_err(|e| format!("{label}: {e}"))?;
+        }
+        let model_files = resolver.files;
+        let material_names: Vec<String> = file.materials.iter().map(|m| m.name.clone()).collect();
         let mut materials = Vec::new();
         for m in &file.materials {
             if file.materials.iter().filter(|o| o.name == m.name).count() > 1 {
@@ -505,6 +521,8 @@ impl SpaceScene {
             culling_off: !file.culling,
             view_culling_off: !file.view_culling,
             compute: file.compute,
+            model_files,
+            material_names,
         })
     }
 
@@ -846,6 +864,8 @@ mod tests {
         let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
         assert!(scene.object_count() >= 1000, "{}", scene.object_count());
         assert_eq!(scene.mesh_count(), 96);
+        // Конвейер, вентилятор, стеллаж и погрузчик — модели форм (М.0).
+        assert_eq!(scene.model_files.len(), 4, "{:?}", scene.model_files);
         assert_eq!(
             scene.bricks.len(),
             1,
