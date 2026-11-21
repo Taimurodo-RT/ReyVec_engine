@@ -318,14 +318,8 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
         texel = 5.5 * here / side;
         bias = 0.02 + 0.01 * here;
     }
-    // Сцена «3D» (солнце и лампы, смотрящие вниз; 8.20в2): полутень — по ближнему к точке
-    // заслоняющему, а не по среднему. У среднего у основания предмета в округу попадает
-    // его верх (близко к свету), полутень выходит во всю округу (до 24 точек карты, около
-    // 25 см на полу у лампы под потолком) и темнит освещённый пол рядом с предметом.
-    bool nearest = sun || (pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0;
     float blockers = 0.0;
     float count = 0.0;
-    float closest = -1e30;
     for (int k = 0; k < 9; k++)
     {
         float2 g = float2(float(k % 3), float(k / 3)) - 1.0;
@@ -336,12 +330,10 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
         float4 shut = 1.0 - step(reference - bias, depth);
         blockers += dot(shut, depth);
         count += dot(shut, float4(1.0, 1.0, 1.0, 1.0));
-        float4 shut_depth = select(shut > 0.5, depth, float4(-1e30, -1e30, -1e30, -1e30));
-        closest = max(closest, max(max(shut_depth.x, shut_depth.y), max(shut_depth.z, shut_depth.w)));
     }
     if (count <= 0.0)
         return 1.0;
-    float blocker = nearest ? closest : blockers / count;
+    float blocker = blockers / count;
     float world = sun ? max(here - blocker, 0.0) * SUN_MAP_SOFT
                       : (here - blocker) / max(blocker, 0.05) * here * MAP_PENUMBRA;
     float radius = clamp(world / texel, 1.0, MAP_SEARCH);
@@ -388,7 +380,7 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
         // Луч останавливается, не дойдя до лампы 35 см: лампочка-шарик вокруг лампы
         // не должна закрывать свою же лампу (а луч, прошедший рядом с ней, — давать
         // полутень кольцами).
-        far = distance - 0.35;
+        far = distance - LAMP_SHADOW_GAP;
         k_hard = 10.0;
         // Лампа, чей свет здесь всё равно не виден (меньше 0,3 % яркости), луча тени
         // не стоит.
