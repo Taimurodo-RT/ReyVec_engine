@@ -1195,6 +1195,60 @@ pub(crate) mod tests {
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
+    /// Границы частей внутри моделей (М.1): склад из стеллажей по 59 деталей рисуется
+    /// с границами и без — картинка та же, а деталей на расчёт сцены считается меньше.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn part_bounds_keep_the_frame() {
+        use std::sync::atomic::Ordering;
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 320,
+            height: 240,
+            time: 0.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/warehouse.ron").into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        SPACE_COUNTERS.set(true);
+        let on = render_headless(&options, &scene);
+        reyvec_sdf::shape3d::PART_BOUNDS.store(false, Ordering::Relaxed);
+        let off = render_headless(&options, &scene);
+        reyvec_sdf::shape3d::PART_BOUNDS.store(true, Ordering::Relaxed);
+        SPACE_COUNTERS.set(false);
+        let (on, off) = (on.expect("кадр с границами"), off.expect("кадр без границ"));
+        let (changed, worst, _) = image_diff(&on.image, &off.image);
+        eprintln!("границы частей: отличается {changed} пикселей, наибольшая {worst}");
+        assert!(changed <= 20 && worst <= 8, "{changed} пикселей, {worst}");
+        let prims = |image: &HeadlessImage| {
+            let rays = image.space_stats.expect("счётчики").rays.expect("лучи");
+            let c = rays[crate::counters::PASS_MARCH];
+            (c.prims, c.scene)
+        };
+        let ((p_on, s_on), (p_off, s_off)) = (prims(&on), prims(&off));
+        let per = |p: u64, s: u64| p as f64 / s.max(1) as f64;
+        eprintln!(
+            "примитивов на расчёт сцены: с границами {:.1}, без {:.1}",
+            per(p_on, s_on),
+            per(p_off, s_off)
+        );
+        assert!(p_on * 2 < p_off, "{p_on} из {p_off}");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
     /// Тени моделей от кирпичей поля (8.15) — почти те же, что от прежних заменителей из
     /// плоскостей граней: сцена моделей рисуется с кирпичами, с плоскостями и совсем без
     /// теней моделей. Кирпичи от плоскостей отличаются намного меньше, чем «без теней»

@@ -804,6 +804,13 @@ pub mod op {
     pub const UNION: u32 = 2;
     pub const SUBTRACT: u32 = 3;
     pub const INTERSECT: u32 = 4;
+    /// Граница части (М.1): слово команды (биты 8–15 — сколько итогов объединений с
+    /// вершины стека сравнивать, биты 16–31 — сколько слов части идёт следом), середина
+    /// шара-границы части в мире (3 числа), радиус и ширина плавного шва. Если точка от
+    /// шара не ближе наименьшего из итогов плюс ширина шва, часть итог не изменит: машина
+    /// кладёт на стек расстояние до шара и перепрыгивает слова части (её операция
+    /// объединения выполняется как обычно).
+    pub const SKIP: u32 = 5;
 }
 
 /// Виды примитивов (биты 8–15 слова команды).
@@ -843,6 +850,17 @@ pub const ESTIMATE_MATERIAL: u32 = u32::MAX;
 pub const MAX_PROGRAM_WORDS: usize = 16384;
 /// Слов на операцию.
 pub const OP_WORDS: usize = 2;
+/// Слов на границу части ([`op::SKIP`]).
+pub const SKIP_WORDS: usize = 6;
+
+/// Границы частей внутри формы (М.1): `false` — программа без слов [`op::SKIP`], как до
+/// М.1 (переключатель на панели, для сравнения времени).
+pub static PART_BOUNDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Включены ли границы частей ([`PART_BOUNDS`]).
+pub fn part_bounds() -> bool {
+    PART_BOUNDS.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Глубина стека машины в шейдере: столько форм может ждать операции одновременно.
 pub const STACK: usize = 8;
 
@@ -918,7 +936,15 @@ impl Placement {
 
 /// Дерево формы → программа.
 pub fn compile(shape: &Shape3) -> Result<Program, CompileError> {
-    let mut out = Emit::default();
+    compile_with(shape, part_bounds())
+}
+
+/// То же с границами частей (М.1) или без них, как ни стоит [`PART_BOUNDS`].
+pub fn compile_with(shape: &Shape3, part_bounds: bool) -> Result<Program, CompileError> {
+    let mut out = Emit {
+        part_bounds,
+        ..Emit::default()
+    };
     emit(shape, Placement::IDENTITY, 0, 0, &mut out)?;
     if out.words.len() > MAX_PROGRAM_WORDS {
         return Err(CompileError::TooLong);
@@ -950,6 +976,11 @@ struct Emit {
     words: Vec<u32>,
     fields: Vec<FieldRef>,
     bricks: Vec<BrickRef>,
+    /// Писать ли границы частей ([`op::SKIP`]).
+    part_bounds: bool,
+    /// Сколько итогов жёстких объединений лежит на стеке прямо под пишущейся формой
+    /// (М.1, [`union_slots`]).
+    hard: usize,
 }
 
 /// Пишет команды формы и возвращает, сколько места на стеке ей понадобилось (`base` уже
@@ -1070,11 +1101,15 @@ fn emit(
             cut,
             smooth,
         } => {
+            // Внутри вырезания итоги объединений снаружи для границ частей не годятся.
+            // (При ошибке программа не нужна, восстанавливать счёт незачем.)
+            let hard = std::mem::take(&mut out.hard);
             let mut need = emit(b, at, material, base, out)?;
             for c in cut {
                 need = need.max(1 + emit(c, at, material, base + 1, out)?);
                 out.words.extend([op::SUBTRACT, smooth.to_bits()]);
             }
+            out.hard = hard;
             Ok(need)
         }
         Shape3::Move {
@@ -1104,8 +1139,9 @@ fn emit(
                 shift: s * at.shift,
                 scale: at.scale,
             };
-            let need = emit(shape, at, material, base, out)?;
-            let need = need.max(1 + emit(shape, mirrored, material, base + 1, out)?);
+            let (first, second) = union_slots(out.hard, *smooth);
+            let need = part(shape, at, material, base, out, first)?;
+            let need = need.max(1 + part(shape, mirrored, material, base + 1, out, second)?);
             out.words.extend([op::UNION, smooth.to_bits()]);
             Ok(need)
         }
@@ -1140,12 +1176,157 @@ fn chain(
     out: &mut Emit,
 ) -> Result<usize, CompileError> {
     let (first, rest) = shapes.split_first().ok_or(CompileError::Empty)?;
-    let mut need = emit(first, at, material, base, out)?;
+    let (head, tail) = if code == op::UNION {
+        union_slots(out.hard, smooth)
+    } else {
+        (Slot::NONE, Slot::NONE)
+    };
+    let mut need = part(first, at, material, base, out, head)?;
     for s in rest {
-        need = need.max(1 + emit(s, at, material, base + 1, out)?);
+        need = need.max(1 + part(s, at, material, base + 1, out, tail)?);
         out.words.extend([code, smooth.to_bits()]);
     }
     Ok(need)
+}
+
+/// С чем часть сравнивает свою границу (М.1): с наименьшим из `count` итогов объединений
+/// на вершине стека плюс ширина шва `smooth`. `hard` — сколько итогов жёстких объединений
+/// лежит под частями внутри неё.
+#[derive(Clone, Copy)]
+struct Slot {
+    count: usize,
+    smooth: f32,
+    hard: usize,
+}
+
+impl Slot {
+    const NONE: Self = Self {
+        count: 0,
+        smooth: 0.0,
+        hard: 0,
+    };
+}
+
+/// Места первой и следующих частей объединения со швом `smooth`, если под ним лежат
+/// `hard` итогов жёстких объединений, в которые оно входит.
+///
+/// Жёсткое объединение — просто наименьшее: часть, до шара которой не ближе какого-то
+/// итога снаружи, итог всего объединения не изменит, и вместо неё можно положить на стек
+/// расстояние до шара (оно не меньше итога). Поэтому у жёстких объединений часть смотрит
+/// на все итоги снаружи, первая часть тоже. У плавного шов смешивает части, и обойти
+/// часть можно, только если она дальше итога этого же объединения на ширину шва (там
+/// плавное объединение — уже просто наименьшее); первую часть — нельзя, а внутри частей
+/// итоги снаружи не годятся.
+fn union_slots(hard: usize, smooth: f32) -> (Slot, Slot) {
+    if smooth == 0.0 {
+        let first = Slot {
+            count: hard,
+            smooth: 0.0,
+            hard,
+        };
+        let rest = Slot {
+            count: hard + 1,
+            smooth: 0.0,
+            hard: hard + 1,
+        };
+        (first, rest)
+    } else {
+        let rest = Slot {
+            count: 1,
+            smooth: smooth.max(0.0),
+            hard: 0,
+        };
+        (Slot::NONE, rest)
+    }
+}
+
+/// Пишет часть объединения с её границей ([`op::SKIP`]), если граница нужна.
+fn part(
+    shape: &Shape3,
+    at: Placement,
+    material: u32,
+    base: usize,
+    out: &mut Emit,
+    slot: Slot,
+) -> Result<usize, CompileError> {
+    let header = (out.part_bounds && slot.count > 0)
+        .then(|| part_bound(shape, at, slot))
+        .flatten();
+    let mark = out.words.len();
+    if let Some(words) = header {
+        out.words.extend(words);
+    }
+    let hard = std::mem::replace(&mut out.hard, slot.hard);
+    let need = emit(shape, at, material, base, out)?;
+    out.hard = hard;
+    if header.is_some() {
+        let len = out.words.len() - mark - SKIP_WORDS;
+        if len > 0xffff {
+            return Err(CompileError::TooLong);
+        }
+        out.words[mark] |= (len as u32) << 16;
+    }
+    Ok(need)
+}
+
+/// Слова границы части `shape` (М.1), если она нужна: часть из нескольких примитивов
+/// (одиночный простой примитив считается не дольше самой проверки), конечная, без полей
+/// слоя и кирпичей (их зеркало на процессоре читает поля по порядку). Длина пропуска
+/// дописывается после части.
+fn part_bound(shape: &Shape3, at: Placement, slot: Slot) -> Option<[u32; SKIP_WORDS]> {
+    if single_primitive(shape) || holds_textures(shape) || slot.count > 0xff {
+        return None;
+    }
+    let (c, r) = shape.bounds()?;
+    // Мир → форма: local = rot · p + shift, значит p = rot⁻¹ · (local − shift).
+    let inv = at.rot.inverse();
+    if !inv.is_finite() {
+        return None;
+    }
+    let center = inv * (c - at.shift);
+    let radius = r * at.scale;
+    Some([
+        op::SKIP | (slot.count as u32) << 8,
+        center.x.to_bits(),
+        center.y.to_bits(),
+        center.z.to_bits(),
+        radius.to_bits(),
+        slot.smooth.to_bits(),
+    ])
+}
+
+/// Форма — один простой примитив (со сдвигами и материалом вокруг).
+fn single_primitive(shape: &Shape3) -> bool {
+    match shape {
+        Shape3::Move { shape, .. } | Shape3::Paint { shape, .. } => single_primitive(shape),
+        Shape3::Sphere { .. }
+        | Shape3::Box { .. }
+        | Shape3::Capsule { .. }
+        | Shape3::Cylinder { .. }
+        | Shape3::Torus { .. }
+        | Shape3::Cone { .. }
+        | Shape3::Plane { .. } => true,
+        _ => false,
+    }
+}
+
+/// В форме есть поле слоя или кирпич поля.
+fn holds_textures(shape: &Shape3) -> bool {
+    match shape {
+        Shape3::Field { .. } | Shape3::Brick { .. } => true,
+        Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => {
+            shapes.iter().any(holds_textures)
+        }
+        Shape3::Subtract { base, cut, .. } => {
+            holds_textures(base) || cut.iter().any(holds_textures)
+        }
+        Shape3::Move { shape, .. }
+        | Shape3::Paint { shape, .. }
+        | Shape3::Animate { shape, .. }
+        | Shape3::Mirror { shape, .. }
+        | Shape3::Repeat { shape, .. } => holds_textures(shape),
+        _ => false,
+    }
 }
 
 impl Program {
@@ -1203,7 +1384,9 @@ impl Program {
         let mut ops = 0usize;
         let mut i = 0;
         while i < w.len() {
-            if w[i] & 0xff == op::PRIM {
+            if w[i] & 0xff == op::SKIP {
+                i += SKIP_WORDS;
+            } else if w[i] & 0xff == op::PRIM {
                 depth += 1;
                 if depth > 2 {
                     return false;
@@ -1225,6 +1408,12 @@ impl Program {
     /// шейдер по этой программе. Материал [`ESTIMATE_MATERIAL`] — ближайшая часть —
     /// поле слоя, и там оно только оценка снизу (7.18б).
     pub fn distance(&self, p: Vec3) -> (f32, u32) {
+        self.distance_counted(p).0
+    }
+
+    /// То же и сколько примитивов пришлось посчитать (М.1: счётчик «примитивов на шаг»).
+    pub fn distance_counted(&self, p: Vec3) -> ((f32, u32), usize) {
+        let mut prims = 0;
         let w = &self.words;
         let f = |i: usize| f32::from_bits(w[i]);
         let mut stack: Vec<(f32, u32)> = Vec::with_capacity(STACK);
@@ -1233,7 +1422,26 @@ impl Program {
         let mut bricks = self.bricks.iter();
         while i < w.len() {
             let code = w[i] & 0xff;
-            if code == op::PRIM {
+            if code == op::SKIP {
+                // Граница части (М.1): то же правило, что в шейдере.
+                let count = ((w[i] >> 8) & 0xff) as usize;
+                let len = (w[i] >> 16) as usize;
+                if count > 0 && stack.len() >= count {
+                    let near = stack[stack.len() - count..]
+                        .iter()
+                        .map(|s| s.0)
+                        .fold(f32::MAX, f32::min);
+                    let center = Vec3::new(f(i + 1), f(i + 2), f(i + 3));
+                    let outside = (p - center).length() - f(i + 4);
+                    if outside >= near + f(i + 5) {
+                        stack.push((outside, 0));
+                        i += SKIP_WORDS + len;
+                        continue;
+                    }
+                }
+                i += SKIP_WORDS;
+            } else if code == op::PRIM {
+                prims += 1;
                 let kind = (w[i] >> 8) & 0xff;
                 let mut material = w[i + 1];
                 let m = |r: usize| Vec3::new(f(i + 2 + 4 * r), f(i + 3 + 4 * r), f(i + 4 + 4 * r));
@@ -1306,7 +1514,7 @@ impl Program {
                 i += OP_WORDS;
             }
         }
-        stack.pop().unwrap_or((f32::MAX, 0))
+        (stack.pop().unwrap_or((f32::MAX, 0)), prims)
     }
 }
 
@@ -1656,6 +1864,124 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Стеллаж из многих деталей (М.1): стойки, полки, ящики с плавными швами, повтор,
+    /// зеркало, сдвиг с поворотом и масштабом.
+    fn m1_rack() -> Shape3 {
+        let post = |x: f32, z: f32| Shape3::Move {
+            at: [x, 1.0, z],
+            turn: [0.0; 3],
+            scale: 1.0,
+            shape: Box::new(Shape3::Box {
+                size: [0.08, 2.0, 0.08],
+                round: 0.01,
+            }),
+        };
+        let shelf = |y: f32| Shape3::Move {
+            at: [0.0, y, 0.0],
+            turn: [0.0; 3],
+            scale: 1.0,
+            shape: Box::new(Shape3::Box {
+                size: [1.0, 0.05, 0.5],
+                round: 0.0,
+            }),
+        };
+        let crate_ = |x: f32, y: f32| {
+            Shape3::Move {
+                at: [x, y, 0.0],
+                turn: [0.0, 15.0, 0.0],
+                scale: 1.0,
+                shape: Box::new(Shape3::Subtract {
+                    base: Box::new(Shape3::Box {
+                        size: [0.3, 0.3, 0.3],
+                        round: 0.02,
+                    }),
+                    cut: vec![Shape3::Sphere { radius: 0.17 }],
+                    smooth: 0.02,
+                }),
+            }
+            .paint(2)
+        };
+        let unit = Shape3::Union {
+            shapes: vec![
+                Shape3::Mirror {
+                    axis: Axis::X,
+                    smooth: 0.0,
+                    shape: Box::new(Shape3::Union {
+                        shapes: vec![post(0.48, 0.22), post(0.48, -0.22)],
+                        smooth: 0.0,
+                    }),
+                }
+                .paint(1),
+                Shape3::Union {
+                    shapes: vec![shelf(0.3), shelf(1.0), shelf(1.7)],
+                    smooth: 0.03,
+                },
+                crate_(-0.25, 0.48),
+                crate_(0.2, 1.18),
+            ],
+            smooth: 0.02,
+        };
+        Shape3::Move {
+            at: [-2.0, 0.0, 0.5],
+            turn: [0.0, 30.0, 5.0],
+            scale: 1.3,
+            shape: Box::new(Shape3::Repeat {
+                count: 6,
+                step: [1.1, 0.0, 0.0],
+                smooth: 0.0,
+                shape: Box::new(unit),
+            }),
+        }
+    }
+
+    #[test]
+    fn m1_part_bounds_keep_distance_and_material() {
+        let mut shapes = m0b_shapes();
+        shapes.push(m1_rack());
+        for shape in shapes {
+            let plain = compile_with(&shape, false).unwrap();
+            let fast = compile_with(&shape, true).unwrap();
+            for x in -40..=40 {
+                for y in -10..=30 {
+                    for z in -12..=12 {
+                        let p = Vec3::new(x as f32 * 0.17, y as f32 * 0.11, z as f32 * 0.19);
+                        let (a, b) = (plain.distance(p), fast.distance(p));
+                        assert!(
+                            (a.0 - b.0).abs() <= 1e-5 * a.0.abs().max(1.0),
+                            "{p}: без границ {a:?}, с границами {b:?}"
+                        );
+                        assert_eq!(a.1, b.1, "{p}: материал");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn m1_part_bounds_cut_primitives_per_step() {
+        let shape = m1_rack();
+        let plain = compile_with(&shape, false).unwrap();
+        let fast = compile_with(&shape, true).unwrap();
+        assert!(fast.words.len() > plain.words.len());
+        // Без границ каждая точка считает все примитивы.
+        let all = plain.distance_counted(Vec3::ZERO).1;
+        assert_eq!(all, 6 * 11);
+        let (mut sum, mut n) = (0, 0);
+        for x in -40..=40 {
+            for y in -10..=30 {
+                let p = Vec3::new(x as f32 * 0.17, y as f32 * 0.11, 0.3);
+                assert_eq!(plain.distance_counted(p).1, all);
+                sum += fast.distance_counted(p).1;
+                n += 1;
+            }
+        }
+        let mean = sum as f32 / n as f32;
+        assert!(
+            mean < all as f32 * 0.4,
+            "в среднем {mean} примитивов из {all}"
+        );
     }
 
     #[test]

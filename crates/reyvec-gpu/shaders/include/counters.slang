@@ -1,12 +1,12 @@
 // Счётчики работы лучей (7.18д2): сколько лучей, шагов, вычислений сцены, объектов,
-// программ форм и чтений поля слоя сделал проход. Есть только в вариантах шейдеров
+// программ форм, примитивов (М.1) и чтений поля слоя сделал проход. Есть только в вариантах шейдеров
 // `*_counted.slang` (там определён SPACE_COUNTERS); в обычных count_* пусты и
 // исчезают при сборке, поэтому замер времени по обычным шейдерам честный.
 // Сложение в буфер — counters_flush в space.slang. Раскладка — space_counters в
 // crates/reyvec-gpu/src/demo.rs.
 
 // Как COUNTERS, COUNTER_SPREAD и номера проходов в demo.rs.
-static const uint COUNTERS = 8;
+static const uint COUNTERS = 9;
 static const uint COUNTER_SPREAD = 32;
 static const uint PASS_CONE = 0;
 static const uint PASS_MARCH = 1;
@@ -28,6 +28,7 @@ static uint counted_objects = 0;
 static uint counted_forms = 0;
 static uint counted_field = 0;
 static uint counted_material = 0;
+static uint counted_prims = 0;
 void count_ray() { counted_rays++; }
 void count_step() { counted_steps++; }
 void count_scene() { counted_scene++; }
@@ -36,6 +37,7 @@ void count_object() { counted_objects++; }
 void count_form() { counted_forms++; }
 void count_field() { counted_field++; }
 void count_material() { counted_material++; }
+void count_prim() { counted_prims++; }
 void counters_reset()
 {
     counted_rays = 0;
@@ -46,6 +48,7 @@ void counters_reset()
     counted_forms = 0;
     counted_field = 0;
     counted_material = 0;
+    counted_prims = 0;
 }
 #else
 void count_ray() {}
@@ -56,5 +59,6 @@ void count_object() {}
 void count_form() {}
 void count_field() {}
 void count_material() {}
+void count_prim() {}
 void counters_reset() {}
 #endif

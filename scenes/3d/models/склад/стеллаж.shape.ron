@@ -1,0 +1,48 @@
+// Стеллаж склада (М.1): 59 деталей — стойки, полки, бортики, раскосы, ящики, бочки.
+// Модель для замера границ частей: без них каждый шаг луча возле стеллажа считал все
+// 59 деталей, с ними — только те, что рядом. Своя работа, CC0.
+(
+    format: "reyvec-shape",
+    version: 1,
+    materials: [
+        (name: "сталь", color: "#3d6fa8"),
+        (name: "полка", color: "#c98a2e"),
+        (name: "ящик", color: "#a8794a"),
+        (name: "лента", color: "#5a3d22"),
+        (name: "бочка", color: "#8a2f2a"),
+        (name: "обруч", color: "#6f7378"),
+    ],
+    shape: Union(shapes: [
+        // Стойки и пятки: одна и три её зеркала.
+        Paint(material: 0, shape: Mirror(axis: X, shape: Mirror(axis: Z, shape: Union(shapes: [
+            Move(at: (0.95, 1.1, 0.27), shape: Box(size: (0.06, 2.2, 0.06), round: 0.005)),
+            Move(at: (0.95, 0.01, 0.27), shape: Box(size: (0.14, 0.02, 0.14), round: 0.004)),
+        ])))),
+        // Раскосы на задней стенке: три пары крест-накрест.
+        Paint(material: 0, shape: Repeat(count: 3, step: (0.0, 0.6, 0.0), shape:
+            Mirror(axis: X, shape: Move(at: (0.0, 0.5, -0.27), turn: (0.0, 0.0, 15.0),
+                shape: Box(size: (1.9, 0.025, 0.02)))))),
+        // Полки и бортики спереди и сзади.
+        Repeat(count: 4, step: (0.0, 0.55, 0.0), shape: Union(shapes: [
+            Paint(material: 1, shape: Move(at: (0.0, 0.45, 0.0),
+                shape: Box(size: (1.92, 0.04, 0.6), round: 0.004))),
+            Paint(material: 0, shape: Mirror(axis: Z, shape: Move(at: (0.0, 0.49, 0.29),
+                shape: Box(size: (1.92, 0.05, 0.02))))),
+        ])),
+        // Ящики на трёх верхних полках: 4 в ряд, у каждого лента поперёк.
+        Repeat(count: 3, step: (0.0, 0.55, 0.0), shape:
+            Repeat(count: 4, step: (0.45, 0.0, 0.0), shape: Union(shapes: [
+                Paint(material: 2, shape: Move(at: (-0.68, 1.19, 0.0),
+                    shape: Box(size: (0.36, 0.34, 0.42), round: 0.01))),
+                Paint(material: 3, shape: Move(at: (-0.68, 1.19, 0.0),
+                    shape: Box(size: (0.06, 0.35, 0.43)))),
+            ]))),
+        // Бочки на нижней полке: корпус и два обруча.
+        Repeat(count: 3, step: (0.62, 0.0, 0.0), shape: Union(shapes: [
+            Paint(material: 4, shape: Move(at: (-0.62, 0.69, 0.0),
+                shape: Cylinder(height: 0.44, radius: 0.2, round: 0.02))),
+            Paint(material: 5, shape: Repeat(count: 2, step: (0.0, 0.26, 0.0), shape:
+                Move(at: (-0.62, 0.56, 0.0), shape: Torus(radius: 0.2, thickness: 0.012)))),
+        ])),
+    ]),
+)

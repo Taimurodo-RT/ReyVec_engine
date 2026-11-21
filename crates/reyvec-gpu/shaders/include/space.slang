@@ -464,6 +464,7 @@ void counters_flush_key(uint pass, bool helper, uint spread, uint key)
     counter_add(out, pass, 5, s, counted_forms, helper, writer);
     counter_add(out, pass, 6, s, counted_field, helper, writer);
     counter_add(out, pass, 7, s, counted_material, helper, writer);
+    counter_add(out, pass, 8, s, counted_prims, helper, writer);
     counters_reset();
 }
 

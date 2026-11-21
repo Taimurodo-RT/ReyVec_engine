@@ -36,7 +36,7 @@ pub const PASS_EDGES: usize = 4;
 #[cfg_attr(not(test), allow(dead_code))]
 pub const PASS_EDGE_SHADOWS: usize = 5;
 /// Счётчиков у прохода (поля [`RayCounts`] по порядку).
-const COUNTERS: usize = 8;
+const COUNTERS: usize = 9;
 /// Копий каждого счётчика.
 const COUNTER_SPREAD: usize = 32;
 /// Номер прохода «края 3D: поиск» (PASS_EDGE_FIND, 8.11а): в его словах — [`EdgeCounts`].
@@ -65,6 +65,8 @@ pub struct RayCounts {
     pub field: u64,
     /// Чтений картинки материалов поля слоя.
     pub material: u64,
+    /// Примитивов, посчитанных в формах (М.1: границы частей их сокращают).
+    pub prims: u64,
 }
 
 impl RayCounts {
@@ -77,7 +79,8 @@ impl RayCounts {
             4 => &mut self.objects,
             5 => &mut self.forms,
             6 => &mut self.field,
-            _ => &mut self.material,
+            7 => &mut self.material,
+            _ => &mut self.prims,
         };
         *slot = slot.wrapping_add(value);
     }
@@ -149,7 +152,8 @@ pub(crate) fn sum(words: &[u32]) -> [RayCounts; RAY_PASSES] {
 /// Счётчики краёв (8.11а) из слов буфера.
 pub(crate) fn edges(words: &[u32]) -> EdgeCounts {
     let mut out = EdgeCounts::default();
-    for counter in 0..COUNTERS {
+    // У поиска краёв восемь счётчиков, девятое слово прохода не пишется.
+    for counter in 0..8 {
         out.add(counter, total(words, PASS_EDGE_FIND, counter));
     }
     out
