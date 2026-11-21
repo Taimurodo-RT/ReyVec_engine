@@ -20,6 +20,7 @@ static const uint OP_PRIM = 1;
 static const uint OP_UNION = 2;
 static const uint OP_SUBTRACT = 3;
 static const uint OP_INTERSECT = 4;
+static const uint OP_SKIP = 5;
 
 static const uint PRIM_SPHERE = 0;
 static const uint PRIM_BOX = 1;
@@ -42,6 +43,8 @@ static const uint FIELD_PRIM_WORDS = 12;
 // nz, 1 запасное (brick3d::BRICK_PRIM_WORDS).
 static const uint BRICK_PRIM_WORDS = 8;
 static const uint OP_WORDS = 2;
+// Слов на границу части (OP_SKIP, М.1): команда, середина шара, радиус, ширина шва.
+static const uint SKIP_WORDS = 6;
 static const uint SDF_STACK = 8;
 
 float sd3_sphere(float3 p, float r)
@@ -252,6 +255,7 @@ float op3_intersect(float a, float b, float k)
 // Один примитив, записанный с слова `i`: расстояние (уже с масштабом) и материал.
 float2 sdf_primitive(uint* code, uint i, float3 p)
 {
+    count_prim();
     uint kind = (code[i] >> 8) & 0xff;
     float material = float(code[i + 1]);
     float4 r0 = float4(asfloat(code[i + 2]), asfloat(code[i + 3]), asfloat(code[i + 4]), asfloat(code[i + 5]));
@@ -381,6 +385,17 @@ float level_field_material(uint* code, uint i, float3 p)
     return floor(id * 65535.0 + 0.5);
 }
 
+// Граница части (М.1, слова OP_SKIP с `i`): true, если часть итог объединения не
+// изменит; `outside` — расстояние до шара части. `near` — наименьший из итогов объединений, с которыми
+// сравнивает часть: если точка от шара не ближе него плюс ширина шва, вместо части на
+// стек кладётся расстояние до шара (shape3d::op::SKIP).
+bool skip_part(uint* code, uint i, float3 p, float near, out float outside)
+{
+    float3 c = float3(asfloat(code[i + 1]), asfloat(code[i + 2]), asfloat(code[i + 3]));
+    outside = length(p - c) - asfloat(code[i + 4]);
+    return outside >= near + asfloat(code[i + 5]);
+}
+
 // Расстояние до формы (x) и материал ближайшей части (y, номер как float) по программе
 // из `len` слов, начиная с `start`.
 float2 sdf_program(uint* code, uint start, uint len, float3 p)
@@ -400,6 +415,27 @@ float2 sdf_program(uint* code, uint start, uint len, float3 p)
                 stack[top] = s;
             top++;
             i += PRIM_WORDS + (word >> 16);
+        }
+        else if (op == OP_SKIP)
+        {
+            // Граница части (М.1): сравниваем с наименьшим из `count` итогов на вершине.
+            int count = int((word >> 8) & 0xff);
+            float d = 0.0;
+            bool skip = false;
+            if (count > 0 && top >= count && top < int(SDF_STACK))
+            {
+                float near = stack[top - 1].x;
+                for (int k = 2; k <= count; k++)
+                    near = min(near, stack[top - k].x);
+                skip = skip_part(code, i, p, near, d);
+            }
+            i += SKIP_WORDS;
+            if (skip)
+            {
+                stack[top] = float2(d, 0.0);
+                top++;
+                i += word >> 16;
+            }
         }
         else
         {
@@ -451,6 +487,18 @@ float2 sdf_chain(uint* code, uint start, uint len, float3 p)
                 next = s;
             first = false;
             i += PRIM_WORDS + (word >> 16);
+        }
+        else if (op == OP_SKIP)
+        {
+            // Здесь итог один — acc.
+            float d = 0.0;
+            bool skip = !first && ((word >> 8) & 0xff) != 0 && skip_part(code, i, p, acc.x, d);
+            i += SKIP_WORDS;
+            if (skip)
+            {
+                next = float2(d, 0.0);
+                i += word >> 16;
+            }
         }
         else
         {

@@ -253,6 +253,8 @@ pub(crate) struct PackCache {
     pub grid: reyvec_sdf::grid3d::GridCache,
     meshes: Vec<(reyvec_sdf::space_file::MeshFrame, Vec<u32>)>,
     programs: Vec<CachedProgram>,
+    /// С какими границами частей (М.1) собраны запомненные программы.
+    part_bounds: bool,
 }
 
 /// То же, что [`pack_with`], с готовым из `cache`; слова те же.
@@ -264,6 +266,14 @@ pub(crate) fn pack_cached(
     grid: GridOptions,
     cache: &mut PackCache,
 ) -> Packed {
+    // Переключили границы частей (М.1) — запомненные программы и сетка собраны по-старому.
+    let part_bounds = reyvec_sdf::shape3d::part_bounds();
+    if cache.part_bounds != part_bounds {
+        *cache = PackCache {
+            part_bounds,
+            ..PackCache::default()
+        };
+    }
     let mut programs = programs_cached(frame, Some(&mut cache.programs));
     // Шейдер читает не больше MAX_OBJECTS объектов и молча пропускает остальные:
     // обрезаем список здесь, чтобы зеркало на процессоре (сетка отсева) видело то же.

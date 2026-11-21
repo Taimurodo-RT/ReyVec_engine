@@ -52,6 +52,8 @@ pub(crate) enum PanelAction {
     EdgeFar(bool),
     /// Тени моделей от кирпичей поля (8.15).
     BrickShadows(bool),
+    /// Границы частей внутри моделей (М.1).
+    PartBounds(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -171,6 +173,8 @@ pub(crate) struct PanelInfo<'a> {
     pub edge_far: bool,
     /// Тени моделей от кирпичей поля (8.15).
     pub brick_shadows: bool,
+    /// Границы частей внутри моделей (М.1).
+    pub part_bounds: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -1046,6 +1050,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 {
                     actions.push(PanelAction::BrickShadows(bricks));
                 }
+                let mut parts = info.part_bounds;
+                if ui
+                    .checkbox(&mut parts, "Границы частей внутри моделей")
+                    .on_hover_text(
+                        "М.1: у модели из многих деталей шаг луча не считает детали, до \
+                     которых заведомо дальше, чем до уже найденной. Вид тот же. \
+                     Выключите, чтобы сравнить время «лучей 3D» с прежним, где каждый \
+                     шаг считал все детали",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::PartBounds(parts));
+                }
                 ui.label("Замер краёв 3D").on_hover_text(
                     "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
                  По разнице времени строки «края 3D» с «как обычно» видно, сколько стоит \
@@ -1544,8 +1561,8 @@ fn ray_count_lines(rays: &[reyvec_gpu::RayCounts; reyvec_gpu::RAY_PASSES]) -> Ve
     let mut lines = vec![
         "Лучи 3D за кадр (счётчики)".to_string(),
         format!(
-            "  {:<11}{:>11}{:>8}{:>15}{:>7}{:>6}{:>6}",
-            "проход", "лучей", "шаг/луч", "сцена/луч", "объект", "форма", "поле"
+            "  {:<11}{:>11}{:>8}{:>15}{:>7}{:>6}{:>6}{:>6}",
+            "проход", "лучей", "шаг/луч", "сцена/луч", "объект", "форма", "прим", "поле"
         ),
     ];
     for (name, c) in reyvec_gpu::RAY_PASS_NAMES.iter().zip(rays) {
@@ -1555,19 +1572,21 @@ fn ray_count_lines(rays: &[reyvec_gpu::RayCounts; reyvec_gpu::RAY_PASSES]) -> Ve
             format!("{:.1}", per(c.scene, c.rays))
         };
         lines.push(format!(
-            "  {name:<11}{:>11}{:>8.1}{scene:>15}{:>7.1}{:>6.1}{:>6.2}",
+            "  {name:<11}{:>11}{:>8.1}{scene:>15}{:>7.1}{:>6.1}{:>6.1}{:>6.2}",
             amount(c.rays),
             per(c.steps, c.rays),
             per(c.objects, c.scene),
             per(c.forms, c.scene),
+            per(c.prims, c.scene),
             per(c.field, c.scene),
         ));
     }
     let total = |f: fn(&reyvec_gpu::RayCounts) -> u64| rays.iter().map(f).sum::<u64>();
     lines.push(format!(
-        "  всего: сцена {}, форм {}, поле {}, материал {}",
+        "  всего: сцена {}, форм {}, примитивов {}, поле {}, материал {}",
         amount(total(|c| c.scene)),
         amount(total(|c| c.forms)),
+        amount(total(|c| c.prims)),
         amount(total(|c| c.field)),
         amount(total(|c| c.material)),
     ));
@@ -1672,6 +1691,7 @@ mod tests {
             forms: 12_441_600,
             field: 12_441_600,
             material: 2_073_600,
+            prims: 62_208_000,
         };
         let lines = ray_count_lines(&rays);
         assert_eq!(lines.len(), 2 + reyvec_gpu::RAY_PASSES + 1);
@@ -1684,7 +1704,10 @@ mod tests {
             march.contains("4.0") && march.contains("6.0 (2.0)"),
             "{march}"
         );
-        assert!(march.contains("3.0") && march.contains("1.00"), "{march}");
+        assert!(
+            march.contains("3.0") && march.contains("5.0") && march.contains("1.00"),
+            "{march}"
+        );
         assert!(
             lines[2].contains("грубо") && lines[2].contains(" 0.0"),
             "{}",
@@ -1838,6 +1861,7 @@ mod tests {
                         forms: 15_000_000,
                         field: 11_600_000,
                         material: 900_000,
+                        prims: 30_000_000,
                     }; reyvec_gpu::RAY_PASSES],
                 ),
                 edge_kinds: Some(reyvec_gpu::EdgeCounts {
@@ -1863,6 +1887,7 @@ mod tests {
             edge_shadow_reuse: true,
             edge_far: false,
             brick_shadows: true,
+            part_bounds: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

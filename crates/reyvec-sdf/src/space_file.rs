@@ -948,6 +948,43 @@ mod tests {
     }
 
     #[test]
+    fn warehouse_racks_skip_far_parts() {
+        // М.1: стеллаж из 59 деталей; границы частей не меняют расстояние и материал,
+        // но возле стеллажа считается меньше деталей.
+        use crate::shape3d::compile_with;
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/warehouse.ron");
+        let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
+        let frame = scene.frame(0.0);
+        assert_eq!(frame.shapes.len(), 9);
+        let rack = &frame.shapes[1];
+        let plain = compile_with(rack, false).unwrap();
+        let fast = compile_with(rack, true).unwrap();
+        let all = plain.distance_counted(glam::Vec3::ZERO).1;
+        assert_eq!(all, 59);
+        let (mut sum, mut n) = (0usize, 0usize);
+        for x in -30..=30 {
+            for y in 0..=24 {
+                for z in -8..=8 {
+                    let p =
+                        glam::Vec3::new(x as f32 * 0.1 - 3.3, y as f32 * 0.1, z as f32 * 0.1 - 1.2);
+                    let (a, b) = (plain.distance(p), fast.distance(p));
+                    assert!(
+                        (a.0 - b.0).abs() <= 1e-5 * a.0.abs().max(1.0),
+                        "{p}: {a:?} {b:?}"
+                    );
+                    assert_eq!(a.1, b.1, "{p}: материал");
+                    sum += fast.distance_counted(p).1;
+                    n += 1;
+                }
+            }
+        }
+        let mean = sum as f32 / n as f32;
+        eprintln!("стеллаж: в среднем {mean:.1} деталей из {all}");
+        assert!(mean < all as f32 * 0.35, "в среднем {mean} из {all}");
+    }
+
+    #[test]
     fn model_errors_say_what_is_wrong() {
         let scene = |meshes: &str| {
             format!(
