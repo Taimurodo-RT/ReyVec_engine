@@ -502,6 +502,14 @@ impl WindowRenderer {
         }
     }
 
+    /// Текст сцены «3D» из папки `dir` (там ищутся `models/` и файлы моделей): так
+    /// редактор показывает модель формы на подставке (М.2). Ошибка — как у
+    /// [`WindowRenderer::set_space_file`].
+    pub fn set_space_file_in(&mut self, text: &str, dir: Option<std::path::PathBuf>) {
+        self.files.space_dir = dir;
+        self.set_space_file(text);
+    }
+
     /// Другой файл сцены той же папки (N в сцене из файла, 6.13): персонаж встаёт на
     /// место из нового файла.
     pub fn switch_scene_file(&mut self, text: &str) {

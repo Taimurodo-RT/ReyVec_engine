@@ -148,6 +148,24 @@ pub(crate) enum Action {
         field: &'static str,
         index: usize,
     },
+    /// Открыть модель формы на подставке (М.2, двойной щелчок в Ассетах).
+    OpenShape(std::path::PathBuf),
+    /// Закрыть подставку, вернуться к сцене.
+    CloseShape,
+    /// Вращать модель на подставке или остановить.
+    ShapeSpin(bool),
+    /// Камера подставки как при открытии.
+    ShapeHome,
+}
+
+/// Модель на подставке «Форм» (М.2).
+pub(crate) struct ShapeInfo<'a> {
+    /// Имя модели (`склад/стеллаж`).
+    pub name: &'a str,
+    /// Модель вращается сама.
+    pub spin: bool,
+    /// Ошибка в файле модели.
+    pub error: Option<&'a str>,
 }
 
 /// Что интерфейсу показать в этом кадре.
@@ -190,6 +208,8 @@ pub(crate) struct Info<'a> {
     pub time_scale: f64,
     /// Идёт симуляция (без управления героем).
     pub simulating: bool,
+    /// Открыта модель во «Формах»: окно сцены показывает её, а не сцену.
+    pub shape: Option<ShapeInfo<'a>>,
 }
 
 /// Состояние интерфейса между кадрами.
@@ -484,6 +504,9 @@ impl EditorUi {
             });
         } else if esc && info.play != PlayState::Edit {
             self.actions.push(Action::Stop);
+        } else if esc && info.shape.is_some() && !ctx.egui_wants_keyboard_input() {
+            self.actions.push(Action::CloseShape);
+            return;
         }
         if info.play != PlayState::Edit {
             if ctx.input(|i| i.key_pressed(Key::F8)) {
@@ -625,6 +648,83 @@ impl EditorUi {
         }
         if esc && self.vp.drag.is_none() {
             self.selected = None;
+        }
+    }
+
+    /// Окно сцены во «Формах» (М.2): движок рисует модель на подставке; сверху полоса с
+    /// именем модели и кнопками, мышь поворачивает камеру.
+    fn shape_view(&mut self, ui: &mut Ui, shape: &ShapeInfo) {
+        let full = ui.max_rect();
+        let bar = Rect::from_min_size(full.min, vec2(full.width(), TOOLBAR_HEIGHT));
+        let rect = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
+        self.viewport = Some(rect);
+        ui.painter().rect_filled(bar, 0, PANEL);
+        ui.painter()
+            .hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(LINE, BORDER));
+        let actions = &mut self.actions;
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(bar.shrink2(vec2(GAP_L, 0.0)))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.label(
+                    RichText::new(format!("Форма: {}", shape.name))
+                        .size(FONT_CHIP)
+                        .color(TEXT),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = GAP_M;
+                    if ui
+                        .button(RichText::new("Закрыть").size(FONT_CHIP))
+                        .on_hover_text("Вернуться к сцене (Esc)")
+                        .clicked()
+                    {
+                        actions.push(Action::CloseShape);
+                    }
+                    if ui
+                        .button(RichText::new("Вид спереди").size(FONT_CHIP))
+                        .on_hover_text("Камера как при открытии, модель снова вращается")
+                        .clicked()
+                    {
+                        actions.push(Action::ShapeHome);
+                    }
+                    let mut spin = shape.spin;
+                    if ui
+                        .checkbox(&mut spin, RichText::new("Вращать").size(FONT_CHIP))
+                        .on_hover_text("Модель медленно поворачивается на подставке")
+                        .changed()
+                    {
+                        actions.push(Action::ShapeSpin(spin));
+                    }
+                });
+            },
+        );
+        let response = ui.interact(
+            rect,
+            ui.scope_id().with("shape-view"),
+            Sense::click_and_drag(),
+        );
+        self.viewport_hovered = response.hovered() || response.dragged();
+        let d = response.drag_delta();
+        if response.dragged() && d != Vec2::ZERO {
+            self.actions.push(Action::Pan(d));
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        }
+        let painter = ui.painter_at(rect);
+        chip(
+            &painter,
+            rect.left_top() + vec2(12.0, 12.0),
+            "Перетаскивайте — повернуть, колесо — ближе. Сохраните файл модели — она \
+             перечитается сама. Esc — назад к сцене",
+            MUTED,
+        );
+        if let Some(e) = shape.error {
+            chip(
+                &painter,
+                rect.left_top() + vec2(12.0, 40.0),
+                &format!("Ошибка в модели: {e}"),
+                BAD,
+            );
         }
     }
 
@@ -963,7 +1063,12 @@ impl EditorUi {
             // Ассеты прокручивают дерево и плитки сами, профайлер раскладывается в колонки
             // по месту и прокрутки не имеет.
             match tab {
-                Tab::Assets => return self.assets.draw(ui),
+                Tab::Assets => {
+                    if let Some(path) = self.assets.draw(ui) {
+                        self.actions.push(Action::OpenShape(path));
+                    }
+                    return;
+                }
                 Tab::Profiler => return profiler(ui, info, &self.frames),
                 // Фильтр и «Очистить» над прокруткой: всегда на виду.
                 Tab::Console => console_bar(ui, &mut self.log_filter, &mut self.log),
@@ -1471,6 +1576,9 @@ impl EditorUi {
     }
 
     fn scene_view(&mut self, ui: &mut Ui, info: &Info) {
+        if let Some(shape) = &info.shape {
+            return self.shape_view(ui, shape);
+        }
         let full = ui.max_rect();
         let editing = info.play == PlayState::Edit;
         let bar = Rect::from_min_size(full.min, vec2(full.width(), TOOLBAR_HEIGHT));
@@ -2843,6 +2951,7 @@ mod tests {
             ejected: false,
             time_scale: 1.0,
             simulating: false,
+            shape: None,
         }
     }
 
@@ -2919,6 +3028,24 @@ mod tests {
         assert_eq!(ui.take_actions(), vec![Action::Play]);
         frame(&ctx, &mut ui, &info(None, PlayState::Playing), vec![f5()]);
         assert_eq!(ui.take_actions(), vec![Action::Stop]);
+    }
+
+    #[test]
+    fn shape_view_closes_on_esc_and_shows_error() {
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Edit);
+        shape_info.shape = Some(ShapeInfo {
+            name: "склад/стеллаж",
+            spin: true,
+            error: Some("нет такого файла"),
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        assert!(ui.take_actions().is_empty(), "без нажатий нет действий");
+        assert!(ui.viewport().is_some(), "окно сцены занято подставкой");
+        let esc = key(egui::Key::Escape, egui::Modifiers::NONE);
+        frame(&ctx, &mut ui, &shape_info, vec![esc]);
+        assert_eq!(ui.take_actions(), vec![Action::CloseShape]);
     }
 
     fn pointer(pos: Pos2, pressed: Option<bool>) -> Vec<egui::Event> {
