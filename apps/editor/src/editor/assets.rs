@@ -1,11 +1,13 @@
 //! Вкладка «Ассеты»: дерево папок проекта слева, строка «крошек» (путь до открытой папки)
 //! и плитки файлов справа. Рисунок SVG можно перетащить в сцену — появится предмет с ним.
+//! Двойной щелчок по модели формы (`*.shape.ron`) открывает её на подставке «Форм» (М.2).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use egui::{Align2, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
+use super::shapes::is_shape;
 use super::theme::*;
 
 /// Папки, которые показываются в дереве: сцены и ассеты проекта.
@@ -119,12 +121,14 @@ impl Assets {
         self.root.as_ref()
     }
 
-    pub(crate) fn draw(&mut self, ui: &mut Ui) {
+    /// Рисует вкладку; возвращает файл модели формы, по которому дважды щёлкнули.
+    pub(crate) fn draw(&mut self, ui: &mut Ui) -> Option<PathBuf> {
         let Some(root) = &self.root else {
             ui.label(RichText::new("Папка проекта не найдена").color(MUTED));
-            return;
+            return None;
         };
         let mut go = None;
+        let mut opened = None;
         let tree_width = 180.0_f32.min(ui.available_width() * 0.4);
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
@@ -173,6 +177,14 @@ impl Assets {
                                 if drag {
                                     r.dnd_set_drag_payload(AssetFile(dir.path.join(f)));
                                 }
+                                if is_shape(f) {
+                                    let r = r.on_hover_text(
+                                        "Модель формы: двойной щелчок — открыть на подставке",
+                                    );
+                                    if r.double_clicked() {
+                                        opened = Some(dir.path.join(f));
+                                    }
+                                }
                             }
                         });
                     });
@@ -185,6 +197,7 @@ impl Assets {
             }
             self.current = p;
         }
+        opened
     }
 }
 

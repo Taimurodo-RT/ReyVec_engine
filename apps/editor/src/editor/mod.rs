@@ -25,6 +25,7 @@ mod outline;
 mod overlay;
 mod parts;
 mod ron_edit;
+mod shapes;
 mod theme;
 mod ui;
 mod viewport;
@@ -149,6 +150,7 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         restore,
         autosave_at: Instant::now(),
         autosaved: String::new(),
+        shape: None,
     };
     event_loop
         .run_app(&mut editor)
@@ -221,6 +223,8 @@ struct Editor {
     autosave_at: Instant,
     /// Что записано в автосохранение последним.
     autosaved: String,
+    /// Открытая во «Формах» модель (М.2): движок рисует её на подставке вместо сцены.
+    shape: Option<shapes::ShapeView>,
 }
 
 impl Editor {
@@ -261,6 +265,56 @@ impl Editor {
             self.ui.scene_changed(doc.file());
         }
         self.send_scene(now);
+    }
+
+    /// Открыть модель формы на подставке (М.2): движок рисует сцену «3D» из подставки.
+    fn open_shape(&mut self, path: PathBuf) {
+        if self.play != PlayState::Edit {
+            tracing::warn!("Во время игры модель не открыть: сначала «Стоп»");
+            return;
+        }
+        let mut shape = match shapes::ShapeView::open(path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("{e}");
+                return;
+            }
+        };
+        let Some(r) = self.renderer.as_mut() else {
+            return;
+        };
+        match shape.load() {
+            Some(text) => r.set_space_file_in(&text, Some(shape.root.clone())),
+            None => tracing::warn!(
+                "Модель {} не прочиталась: {}",
+                shape.name,
+                shape.error.as_deref().unwrap_or("")
+            ),
+        }
+        r.set_scene(DemoScene::Space);
+        r.set_space_camera(shape.camera());
+        tracing::info!("Формы: модель {}", shape.name);
+        self.shape = Some(shape);
+    }
+
+    /// Модель на подставке: перечитать сохранённый файл, повернуть камеру.
+    fn update_shape(&mut self) {
+        let (Some(shape), Some(r)) = (self.shape.as_mut(), self.renderer.as_mut()) else {
+            return;
+        };
+        if shape.changed() {
+            if let Some(text) = shape.load() {
+                r.set_space_file_in(&text, Some(shape.root.clone()));
+                tracing::info!("Модель {} перечитана", shape.name);
+            } else {
+                tracing::warn!(
+                    "Модель {}: {}",
+                    shape.name,
+                    shape.error.as_deref().unwrap_or("")
+                );
+            }
+        }
+        r.set_space_camera(shape.camera());
     }
 
     /// Камера сцены в точках интерфейса.
@@ -384,6 +438,10 @@ impl Editor {
         };
         match action {
             Action::Play | Action::Simulate => {
+                if self.shape.take().is_some() {
+                    // Играют в сцену, а не в модель на подставке.
+                    r.set_scene(DemoScene::File);
+                }
                 let simulate = action == Action::Simulate;
                 let camera = r.camera();
                 if !self.hidden.is_empty()
@@ -464,6 +522,28 @@ impl Editor {
             Action::Resize(dir) => {
                 if let Err(e) = w.drag_resize_window(dir) {
                     tracing::debug!("Окно не растягивается: {e}");
+                }
+            }
+            Action::Pan(d) if self.shape.is_some() => {
+                if let Some(shape) = self.shape.as_mut() {
+                    shape.orbit(d.x, d.y);
+                }
+            }
+            Action::OpenShape(path) => self.open_shape(path),
+            Action::CloseShape => {
+                if self.shape.take().is_some() {
+                    r.set_scene(DemoScene::File);
+                    tracing::info!("Формы закрыты, снова сцена");
+                }
+            }
+            Action::ShapeSpin(on) => {
+                if let Some(shape) = self.shape.as_mut() {
+                    shape.spin = on;
+                }
+            }
+            Action::ShapeHome => {
+                if let Some(shape) = self.shape.as_mut() {
+                    shape.home();
                 }
             }
             Action::Pan(d) => {
@@ -925,6 +1005,7 @@ impl Editor {
         if self.engine_stale {
             self.send_scene(false);
         }
+        self.update_shape();
         self.autosave();
         if self.frames >= 2 && !self.centered && self.ui.viewport().is_some() {
             // Камера уже встала на героя: дальше она не идёт за ним, пока не нажмут «Играть».
@@ -963,6 +1044,7 @@ impl Editor {
             .shader_error()
             .map(|e| format!("шейдер: {e}"))
             .or_else(|| renderer.scene_error());
+        let shape_error = self.shape.as_ref().and_then(|_| renderer.space_error());
         let doc = self.doc.as_ref();
         let error = doc
             .and_then(SceneDoc::error)
@@ -991,6 +1073,11 @@ impl Editor {
             ejected: self.ejected,
             time_scale: self.time_scale,
             simulating: self.simulating,
+            shape: self.shape.as_ref().map(|s| ui::ShapeInfo {
+                name: &s.name,
+                spin: s.spin,
+                error: s.error.as_deref().or(shape_error.as_deref()),
+            }),
         };
         let input = state.take_egui_input(window);
         let editor_ui = &mut self.ui;
@@ -1085,6 +1172,10 @@ impl Editor {
         if repeat {
             return;
         }
+        if self.shape.is_some() {
+            // Во «Формах» мышь и клавиши — камере подставки, не герою.
+            return;
+        }
         let over_scene = self.ui.viewport_hovered();
         match input {
             Input::Key(_) if self.egui_ctx.egui_wants_keyboard_input() => return,
@@ -1164,7 +1255,9 @@ impl ApplicationHandler for Editor {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
                     MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
                 };
-                if let (Some(r), Some(w)) = (self.renderer.as_mut(), &self.window) {
+                if let Some(shape) = self.shape.as_mut() {
+                    shape.zoom(steps as f32);
+                } else if let (Some(r), Some(w)) = (self.renderer.as_mut(), &self.window) {
                     let size = w.inner_size();
                     let at = self
                         .cursor

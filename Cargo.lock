@@ -3343,9 +3343,11 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "egui-winit",
+ "glam 0.30.10",
  "reyvec-app",
  "reyvec-gpu",
  "reyvec-scene",
+ "reyvec-sdf",
  "reyvec-vector",
  "tracing",
  "winit",
