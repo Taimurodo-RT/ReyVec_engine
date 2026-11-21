@@ -1,0 +1,12 @@
+// Стеллаж: две стойки и две полки. Модель цеха factory.ron, собрана скриптом factory.py (CC0).
+// Цвет даёт предмет сцены (material), поэтому своих материалов у модели нет.
+(
+    format: "reyvec-shape",
+    version: 1,
+    shape: Union(shapes: [
+        Move(at: (-0.95, 0.00, 0.00), shape: Box(size: (0.06, 2.00, 0.80))),
+        Move(at: (0.95, 0.00, 0.00), shape: Box(size: (0.06, 2.00, 0.80))),
+        Move(at: (0.00, -0.55, 0.00), shape: Box(size: (1.96, 0.05, 0.80))),
+        Move(at: (0.00, 0.15, 0.00), shape: Box(size: (1.96, 0.05, 0.80))),
+    ]),
+)
