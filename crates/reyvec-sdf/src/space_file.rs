@@ -555,7 +555,10 @@ impl SpaceScene {
             .objects
             .iter()
             .map(|o| {
-                !moves(&o.bob, &o.circle, &o.spin) && !matches!(o.shape, Shape3::Animate { .. })
+                // Форма, части которой движутся внутри (8.20е), тоже не неподвижна.
+                !moves(&o.bob, &o.circle, &o.spin)
+                    && !matches!(o.shape, Shape3::Animate { .. })
+                    && !o.shape.morphs()
             })
             .collect();
         let mut shapes: Vec<Shape3> = self
