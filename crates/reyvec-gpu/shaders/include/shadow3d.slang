@@ -305,10 +305,15 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
     else
     {
         rel = p - read_lamp(square).at;
-        // Лампа сцены «3D» смотрит вниз (8.20в2): нормаль — в оси её вида (map_reference
-        // сравнивает её с направлениями вида; rel·n от поворота не зависит).
+        // Лампа сцены «3D» смотрит вниз (8.20в2): нормаль и `rel` — в оси её вида
+        // (map_reference сравнивает нормаль с направлениями вида). Поворачиваются оба:
+        // с одной повёрнутой нормалью rel·n выходил неверным, и плоскость точки — тоже
+        // (освещённый пол у основания предметов темнел).
         if ((pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0)
+        {
             n = float3(n.x, -n.z, n.y);
+            rel = float3(rel.x, -rel.z, rel.y);
+        }
         here = length(rel);
         texel = 5.5 * here / side;
         bias = 0.02 + 0.01 * here;
