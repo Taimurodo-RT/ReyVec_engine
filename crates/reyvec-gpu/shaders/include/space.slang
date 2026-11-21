@@ -133,6 +133,10 @@ static const uint MESH_VIEW_PROJ = 4;
 static const uint MESH_SHADOW_PROJ = 20;
 // Слово 11 заголовка сцены, бит 1: солнца нет (2.5D-вид — уровень в помещении).
 static const uint SCENE_NO_SUN = 2;
+// Бит 3 слова 11 (8.20в2, как SCENE_LAMP_MAPS_DOWN в space.rs): карты ламп смотрят вниз
+// (сцена «3D», режим «треугольники»; оси вида: x — X, y — −Z, z — Y), и внутри карты тень
+// лампы — только по ней, без лучей.
+static const uint SCENE_LAMP_MAPS_DOWN = 8;
 
 // Расстояние до ближайшего объекта (x) и его материал (y).
 //

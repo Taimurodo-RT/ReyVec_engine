@@ -305,6 +305,10 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
     else
     {
         rel = p - read_lamp(square).at;
+        // Лампа сцены «3D» смотрит вниз (8.20в2): нормаль — в оси её вида (map_reference
+        // сравнивает её с направлениями вида; rel·n от поворота не зависит).
+        if ((pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0)
+            n = float3(n.x, -n.z, n.y);
         here = length(rel);
         texel = 5.5 * here / side;
         bias = 0.02 + 0.01 * here;
@@ -381,9 +385,9 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
     // Только там, куда свет падает: обратная сторона и так тёмная.
     if (dot(n, dir) <= 0.0 || far <= 0.0)
         return 1.0;
-    // Треугольники заслоняют по картам: лампу (7.9б) — по её карте, и формы SDF как
-    // обычно; солнце в режиме «треугольники» 3D (8.20в) — по его карте, лучи только вне
-    // неё. Вызов один на обе: шейдер не растёт.
+    // Треугольники заслоняют по картам: лампу уровня (7.9б) — по её карте, и формы SDF
+    // как обычно; солнце и лампы в режиме «треугольники» 3D (8.20в) — по их картам, лучи
+    // только вне карт. Вызов один на обе: шейдер не растёт.
     uint mesh_at = pc.scene[7];
     bool sun = part == 0;
     float by_map = 1.0;
@@ -393,7 +397,7 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
         bool inside;
         uint square = sun ? min(pc.scene[mesh_at + 1], SHADOW_LAMPS) : part - 2;
         by_map = map_shadow(p, n, square, sun, inside);
-        if (sun && inside)
+        if (inside && (sun || (pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0))
             return by_map;
         if (by_map <= 0.0)
             return 0.0;
