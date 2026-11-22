@@ -18,6 +18,7 @@
 mod arrange;
 mod assets;
 mod doc;
+mod endless;
 mod files;
 mod geom;
 mod layout;
@@ -146,6 +147,8 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         minimized: false,
         centered: false,
         cursor: None,
+        endless: false,
+        endless_cursor: endless::EndlessCursor::default(),
         snapshot_requested: false,
         scenes,
         restore,
@@ -220,6 +223,9 @@ struct Editor {
     /// Камеру уже поставили серединой сцены в середину свободного места.
     centered: bool,
     cursor: Option<PhysicalPosition<f64>>,
+    /// Тянут число или камеру без края экрана (по прошлому кадру интерфейса).
+    endless: bool,
+    endless_cursor: endless::EndlessCursor,
     snapshot_requested: bool,
     /// Сцены в папке открытой (меню «Файл → Открыть»).
     scenes: Vec<PathBuf>,
@@ -650,11 +656,6 @@ impl Editor {
                     tracing::debug!("Окно не растягивается: {e}");
                 }
             }
-            Action::Pan(d) if self.shape.is_some() => {
-                if let Some(shape) = self.shape.as_mut() {
-                    shape.orbit(d.x, d.y);
-                }
-            }
             Action::OpenShape(path) => self.open_shape(path),
             Action::CloseShape => {
                 if let Some(t) = self.shape_pending.take() {
@@ -669,14 +670,9 @@ impl Editor {
                     tracing::info!("Формы закрыты, снова сцена");
                 }
             }
-            Action::ShapeSpin(on) => {
+            Action::ShapeCamera(c) => {
                 if let Some(shape) = self.shape.as_mut() {
-                    shape.spin = on;
-                }
-            }
-            Action::ShapeHome => {
-                if let Some(shape) = self.shape.as_mut() {
-                    shape.home();
+                    shape_camera(shape, c);
                 }
             }
             Action::Pan(d) => {
@@ -1209,6 +1205,7 @@ impl Editor {
             shape: self.shape.as_ref().map(|s| ui::ShapeInfo {
                 name: &s.name,
                 spin: s.spin,
+                free: s.free,
                 error: s.error.as_deref().or(shape_error.as_deref()),
                 text: &s.text,
             }),
@@ -1216,6 +1213,7 @@ impl Editor {
         let input = state.take_egui_input(window);
         let editor_ui = &mut self.ui;
         let out = self.egui_ctx.run_ui(input, |ui| editor_ui.draw(ui, &info));
+        self.endless = ui::take_endless_drag(&self.egui_ctx);
         state.handle_platform_output(window, out.platform_output);
         let primitives = self.egui_ctx.tessellate(out.shapes, out.pixels_per_point);
         let ui_frame = UiFrame {
@@ -1356,6 +1354,16 @@ impl ApplicationHandler for Editor {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let event = match event {
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+            } => WindowEvent::CursorMoved {
+                device_id,
+                position: self.endless_move(position),
+            },
+            e => e,
+        };
         let mut egui_took = false;
         if let (Some(state), Some(window)) = (self.egui_state.as_mut(), &self.window) {
             egui_took = state.on_window_event(window, &event).consumed;
@@ -1389,9 +1397,10 @@ impl ApplicationHandler for Editor {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y),
                     MouseScrollDelta::PixelDelta(p) => p.y / 50.0,
                 };
-                if let Some(shape) = self.shape.as_mut() {
-                    shape.zoom(steps as f32);
-                } else if let (Some(r), Some(w)) = (self.renderer.as_mut(), &self.window) {
+                // Во «Формах» колесо читает само окно подставки (ui.rs).
+                if self.shape.is_none()
+                    && let (Some(r), Some(w)) = (self.renderer.as_mut(), &self.window)
+                {
                     let size = w.inner_size();
                     let at = self
                         .cursor
@@ -1403,6 +1412,48 @@ impl ApplicationHandler for Editor {
             }
             _ => {}
         }
+    }
+}
+
+impl Editor {
+    /// Курсор без края экрана (`endless.rs`): у края окна переносится на другую сторону,
+    /// а интерфейс видит положение «дальше края».
+    fn endless_move(&mut self, real: PhysicalPosition<f64>) -> PhysicalPosition<f64> {
+        let Some(w) = &self.window else { return real };
+        let size = w.inner_size();
+        let (shown, warp) = self.endless_cursor.moved(
+            [real.x, real.y],
+            [f64::from(size.width), f64::from(size.height)],
+            self.endless,
+        );
+        if let Some([x, y]) = warp
+            && let Err(e) = w.set_cursor_position(PhysicalPosition::new(x, y))
+        {
+            tracing::debug!("Курсор не переносится: {e}");
+            self.endless = false;
+        }
+        PhysicalPosition::new(shown[0], shown[1])
+    }
+}
+
+/// Действие с камерой подставки «Форм».
+fn shape_camera(shape: &mut shapes::ShapeView, c: ui::ShapeCam) {
+    use ui::ShapeCam;
+    match c {
+        ShapeCam::Orbit(d) => shape.orbit(d.x, d.y),
+        ShapeCam::Pan(d) => shape.pan(d.x, d.y),
+        ShapeCam::Zoom(steps) => shape.zoom(steps),
+        ShapeCam::Fly(dir, dt) => shape.fly(dir, dt),
+        ShapeCam::View(shapes::ShapeAngle::Overview) => shape.home(),
+        ShapeCam::View(a) => shape.view(a),
+        ShapeCam::Focus(path) => {
+            if !shape.focus(&path) {
+                tracing::info!("У этой детали не узнать размер: показываю всю модель");
+                shape.view(shapes::ShapeAngle::Overview);
+            }
+        }
+        ShapeCam::Free(on) => shape.set_free(on),
+        ShapeCam::Spin(on) => shape.spin = on,
     }
 }
 

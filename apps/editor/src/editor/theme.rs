@@ -46,6 +46,11 @@ pub(crate) const KIND_LIGHT: Color32 = ACCENT;
 pub(crate) const KIND_BODY: Color32 = SELECT;
 pub(crate) const KIND_SCRIPT: Color32 = Color32::from_rgb(192, 132, 252);
 pub(crate) const KIND_PLAIN: Color32 = Color32::from_rgb(111, 120, 145);
+/// Цвета видов файлов в «Ассетах» (те, что не совпали с цветами выше).
+pub(crate) const FILE_SHAPE: Color32 = Color32::from_rgb(255, 138, 101);
+pub(crate) const FILE_IMAGE: Color32 = Color32::from_rgb(244, 114, 182);
+pub(crate) const FILE_SOUND: Color32 = Color32::from_rgb(250, 204, 21);
+pub(crate) const FILE_FONT: Color32 = Color32::from_rgb(148, 163, 184);
 
 // ---- Токены размеров. Все размеры в точках интерфейса (на экране 150 % точка — 1,5
 // пикселя). Панели всех рабочих пространств берут одни и те же размеры отсюда, поэтому при
