@@ -924,7 +924,7 @@ impl EditorUi {
                 painter.line_segment([p, q], Stroke::new(1.0, ACCENT.gamma_multiply(0.8)));
             }
         }
-        if path.is_empty() || self.part_locked(&path) {
+        if self.part_locked(&path) {
             return None;
         }
         let root = shape_edit::parse(shape.text).ok()?;
@@ -932,8 +932,6 @@ impl EditorUi {
         let at = shape_edit::read_vec3(shape.text, part.moved, "at", [0.0; 3]);
         let turn = shape_edit::read_vec3(shape.text, part.moved, "turn", [0.0; 3]);
         let scale = shape_edit::read_num(shape.text, part.moved, "scale", 1.0);
-        let size = (part.kind == "Box")
-            .then(|| shape_edit::read_vec3(shape.text, part.open, "size", [1.0; 3]));
         let frame = super::shapes::parent_frame(shape.text, &path)?;
         let at3 = glam::Vec3::new(at[0] as f32, at[1] as f32, at[2] as f32);
         let origin = shift + frame.transform_point3(at3);
@@ -967,9 +965,6 @@ impl EditorUi {
             let unit = v / per_local;
             match mode {
                 GizmoMode::Move | GizmoMode::Size => {
-                    if mode == GizmoMode::Size && size.is_none() {
-                        continue;
-                    }
                     let tip = origin + unit * len;
                     let Some(t) = to_screen(tip) else { continue };
                     let screen_len = (t - o).length();
@@ -986,11 +981,11 @@ impl EditorUi {
                         hot = Some(h);
                     }
                     // Точек экрана на единицу числа: у места — на единицу `at`, у размера
-                    // — на метр размера в осях детали (без её масштаба).
+                    // — на всю длину ручки (протянули на её длину — деталь вдвое больше).
                     let px_per_unit = if mode == GizmoMode::Move {
                         screen_len / len * per_local
                     } else {
-                        screen_len / len * per_local * scale as f32
+                        screen_len
                     };
                     handles.push(GizmoHandle {
                         handle: h,
@@ -1065,12 +1060,7 @@ impl EditorUi {
         painter.circle_filled(o, 3.0, TEXT);
         Some(Gizmo {
             path,
-            start: GizmoStart {
-                at,
-                turn,
-                scale,
-                size,
-            },
+            start: GizmoStart { at, turn, scale },
             origin: o,
             handles,
             hot,
@@ -4155,8 +4145,8 @@ impl GizmoMode {
             GizmoMode::Move => "Двигать деталь стрелками X, Y, Z (W). Ctrl — по сантиметру",
             GizmoMode::Turn => "Поворачивать деталь кольцами вокруг осей (E). Ctrl — по 15°",
             GizmoMode::Size => {
-                "Менять размер (R): квадрат — вся деталь, ручки на осях — коробка по одной \
-                 оси. Ctrl — ровные шаги"
+                "Менять размер (R): ручки на осях растягивают деталь по одной оси, квадрат \
+                 — всю сразу. Ctrl — ровные шаги"
             }
         }
     }
@@ -4169,7 +4159,7 @@ enum Handle {
     Move(usize),
     /// Кольцо вокруг оси родителя.
     Turn(usize),
-    /// Размер коробки по её оси.
+    /// Растянуть деталь по её оси.
     Size(usize),
     /// Масштаб всей детали.
     Scale,
@@ -4181,8 +4171,6 @@ struct GizmoStart {
     at: [f64; 3],
     turn: [f64; 3],
     scale: f64,
-    /// Размер коробки (у других деталей нет).
-    size: Option<[f64; 3]>,
 }
 
 /// Ручки выбранной детали на экране в этом кадре.
@@ -4242,12 +4230,10 @@ impl GizmoDrag {
                 shape_edit::set_moved(&self.text, part, "turn", &shape_edit::triple(turn))
             }
             Handle::Size(i) => {
-                let Some(mut size) = s.size else {
-                    return Err(ron_edit::EditError("у детали нет размера по осям".into()));
-                };
-                // Грань идёт за курсором, деталь растёт в обе стороны.
-                size[i] = round(size[i] + 2.0 * f64::from(along), 0.01).max(0.001);
-                shape_edit::set(&self.text, part, "size", &shape_edit::triple(size))
+                // Конец ручки идёт за курсором, деталь растягивается по оси в обе стороны.
+                let mut f = [1.0; 3];
+                f[i] = round(1.0 + f64::from(along), 0.05).max(0.05);
+                shape_edit::stretch(&self.text, part, f)
             }
             Handle::Scale => {
                 let k = f64::from(self.moved.dot(self.dir) / 120.0).exp();
@@ -4898,7 +4884,6 @@ mod tests {
             at: [0.0; 3],
             turn: [0.0; 3],
             scale: 1.0,
-            size: Some([0.4, 0.2, 0.2]),
         };
         let drag = |handle, dir: Vec2, moved: Vec2| GizmoDrag {
             handle,
@@ -4911,11 +4896,11 @@ mod tests {
             pointer: pos2(150.0, 100.0),
             moved,
         };
-        // Ручка размера по X: протянули на 0.05 м — коробка шире на 0.1.
+        // Ручка размера по X: протянули на 5 % её длины — коробка на 5 % шире.
         let t = drag(Handle::Size(0), vec2(1.0, 0.0), vec2(5.0, 0.0))
             .edit(&part, false)
             .unwrap();
-        assert!(t.contains("Box(size: (0.5, 0.2, 0.2))"), "{t}");
+        assert!(t.contains("Box(size: (0.42, 0.2, 0.2))"), "{t}");
         // Кольцо Y: курсор ушёл с «трёх часов» на «двенадцать» — плюс 90° (ось к нам).
         let t = drag(Handle::Turn(1), vec2(1.0, 0.0), vec2(-50.0, -50.0))
             .edit(&part, true)
@@ -5255,8 +5240,8 @@ mod tests {
             (START_WORKSPACE, PlayState::Edit, false, true),
         ] {
             ui.shape_selected = vec![3, 0];
-            // «Формы» — с кольцами поворота у выбранной коробки (М.4в).
-            ui.gizmo_mode = GizmoMode::Turn;
+            // «Формы» — с ручками размера по осям у выбранной части (М.4г).
+            ui.gizmo_mode = GizmoMode::Size;
             if play == PlayState::Paused {
                 ui.tabs[ws][Side::Bottom.index()] = 2;
             }

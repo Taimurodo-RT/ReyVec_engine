@@ -470,6 +470,119 @@ pub(crate) fn unwrap(text: &str, part: &Part) -> Result<String, EditError> {
     ))
 }
 
+/// Правки текста: что поставить на место каких байтов.
+type Patches = Vec<(Range<usize>, String)>;
+
+/// Значение поля `name` в скобках `open`: заменить или (поля нет) вписать первым.
+fn put(patches: &mut Patches, text: &str, open: usize, name: &str, value: String) {
+    let s = text.as_bytes();
+    match fields(s, open).and_then(|f| f.into_iter().find(|f| f.name == name)) {
+        Some(f) => patches.push((f.value, value)),
+        None => patches.push((open + 1..open + 1, format!("{name}: {value}, "))),
+    }
+}
+
+/// Множитель, сильнее всех отличный от 1 (для того, что тянется только целиком).
+fn strongest(fs: &[f64]) -> f64 {
+    fs.iter()
+        .copied()
+        .max_by(|a, b| (a.ln().abs()).total_cmp(&b.ln().abs()))
+        .unwrap_or(1.0)
+}
+
+/// Растягивает часть по её осям в `f` раз (X, Y, Z): размеры деталей, места вложенных
+/// и шаги повторов. Середина части (её `at`) остаётся на месте. Шар и другие детали без
+/// размера по осям меняются целиком (по сильнейшему множителю), у цилиндра, капсулы и
+/// конуса ось — Y, у тора — плоскость XZ.
+pub(crate) fn stretch(text: &str, part: &Part, f: [f64; 3]) -> Result<String, EditError> {
+    if f.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err(EditError("растяжение должно быть больше нуля".into()));
+    }
+    let mut patches = Patches::new();
+    stretch_into(text, part, f, &mut patches);
+    patches.sort_by_key(|(r, _)| std::cmp::Reverse((r.start, r.end)));
+    let mut out = text.to_owned();
+    for (r, v) in patches {
+        out.replace_range(r, &v);
+    }
+    Ok(out)
+}
+
+/// Множители растяжения в осях вложенной части, повёрнутой на `turn`: каждой её оси —
+/// множитель той оси родителя, вдоль которой она идёт больше всего.
+fn turned_factors(f: [f64; 3], turn: [f64; 3]) -> [f64; 3] {
+    let r = reyvec_sdf::shape3d::rotation(turn.map(|v| v as f32));
+    std::array::from_fn(|j| {
+        let col = r.col(j).abs();
+        let i = if col.x >= col.y && col.x >= col.z {
+            0
+        } else if col.y >= col.z {
+            1
+        } else {
+            2
+        };
+        f[i]
+    })
+}
+
+fn stretch_into(text: &str, part: &Part, f: [f64; 3], patches: &mut Patches) {
+    let Some(open) = part.open else { return };
+    let num_of = |name: &str, default: f64| read_num(text, Some(open), name, default);
+    let radial = strongest(&[f[0], f[2]]);
+    let mut set = |name: &str, v: f64| put(patches, text, open, name, num(v));
+    match part.kind.as_str() {
+        "Box" => {
+            let size = read_vec3(text, Some(open), "size", [1.0; 3]);
+            let size = std::array::from_fn(|i| size[i] * f[i]);
+            put(patches, text, open, "size", triple(size));
+        }
+        "Sphere" => set("radius", num_of("radius", 0.5) * strongest(&f)),
+        "Cylinder" => {
+            set("height", num_of("height", 1.0) * f[1]);
+            set("radius", num_of("radius", 0.5) * radial);
+        }
+        "Capsule" => {
+            let (h, r) = (num_of("height", 1.0), num_of("radius", 0.25));
+            let r2 = r * radial;
+            set("height", ((h + 2.0 * r) * f[1] - 2.0 * r2).max(0.0));
+            set("radius", r2);
+        }
+        "Cone" => {
+            set("height", num_of("height", 1.0) * f[1]);
+            set("bottom", num_of("bottom", 0.5) * radial);
+            let top = num_of("top", 0.0);
+            if top != 0.0 {
+                set("top", top * radial);
+            }
+        }
+        "Torus" => {
+            set("radius", num_of("radius", 0.5) * radial);
+            set("thickness", num_of("thickness", 0.1) * strongest(&f));
+        }
+        "Repeat" => {
+            let step = read_vec3(text, Some(open), "step", [0.0; 3]);
+            let step = std::array::from_fn(|i| step[i] * f[i]);
+            put(patches, text, open, "step", triple(step));
+        }
+        _ => {}
+    }
+    // Вложенная часть со сдвигом `Move` (своим или отдельной частью): её место
+    // растягивается, внутри — множители в её осях.
+    let moved = |p: &Part| if p.kind == "Move" { p.open } else { p.moved };
+    for child in &part.children {
+        let mut cf = f;
+        if let Some(o) = moved(child) {
+            let at = read_vec3(text, Some(o), "at", [0.0; 3]);
+            if at != [0.0; 3] {
+                let at = std::array::from_fn(|i| at[i] * f[i]);
+                put(patches, text, o, "at", triple(at));
+            }
+            cf = turned_factors(f, read_vec3(text, Some(o), "turn", [0.0; 3]));
+        }
+        stretch_into(text, child, cf, patches);
+    }
+}
+
 /// Повтор, который можно разделить на отдельные детали.
 pub(crate) fn can_split(part: &Part) -> bool {
     part.kind == "Repeat" && part.open.is_some() && part.children.len() == 1
@@ -856,5 +969,37 @@ mod tests {
             assert!((a - b).abs() < 1e-5, "{p}: {a} против {b}");
         }
         assert!(split_repeat(model, &root).is_err());
+    }
+
+    #[test]
+    fn stretch_scales_sizes_places_and_steps_along_axes() {
+        let model = "(\n    shape: Union(shapes: [\n        \
+                     Move(at: (0.5, 1.0, 0.0), shape: Box(size: (0.2, 0.4, 0.2))),\n        \
+                     Move(at: (0.0, 0.5, 0.0), turn: (0.0, 0.0, 90.0), shape: Cylinder(height: 1.0, radius: 0.1)),\n        \
+                     Repeat(count: 3, step: (0.3, 0.0, 0.0), shape: Sphere(radius: 0.1)),\n        \
+                     Capsule(height: 0.6, radius: 0.2),\n    ]),\n)\n";
+        let root = parse(model).unwrap();
+        let t = stretch(model, &root, [2.0, 1.0, 1.0]).unwrap();
+        // Места и шаги по X вдвое дальше, коробка вдвое шире.
+        assert!(
+            t.contains("Move(at: (1.0, 1.0, 0.0), shape: Box(size: (0.4, 0.4, 0.2)))"),
+            "{t}"
+        );
+        assert!(t.contains("step: (0.6, 0.0, 0.0)"), "{t}");
+        // Цилиндр повёрнут на 90° вокруг Z: его ось Y лежит вдоль X — длиннее он.
+        assert!(t.contains("Cylinder(height: 2.0, radius: 0.1)"), "{t}");
+        // Шар меняется целиком, капсула вдоль Y не меняется.
+        assert!(t.contains("Sphere(radius: 0.2)"), "{t}");
+        assert!(t.contains("Capsule(height: 0.2, radius: 0.4)"), "{t}");
+        reparse(&t);
+        // Коробка без поля размера получает его.
+        let t = stretch(
+            "(shape: Box())",
+            &parse("(shape: Box())").unwrap(),
+            [1.0, 3.0, 1.0],
+        )
+        .unwrap();
+        assert!(t.contains("Box(size: (1.0, 3.0, 1.0), )"), "{t}");
+        assert!(stretch(model, &root, [0.0, 1.0, 1.0]).is_err());
     }
 }
