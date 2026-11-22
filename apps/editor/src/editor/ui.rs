@@ -157,6 +157,12 @@ pub(crate) enum Action {
     CloseShape,
     /// Камера подставки: повернуть, сдвинуть, приблизить, готовый вид, деталь крупно.
     ShapeCamera(ShapeCam),
+    /// Спрятать деталь модели на подставке (`true`) или показать (в файл не пишется).
+    ShapeHide(Vec<usize>, bool),
+    /// Разрешение 3D-кадра (во «Формах» — меню «Качество»).
+    SpaceScale(reyvec_gpu::SpaceScale),
+    /// Режим «треугольники»: формы рисуются сетками (быстрее на слабых видеокартах).
+    SpaceTriangles(bool),
     /// Новый текст файла модели на подставке (М.3). `commit: false` — число ещё тянут
     /// мышью (в историю правка попадёт одним шагом, когда отпустят).
     ShapeText {
@@ -194,6 +200,13 @@ pub(crate) struct ShapeInfo<'a> {
     pub spin: bool,
     /// Свободный полёт камеры.
     pub free: bool,
+    /// Спрятанные детали.
+    pub hidden: &'a [Vec<usize>],
+    /// Разрешение 3D-кадра и режим «треугольники».
+    pub scale: reyvec_gpu::SpaceScale,
+    pub triangles: bool,
+    /// Самые долгие проходы видеокарты за последнюю секунду, мс (и весь кадр).
+    pub passes: &'a [(&'static str, f64)],
     /// Ошибка в файле модели.
     pub error: Option<&'a str>,
     /// Текст файла модели (из него — дерево частей и числа инспектора).
@@ -295,6 +308,8 @@ pub(crate) struct EditorUi {
     shape_combine: shape_edit::Combine,
     /// Свёрнутые части в дереве модели.
     shape_closed: HashSet<Vec<usize>>,
+    /// Закреплённые части модели: их не правят и (с М.4) не выбирают на подставке.
+    shape_locked: HashSet<Vec<usize>>,
 }
 
 /// Фильтр консоли.
@@ -355,6 +370,7 @@ impl EditorUi {
             shape_selected: Vec::new(),
             shape_combine: shape_edit::Combine::Add,
             shape_closed: HashSet::new(),
+            shape_locked: HashSet::new(),
         }
     }
 
@@ -734,6 +750,8 @@ impl EditorUi {
             root: &root,
             selected: &self.shape_selected,
             closed: &self.shape_closed,
+            hidden: shape.hidden,
+            locked: &self.shape_locked,
             materials: &materials,
             out: &mut out,
         };
@@ -742,6 +760,14 @@ impl EditorUi {
             && !self.shape_closed.remove(&p)
         {
             self.shape_closed.insert(p);
+        }
+        if let Some(p) = out.lock
+            && !self.shape_locked.remove(&p)
+        {
+            self.shape_locked.insert(p);
+        }
+        if let Some((p, hide)) = out.hide {
+            self.actions.push(Action::ShapeHide(p, hide));
         }
         if let Some(p) = out.pick {
             self.shape_selected = p;
@@ -763,6 +789,10 @@ impl EditorUi {
             return;
         }
         let Some(part) = root.at(&path) else { return };
+        if self.part_locked(&path) {
+            tracing::info!("Деталь закреплена: сначала снимите замок в иерархии");
+            return;
+        }
         let sibling = |d: isize| {
             let (&last, up) = path.split_last()?;
             let i = last.checked_add_signed(d)?;
@@ -808,6 +838,11 @@ impl EditorUi {
         }
     }
 
+    /// Закреплена ли деталь (она сама или часть, в которой она лежит).
+    fn part_locked(&self, path: &[usize]) -> bool {
+        (0..=path.len()).any(|n| self.shape_locked.contains(&path[..n]))
+    }
+
     /// Числа выбранной части модели (М.3) по сворачиваемым карточкам: размеры, место,
     /// цвет, новая деталь. У чисел кнопки «−» и «+», тянуть их можно без края экрана.
     fn shape_inspector(&mut self, ui: &mut Ui, info: &Info) {
@@ -821,6 +856,14 @@ impl EditorUi {
         let Some(part) = root.at(&path) else { return };
         let parent = path.split_last().and_then(|(_, up)| root.at(up));
         let materials = shape_edit::materials(text);
+        if self.part_locked(&path) {
+            ui.label(
+                RichText::new("Деталь закреплена (замок в иерархии): числа не правятся")
+                    .color(MUTED)
+                    .size(FONT_SMALL),
+            );
+            ui.disable();
+        }
         let actions = &mut self.actions;
         let mut end = false;
         let mut send = |r: Result<String, ron_edit::EditError>, commit: bool| match r {
@@ -966,21 +1009,19 @@ impl EditorUi {
         card(ui, "Новая деталь", |ui| {
             ui.horizontal(|ui| {
                 use shape_edit::Combine;
-                for (c, name, hint) in [
-                    (Combine::Add, "Добавить", "Деталь добавляется к модели"),
-                    (
-                        Combine::Cut,
-                        "Вырезать",
-                        "Деталь вырезается из выбранной части",
-                    ),
-                    (
-                        Combine::Intersect,
-                        "Пересечь",
-                        "От выбранной остаётся общее с деталью",
-                    ),
-                ] {
-                    ui.selectable_value(combine, c, name).on_hover_text(hint);
+                ui.spacing_mut().item_spacing.x = GAP_XS;
+                for c in [Combine::Add, Combine::Cut, Combine::Intersect] {
+                    if combine_button(ui, c, *combine == c).clicked() {
+                        *combine = c;
+                    }
                 }
+                ui.add_space(GAP_M);
+                let name = match *combine {
+                    Combine::Add => "добавить",
+                    Combine::Cut => "вырезать",
+                    Combine::Intersect => "пересечь",
+                };
+                ui.label(RichText::new(name).color(MUTED).size(FONT_SMALL));
             });
             ui.horizontal_wrapped(|ui| {
                 for kind in shape_edit::PALETTE {
@@ -1092,20 +1133,21 @@ impl EditorUi {
                     {
                         actions.push(cam(ShapeCam::Spin(spin)));
                     }
+                    quality_menu(ui, shape, actions);
                     ui.separator();
                     ui.spacing_mut().item_spacing.x = GAP_XS;
                     for (free, name, hint) in [
                         (
                             true,
                             "Полёт",
-                            "Свободная камера: мышь — оглядеться, W A S D — лететь, \
+                            "Свободная камера: правая кнопка — оглядеться, W A S D — лететь, \
                              Q и E — вниз и вверх, Shift — быстрее, колесо — вперёд-назад",
                         ),
                         (
                             false,
                             "Вокруг",
-                            "Камера ходит вокруг модели или показанной детали: левая кнопка — \
-                             повернуть, правая или средняя — сдвинуть, колесо — ближе",
+                            "Камера ходит вокруг модели или показанной детали: правая кнопка — \
+                             повернуть, средняя — сдвинуть, колесо — ближе",
                         ),
                     ] {
                         if ui
@@ -1131,8 +1173,9 @@ impl EditorUi {
         self.viewport_hovered = response.hovered() || response.dragged();
         let d = response.drag_delta();
         if response.dragged() && d != Vec2::ZERO {
-            let pan = response.dragged_by(egui::PointerButton::Middle)
-                || (!shape.free && response.dragged_by(egui::PointerButton::Secondary));
+            // Правая (и пока левая, до выбора деталей щелчком) — повернуть, средняя —
+            // сдвинуть.
+            let pan = response.dragged_by(egui::PointerButton::Middle);
             self.actions.push(cam(if pan {
                 ShapeCam::Pan(d)
             } else {
@@ -1169,11 +1212,11 @@ impl EditorUi {
         }
         let painter = ui.painter_at(rect);
         let hint = if shape.free {
-            "Полёт: мышь — оглядеться, W A S D — лететь, Q E — вниз и вверх, Shift — \
-             быстрее. Esc — назад к сцене"
+            "Полёт: правая кнопка — оглядеться, W A S D — лететь, Q E — вниз и вверх, \
+             Shift — быстрее. Esc — назад к сцене"
         } else {
-            "Левая кнопка — повернуть, правая — сдвинуть, колесо — ближе, F — деталь крупно. \
-             Esc — назад к сцене"
+            "Правая кнопка — повернуть, средняя — сдвинуть, колесо — ближе, F — деталь \
+             крупно. Esc — назад к сцене"
         };
         chip(&painter, rect.left_top() + vec2(12.0, 12.0), hint, MUTED);
         if let Some(e) = shape.error {
@@ -2931,6 +2974,128 @@ fn angle_button(ui: &mut Ui, angle: ShapeAngle) -> Response {
     resp.on_hover_text(angle.label())
 }
 
+/// Меню «Качество» подставки: время кадра на видеокарте и самые долгие проходы,
+/// разрешение 3D-кадра, режим «треугольники».
+fn quality_menu(ui: &mut Ui, shape: &ShapeInfo, actions: &mut Vec<Action>) {
+    let total = shape
+        .passes
+        .first()
+        .map_or(String::new(), |(_, ms)| format!(" · {ms:.1} мс"));
+    ui.menu_button(
+        RichText::new(format!("Качество{total}")).size(FONT_CHIP),
+        |ui| {
+            ui.set_min_width(260.0);
+            ui.label(RichText::new("Видеокарта на кадр, среднее за секунду").color(TEXT_DIM));
+            if shape.passes.is_empty() {
+                ui.label(RichText::new("замеров нет").color(MUTED));
+            }
+            for (i, (name, ms)) in shape.passes.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let name = if i == 0 { "весь кадр" } else { name };
+                    ui.label(RichText::new(name).color(if i == 0 { TEXT } else { TEXT_DIM }));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(format!("{ms:.2} мс")).monospace().color(TEXT));
+                    });
+                });
+            }
+            ui.separator();
+            ui.label(RichText::new("Разрешение 3D").color(TEXT_DIM));
+            ui.horizontal(|ui| {
+                for s in reyvec_gpu::SpaceScale::ALL {
+                    if ui.selectable_label(shape.scale == s, s.title()).clicked() {
+                        actions.push(Action::SpaceScale(s));
+                    }
+                }
+            });
+            let mut tri = shape.triangles;
+            if ui
+                .checkbox(&mut tri, "Треугольники")
+                .on_hover_text(
+                    "Формы рисуются сетками, тени — картами: быстро на слабых видеокартах, \
+                     но края чуть грубее",
+                )
+                .changed()
+            {
+                actions.push(Action::SpaceTriangles(tri));
+            }
+        },
+    )
+    .response
+    .on_hover_text("Сколько стоит кадр и как его удешевить");
+}
+
+/// Кнопка режима новой детали значком: два круга — объединение, круг с вырезом —
+/// вырезание, общая часть кругов — пересечение. Название и пояснение при наведении.
+fn combine_button(ui: &mut Ui, how: shape_edit::Combine, on: bool) -> Response {
+    use shape_edit::Combine;
+    let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 24.0), Sense::click());
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(rect, RADIUS_S, SELECT_BG);
+    } else if resp.hovered() {
+        painter.rect_filled(rect, RADIUS_S, HOVER);
+    }
+    let hot = if on {
+        SELECT
+    } else if resp.hovered() {
+        TEXT
+    } else {
+        MUTED
+    };
+    let fill = hot.gamma_multiply(0.55);
+    let c = rect.center();
+    let (a, b, r) = (c - vec2(3.2, 0.0), c + vec2(3.2, 0.0), 6.0);
+    let arc = |o: Pos2, from: f32, to: f32| -> Vec<Pos2> {
+        (0..=12)
+            .map(|k| {
+                let t = from + (to - from) * k as f32 / 12.0;
+                o + vec2(t.cos(), t.sin()) * r
+            })
+            .collect()
+    };
+    let stroke = Stroke::new(1.0, hot);
+    let half = (3.2f32 / r).acos();
+    match how {
+        Combine::Add => {
+            painter.circle(a, r, fill, Stroke::NONE);
+            painter.circle(b, r, fill, Stroke::NONE);
+            painter.circle_stroke(a, r, stroke);
+            painter.circle_stroke(b, r, stroke);
+        }
+        Combine::Cut => {
+            painter.circle(a, r, fill, stroke);
+            let bg = if on {
+                SELECT_BG
+            } else if resp.hovered() {
+                HOVER
+            } else {
+                CARD
+            };
+            painter.circle_filled(b, r, bg);
+            let mut ring = arc(b, 0.0, std::f32::consts::TAU);
+            ring.push(ring[0]);
+            painter.extend(egui::Shape::dashed_line(&ring, stroke, 2.0, 1.5));
+        }
+        Combine::Intersect => {
+            let mut lens = arc(a, -half, half);
+            lens.extend(arc(
+                b,
+                std::f32::consts::PI - half,
+                std::f32::consts::PI + half,
+            ));
+            painter.add(egui::Shape::convex_polygon(lens, fill, Stroke::NONE));
+            painter.circle_stroke(a, r, Stroke::new(1.0, hot.gamma_multiply(0.6)));
+            painter.circle_stroke(b, r, Stroke::new(1.0, hot.gamma_multiply(0.6)));
+        }
+    }
+    let hint = match how {
+        Combine::Add => "Добавить: новая деталь прибавляется к модели",
+        Combine::Cut => "Вырезать: новая деталь вырезается из выбранной части",
+        Combine::Intersect => "Пересечь: от выбранной части остаётся общее с новой деталью",
+    };
+    resp.on_hover_text(hint)
+}
+
 /// Число с кнопками «−» и «+» по бокам: тянуть мышью (без края экрана), ввести с
 /// клавиатуры или шагнуть на `step`. Не меньше `min`.
 fn step_field(
@@ -3539,6 +3704,8 @@ struct TreeOut {
     pick: Option<Vec<usize>>,
     toggle: Option<Vec<usize>>,
     cmd: Option<PartCmd>,
+    hide: Option<(Vec<usize>, bool)>,
+    lock: Option<Vec<usize>>,
 }
 
 /// Дерево частей модели (М.3): что нужно строкам.
@@ -3547,6 +3714,8 @@ struct ShapeTree<'a> {
     root: &'a shape_edit::Part,
     selected: &'a [usize],
     closed: &'a HashSet<Vec<usize>>,
+    hidden: &'a [Vec<usize>],
+    locked: &'a HashSet<Vec<usize>>,
     materials: &'a [String],
     out: &'a mut TreeOut,
 }
@@ -3599,6 +3768,53 @@ impl ShapeTree<'_> {
                 self.out.pick = Some(path.clone());
             }
             row.context_menu(|ui| self.menu(ui, part, path));
+            // Глаз и замок справа: видны всегда, включённые — ярче.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let hidden = self.hidden.iter().any(|p| p == path);
+                let locked = self.locked.contains(path.as_slice());
+                let icon = |ui: &mut Ui, on: bool, can: bool| {
+                    let (r, resp) = ui.allocate_exact_size(
+                        vec2(16.0, 18.0),
+                        if can { Sense::click() } else { Sense::hover() },
+                    );
+                    let color = if !can {
+                        Color32::TRANSPARENT
+                    } else if resp.hovered() {
+                        Color32::WHITE
+                    } else if on {
+                        ACCENT
+                    } else {
+                        MUTED.gamma_multiply(0.6)
+                    };
+                    (r, resp, color)
+                };
+                let (r, resp, color) = icon(ui, locked, true);
+                paint_lock(ui.painter(), r.center(), locked, color);
+                if resp
+                    .on_hover_text(if locked {
+                        "Закреплена: числа не правятся. Щёлкните, чтобы открепить"
+                    } else {
+                        "Закрепить: числа детали не будут правиться"
+                    })
+                    .clicked()
+                {
+                    self.out.lock = Some(path.clone());
+                }
+                let can_hide = part.removable;
+                let (r, resp, color) = icon(ui, hidden, can_hide);
+                paint_eye(ui.painter(), r.center(), !hidden, color);
+                if can_hide
+                    && resp
+                        .on_hover_text(if hidden {
+                            "Спрятана на подставке (в файле есть). Щёлкните, чтобы показать"
+                        } else {
+                            "Спрятать на подставке (в файле останется)"
+                        })
+                        .clicked()
+                {
+                    self.out.hide = Some((path.clone(), !hidden));
+                }
+            });
         });
         if closed {
             return;
@@ -3855,6 +4071,10 @@ mod tests {
             name: "склад/стеллаж",
             spin: true,
             free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            passes: &[],
             error: Some("нет такого файла"),
             text: "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Sphere(radius: 0.3), Box(size: (0.2, 0.2, 0.2))]))",
         });
@@ -3876,6 +4096,10 @@ mod tests {
             name: "шар",
             spin: true,
             free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            passes: &[],
             error: None,
             text,
         });
@@ -4298,6 +4522,10 @@ mod tests {
                     name: "склад/стеллаж",
                     spin: true,
                     free: false,
+                    hidden: &[],
+                    scale: reyvec_gpu::SpaceScale::Full,
+                    triangles: false,
+                    passes: &[],
                     error: None,
                     text: &rack,
                 });

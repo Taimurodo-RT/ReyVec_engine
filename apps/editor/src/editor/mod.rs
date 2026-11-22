@@ -140,6 +140,8 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         fps: 0.0,
         frame_ms: 0.0,
         gpu_ms: None,
+        gpu_avg: reyvec_gpu::GpuTimingAverage::default(),
+        gpu_passes: Vec::new(),
         adapter: String::new(),
         error: None,
         closing: false,
@@ -215,6 +217,9 @@ struct Editor {
     fps: f64,
     frame_ms: f64,
     gpu_ms: Option<f64>,
+    /// Замеры видеокарты за секунду и самые долгие проходы (весь кадр первым).
+    gpu_avg: reyvec_gpu::GpuTimingAverage,
+    gpu_passes: Vec<(&'static str, f64)>,
     adapter: String,
     error: Option<AppError>,
     closing: bool,
@@ -669,6 +674,20 @@ impl Editor {
                     r.set_scene(DemoScene::File);
                     tracing::info!("Формы закрыты, снова сцена");
                 }
+            }
+            Action::ShapeHide(path, hide) => {
+                if let Some(shape) = self.shape.as_mut() {
+                    let text = shape.set_hidden(&path, hide);
+                    r.set_space_file_in(&text, Some(shape.root.clone()));
+                }
+            }
+            Action::SpaceScale(scale) => {
+                r.set_space_scale(scale);
+                tracing::info!("Разрешение 3D: {}", scale.title());
+            }
+            Action::SpaceTriangles(on) => {
+                r.set_space_triangles(on);
+                tracing::info!("Треугольники: {}", if on { "вкл" } else { "выкл" });
             }
             Action::ShapeCamera(c) => {
                 if let Some(shape) = self.shape.as_mut() {
@@ -1206,6 +1225,10 @@ impl Editor {
                 name: &s.name,
                 spin: s.spin,
                 free: s.free,
+                hidden: &s.hidden,
+                scale: renderer.space_scale(),
+                triangles: renderer.space_triangles(),
+                passes: &self.gpu_passes,
                 error: s.error.as_deref().or(shape_error.as_deref()),
                 text: &s.text,
             }),
@@ -1245,6 +1268,7 @@ impl Editor {
                 self.stats_frames += 1;
                 if let Some(t) = renderer.gpu_timings() {
                     self.gpu_ms = Some(t.total_ms);
+                    self.gpu_avg.add(t);
                 }
                 let now = Instant::now();
                 let since = now.duration_since(self.stats_at);
@@ -1254,6 +1278,15 @@ impl Editor {
                     self.frame_ms = s * 1000.0 / f64::from(self.stats_frames.max(1));
                     self.stats_frames = 0;
                     self.stats_at = now;
+                    if let Some(avg) = self.gpu_avg.average() {
+                        let mut passes: Vec<_> =
+                            avg.passes.iter().map(|p| (p.name, p.ms)).collect();
+                        passes.sort_by(|a, b| b.1.total_cmp(&a.1));
+                        passes.truncate(5);
+                        passes.insert(0, ("кадр", avg.total_ms));
+                        self.gpu_passes = passes;
+                    }
+                    self.gpu_avg.clear();
                 }
                 if let (Some(path), Some(image)) =
                     (self.config.snapshot.clone(), renderer.take_snapshot())
@@ -1444,7 +1477,6 @@ fn shape_camera(shape: &mut shapes::ShapeView, c: ui::ShapeCam) {
         ShapeCam::Pan(d) => shape.pan(d.x, d.y),
         ShapeCam::Zoom(steps) => shape.zoom(steps),
         ShapeCam::Fly(dir, dt) => shape.fly(dir, dt),
-        ShapeCam::View(shapes::ShapeAngle::Overview) => shape.home(),
         ShapeCam::View(a) => shape.view(a),
         ShapeCam::Focus(path) => {
             if !shape.focus(&path) {
