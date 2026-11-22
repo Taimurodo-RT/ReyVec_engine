@@ -268,17 +268,7 @@ jobs:
           echo "--- PNG editor-space ---"
           base64 -w 4000 "$RUNNER_TEMP/editor-space.png"
           echo "--- конец PNG ---"
-
-  # Та же команда, что у EmbarkStudios/cargo-deny-action@v2, но без его
-  # Docker-образа: тот скачивает cargo-deny с GitHub Releases без повторов и
-  # кэша и падал вместе с ним (2026-11-08).
-  deny:
-    name: Licenses and advisories (cargo-deny)
-    runs-on: ubuntu-latest
-    env:
-      DENY_VERSION: "0.20.2"
-    steps:
-      - uses: actions/checkout@v4
+      # Проводник «Ассетов» (Э.1): сцена под ним рисуется крошечной, снимок — в лог.
       - name: Editor assets explorer with validation, snapshot
         run: |
           xvfb-run -a -s "-screen 0 1920x1080x24" ./target/debug/reyvec-editor --validation --assets --snapshot "$RUNNER_TEMP/editor-assets.png" --snapshot-after 6
