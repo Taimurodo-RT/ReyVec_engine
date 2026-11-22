@@ -369,15 +369,27 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
     }
     if (count <= 0.0)
         return 1.0;
+    // Все 36 точек округи заслонены — точка в полной тени: полутень уже округи, и
+    // в ней светлого не найти (8.20и: на заводе так большая часть тени, а 25 проб
+    // фильтра — две трети работы карты).
+    if (count >= 36.0)
+        return 0.0;
     float blocker = blockers / count;
     float world = sun ? max(here - blocker, 0.0) * SUN_MAP_SOFT
                       : (here - blocker) / max(blocker, 0.05) * here * MAP_PENUMBRA;
     float radius = clamp(world / texel, 1.0, MAP_SEARCH);
+    // Узкая полутень (до 4 точек карты) — 9 проб повёрнутым квадратом 3×3 вместо 25:
+    // на таком размере пробы с четырьмя точками каждая и так перекрываются (8.20и).
+    // Цикл тот же, меняется только число проб: лишний цикл удлиняет сборку шейдера.
+    int across = radius <= 4.0 ? 3 : 5;
+    int probes = across * across;
+    float half_ = float(across / 2);
+    float spread = radius / (float(across) * half_ + half_);
     float lit = 0.0;
-    for (int k = 0; k < 25; k++)
+    for (int k = 0; k < probes; k++)
     {
-        float2 g = float2(float(k % 5), float(k / 5)) - 2.0;
-        float2 q = uv + float2(5.0 * g.x - g.y, g.x + 5.0 * g.y) * (radius / 12.0);
+        float2 g = float2(float(k % across), float(k / across)) - half_;
+        float2 q = uv + float2(float(across) * g.x - g.y, g.x + float(across) * g.y) * spread;
         float2 between;
         float4 depth = map_gather(map, q, lo, side, inv, between);
         float reference = map_plane(sun, q, uv, side, slope, here, f, rel, n);
@@ -385,7 +397,7 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
         lit += lerp(lerp(open.w, open.z, between.x), lerp(open.x, open.y, between.x),
                     between.y);
     }
-    return lit / 25.0;
+    return lit / float(probes);
 }
 
 // Одна из четырёх долей света точки `surface` (на поверхности, нормаль `n`, `t` —
