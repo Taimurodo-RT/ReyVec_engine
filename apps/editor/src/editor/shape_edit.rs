@@ -359,6 +359,101 @@ pub(crate) fn add(text: &str, part: &Part, item: &str) -> Result<String, EditErr
     insert_item_at(text, list, usize::MAX, item)
 }
 
+/// Копия детали сразу за ней в том же списке (с её сдвигом и цветом). Деталь на своей
+/// строке — копия тоже на своей, с тем же отступом.
+pub(crate) fn duplicate(text: &str, part: &Part) -> Result<String, EditError> {
+    if !part.removable {
+        return Err(EditError(
+            "эту часть не повторить: она не в списке деталей".into(),
+        ));
+    }
+    let (start, end) = (part.outer.start, part.outer.end);
+    let line = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let indent = &text[line..start];
+    let sep = if indent.trim().is_empty() {
+        format!(",\n{indent}")
+    } else {
+        ", ".to_owned()
+    };
+    Ok(format!(
+        "{}{sep}{}{}",
+        &text[..end],
+        &text[start..end],
+        &text[end..]
+    ))
+}
+
+/// Меняет местами две детали одного списка (`a` раньше `b` в тексте).
+pub(crate) fn swap(text: &str, a: &Part, b: &Part) -> Result<String, EditError> {
+    if !(a.removable && b.removable) || a.outer.end > b.outer.start {
+        return Err(EditError("детали не переставить".into()));
+    }
+    Ok(format!(
+        "{}{}{}{}{}",
+        &text[..a.outer.start],
+        &text[b.outer.clone()],
+        &text[a.outer.end..b.outer.start],
+        &text[a.outer.clone()],
+        &text[b.outer.end..]
+    ))
+}
+
+/// Во что обернуть деталь.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Wrap {
+    /// Объединение из одной детали (дальше в него добавляют).
+    Union,
+    /// Зеркало через плоскость YZ: деталь и её отражение.
+    Mirror,
+    /// Две копии со сдвигом `step` по X.
+    Repeat(f64),
+}
+
+/// Оборачивает деталь (со сдвигом и цветом) в объединение, зеркало или повтор.
+pub(crate) fn wrap_in(text: &str, part: &Part, how: Wrap) -> String {
+    match how {
+        Wrap::Union => wrap(text, part, "Union(shapes: [", "])"),
+        Wrap::Mirror => wrap(text, part, "Mirror(axis: X, shape: ", ")"),
+        Wrap::Repeat(step) => wrap(
+            text,
+            part,
+            &format!("Repeat(count: 2, step: ({}, 0.0, 0.0), shape: ", num(step)),
+            ")",
+        ),
+    }
+}
+
+/// У части одна вложенная, и обёртку можно снять.
+pub(crate) fn can_unwrap(part: &Part) -> bool {
+    part.children.len() == 1
+        && matches!(
+            part.kind.as_str(),
+            "Union" | "Intersect" | "Subtract" | "Mirror" | "Repeat" | "Move" | "Paint" | "Animate"
+        )
+}
+
+/// Снимает обёртку: на месте части остаётся её единственная вложенная (сдвиг и цвет
+/// самой части остаются).
+pub(crate) fn unwrap(text: &str, part: &Part) -> Result<String, EditError> {
+    let err = || EditError("обёртку не снять".into());
+    let (true, Some(open)) = (can_unwrap(part), part.open) else {
+        return Err(err());
+    };
+    let head = text[..open].trim_end();
+    let start = head.len().checked_sub(part.kind.len()).ok_or_else(err)?;
+    if head[start..] != part.kind {
+        return Err(err());
+    }
+    let end = value_end(text.as_bytes(), start).ok_or_else(err)?;
+    let inner = &part.children[0].outer;
+    Ok(format!(
+        "{}{}{}",
+        &text[..start],
+        &text[inner.clone()],
+        &text[end..]
+    ))
+}
+
 /// Как сложить новую деталь с выбранной частью.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Combine {
@@ -592,5 +687,46 @@ mod tests {
             }
         }
         assert!(n >= 10, "моделей {n}");
+    }
+
+    #[test]
+    fn tree_actions_duplicate_swap_wrap_unwrap() {
+        let root = parse(MODEL).unwrap();
+        let seat = root.at(&[0]).unwrap();
+        // Копия сиденья сразу за ним, на своей строке.
+        let t = duplicate(MODEL, seat).unwrap();
+        let r = parse(&t).unwrap();
+        assert_eq!(r.children.len(), 4);
+        assert_eq!(r.children[1].kind, "Cylinder");
+        assert!(t.contains("radius: 0.2))),\n        Paint("), "{t}");
+        reparse(&t);
+        assert!(duplicate(MODEL, &root).is_err(), "корень не в списке");
+        // Ножки выше сиденья.
+        let t = swap(MODEL, seat, root.at(&[1]).unwrap()).unwrap();
+        let r = parse(&t).unwrap();
+        assert_eq!(r.children[0].kind, "Mirror");
+        assert_eq!(r.children[1].kind, "Cylinder");
+        reparse(&t);
+        // Шар в зеркало, потом обёртку снять — текст как был.
+        let ball = root.at(&[2]).unwrap();
+        let t = wrap_in(MODEL, ball, Wrap::Mirror);
+        let r = parse(&t).unwrap();
+        assert_eq!(r.children[2].kind, "Mirror");
+        reparse(&t);
+        assert_eq!(unwrap(&t, r.at(&[2]).unwrap()).unwrap(), MODEL);
+        let t = wrap_in(MODEL, ball, Wrap::Repeat(0.25));
+        assert!(t.contains("Repeat(count: 2, step: (0.25, 0.0, 0.0), shape: Sphere"));
+        reparse(&t);
+        let t = wrap_in(MODEL, ball, Wrap::Union);
+        reparse(&t);
+        // Зеркало ножки снимается: остаётся одна ножка со своим сдвигом.
+        let legs = root.at(&[1]).unwrap();
+        assert!(can_unwrap(legs) && !can_unwrap(ball) && !can_unwrap(&root));
+        let t = unwrap(MODEL, legs).unwrap();
+        assert!(
+            t.contains("        Move(at: (0.12, 0.22, 0.0), shape: Box"),
+            "{t}"
+        );
+        reparse(&t);
     }
 }

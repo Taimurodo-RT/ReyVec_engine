@@ -5,9 +5,9 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use egui::{Align2, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
 
-use super::shapes::is_shape;
+use super::shapes::{EXTENSION, is_shape};
 use super::theme::*;
 
 /// Папки, которые показываются в дереве: сцены и ассеты проекта.
@@ -308,7 +308,27 @@ fn droppable(name: &str) -> bool {
     name.to_lowercase().ends_with(".svg")
 }
 
-/// Плитка файла или папки.
+/// Вид файла для плитки: подпись и цвет, чтобы файлы разных видов различались с
+/// первого взгляда. `prefab` — файл из папки заготовок.
+pub(crate) fn kind_of(name: &str, folder: bool, prefab: bool) -> (&'static str, Color32) {
+    let lower = name.to_lowercase();
+    let ext = lower.rsplit_once('.').map_or("", |(_, e)| e);
+    match ext {
+        _ if folder => ("папка", ACCENT),
+        _ if is_shape(&lower) => ("модель формы", FILE_SHAPE),
+        "ron" if prefab => ("заготовка", KIND_SCRIPT),
+        "ron" => ("сцена", SELECT),
+        "svg" => ("рисунок", GOOD),
+        "png" | "jpg" | "jpeg" | "webp" | "ktx2" => ("картинка", FILE_IMAGE),
+        "glb" | "gltf" | "obj" => ("3D-сетка", KIND_PLAYER),
+        "wav" | "ogg" | "mp3" | "flac" => ("звук", FILE_SOUND),
+        "ttf" | "otf" => ("шрифт", FILE_FONT),
+        "slang" | "rs" | "lua" | "rhai" => ("код", BAD),
+        _ => ("файл", MUTED),
+    }
+}
+
+/// Плитка файла или папки: цветная полоса и подпись по виду файла.
 fn tile(ui: &mut Ui, name: &str, folder: bool, drag: bool) -> egui::Response {
     let sense = if drag {
         Sense::click_and_drag()
@@ -317,27 +337,58 @@ fn tile(ui: &mut Ui, name: &str, folder: bool, drag: bool) -> egui::Response {
     };
     let (rect, response) = ui.allocate_exact_size(vec2(96.0, 92.0), sense);
     let thumb = Rect::from_min_size(rect.min, vec2(rect.width(), 64.0));
+    let prefab = drag && !droppable(name);
+    let (kind, color) = kind_of(name, folder, prefab);
     let fill = if response.hovered() { HOVER } else { CARD };
-    ui.painter().rect(
+    let painter = ui.painter();
+    painter.rect(
         thumb,
         RADIUS_M,
         fill,
         Stroke::new(LINE, BORDER_STRONG),
         egui::StrokeKind::Inside,
     );
+    // Цвет вида: лёгкая заливка и полоса сверху.
+    painter.rect_filled(thumb.shrink(LINE), RADIUS_M, color.gamma_multiply(0.08));
+    let band = Rect::from_min_size(
+        thumb.min + vec2(LINE, LINE),
+        vec2(thumb.width() - 2.0 * LINE, 3.0),
+    );
+    painter.rect_filled(
+        band,
+        egui::CornerRadius {
+            nw: RADIUS_M - 1,
+            ne: RADIUS_M - 1,
+            sw: 0,
+            se: 0,
+        },
+        color,
+    );
     let ext = if folder {
         "папка".to_owned()
+    } else if is_shape(name) {
+        EXTENSION.to_owned()
     } else {
         name.rsplit_once('.')
             .map_or_else(String::new, |(_, e)| format!(".{e}"))
     };
-    ui.painter().text(
-        thumb.center(),
+    let lift = if folder { 0.0 } else { 6.0 };
+    painter.text(
+        thumb.center() - vec2(0.0, lift),
         Align2::CENTER_CENTER,
         ext,
         FontId::monospace(FONT_SMALL),
-        if folder { ACCENT } else { MUTED },
+        color,
     );
+    if !folder {
+        painter.text(
+            thumb.center() + vec2(0.0, 10.0),
+            Align2::CENTER_CENTER,
+            kind,
+            FontId::proportional(FONT_SMALL - 1.5),
+            MUTED,
+        );
+    }
     let short: String = if name.chars().count() > 14 {
         name.chars().take(13).chain(['…']).collect()
     } else {
@@ -357,14 +408,45 @@ fn tile(ui: &mut Ui, name: &str, folder: bool, drag: bool) -> egui::Response {
     } else if drag {
         format!("{name}\nЗаготовка: перетащите в сцену — появится такой же предмет")
     } else {
-        name.to_owned()
+        format!("{name}\n{}", capital(kind))
     };
     response.on_hover_text(hint)
+}
+
+/// Слово с большой буквы.
+fn capital(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_kinds_have_their_own_colours() {
+        let kinds = [
+            kind_of("стеллаж.shape.ron", false, false),
+            kind_of("first-room.ron", false, false),
+            kind_of("ящик.ron", false, true),
+            kind_of("hero.SVG", false, false),
+            kind_of("table.glb", false, false),
+            kind_of("музыка.ogg", false, false),
+            kind_of("scenes", true, false),
+        ];
+        assert_eq!(kinds[0].0, "модель формы");
+        assert_eq!(kinds[1].0, "сцена");
+        assert_eq!(kinds[2].0, "заготовка");
+        assert_eq!(kinds[3].0, "рисунок");
+        for (i, a) in kinds.iter().enumerate() {
+            for b in &kinds[i + 1..] {
+                assert_ne!(a.1, b.1, "{} и {} одного цвета", a.0, b.0);
+            }
+        }
+        assert_eq!(capital("звук"), "Звук");
+    }
 
     fn project() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
