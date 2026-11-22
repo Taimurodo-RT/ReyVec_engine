@@ -143,7 +143,7 @@ pub(crate) struct ShapeView {
     /// подходит.
     near: f32,
     /// Сдвиг модели на подставке (из её координат в координаты подставки).
-    shift: Vec3,
+    pub shift: Vec3,
     /// Камера плавно едет к готовому виду или к детали.
     goal: Option<Goal>,
     /// Свободный полёт: мышь крутит голову камеры на месте, клавиши её двигают.
@@ -329,7 +329,7 @@ impl ShapeView {
     }
 
     /// Камера без хода времени.
-    fn camera_now(&self) -> Camera3D {
+    pub(crate) fn camera_now(&self) -> Camera3D {
         let eye = self.eye();
         let mut camera = Camera3D::looking_at(eye, self.target);
         camera.near = (self.distance.min(self.near * 2.0) * 0.01).max(0.002);
@@ -584,37 +584,147 @@ fn angle_to(from: f32, to: f32) -> f32 {
     (to - from + PI).rem_euclid(TAU) - PI
 }
 
+/// Что лежит вокруг части по пути к ней: сдвиги, зеркала, повторы.
+#[derive(Clone, Copy, Debug)]
+enum Around {
+    Move(Placing),
+    Mirror(reyvec_sdf::shape3d::Axis),
+    Repeat(u32, [f32; 3]),
+}
+
+/// Часть по пути `path` (со своими сдвигом и цветом) и что вокруг неё, снаружи внутрь.
+fn walk<'a>(shape: &'a Shape3, path: &[usize]) -> Option<(&'a Shape3, Vec<Around>)> {
+    let mut around = Vec::new();
+    let mut node = shape;
+    for &i in path {
+        node = unwrap(node, &mut around);
+        node = child(node, i, &mut around)?;
+    }
+    Some((node, around))
+}
+
+/// Форма части в координатах модели: обёрнута во всё, что вокруг неё (`copies` — с
+/// копиями зеркал и повторов).
+fn placed(node: &Shape3, around: &[Around], copies: bool) -> Shape3 {
+    let mut shape = node.clone();
+    for a in around.iter().rev() {
+        shape = match *a {
+            Around::Move((at, turn, scale)) => Shape3::Move {
+                at,
+                turn,
+                scale,
+                shape: Box::new(shape),
+            },
+            Around::Mirror(axis) if copies => Shape3::Mirror {
+                axis,
+                smooth: 0.0,
+                shape: Box::new(shape),
+            },
+            Around::Repeat(count, step) if copies => Shape3::Repeat {
+                count,
+                step,
+                smooth: 0.0,
+                shape: Box::new(shape),
+            },
+            _ => shape,
+        };
+    }
+    shape
+}
+
 /// Коробка детали по пути `path` в дереве частей (`shape_edit::parse`) в координатах
 /// модели: со всеми сдвигами вокруг неё. Копии зеркала и повтора не входят — коробка
 /// самой детали. `None` — модель не читается или у детали нет размера (ссылка `Use`).
 pub(crate) fn part_bounds(text: &str, path: &[usize]) -> Option<(Vec3, Vec3)> {
     let file = ModelFile::parse(text).ok()?;
-    let mut moves = Vec::new();
-    let mut node = &file.shape;
-    for &i in path {
-        node = unwrap(node, &mut moves);
-        node = child(node, i, &mut moves)?;
-    }
-    let mut shape = node.clone();
-    for &(at, turn, scale) in moves.iter().rev() {
-        shape = Shape3::Move {
-            at,
-            turn,
-            scale,
-            shape: Box::new(shape),
-        };
-    }
+    let (node, around) = walk(&file.shape, path)?;
     // Ссылка на другую модель здесь не раскрыта: у неё коробка в точку.
-    shape
+    placed(node, &around, false)
         .bounds_box()
         .filter(|(lo, hi)| (*hi - *lo).max_element() > 1e-6)
+}
+
+/// Переход из координат родителя детали (где записано её `at`) в координаты модели.
+pub(crate) fn parent_frame(text: &str, path: &[usize]) -> Option<glam::Affine3A> {
+    let file = ModelFile::parse(text).ok()?;
+    let (_, around) = walk(&file.shape, path)?;
+    let mut m = glam::Affine3A::IDENTITY;
+    for a in &around {
+        if let Around::Move((at, turn, scale)) = *a {
+            let r = glam::Mat3A::from(reyvec_sdf::shape3d::rotation(turn));
+            m *= glam::Affine3A {
+                matrix3: r * scale,
+                translation: Vec3::from(at).into(),
+            };
+        }
+    }
+    Some(m)
+}
+
+/// Какую деталь видно по лучу из `origin` вдоль `dir` (координаты модели): луч идёт до
+/// поверхности модели без спрятанных деталей, там берётся ближайшая деталь без вложенных
+/// (с копиями зеркал и повторов). `None` — луч мимо модели.
+pub(crate) fn pick(
+    text: &str,
+    hidden: &[Vec<usize>],
+    origin: Vec3,
+    dir: Vec3,
+    far: f32,
+) -> Option<Vec<usize>> {
+    let file = ModelFile::parse(text).ok()?;
+    let mut sorted = hidden.to_vec();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    let mut whole = file.shape.clone();
+    for p in &sorted {
+        remove_part(&mut whole, p);
+    }
+    let (lo, hi) = whole.bounds_box()?;
+    let eps = ((hi - lo).max_element() * 2e-4).max(1e-5);
+    let mut t = 0.0;
+    let mut hit = None;
+    for _ in 0..400 {
+        let p = origin + dir * t;
+        let d = whole.distance(p);
+        if d.abs() < eps {
+            hit = Some(p);
+            break;
+        }
+        t += d.max(eps * 0.5);
+        if t > far {
+            break;
+        }
+    }
+    let p = hit?;
+    let tree = super::shape_edit::parse(text).ok()?;
+    let mut best: Option<(f32, Vec<usize>)> = None;
+    let mut stack = vec![(Vec::new(), &tree)];
+    while let Some((path, part)) = stack.pop() {
+        if hidden.iter().any(|h| path.starts_with(h)) {
+            continue;
+        }
+        if part.children.is_empty() {
+            if let Some((node, around)) = walk(&file.shape, &path) {
+                let d = placed(node, &around, true).distance(p).abs();
+                if d < f32::MAX && best.as_ref().is_none_or(|(b, _)| d < *b) {
+                    best = Some((d, path.clone()));
+                }
+            }
+            continue;
+        }
+        for (i, c) in part.children.iter().enumerate() {
+            let mut q = path.clone();
+            q.push(i);
+            stack.push((q, c));
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 /// Сдвиг одной части: место, поворот, масштаб.
 type Placing = ([f32; 3], [f32; 3], f32);
 
 /// Снимает со части её сдвиг и цвет (по одному, как дерево `shape_edit`), запоминая сдвиг.
-fn unwrap<'a>(mut node: &'a Shape3, moves: &mut Vec<Placing>) -> &'a Shape3 {
+fn unwrap<'a>(mut node: &'a Shape3, around: &mut Vec<Around>) -> &'a Shape3 {
     let (mut moved, mut painted) = (false, false);
     loop {
         match node {
@@ -625,7 +735,7 @@ fn unwrap<'a>(mut node: &'a Shape3, moves: &mut Vec<Placing>) -> &'a Shape3 {
                 shape,
             } if !moved => {
                 moved = true;
-                moves.push((*at, *turn, *scale));
+                around.push(Around::Move((*at, *turn, *scale)));
                 node = shape;
             }
             Shape3::Paint { shape, .. } if !painted => {
@@ -638,7 +748,7 @@ fn unwrap<'a>(mut node: &'a Shape3, moves: &mut Vec<Placing>) -> &'a Shape3 {
 }
 
 /// Вложенная часть номер `i` (по порядку, как в дереве `shape_edit`).
-fn child<'a>(node: &'a Shape3, i: usize, moves: &mut Vec<Placing>) -> Option<&'a Shape3> {
+fn child<'a>(node: &'a Shape3, i: usize, around: &mut Vec<Around>) -> Option<&'a Shape3> {
     match node {
         Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => shapes.get(i),
         Shape3::Subtract { base, cut, .. } => {
@@ -654,17 +764,20 @@ fn child<'a>(node: &'a Shape3, i: usize, moves: &mut Vec<Placing>) -> Option<&'a
             scale,
             shape,
         } if i == 0 => {
-            moves.push((*at, *turn, *scale));
+            around.push(Around::Move((*at, *turn, *scale)));
             Some(shape)
         }
-        Shape3::Paint { shape, .. }
-        | Shape3::Mirror { shape, .. }
-        | Shape3::Repeat { shape, .. }
-        | Shape3::Animate { shape, .. }
-            if i == 0 =>
-        {
+        Shape3::Mirror { axis, shape, .. } if i == 0 => {
+            around.push(Around::Mirror(*axis));
             Some(shape)
         }
+        Shape3::Repeat {
+            count, step, shape, ..
+        } if i == 0 => {
+            around.push(Around::Repeat(*count, *step));
+            Some(shape)
+        }
+        Shape3::Paint { shape, .. } | Shape3::Animate { shape, .. } if i == 0 => Some(shape),
         _ => None,
     }
 }
@@ -907,5 +1020,35 @@ mod tests {
         let back = view.set_hidden(&[first], false);
         assert_eq!(back, full);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), view.text);
+    }
+
+    const PICK: &str = r#"(format: "reyvec-shape", version: 1, shape: Union(shapes: [
+        Sphere(radius: 0.3),
+        Mirror(axis: X, shape: Move(at: (1.0, 0.0, 0.0), shape: Box(size: (0.4, 0.4, 0.4)))),
+    ]))"#;
+
+    #[test]
+    fn click_picks_the_part_under_the_cursor() {
+        let back = Vec3::NEG_Z;
+        let at = |x: f32| Vec3::new(x, 0.0, 5.0);
+        assert_eq!(pick(PICK, &[], at(0.0), back, 50.0), Some(vec![0]));
+        // Коробка и её отражение — одна деталь.
+        assert_eq!(pick(PICK, &[], at(1.0), back, 50.0), Some(vec![1, 0]));
+        assert_eq!(pick(PICK, &[], at(-1.0), back, 50.0), Some(vec![1, 0]));
+        assert_eq!(pick(PICK, &[], at(3.0), back, 50.0), None, "мимо");
+        // Спрятанный шар не мешает: луч проходит насквозь.
+        assert_eq!(pick(PICK, &[vec![0]], at(0.0), back, 50.0), None);
+    }
+
+    #[test]
+    fn parent_frame_follows_enclosing_moves() {
+        let text = r#"(format: "reyvec-shape", version: 1, shape: Move(at: (1.0, 0.0, 0.0), scale: 2.0,
+            shape: Union(shapes: [Move(at: (0.0, 1.0, 0.0), shape: Sphere(radius: 0.1))])))"#;
+        let f = parent_frame(text, &[0]).expect("место родителя");
+        assert!(
+            (f.transform_point3(Vec3::new(0.0, 1.0, 0.0)) - Vec3::new(1.0, 2.0, 0.0)).length()
+                < 1e-5
+        );
+        assert!((f.transform_vector3(Vec3::X).length() - 2.0).abs() < 1e-5);
     }
 }
