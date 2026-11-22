@@ -21,6 +21,7 @@ reyvec-app.workspace = true
 reyvec-gpu.workspace = true
 reyvec-scene.workspace = true
 reyvec-sdf.workspace = true
+png.workspace = true
 ron.workspace = true
 reyvec-vector.workspace = true
 tracing.workspace = true

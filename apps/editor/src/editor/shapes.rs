@@ -799,7 +799,7 @@ fn unwrap_mut(node: &mut Shape3) -> &mut Shape3 {
 }
 
 /// [`child`] для правки.
-fn child_mut(node: &mut Shape3, i: usize) -> Option<&mut Shape3> {
+pub(crate) fn child_mut(node: &mut Shape3, i: usize) -> Option<&mut Shape3> {
     match node {
         Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => shapes.get_mut(i),
         Shape3::Subtract { base, cut, .. } => {

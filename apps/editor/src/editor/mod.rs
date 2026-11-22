@@ -36,6 +36,7 @@ mod shape_edit;
 mod shapes;
 mod space_edit;
 mod theme;
+mod thumbs;
 mod ui;
 mod viewport;
 

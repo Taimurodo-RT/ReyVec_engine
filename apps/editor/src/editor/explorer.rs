@@ -21,6 +21,7 @@ use super::assets::{PREFABS, is_space_scene, kind_of};
 use super::project_files::{self as pf, Done, NewKind, ROOTS};
 use super::shapes::is_shape;
 use super::theme::*;
+use super::thumbs::Thumbs;
 
 /// Как часто перечитывать открытую папку: файлы могли поменять в другой программе.
 const REFRESH_S: f64 = 1.5;
@@ -134,6 +135,13 @@ pub(crate) struct Creating {
     error: Option<String>,
 }
 
+impl Item {
+    /// У файла бывает миниатюра (Э.3): модель формы или сцена 3D.
+    fn has_thumb(&self) -> bool {
+        !self.folder && (self.kind == "модель формы" || self.kind == "сцена 3D")
+    }
+}
+
 /// Файлы, которые тащат мышью внутри проводника.
 #[derive(Clone, Debug)]
 struct Dragged(Vec<PathBuf>);
@@ -170,6 +178,8 @@ pub(crate) struct Explorer {
     pub(crate) creating: Option<Creating>,
     /// Рамка выделения мышью: откуда тянут (точка экрана) и выбранное до неё (с Ctrl).
     band: Option<(Pos2, Vec<PathBuf>)>,
+    /// Миниатюры моделей и сцен 3D (Э.3).
+    thumbs: Thumbs,
     /// Где используется выбранный: для какого файла посчитано и что нашлось.
     used: Option<(PathBuf, Vec<(PathBuf, usize)>)>,
     /// Последнее сообщение внизу: текст и ошибка ли.
@@ -196,6 +206,7 @@ impl Explorer {
             .chain(project.clone())
             .collect();
         Self {
+            thumbs: Thumbs::new(project.as_deref()),
             project,
             dir,
             back: Vec::new(),
@@ -378,6 +389,9 @@ impl Explorer {
 
     /// Запомнить для отмены, не трогая повтор.
     fn remember(&mut self, done: Done) {
+        if matches!(done, Done::Moved { .. }) {
+            self.thumbs.forget();
+        }
         self.undo.push(done);
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
@@ -877,6 +891,7 @@ impl Explorer {
             self.list(now);
         }
         let per_row = self.keys(ui, busy);
+        self.thumbs.poll(ui.ctx());
         let frame = Frame::NONE.fill(PANEL);
         egui::Panel::top("explorer-nav")
             .exact_size(44.0)
@@ -1437,6 +1452,7 @@ impl Explorer {
     /// Плитки или список файлов открытой папки.
     fn files(&mut self, ui: &mut Ui, busy: &Busy, per_row: usize) {
         let full = ui.max_rect();
+        let now = ui.input(|i| i.time);
         // Пустое место: щелчок снимает выбор, правая кнопка — меню папки, тянуть мышью —
         // рамка выделения (с Ctrl — добавить к выбранному).
         let bg = ui.interact(
@@ -1505,10 +1521,14 @@ impl Explorer {
                 let mut body = |ui: &mut Ui| {
                     for item in &items {
                         let selected = self.selected.contains(&item.path);
+                        let pic = item
+                            .has_thumb()
+                            .then(|| self.thumbs.get(&item.path, now))
+                            .flatten();
                         let r = if list {
-                            row(ui, item, selected, self.renaming_text(&item.path))
+                            row(ui, item, selected, self.renaming_text(&item.path), pic)
                         } else {
-                            tile(ui, item, selected, self.renaming_text(&item.path))
+                            tile(ui, item, selected, self.renaming_text(&item.path), pic)
                         };
                         let (r, edit) = r;
                         if let Some(edit) = edit {
@@ -1878,7 +1898,11 @@ impl Explorer {
     fn one_details(&mut self, ui: &mut Ui, item: &Item) {
         // Большая плитка-образец вида файла.
         let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 120.0), Sense::hover());
-        thumb(ui.painter(), rect, item, false);
+        let pic = item
+            .has_thumb()
+            .then(|| self.thumbs.get(&item.path, ui.input(|i| i.time)))
+            .flatten();
+        thumb(ui.painter(), rect, item, false, pic);
         ui.add_space(GAP_L);
         heading(ui, &item.name);
         ui.label(RichText::new(capital(item.kind)).color(item.color));
@@ -2226,7 +2250,13 @@ fn columns(rect: Rect) -> [Rect; 4] {
 }
 
 /// Строка списка. Второе — где поле имени, если файл переименовывают.
-fn row(ui: &mut Ui, item: &Item, selected: bool, renaming: bool) -> (egui::Response, Option<Rect>) {
+fn row(
+    ui: &mut Ui,
+    item: &Item,
+    selected: bool,
+    renaming: bool,
+    pic: Option<egui::TextureId>,
+) -> (egui::Response, Option<Rect>) {
     let (rect, r) = ui.allocate_exact_size(
         vec2(ui.available_width(), ROW_HEIGHT),
         Sense::click_and_drag(),
@@ -2244,6 +2274,14 @@ fn row(ui: &mut Ui, item: &Item, selected: bool, renaming: bool) -> (egui::Respo
     );
     if item.folder {
         paint_glyph(p, dot.center(), Glyph::Folder, item.color);
+    } else if let Some(pic) = pic {
+        let r = Rect::from_center_size(dot.center(), vec2(20.0, 20.0));
+        p.image(
+            pic,
+            r,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
     } else {
         p.rect_filled(dot.shrink(2.0), 3, item.color.gamma_multiply(0.85));
     }
@@ -2287,6 +2325,7 @@ fn tile(
     item: &Item,
     selected: bool,
     renaming: bool,
+    pic: Option<egui::TextureId>,
 ) -> (egui::Response, Option<Rect>) {
     let (rect, r) = ui.allocate_exact_size(TILE, Sense::click_and_drag());
     let p = ui.painter();
@@ -2296,7 +2335,7 @@ fn tile(
         p.rect_filled(rect.expand(3.0), RADIUS_M, HOVER);
     }
     let t = Rect::from_min_size(rect.min, vec2(rect.width(), THUMB_H));
-    thumb(p, t, item, r.hovered());
+    thumb(p, t, item, r.hovered(), pic);
     let name_rect = Rect::from_min_max(
         pos2(rect.left() - 2.0, t.bottom() + GAP_S),
         pos2(rect.right() + 2.0, t.bottom() + GAP_S + 22.0),
@@ -2321,7 +2360,7 @@ fn tile(
 }
 
 /// Образец вида файла: цветная полоса сверху, значок папки или окончание и вид.
-fn thumb(p: &egui::Painter, t: Rect, item: &Item, hovered: bool) {
+fn thumb(p: &egui::Painter, t: Rect, item: &Item, hovered: bool, pic: Option<egui::TextureId>) {
     let fill = if hovered { RAISED } else { CARD };
     p.rect(
         t,
@@ -2334,6 +2373,25 @@ fn thumb(p: &egui::Painter, t: Rect, item: &Item, hovered: bool) {
     if item.folder {
         let s = (t.height() / 70.0).clamp(1.0, 2.0);
         paint_folder(p, t.center(), s * 1.9, item.color);
+        return;
+    }
+    if let Some(pic) = pic {
+        // Миниатюра модели (Э.3): квадрат по меньшей стороне, посередине.
+        let side = t.height().min(t.width()) - 2.0 * GAP_S;
+        let r = Rect::from_center_size(t.center(), vec2(side, side));
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        p.image(pic, r, uv, Color32::WHITE);
+        let band = Rect::from_min_size(t.min + vec2(LINE, LINE), vec2(t.width() - 2.0 * LINE, 3.0));
+        p.rect_filled(
+            band,
+            egui::CornerRadius {
+                nw: RADIUS_M - 1,
+                ne: RADIUS_M - 1,
+                sw: 0,
+                se: 0,
+            },
+            item.color,
+        );
         return;
     }
     let band = Rect::from_min_size(t.min + vec2(LINE, LINE), vec2(t.width() - 2.0 * LINE, 3.0));
