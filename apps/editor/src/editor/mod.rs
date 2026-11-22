@@ -18,6 +18,7 @@
 mod arrange;
 mod assets;
 mod clay_edit;
+mod code;
 mod contour;
 mod cost;
 mod doc;
@@ -26,6 +27,7 @@ mod explorer;
 mod files;
 mod geom;
 mod layout;
+mod luau_text;
 mod model_params;
 mod outline;
 mod overlay;
@@ -704,7 +706,11 @@ impl Editor {
             Action::Close => self.close_or_ask(event_loop),
             Action::ForceClose => self.close(event_loop),
             Action::SaveAndClose => {
-                let saved = self.doc.as_mut().map(SceneDoc::save);
+                if let Err(e) = self.ui.save_code() {
+                    tracing::warn!("{e}, окно остаётся");
+                    return;
+                }
+                let saved = self.doc.as_mut().filter(|d| d.dirty()).map(SceneDoc::save);
                 match saved {
                     Some(Err(e)) => tracing::warn!("Сцена не сохранена, окно остаётся: {e}"),
                     _ => self.close(event_loop),
@@ -991,7 +997,7 @@ impl Editor {
     }
 
     fn close_or_ask(&mut self, event_loop: &ActiveEventLoop) {
-        if self.doc.as_ref().is_some_and(SceneDoc::dirty) {
+        if self.doc.as_ref().is_some_and(SceneDoc::dirty) || self.ui.code_dirty() {
             self.ui.ask_close();
             if let Some(w) = &self.window {
                 w.request_redraw();

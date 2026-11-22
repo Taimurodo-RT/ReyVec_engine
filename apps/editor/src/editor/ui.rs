@@ -17,6 +17,7 @@ use winit::window::ResizeDirection;
 
 use super::arrange;
 use super::assets::{AssetFile, Assets};
+use super::code::{CodeEditor, CodeOut};
 use super::contour;
 use super::doc::{Change, Edit};
 use super::explorer::{self, Explorer};
@@ -321,6 +322,8 @@ pub(crate) struct EditorUi {
     explorer: Explorer,
     /// В прошлом кадре вместо сцены был проводник: сцену можно не рисовать.
     files_shown: bool,
+    /// Открытый в «Ассетах» скрипт (С.1): вместо проводника.
+    pub(crate) code: Option<CodeEditor>,
     /// Где сцена в прошлом кадре (точки интерфейса).
     viewport: Option<Rect>,
     viewport_hovered: bool,
@@ -421,6 +424,7 @@ impl EditorUi {
             assets: Assets::scan(project),
             explorer: Explorer::new(project),
             files_shown: false,
+            code: None,
             viewport: None,
             viewport_hovered: false,
             actions: Vec::new(),
@@ -635,8 +639,52 @@ impl EditorUi {
         }
     }
 
+    /// В открытом скрипте несохранённые правки.
+    pub(crate) fn code_dirty(&self) -> bool {
+        self.code.as_ref().is_some_and(CodeEditor::dirty)
+    }
+
+    /// Сохранить открытый скрипт (перед закрытием окна).
+    pub(crate) fn save_code(&mut self) -> Result<(), String> {
+        match self.code.as_mut() {
+            Some(c) if c.dirty() => c.save(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Открыть скрипт в редакторе кода.
+    fn open_code(&mut self, path: &Path) {
+        let project = self.explorer.project().map(Path::to_path_buf);
+        match CodeEditor::open(path, project.as_deref()) {
+            Ok(c) => self.code = Some(c),
+            Err(e) => self.push_log([(BAD, e)]),
+        }
+    }
+
+    /// Редактор кода вместо проводника.
+    fn code_view(&mut self, ui: &mut Ui) -> bool {
+        let Some(code) = self.code.as_mut() else {
+            return false;
+        };
+        for out in code.draw(ui) {
+            match out {
+                CodeOut::Close => {
+                    self.code = None;
+                    self.explorer.refresh();
+                }
+                CodeOut::Saved => self.explorer.refresh(),
+                CodeOut::Reveal(p) => self.actions.push(Action::ShowInFolder(p)),
+                CodeOut::Log(c, t) => self.push_log([(c, t)]),
+            }
+        }
+        true
+    }
+
     /// Проводник «Ассетов» и то, что он просит.
     fn files(&mut self, ui: &mut Ui, info: &Info) {
+        if self.code_view(ui) {
+            return;
+        }
         let busy = explorer::Busy {
             scene: info.scene_path,
             scene_dirty: info.dirty,
@@ -657,6 +705,7 @@ impl EditorUi {
                     self.actions.push(Action::OpenScene(p));
                     self.open_workspace("Мир");
                 }
+                explorer::Out::OpenScript(p) => self.open_code(&p),
                 explorer::Out::OpenFile(p) => self.actions.push(Action::OpenFile(p)),
                 explorer::Out::Reveal(p) => self.actions.push(Action::ShowInFolder(p)),
                 explorer::Out::Log(c, t) => self.push_log([(c, t)]),
@@ -670,37 +719,53 @@ impl EditorUi {
 
     /// «Сохранить правки перед закрытием?»
     fn close_dialog(&mut self, ctx: &egui::Context, info: &Info) {
-        let modal = egui::Modal::new(Id::unique("editor-close")).show(ctx, |ui| {
-            ui.set_width(380.0);
-            ui.label(
-                RichText::new("Сохранить правки?")
-                    .size(FONT_HEADING)
-                    .color(Color32::WHITE),
-            );
-            ui.add_space(GAP_M);
-            ui.label(
-                RichText::new(format!(
-                    "В сцене {} есть несохранённые правки. Без сохранения они пропадут.",
-                    info.scene_name
-                ))
+        let modal =
+            egui::Modal::new(Id::unique("editor-close")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(
+                    RichText::new("Сохранить правки?")
+                        .size(FONT_HEADING)
+                        .color(Color32::WHITE),
+                );
+                ui.add_space(GAP_M);
+                ui.label(
+                RichText::new(match (info.dirty, self.code.as_ref().filter(|c| c.dirty())) {
+                    (true, Some(c)) => format!(
+                        "В сцене {} и скрипте {} есть несохранённые правки. Без сохранения они \
+                         пропадут.",
+                        info.scene_name,
+                        pf_name(&c.path)
+                    ),
+                    (false, Some(c)) => format!(
+                        "В скрипте {} есть несохранённые правки. Без сохранения они пропадут.",
+                        pf_name(&c.path)
+                    ),
+                    _ => format!(
+                        "В сцене {} есть несохранённые правки. Без сохранения они пропадут.",
+                        info.scene_name
+                    ),
+                })
                 .color(TEXT_DIM),
             );
-            ui.add_space(GAP_XL);
-            ui.horizontal(|ui| {
-                let save = egui::Button::new(RichText::new("Сохранить").color(BG)).fill(ACCENT);
-                if ui.add_enabled(info.can_save, save).clicked() {
-                    self.actions.push(Action::SaveAndClose);
-                    self.asking_close = false;
-                }
-                if ui.button("Не сохранять").clicked() {
-                    self.actions.push(Action::ForceClose);
-                    self.asking_close = false;
-                }
-                if ui.button("Отмена").clicked() {
-                    self.asking_close = false;
-                }
+                ui.add_space(GAP_XL);
+                ui.horizontal(|ui| {
+                    let save = egui::Button::new(RichText::new("Сохранить").color(BG)).fill(ACCENT);
+                    if ui
+                        .add_enabled(info.can_save || self.code_dirty(), save)
+                        .clicked()
+                    {
+                        self.actions.push(Action::SaveAndClose);
+                        self.asking_close = false;
+                    }
+                    if ui.button("Не сохранять").clicked() {
+                        self.actions.push(Action::ForceClose);
+                        self.asking_close = false;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        self.asking_close = false;
+                    }
+                });
             });
-        });
         if modal.should_close() {
             self.asking_close = false;
         }
@@ -5825,6 +5890,13 @@ fn newest(old: &shape_edit::Part, new: &shape_edit::Part, fallback: &[usize]) ->
         }
     }
     fallback.to_vec()
+}
+
+/// Имя файла словами.
+fn pf_name(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
