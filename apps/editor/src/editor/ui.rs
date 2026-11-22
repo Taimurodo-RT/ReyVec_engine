@@ -667,8 +667,10 @@ impl EditorUi {
         // Во «Формах» клавиши — для деталей модели, а не для предметов сцены.
         if let Some(shape) = &info.shape {
             let f = ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::F));
-            // W, E, R — двигать, повернуть, размер (в полёте эти буквы ведут камеру).
-            if !shape.free {
+            // W, E, R — двигать, повернуть, размер (в полёте и с зажатой правой кнопкой эти
+            // буквы ведут камеру).
+            let looking = ctx.input(|i| i.pointer.secondary_down());
+            if !shape.free && !looking {
                 for (key, m) in [
                     (Key::W, GizmoMode::Move),
                     (Key::E, GizmoMode::Turn),
@@ -2068,7 +2070,10 @@ impl EditorUi {
             if steps != 0.0 {
                 self.actions.push(cam(ShapeCam::Zoom(steps)));
             }
-            if shape.free && !ui.ctx().egui_wants_keyboard_input() {
+            // W A S D, Q E ведут камеру в полёте и, как в других редакторах, пока зажата
+            // правая кнопка (без неё W E R — ручки детали).
+            let looking = ui.input(|i| i.pointer.secondary_down());
+            if (shape.free || looking) && !ui.ctx().egui_wants_keyboard_input() {
                 let (dir, dt) = ui.input(|i| {
                     let k = |a: egui::Key, b: egui::Key| {
                         f32::from(u8::from(i.key_down(a))) - f32::from(u8::from(i.key_down(b)))
@@ -2086,27 +2091,51 @@ impl EditorUi {
             }
         }
         let painter = ui.painter_at(rect);
+        let camera = "Камера: правая кнопка — повернуть (щелчок — меню детали), с ней W A S D — \
+                      лететь, Q E — вниз и вверх, Shift — быстрее. Средняя — сдвинуть, \
+                      колесо — ближе, F — выбранное крупно. Esc — назад к сцене";
         let hint = if shape.free {
             "Полёт: правая кнопка — оглядеться, W A S D — лететь, Q E — вниз и вверх, \
-             Shift — быстрее. Esc — назад к сцене"
+             Shift — быстрее, колесо — вперёд-назад. Esc — назад к сцене"
+                .to_owned()
         } else if shape.scene {
-            "Левая — выбрать предмет и тянуть ручки (W E R), кружки — лампы (Shift — вверх). \
-             Модели — мышью из «Ассетов». Правая — камера, колесо — ближе"
+            format!(
+                "Левая — выбрать предмет и тянуть его ручки: W — двигать, E — повернуть, \
+                 R — размер. Кружки — лампы: тянуть по полу, с Shift — вверх. Модели \
+                 перетаскивайте из «Ассетов».\n{camera}"
+            )
         } else {
-            "Левая — выбрать деталь и тянуть её ручки (W двигать, E повернуть, R размер), \
-             правая — повернуть камеру (щелчок — меню детали), средняя — сдвинуть, колесо — \
-             ближе, F — крупно. Esc — назад к сцене"
+            format!(
+                "Левая — выбрать деталь и тянуть её ручки: W — двигать, E — повернуть, \
+                 R — размер.\n{camera}"
+            )
         };
-        chip(&painter, rect.left_top() + vec2(12.0, 12.0), hint, MUTED);
+        // Подсказка по клавишам — значок «?»: текст всплывает при наведении.
+        let help = Rect::from_min_size(rect.left_top() + vec2(12.0, 12.0), vec2(26.0, 26.0));
+        let r = ui
+            .interact(help, ui.scope_id().with("shape-help"), Sense::hover())
+            .on_hover_ui(|ui| {
+                ui.set_max_width(420.0);
+                ui.label(&hint);
+            });
+        painter.circle(
+            help.center(),
+            12.0,
+            Color32::from_rgba_unmultiplied(21, 24, 30, 220),
+            Stroke::new(1.0, if r.hovered() { ACCENT } else { BORDER_STRONG }),
+        );
+        painter.text(
+            help.center(),
+            Align2::CENTER_CENTER,
+            "?",
+            FontId::proportional(FONT_CHIP + 2.0),
+            if r.hovered() { ACCENT } else { TEXT_DIM },
+        );
+        let at = rect.left_top() + vec2(48.0, 12.0);
         if let Some(e) = shape.error {
-            chip(
-                &painter,
-                rect.left_top() + vec2(12.0, 40.0),
-                &format!("Ошибка в модели: {e}"),
-                BAD,
-            );
+            chip(&painter, at, &format!("Ошибка в модели: {e}"), BAD);
         } else {
-            self.scene_note_chip(&painter, rect.left_top() + vec2(12.0, 40.0));
+            self.scene_note_chip(&painter, at);
         }
     }
 
@@ -5826,6 +5855,75 @@ mod tests {
         ui.shape_selected = vec![0];
         ui.shape_command(text, PartCmd::Up);
         assert!(ui.take_actions().is_empty(), "первую выше не поднять");
+    }
+
+    #[test]
+    fn right_button_with_wasd_flies_the_camera_without_switching_handles() {
+        let text = "(format: \"reyvec-shape\", version: 1, shape: Sphere(radius: 0.3))";
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Edit);
+        shape_info.shape = Some(ShapeInfo {
+            name: "шар",
+            spin: false,
+            free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            post_aa: false,
+            in_view: true,
+            passes: &[],
+            camera: reyvec_sdf::Camera3D::default(),
+            shift: [0.0; 3],
+            error: None,
+            text,
+            preview: &NO_PREVIEW,
+            cost: None,
+            scene: false,
+            root: std::path::Path::new("."),
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        let at = ui.viewport().expect("окно подставки").center();
+        let right = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            vec![egui::Event::PointerMoved(at), right(true)],
+        );
+        ui.take_actions();
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            vec![key(egui::Key::E, egui::Modifiers::NONE)],
+        );
+        let acts = ui.take_actions();
+        assert_eq!(
+            ui.gizmo_mode,
+            GizmoMode::Move,
+            "E с правой кнопкой — не ручки"
+        );
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ShapeCamera(ShapeCam::Fly(d, _)) if d[1] > 0.0)),
+            "{acts:?}"
+        );
+        // Без правой кнопки E — снова «повернуть».
+        frame(&ctx, &mut ui, &shape_info, vec![right(false)]);
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            vec![key(egui::Key::E, egui::Modifiers::NONE)],
+        );
+        assert_eq!(ui.gizmo_mode, GizmoMode::Turn);
     }
 
     #[test]
