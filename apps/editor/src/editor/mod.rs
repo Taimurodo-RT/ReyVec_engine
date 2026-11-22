@@ -1229,6 +1229,8 @@ impl Editor {
                 scale: renderer.space_scale(),
                 triangles: renderer.space_triangles(),
                 passes: &self.gpu_passes,
+                camera: s.camera_now(),
+                shift: s.shift.into(),
                 error: s.error.as_deref().or(shape_error.as_deref()),
                 text: &s.text,
             }),

@@ -207,6 +207,10 @@ pub(crate) struct ShapeInfo<'a> {
     pub triangles: bool,
     /// Самые долгие проходы видеокарты за последнюю секунду, мс (и весь кадр).
     pub passes: &'a [(&'static str, f64)],
+    /// Камера подставки в этом кадре (для выбора щелчком и стрелок).
+    pub camera: reyvec_sdf::Camera3D,
+    /// Сдвиг модели на подставке.
+    pub shift: [f32; 3],
     /// Ошибка в файле модели.
     pub error: Option<&'a str>,
     /// Текст файла модели (из него — дерево частей и числа инспектора).
@@ -308,8 +312,12 @@ pub(crate) struct EditorUi {
     shape_combine: shape_edit::Combine,
     /// Свёрнутые части в дереве модели.
     shape_closed: HashSet<Vec<usize>>,
-    /// Закреплённые части модели: их не правят и (с М.4) не выбирают на подставке.
+    /// Закреплённые части модели: их не правят и не выбирают на подставке.
     shape_locked: HashSet<Vec<usize>>,
+    /// Тянут стрелку детали на подставке (М.4).
+    gizmo_drag: Option<GizmoDrag>,
+    /// Деталь под правой кнопкой: для неё меню на подставке.
+    shape_menu: Option<Vec<usize>>,
 }
 
 /// Фильтр консоли.
@@ -371,6 +379,8 @@ impl EditorUi {
             shape_combine: shape_edit::Combine::Add,
             shape_closed: HashSet::new(),
             shape_locked: HashSet::new(),
+            gizmo_drag: None,
+            shape_menu: None,
         }
     }
 
@@ -838,6 +848,220 @@ impl EditorUi {
         }
     }
 
+    /// Стрелки выбранной детали на экране (М.4): откуда и куда идёт каждая ось, и
+    /// сколько точек экрана на метр по ней. Рисует рамку детали и стрелки.
+    fn shape_gizmo(&mut self, ui: &mut Ui, shape: &ShapeInfo) -> Option<Gizmo> {
+        let path = self.shape_selected.clone();
+        let screen = ui.ctx().content_rect();
+        let to_screen = |w: glam::Vec3| -> Option<Pos2> {
+            let aspect = screen.width() / screen.height().max(1.0);
+            let n = shape.camera.project(w, aspect)?;
+            (n.z > 0.0 && n.z <= 1.0).then(|| {
+                pos2(
+                    screen.left() + (n.x * 0.5 + 0.5) * screen.width(),
+                    screen.top() + (0.5 - n.y * 0.5) * screen.height(),
+                )
+            })
+        };
+        let shift = glam::Vec3::from(shape.shift);
+        let painter = ui.painter_at(self.viewport?);
+        // Рамка детали.
+        let (lo, hi) = super::shapes::part_bounds(shape.text, &path)?;
+        let (lo, hi) = (lo + shift, hi + shift);
+        let corner = |k: usize| {
+            glam::Vec3::new(
+                if k & 1 == 0 { lo.x } else { hi.x },
+                if k & 2 == 0 { lo.y } else { hi.y },
+                if k & 4 == 0 { lo.z } else { hi.z },
+            )
+        };
+        for (a, b) in [
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7),
+            (0, 2),
+            (1, 3),
+            (4, 6),
+            (5, 7),
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7),
+        ] {
+            if let (Some(p), Some(q)) = (to_screen(corner(a)), to_screen(corner(b))) {
+                painter.line_segment([p, q], Stroke::new(1.0, ACCENT.gamma_multiply(0.8)));
+            }
+        }
+        if path.is_empty() || self.part_locked(&path) {
+            return None;
+        }
+        let root = shape_edit::parse(shape.text).ok()?;
+        let part = root.at(&path)?;
+        let at = shape_edit::read_vec3(shape.text, part.moved, "at", [0.0; 3]);
+        let frame = super::shapes::parent_frame(shape.text, &path)?;
+        let at3 = glam::Vec3::new(at[0] as f32, at[1] as f32, at[2] as f32);
+        let origin = shift + frame.transform_point3(at3);
+        let size = (hi - lo).max_element();
+        let len = (size * 0.5 + 0.05 * size).max(0.02);
+        let o = to_screen(origin)?;
+        let mut axes = Vec::new();
+        let hover = ui.ctx().pointer_hover_pos();
+        let active = self.gizmo_drag.as_ref().map(|g| g.axis);
+        let mut hot = None;
+        for (i, color) in [BAD, GOOD, SELECT].into_iter().enumerate() {
+            let mut e = glam::Vec3::ZERO;
+            e[i] = 1.0;
+            let v = frame.transform_vector3(e);
+            let per_local = v.length();
+            if per_local < 1e-6 {
+                continue;
+            }
+            let tip = origin + v / per_local * len;
+            let Some(t) = to_screen(tip) else { continue };
+            let screen_len = (t - o).length();
+            if screen_len < 4.0 {
+                continue;
+            }
+            let near = hover.is_some_and(|h| dist_to_segment(h, o, t) < 7.0);
+            if near && hot.is_none() {
+                hot = Some(i);
+            }
+            axes.push(GizmoAxis {
+                axis: i,
+                from: o,
+                to: t,
+                px_per_unit: screen_len / len * per_local,
+            });
+            let lit = active == Some(i) || (active.is_none() && near);
+            let c = if lit { Color32::WHITE } else { color };
+            painter.line_segment([o, t], Stroke::new(if lit { 3.0 } else { 2.0 }, c));
+            let dir = (t - o) / screen_len;
+            let side = vec2(-dir.y, dir.x);
+            painter.add(egui::Shape::convex_polygon(
+                vec![t + dir * 9.0, t + side * 4.0, t - side * 4.0],
+                c,
+                Stroke::NONE,
+            ));
+        }
+        painter.circle_filled(o, 3.0, TEXT);
+        Some(Gizmo {
+            path,
+            at,
+            axes,
+            hot,
+        })
+    }
+
+    /// Мышь на подставке (М.4): левый щелчок выбирает деталь (пусто — вся модель), левая
+    /// по стрелке тянет деталь вдоль оси, правый щелчок по детали открывает её меню.
+    fn shape_pointer(
+        &mut self,
+        ui: &mut Ui,
+        response: &Response,
+        shape: &ShapeInfo,
+        gizmo: Option<&Gizmo>,
+    ) {
+        let screen = ui.ctx().content_rect();
+        let ray = |pos: Pos2| {
+            let aspect = screen.width() / screen.height().max(1.0);
+            let x = (pos.x - screen.left()) / screen.width() * 2.0 - 1.0;
+            let y = 1.0 - (pos.y - screen.top()) / screen.height() * 2.0;
+            let (o, d) = shape.camera.ray([x, y], aspect);
+            (o - glam::Vec3::from(shape.shift), d)
+        };
+        let far = shape.camera.far;
+        let pick = |pos: Option<Pos2>| {
+            let (o, d) = ray(pos?);
+            super::shapes::pick(shape.text, shape.hidden, o, d, far)
+        };
+        // Стрелки.
+        if response.drag_started_by(egui::PointerButton::Primary)
+            && let Some(g) = gizmo
+            && let Some(i) = g.hot
+            && let Some(a) = g.axes.iter().find(|a| a.axis == i)
+        {
+            self.gizmo_drag = Some(GizmoDrag {
+                axis: i,
+                path: g.path.clone(),
+                text: shape.text.to_owned(),
+                at: g.at,
+                dir: (a.to - a.from).normalized(),
+                px_per_unit: a.px_per_unit,
+                moved: 0.0,
+            });
+        }
+        if let Some(g) = self.gizmo_drag.as_mut() {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                g.moved += response.drag_delta().dot(g.dir);
+                endless_drag(ui.ctx());
+                let mut at = g.at;
+                let mut v = at[g.axis] + f64::from(g.moved / g.px_per_unit);
+                if ui.input(|i| i.modifiers.command) {
+                    v = (v * 100.0).round() / 100.0;
+                }
+                at[g.axis] = v;
+                let edit = shape_edit::parse(&g.text)
+                    .ok()
+                    .and_then(|r| r.at(&g.path).cloned())
+                    .map(|part| {
+                        shape_edit::set_moved(&g.text, &part, "at", &shape_edit::triple(at))
+                    });
+                if let Some(Ok(text)) = edit {
+                    self.actions.push(Action::ShapeText {
+                        text,
+                        commit: false,
+                    });
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            } else {
+                self.gizmo_drag = None;
+                self.actions.push(Action::EndEdit);
+            }
+            return;
+        }
+        if gizmo.is_some_and(|g| g.hot.is_some()) {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        if response.clicked_by(egui::PointerButton::Primary) {
+            match pick(response.interact_pointer_pos()) {
+                Some(p) if !self.part_locked(&p) => self.shape_selected = p,
+                Some(_) => {}
+                None => self.shape_selected.clear(),
+            }
+        }
+        if response.secondary_clicked() {
+            self.shape_menu =
+                pick(response.interact_pointer_pos()).filter(|p| !self.part_locked(p));
+            if let Some(p) = &self.shape_menu {
+                self.shape_selected = p.clone();
+            }
+        }
+        let Some(path) = self.shape_menu.clone() else {
+            return;
+        };
+        let Ok(root) = shape_edit::parse(shape.text) else {
+            return;
+        };
+        let Some(part) = root.at(&path) else { return };
+        let materials = shape_edit::materials(shape.text);
+        let mut out = TreeOut::default();
+        let mut tree = ShapeTree {
+            text: shape.text,
+            root: &root,
+            selected: &self.shape_selected,
+            closed: &self.shape_closed,
+            hidden: shape.hidden,
+            locked: &self.shape_locked,
+            materials: &materials,
+            out: &mut out,
+        };
+        response.context_menu(|ui| tree.menu(ui, part, &path));
+        if let Some(cmd) = out.cmd {
+            self.shape_command(shape.text, cmd);
+        }
+    }
+
     /// Закреплена ли деталь (она сама или часть, в которой она лежит).
     fn part_locked(&self, path: &[usize]) -> bool {
         (0..=path.len()).any(|n| self.shape_locked.contains(&path[..n]))
@@ -1171,10 +1395,14 @@ impl EditorUi {
             Sense::click_and_drag(),
         );
         self.viewport_hovered = response.hovered() || response.dragged();
+        // Левая кнопка — выбор и стрелки детали (М.4), правая — повернуть, средняя —
+        // сдвинуть.
+        let gizmo = self.shape_gizmo(ui, shape);
+        self.shape_pointer(ui, &response, shape, gizmo.as_ref());
         let d = response.drag_delta();
-        if response.dragged() && d != Vec2::ZERO {
-            // Правая (и пока левая, до выбора деталей щелчком) — повернуть, средняя —
-            // сдвинуть.
+        let camera_drag = response.dragged_by(egui::PointerButton::Secondary)
+            || response.dragged_by(egui::PointerButton::Middle);
+        if camera_drag && d != Vec2::ZERO {
             let pan = response.dragged_by(egui::PointerButton::Middle);
             self.actions.push(cam(if pan {
                 ShapeCam::Pan(d)
@@ -1215,8 +1443,8 @@ impl EditorUi {
             "Полёт: правая кнопка — оглядеться, W A S D — лететь, Q E — вниз и вверх, \
              Shift — быстрее. Esc — назад к сцене"
         } else {
-            "Правая кнопка — повернуть, средняя — сдвинуть, колесо — ближе, F — деталь \
-             крупно. Esc — назад к сцене"
+            "Левая — выбрать деталь и тянуть её стрелки, правая — повернуть (щелчок — меню \
+             детали), средняя — сдвинуть, колесо — ближе, F — крупно. Esc — назад к сцене"
         };
         chip(&painter, rect.left_top() + vec2(12.0, 12.0), hint, MUTED);
         if let Some(e) = shape.error {
@@ -3686,7 +3914,46 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
-/// Действие над деталью модели из меню дерева или с клавиатуры.
+/// Стрелки выбранной детали на экране в этом кадре.
+struct Gizmo {
+    path: Vec<usize>,
+    /// Место детали у родителя (`at`).
+    at: [f64; 3],
+    axes: Vec<GizmoAxis>,
+    /// Ось, над стрелкой которой мышь.
+    hot: Option<usize>,
+}
+
+struct GizmoAxis {
+    axis: usize,
+    from: Pos2,
+    to: Pos2,
+    /// Точек экрана на единицу `at` вдоль оси.
+    px_per_unit: f32,
+}
+
+/// Деталь тянут за стрелку: всё считается от текста и места в начале, чтобы запись в
+/// файл с задержкой не теряла движение.
+struct GizmoDrag {
+    axis: usize,
+    path: Vec<usize>,
+    text: String,
+    at: [f64; 3],
+    /// Направление стрелки на экране.
+    dir: Vec2,
+    px_per_unit: f32,
+    /// Сколько точек протянули вдоль стрелки.
+    moved: f32,
+}
+
+/// Расстояние от точки до отрезка, точки экрана.
+fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+/// Действие над деталью модели из меню дерева или с клавиатуры./// Действие над деталью модели из меню дерева или с клавиатуры.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PartCmd {
     Focus,
@@ -4075,6 +4342,8 @@ mod tests {
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
             passes: &[],
+            camera: reyvec_sdf::Camera3D::default(),
+            shift: [0.0; 3],
             error: Some("нет такого файла"),
             text: "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Sphere(radius: 0.3), Box(size: (0.2, 0.2, 0.2))]))",
         });
@@ -4100,6 +4369,8 @@ mod tests {
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
             passes: &[],
+            camera: reyvec_sdf::Camera3D::default(),
+            shift: [0.0; 3],
             error: None,
             text,
         });
@@ -4147,6 +4418,114 @@ mod tests {
         ui.shape_selected = vec![0];
         ui.shape_command(text, PartCmd::Up);
         assert!(ui.take_actions().is_empty(), "первую выше не поднять");
+    }
+
+    #[test]
+    fn click_on_the_stand_selects_a_part_and_right_click_opens_its_menu() {
+        let text = "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Sphere(radius: 0.3), Move(at: (30.0, 0.0, 0.0), shape: Box(size: (0.2, 0.2, 0.2)))]))";
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Edit);
+        let mut camera =
+            reyvec_sdf::Camera3D::looking_at(glam::Vec3::new(0.0, 0.0, 3.0), glam::Vec3::ZERO);
+        camera.far = 100.0;
+        shape_info.shape = Some(ShapeInfo {
+            name: "шар",
+            spin: false,
+            free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            passes: &[],
+            camera,
+            shift: [0.0; 3],
+            error: None,
+            text,
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        // Середина экрана — шар (камера смотрит на него).
+        let mid = pos2(800.0, 450.0);
+        assert!(ui.viewport().unwrap().contains(mid));
+        ui.shape_selected = vec![1];
+        frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(true)));
+        frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(false)));
+        assert_eq!(ui.shape_selected, vec![0]);
+        // Щелчок мимо модели — выбрана вся модель.
+        let empty = ui.viewport().unwrap().left_bottom() + vec2(20.0, -20.0);
+        frame(&ctx, &mut ui, &shape_info, pointer(empty, Some(true)));
+        frame(&ctx, &mut ui, &shape_info, pointer(empty, Some(false)));
+        assert!(ui.shape_selected.is_empty());
+        // Закреплённый шар щелчком не выбирается.
+        ui.shape_locked.insert(vec![0]);
+        frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(true)));
+        frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(false)));
+        assert!(ui.shape_selected.is_empty());
+        ui.shape_locked.clear();
+        // Правый щелчок по шару — выбран и для него меню.
+        let right = |pressed| egui::Event::PointerButton {
+            pos: mid,
+            button: egui::PointerButton::Secondary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            vec![egui::Event::PointerMoved(mid), right(true)],
+        );
+        frame(&ctx, &mut ui, &shape_info, vec![right(false)]);
+        assert_eq!(ui.shape_menu, Some(vec![0]));
+        assert_eq!(ui.shape_selected, vec![0]);
+        ui.shape_menu = None;
+        ui.take_actions();
+        // Стрелка X: тянем вправо — шар уезжает по X (обёрнут в сдвиг), отпустили — конец
+        // правки.
+        let screen = ctx.content_rect();
+        let p = camera
+            .project(
+                glam::Vec3::new(0.12, 0.0, 0.0),
+                screen.width() / screen.height(),
+            )
+            .unwrap();
+        let on_arrow = pos2(
+            (p.x * 0.5 + 0.5) * screen.width(),
+            (0.5 - p.y * 0.5) * screen.height(),
+        );
+        frame(&ctx, &mut ui, &shape_info, pointer(on_arrow, None));
+        frame(&ctx, &mut ui, &shape_info, pointer(on_arrow, Some(true)));
+        for k in 1..=4 {
+            let to = on_arrow + vec2(15.0 * k as f32, 0.0);
+            frame(&ctx, &mut ui, &shape_info, pointer(to, None));
+        }
+        let actions = ui.take_actions();
+        let Some(Action::ShapeText {
+            text: moved,
+            commit,
+        }) = actions
+            .iter()
+            .rev()
+            .find(|a| matches!(a, Action::ShapeText { .. }))
+            .cloned()
+        else {
+            panic!("стрелка не тянется: {actions:?}");
+        };
+        assert!(!commit);
+        let x: f64 = moved
+            .split("Move(at: (")
+            .nth(1)
+            .and_then(|r| r.split(',').next())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{moved}"));
+        assert!(x > 0.05, "{x}");
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            pointer(on_arrow + vec2(60.0, 0.0), Some(false)),
+        );
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        assert!(ui.take_actions().contains(&Action::EndEdit));
     }
 
     fn pointer(pos: Pos2, pressed: Option<bool>) -> Vec<egui::Event> {
@@ -4526,6 +4905,8 @@ mod tests {
                     scale: reyvec_gpu::SpaceScale::Full,
                     triangles: false,
                     passes: &[],
+                    camera: reyvec_sdf::Camera3D::default(),
+                    shift: [0.0; 3],
                     error: None,
                     text: &rack,
                 });
