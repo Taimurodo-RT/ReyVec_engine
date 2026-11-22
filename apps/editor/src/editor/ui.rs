@@ -322,6 +322,8 @@ pub(crate) struct EditorUi {
     shape_locked: HashSet<Vec<usize>>,
     /// Тянут стрелку детали на подставке (М.4).
     gizmo_drag: Option<GizmoDrag>,
+    /// Что делают ручки детали: двигать, повернуть, размер.
+    gizmo_mode: GizmoMode,
     /// Деталь под правой кнопкой: для неё меню на подставке.
     shape_menu: Option<Vec<usize>>,
 }
@@ -386,6 +388,7 @@ impl EditorUi {
             shape_closed: HashSet::new(),
             shape_locked: HashSet::new(),
             gizmo_drag: None,
+            gizmo_mode: GizmoMode::Move,
             shape_menu: None,
         }
     }
@@ -634,6 +637,18 @@ impl EditorUi {
         // Во «Формах» клавиши — для деталей модели, а не для предметов сцены.
         if let Some(shape) = &info.shape {
             let f = ctx.input(|i| i.modifiers.is_none() && i.key_pressed(Key::F));
+            // W, E, R — двигать, повернуть, размер (в полёте эти буквы ведут камеру).
+            if !shape.free {
+                for (key, m) in [
+                    (Key::W, GizmoMode::Move),
+                    (Key::E, GizmoMode::Turn),
+                    (Key::R, GizmoMode::Size),
+                ] {
+                    if ctx.input(|i| i.modifiers.is_none() && i.key_pressed(key)) {
+                        self.gizmo_mode = m;
+                    }
+                }
+            }
             for (on, cmd) in [
                 (f, PartCmd::Focus),
                 (dup, PartCmd::Duplicate),
@@ -863,8 +878,9 @@ impl EditorUi {
         }
     }
 
-    /// Стрелки выбранной детали на экране (М.4): откуда и куда идёт каждая ось, и
-    /// сколько точек экрана на метр по ней. Рисует рамку детали и стрелки.
+    /// Ручки выбранной детали на экране (М.4, М.4в): рамка детали и, по режиму, стрелки
+    /// X, Y, Z (двигать), кольца вокруг осей (повернуть) или ручки размера. Возвращает,
+    /// где ручки и какая под мышью.
     fn shape_gizmo(&mut self, ui: &mut Ui, shape: &ShapeInfo) -> Option<Gizmo> {
         let path = self.shape_selected.clone();
         let screen = self.shape_screen(ui, shape);
@@ -914,56 +930,149 @@ impl EditorUi {
         let root = shape_edit::parse(shape.text).ok()?;
         let part = root.at(&path)?;
         let at = shape_edit::read_vec3(shape.text, part.moved, "at", [0.0; 3]);
+        let turn = shape_edit::read_vec3(shape.text, part.moved, "turn", [0.0; 3]);
+        let scale = shape_edit::read_num(shape.text, part.moved, "scale", 1.0);
+        let size = (part.kind == "Box")
+            .then(|| shape_edit::read_vec3(shape.text, part.open, "size", [1.0; 3]));
         let frame = super::shapes::parent_frame(shape.text, &path)?;
         let at3 = glam::Vec3::new(at[0] as f32, at[1] as f32, at[2] as f32);
         let origin = shift + frame.transform_point3(at3);
-        let size = (hi - lo).max_element();
-        let len = (size * 0.5 + 0.05 * size).max(0.02);
+        let extent = (hi - lo).max_element();
+        let len = (extent * 0.55).max(0.02);
         let o = to_screen(origin)?;
-        let mut axes = Vec::new();
         let hover = ui.ctx().pointer_hover_pos();
-        let active = self.gizmo_drag.as_ref().map(|g| g.axis);
+        let active = self.gizmo_drag.as_ref().map(|g| g.handle);
+        let mode = self.gizmo_mode;
+        let mut handles: Vec<GizmoHandle> = Vec::new();
+        let colors = [BAD, GOOD, SELECT];
+        let lit_color = |h: Handle, near: bool, color: Color32| {
+            let lit = active == Some(h) || (active.is_none() && near);
+            (lit, if lit { Color32::WHITE } else { color })
+        };
+        // Оси родителя (двигать и повернуть) или самой детали (размер коробки).
+        let own = frame.matrix3
+            * glam::Mat3A::from(reyvec_sdf::shape3d::rotation(turn.map(|v| v as f32)));
         let mut hot = None;
-        for (i, color) in [BAD, GOOD, SELECT].into_iter().enumerate() {
-            let mut e = glam::Vec3::ZERO;
-            e[i] = 1.0;
-            let v = frame.transform_vector3(e);
+        for (i, color) in colors.into_iter().enumerate() {
+            let axes = if mode == GizmoMode::Size {
+                own
+            } else {
+                frame.matrix3
+            };
+            let v = glam::Vec3::from(axes.col(i));
             let per_local = v.length();
             if per_local < 1e-6 {
                 continue;
             }
-            let tip = origin + v / per_local * len;
-            let Some(t) = to_screen(tip) else { continue };
-            let screen_len = (t - o).length();
-            if screen_len < 4.0 {
-                continue;
+            let unit = v / per_local;
+            match mode {
+                GizmoMode::Move | GizmoMode::Size => {
+                    if mode == GizmoMode::Size && size.is_none() {
+                        continue;
+                    }
+                    let tip = origin + unit * len;
+                    let Some(t) = to_screen(tip) else { continue };
+                    let screen_len = (t - o).length();
+                    if screen_len < 4.0 {
+                        continue;
+                    }
+                    let h = if mode == GizmoMode::Move {
+                        Handle::Move(i)
+                    } else {
+                        Handle::Size(i)
+                    };
+                    let near = hover.is_some_and(|p| dist_to_segment(p, o, t) < 7.0);
+                    if near && hot.is_none() {
+                        hot = Some(h);
+                    }
+                    // Точек экрана на единицу числа: у места — на единицу `at`, у размера
+                    // — на метр размера в осях детали (без её масштаба).
+                    let px_per_unit = if mode == GizmoMode::Move {
+                        screen_len / len * per_local
+                    } else {
+                        screen_len / len * per_local * scale as f32
+                    };
+                    handles.push(GizmoHandle {
+                        handle: h,
+                        dir: (t - o) / screen_len,
+                        px_per_unit,
+                    });
+                    let (lit, c) = lit_color(h, near, color);
+                    painter.line_segment([o, t], Stroke::new(if lit { 3.0 } else { 2.0 }, c));
+                    let dir = (t - o) / screen_len;
+                    if mode == GizmoMode::Move {
+                        let side = vec2(-dir.y, dir.x);
+                        painter.add(egui::Shape::convex_polygon(
+                            vec![t + dir * 9.0, t + side * 4.0, t - side * 4.0],
+                            c,
+                            Stroke::NONE,
+                        ));
+                    } else {
+                        painter.rect_filled(Rect::from_center_size(t, vec2(8.0, 8.0)), 1, c);
+                    }
+                }
+                GizmoMode::Turn => {
+                    // Кольцо в плоскости, поперёк оси.
+                    let (a, b) = unit.any_orthonormal_pair();
+                    let ring: Vec<Pos2> = (0..=48)
+                        .filter_map(|k| {
+                            let t = k as f32 / 48.0 * std::f32::consts::TAU;
+                            to_screen(origin + (a * t.cos() + b * t.sin()) * len)
+                        })
+                        .collect();
+                    if ring.len() < 2 {
+                        continue;
+                    }
+                    let h = Handle::Turn(i);
+                    let near = hover.is_some_and(|p| {
+                        ring.windows(2)
+                            .any(|w| dist_to_segment(p, w[0], w[1]) < 6.0)
+                    });
+                    if near && hot.is_none() {
+                        hot = Some(h);
+                    }
+                    // Ось к нам — поворот на плюс идёт против часовой стрелки.
+                    let toward = unit.dot(origin - shape.camera.eye) < 0.0;
+                    handles.push(GizmoHandle {
+                        handle: h,
+                        dir: vec2(if toward { 1.0 } else { -1.0 }, 0.0),
+                        px_per_unit: 1.0,
+                    });
+                    let (lit, c) = lit_color(h, near, color);
+                    painter.add(egui::Shape::line(
+                        ring,
+                        Stroke::new(if lit { 3.0 } else { 2.0 }, c),
+                    ));
+                }
             }
-            let near = hover.is_some_and(|h| dist_to_segment(h, o, t) < 7.0);
+        }
+        // Общий размер детали — квадрат у её середины (в режиме «размер»).
+        if mode == GizmoMode::Size {
+            let r = Rect::from_center_size(o + vec2(14.0, -14.0), vec2(10.0, 10.0));
+            let near = hover.is_some_and(|p| r.expand(3.0).contains(p));
+            let h = Handle::Scale;
             if near && hot.is_none() {
-                hot = Some(i);
+                hot = Some(h);
             }
-            axes.push(GizmoAxis {
-                axis: i,
-                from: o,
-                to: t,
-                px_per_unit: screen_len / len * per_local,
+            handles.push(GizmoHandle {
+                handle: h,
+                dir: vec2(1.0, -1.0).normalized(),
+                px_per_unit: 1.0,
             });
-            let lit = active == Some(i) || (active.is_none() && near);
-            let c = if lit { Color32::WHITE } else { color };
-            painter.line_segment([o, t], Stroke::new(if lit { 3.0 } else { 2.0 }, c));
-            let dir = (t - o) / screen_len;
-            let side = vec2(-dir.y, dir.x);
-            painter.add(egui::Shape::convex_polygon(
-                vec![t + dir * 9.0, t + side * 4.0, t - side * 4.0],
-                c,
-                Stroke::NONE,
-            ));
+            let (_, c) = lit_color(h, near, TEXT);
+            painter.rect_stroke(r, 1, Stroke::new(2.0, c), egui::StrokeKind::Middle);
         }
         painter.circle_filled(o, 3.0, TEXT);
         Some(Gizmo {
             path,
-            at,
-            axes,
+            start: GizmoStart {
+                at,
+                turn,
+                scale,
+                size,
+            },
+            origin: o,
+            handles,
             hot,
         })
     }
@@ -990,38 +1099,36 @@ impl EditorUi {
             let (o, d) = ray(pos?);
             super::shapes::pick(shape.text, shape.hidden, o, d, far)
         };
-        // Стрелки.
+        // Ручки.
         if response.drag_started_by(egui::PointerButton::Primary)
             && let Some(g) = gizmo
-            && let Some(i) = g.hot
-            && let Some(a) = g.axes.iter().find(|a| a.axis == i)
+            && let Some(h) = g.hot
+            && let Some(a) = g.handles.iter().find(|a| a.handle == h)
         {
             self.gizmo_drag = Some(GizmoDrag {
-                axis: i,
+                handle: h,
                 path: g.path.clone(),
                 text: shape.text.to_owned(),
-                at: g.at,
-                dir: (a.to - a.from).normalized(),
+                start: g.start,
+                dir: a.dir,
                 px_per_unit: a.px_per_unit,
-                moved: 0.0,
+                origin: g.origin,
+                pointer: response.interact_pointer_pos().unwrap_or(g.origin),
+                moved: Vec2::ZERO,
             });
         }
         if let Some(g) = self.gizmo_drag.as_mut() {
             if response.dragged_by(egui::PointerButton::Primary) {
-                g.moved += response.drag_delta().dot(g.dir);
-                endless_drag(ui.ctx());
-                let mut at = g.at;
-                let mut v = at[g.axis] + f64::from(g.moved / g.px_per_unit);
-                if ui.input(|i| i.modifiers.command) {
-                    v = (v * 100.0).round() / 100.0;
+                g.moved += response.drag_delta();
+                // Поворот идёт по углу курсора вокруг детали: курсор не переносится.
+                if !matches!(g.handle, Handle::Turn(_)) {
+                    endless_drag(ui.ctx());
                 }
-                at[g.axis] = v;
+                let snap = ui.input(|i| i.modifiers.command);
                 let edit = shape_edit::parse(&g.text)
                     .ok()
                     .and_then(|r| r.at(&g.path).cloned())
-                    .map(|part| {
-                        shape_edit::set_moved(&g.text, &part, "at", &shape_edit::triple(at))
-                    });
+                    .map(|part| g.edit(&part, snap));
                 if let Some(Ok(text)) = edit {
                     self.actions.push(Action::ShapeText {
                         text,
@@ -1410,7 +1517,30 @@ impl EditorUi {
             Sense::click_and_drag(),
         );
         self.viewport_hovered = response.hovered() || response.dragged();
-        // Левая кнопка — выбор и стрелки детали (М.4), правая — повернуть, средняя —
+        // Режимы ручек детали — столбик значков у левого края окна.
+        let tools = Rect::from_min_size(
+            rect.left_top() + vec2(12.0, 72.0),
+            vec2(36.0, 3.0 * 28.0 + 8.0),
+        );
+        ui.painter()
+            .rect_filled(tools, RADIUS_S, PANEL.gamma_multiply(0.9));
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(tools.shrink(4.0))
+                .layout(Layout::top_down(Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for m in GizmoMode::ALL {
+                    if gizmo_button(ui, m, self.gizmo_mode == m)
+                        .on_hover_text(m.hint())
+                        .clicked()
+                    {
+                        self.gizmo_mode = m;
+                    }
+                }
+            },
+        );
+        // Левая кнопка — выбор и ручки детали (М.4), правая — повернуть, средняя —
         // сдвинуть.
         let gizmo = self.shape_gizmo(ui, shape);
         self.shape_pointer(ui, &response, shape, gizmo.as_ref());
@@ -1458,8 +1588,9 @@ impl EditorUi {
             "Полёт: правая кнопка — оглядеться, W A S D — лететь, Q E — вниз и вверх, \
              Shift — быстрее. Esc — назад к сцене"
         } else {
-            "Левая — выбрать деталь и тянуть её стрелки, правая — повернуть (щелчок — меню \
-             детали), средняя — сдвинуть, колесо — ближе, F — крупно. Esc — назад к сцене"
+            "Левая — выбрать деталь и тянуть её ручки (W двигать, E повернуть, R размер), \
+             правая — повернуть камеру (щелчок — меню детали), средняя — сдвинуть, колесо — \
+             ближе, F — крупно. Esc — назад к сцене"
         };
         chip(&painter, rect.left_top() + vec2(12.0, 12.0), hint, MUTED);
         if let Some(e) = shape.error {
@@ -3158,6 +3289,70 @@ pub(crate) fn take_endless_drag(ctx: &egui::Context) -> bool {
 
 /// Кнопка готового вида: кубик, у которого выделена грань, на которую смотрит камера
 /// (у невидимых граней — пунктир); название при наведении.
+/// Кнопка режима ручек значком: крест стрелок — двигать, дуга со стрелкой — повернуть,
+/// квадрат со стрелкой из угла — размер.
+fn gizmo_button(ui: &mut Ui, mode: GizmoMode, on: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 24.0), Sense::click());
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(rect, RADIUS_S, ACCENT.gamma_multiply(0.25));
+    } else if resp.hovered() {
+        painter.rect_filled(rect, RADIUS_S, HOVER);
+    }
+    let c = rect.center();
+    let col = if on || resp.hovered() { TEXT } else { MUTED };
+    let stroke = Stroke::new(1.5, col);
+    let head = |tip: Pos2, dir: Vec2| {
+        let side = vec2(-dir.y, dir.x);
+        egui::Shape::convex_polygon(
+            vec![
+                tip,
+                tip - dir * 4.0 + side * 3.0,
+                tip - dir * 4.0 - side * 3.0,
+            ],
+            col,
+            Stroke::NONE,
+        )
+    };
+    match mode {
+        GizmoMode::Move => {
+            for d in [
+                vec2(1.0, 0.0),
+                vec2(-1.0, 0.0),
+                vec2(0.0, 1.0),
+                vec2(0.0, -1.0),
+            ] {
+                painter.line_segment([c, c + d * 6.0], stroke);
+                painter.add(head(c + d * 9.0, d));
+            }
+        }
+        GizmoMode::Turn => {
+            let arc: Vec<Pos2> = (0..=20)
+                .map(|k| {
+                    let t = 0.6 + k as f32 / 20.0 * 4.6;
+                    c + vec2(t.cos(), -t.sin()) * 7.0
+                })
+                .collect();
+            let end = arc[arc.len() - 1];
+            let before = arc[arc.len() - 2];
+            painter.add(egui::Shape::line(arc, stroke));
+            painter.add(head(
+                end + (end - before).normalized() * 3.0,
+                (end - before).normalized(),
+            ));
+        }
+        GizmoMode::Size => {
+            let r = Rect::from_center_size(c + vec2(-2.0, 2.0), vec2(10.0, 10.0));
+            painter.rect_stroke(r, 1, stroke, egui::StrokeKind::Middle);
+            let from = r.right_top();
+            let d = vec2(1.0, -1.0).normalized();
+            painter.line_segment([from, from + d * 4.0], stroke);
+            painter.add(head(from + d * 8.0, d));
+        }
+    }
+    resp
+}
+
 fn angle_button(ui: &mut Ui, angle: ShapeAngle) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 24.0), Sense::click());
     let painter = ui.painter();
@@ -3940,36 +4135,143 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
-/// Стрелки выбранной детали на экране в этом кадре.
+/// Что делают ручки выбранной детали на подставке.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum GizmoMode {
+    /// Стрелки X, Y, Z двигают деталь.
+    #[default]
+    Move,
+    /// Кольца поворачивают деталь вокруг осей её родителя.
+    Turn,
+    /// Ручки меняют размер: у коробки — по каждой её оси, квадрат — всю деталь.
+    Size,
+}
+
+impl GizmoMode {
+    pub(crate) const ALL: [GizmoMode; 3] = [GizmoMode::Move, GizmoMode::Turn, GizmoMode::Size];
+
+    fn hint(self) -> &'static str {
+        match self {
+            GizmoMode::Move => "Двигать деталь стрелками X, Y, Z (W). Ctrl — по сантиметру",
+            GizmoMode::Turn => "Поворачивать деталь кольцами вокруг осей (E). Ctrl — по 15°",
+            GizmoMode::Size => {
+                "Менять размер (R): квадрат — вся деталь, ручки на осях — коробка по одной \
+                 оси. Ctrl — ровные шаги"
+            }
+        }
+    }
+}
+
+/// Ручка детали.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handle {
+    /// Стрелка вдоль оси родителя.
+    Move(usize),
+    /// Кольцо вокруг оси родителя.
+    Turn(usize),
+    /// Размер коробки по её оси.
+    Size(usize),
+    /// Масштаб всей детали.
+    Scale,
+}
+
+/// Числа детали в начале правки ручкой.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GizmoStart {
+    at: [f64; 3],
+    turn: [f64; 3],
+    scale: f64,
+    /// Размер коробки (у других деталей нет).
+    size: Option<[f64; 3]>,
+}
+
+/// Ручки выбранной детали на экране в этом кадре.
 struct Gizmo {
     path: Vec<usize>,
-    /// Место детали у родителя (`at`).
-    at: [f64; 3],
-    axes: Vec<GizmoAxis>,
-    /// Ось, над стрелкой которой мышь.
-    hot: Option<usize>,
+    start: GizmoStart,
+    /// Середина детали на экране.
+    origin: Pos2,
+    handles: Vec<GizmoHandle>,
+    /// Ручка под мышью.
+    hot: Option<Handle>,
 }
 
-struct GizmoAxis {
-    axis: usize,
-    from: Pos2,
-    to: Pos2,
-    /// Точек экрана на единицу `at` вдоль оси.
+struct GizmoHandle {
+    handle: Handle,
+    /// Куда тянуть на экране (у колец — знак поворота в `x`).
+    dir: Vec2,
+    /// Точек экрана на единицу числа вдоль `dir`.
     px_per_unit: f32,
 }
 
-/// Деталь тянут за стрелку: всё считается от текста и места в начале, чтобы запись в
+/// Деталь тянут за ручку: всё считается от текста и чисел в начале, чтобы запись в
 /// файл с задержкой не теряла движение.
 struct GizmoDrag {
-    axis: usize,
+    handle: Handle,
     path: Vec<usize>,
     text: String,
-    at: [f64; 3],
-    /// Направление стрелки на экране.
+    start: GizmoStart,
     dir: Vec2,
     px_per_unit: f32,
-    /// Сколько точек протянули вдоль стрелки.
-    moved: f32,
+    origin: Pos2,
+    /// Где нажали.
+    pointer: Pos2,
+    /// Сколько протянули с нажатия.
+    moved: Vec2,
+}
+
+impl GizmoDrag {
+    /// Текст модели после того, как ручку протянули на `moved` (`snap` — ровные шаги).
+    fn edit(&self, part: &shape_edit::Part, snap: bool) -> Result<String, ron_edit::EditError> {
+        let s = self.start;
+        let along = self.moved.dot(self.dir) / self.px_per_unit;
+        let round = |v: f64, step: f64| if snap { (v / step).round() * step } else { v };
+        match self.handle {
+            Handle::Move(i) => {
+                let mut at = s.at;
+                at[i] = round(at[i] + f64::from(along), 0.01);
+                shape_edit::set_moved(&self.text, part, "at", &shape_edit::triple(at))
+            }
+            Handle::Turn(i) => {
+                let a = self.pointer - self.origin;
+                let b = a + self.moved;
+                // Экран смотрит вниз по y: угол по часовой — минус.
+                let delta = -(b.y.atan2(b.x) - a.y.atan2(a.x)) * self.dir.x;
+                let delta = round(f64::from(delta).to_degrees(), 15.0);
+                let turn = turned(s.turn, i, delta);
+                shape_edit::set_moved(&self.text, part, "turn", &shape_edit::triple(turn))
+            }
+            Handle::Size(i) => {
+                let Some(mut size) = s.size else {
+                    return Err(ron_edit::EditError("у детали нет размера по осям".into()));
+                };
+                // Грань идёт за курсором, деталь растёт в обе стороны.
+                size[i] = round(size[i] + 2.0 * f64::from(along), 0.01).max(0.001);
+                shape_edit::set(&self.text, part, "size", &shape_edit::triple(size))
+            }
+            Handle::Scale => {
+                let k = f64::from(self.moved.dot(self.dir) / 120.0).exp();
+                let scale = round(s.scale * k, 0.05).max(0.01);
+                shape_edit::set_moved(&self.text, part, "scale", &ron_edit::num(scale))
+            }
+        }
+    }
+}
+
+/// Поворот детали `turn` (градусы, как в файле), повёрнутый ещё на `degrees` вокруг оси
+/// `axis` её родителя.
+fn turned(turn: [f64; 3], axis: usize, degrees: f64) -> [f64; 3] {
+    let old = reyvec_sdf::shape3d::rotation(turn.map(|v| v as f32));
+    let mut e = glam::Vec3::ZERO;
+    e[axis] = 1.0;
+    let new = glam::Mat3::from_axis_angle(e, (degrees as f32).to_radians()) * old;
+    // rotation() — Rz · Ry · Rx.
+    let (z, y, x) = glam::Quat::from_mat3(&new).to_euler(glam::EulerRot::ZYX);
+    let clean = |r: f32| {
+        let d = (f64::from(r.to_degrees()) * 1000.0).round() / 1000.0;
+        if d == 0.0 { 0.0 } else { d }
+    };
+    [clean(x), clean(y), clean(z)]
 }
 
 /// Расстояние от точки до отрезка, точки экрана.
@@ -4568,6 +4870,68 @@ mod tests {
         assert!(ui.take_actions().contains(&Action::EndEdit));
     }
 
+    #[test]
+    fn turn_and_size_handles_edit_the_part() {
+        // Поворот вокруг оси родителя складывается с прежним поворотом.
+        let near = |a: [f64; 3], b: [f64; 3]| {
+            let (ra, rb) = (
+                reyvec_sdf::shape3d::rotation(a.map(|v| v as f32)),
+                reyvec_sdf::shape3d::rotation(b.map(|v| v as f32)),
+            );
+            ra.abs_diff_eq(rb, 1e-4)
+        };
+        assert_eq!(turned([0.0; 3], 1, 90.0), [0.0, 90.0, 0.0]);
+        let t = turned([30.0, 0.0, 0.0], 2, 45.0);
+        let want = glam::Mat3::from_rotation_z(45f32.to_radians())
+            * glam::Mat3::from_rotation_x(30f32.to_radians());
+        assert!(
+            reyvec_sdf::shape3d::rotation(t.map(|v| v as f32)).abs_diff_eq(want, 1e-4),
+            "{t:?}"
+        );
+        assert!(near(turned(t, 2, -45.0), [30.0, 0.0, 0.0]));
+
+        let text = "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [\n    \
+                    Box(size: (0.4, 0.2, 0.2)),\n]))\n";
+        let root = shape_edit::parse(text).unwrap();
+        let part = root.at(&[0]).unwrap().clone();
+        let start = GizmoStart {
+            at: [0.0; 3],
+            turn: [0.0; 3],
+            scale: 1.0,
+            size: Some([0.4, 0.2, 0.2]),
+        };
+        let drag = |handle, dir: Vec2, moved: Vec2| GizmoDrag {
+            handle,
+            path: vec![0],
+            text: text.to_owned(),
+            start,
+            dir,
+            px_per_unit: 100.0,
+            origin: pos2(100.0, 100.0),
+            pointer: pos2(150.0, 100.0),
+            moved,
+        };
+        // Ручка размера по X: протянули на 0.05 м — коробка шире на 0.1.
+        let t = drag(Handle::Size(0), vec2(1.0, 0.0), vec2(5.0, 0.0))
+            .edit(&part, false)
+            .unwrap();
+        assert!(t.contains("Box(size: (0.5, 0.2, 0.2))"), "{t}");
+        // Кольцо Y: курсор ушёл с «трёх часов» на «двенадцать» — плюс 90° (ось к нам).
+        let t = drag(Handle::Turn(1), vec2(1.0, 0.0), vec2(-50.0, -50.0))
+            .edit(&part, true)
+            .unwrap();
+        assert!(t.contains("Move(turn: (0.0, 90.0, 0.0), shape: Box"), "{t}");
+        // Квадрат: тянем вправо-вверх — деталь крупнее.
+        let t = drag(
+            Handle::Scale,
+            vec2(1.0, -1.0).normalized(),
+            vec2(60.0, -60.0),
+        )
+        .edit(&part, true)
+        .unwrap();
+        assert!(t.contains("Move(scale: 2.05, shape: Box"), "{t}");
+    }
+
     fn pointer(pos: Pos2, pressed: Option<bool>) -> Vec<egui::Event> {
         let mut e = vec![egui::Event::PointerMoved(pos)];
         if let Some(pressed) = pressed {
@@ -4891,6 +5255,8 @@ mod tests {
             (START_WORKSPACE, PlayState::Edit, false, true),
         ] {
             ui.shape_selected = vec![3, 0];
+            // «Формы» — с кольцами поворота у выбранной коробки (М.4в).
+            ui.gizmo_mode = GizmoMode::Turn;
             if play == PlayState::Paused {
                 ui.tabs[ws][Side::Bottom.index()] = 2;
             }
@@ -4947,7 +5313,10 @@ mod tests {
                     post_aa: false,
                     in_view: true,
                     passes: &[],
-                    camera: reyvec_sdf::Camera3D::default(),
+                    camera: reyvec_sdf::Camera3D::looking_at(
+                        glam::Vec3::new(1.6, 1.4, 2.4),
+                        glam::Vec3::new(0.0, 0.8, 0.0),
+                    ),
                     shift: [0.0; 3],
                     error: None,
                     text: &rack,
