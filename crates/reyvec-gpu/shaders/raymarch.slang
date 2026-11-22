@@ -22,7 +22,7 @@
 [shader("fragment")]
 uint4 fs_main(VertexOut input) : SV_Target
 {
-    float4 g = march_pixel(int2(input.position.xy), input.screen, -1, input.screen);
+    float4 g = march_pixel(int2(input.position.xy), input.screen, -1, input.screen, 0.0);
     counters_flush_fragment(PASS_MARCH, int2(input.position.xy));
     return uint4(pack_gbuffer(g), 0, 0);
 }
@@ -39,6 +39,6 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     if (id.x >= w || id.y >= h)
         return;
     float2 screen = float2((float(id.x) + 0.5) / float(w) * 2.0 - 1.0, 1.0 - (float(id.y) + 0.5) / float(h) * 2.0);
-    images[pc.target][id.xy] = pack_gbuffer(march_pixel(int2(id.xy), screen, -1, screen));
+    images[pc.target][id.xy] = pack_gbuffer(march_pixel(int2(id.xy), screen, -1, screen, 0.0));
     counters_flush(PASS_MARCH, counter_spread(int2(id.xy)));
 }

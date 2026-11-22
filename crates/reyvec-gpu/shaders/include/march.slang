@@ -57,7 +57,7 @@ static const float SHAPE_MESH_NEAR = 0.006;
 // Точка буфера геометрии для пикселя `px` (точка экрана `screen`). Общая для
 // пиксельного шейдера и вычислительного (опыт 7.6м). Лучи краёв (raymarch_edges.slang)
 // передают свой номер `sub` и середину пикселя `center` на экране, луч середины — −1.
-float4 march_pixel(int2 px, float2 screen, int sub, float2 center)
+float4 march_pixel(int2 px, float2 screen, int sub, float2 center, float start)
 {
     count_ray();
     Ray ray = screen_ray(screen);
@@ -91,7 +91,9 @@ float4 march_pixel(int2 px, float2 screen, int sub, float2 center)
     float2 plane = plane_hit(ray.origin, ray.dir, plane_normal);
     bool plane_first = plane.x <= limit;
     limit = min(limit, plane.x);
-    float t = min(textures[pc.cone].Load(int3(px / 8, 0)).x, limit);
+    // Доп. лучи краёв (8.23) начинают не раньше `start` — чуть ближе ближайшей точки
+    // соседних пикселей: до неё пусто и у них. Основной проход передаёт 0.
+    float t = min(max(textures[pc.cone].Load(int3(px / 8, 0)).x, start), limit);
     float2 hit = float2(-1.0, 0.0);
     bool shape_point = false;
     // Шаг с «перелётом» (over-relaxation, Keinert и др., «Enhanced Sphere Tracing»,
