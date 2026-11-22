@@ -403,6 +403,7 @@ pub(crate) fn move_all(project: &Path, moves: Vec<(PathBuf, PathBuf)>) -> Result
             tracing::warn!("Ссылки в «{}» не переписаны: {err}", e.file.display());
         }
     }
+    super::labels::follow(project, &done);
     Ok(Done::Moved { moves: done, refs })
 }
 
@@ -417,8 +418,9 @@ fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 /// Скопировать файлы и папки в папку `dir`; имя занято — «имя - копия».
-pub(crate) fn copy_into(dir: &Path, items: &[PathBuf]) -> Result<Done, String> {
+pub(crate) fn copy_into(project: &Path, dir: &Path, items: &[PathBuf]) -> Result<Done, String> {
     let mut made = Vec::new();
+    let mut pairs = Vec::new();
     for item in items {
         if same(item, dir) || inside(dir, item) {
             return Err(format!(
@@ -433,8 +435,10 @@ pub(crate) fn copy_into(dir: &Path, items: &[PathBuf]) -> Result<Done, String> {
             to = free_name(dir, &format!("{stem} - копия{ext}"));
         }
         copy_all(item, &to).map_err(|e| format!("Не скопировать «{name}»: {e}"))?;
+        pairs.push((item.clone(), to.clone()));
         made.push(to);
     }
+    super::labels::copied(project, &pairs);
     Ok(Done::Created(made))
 }
 
@@ -491,6 +495,7 @@ pub(crate) fn trash(project: &Path, items: &[PathBuf]) -> Result<Done, String> {
         }
         gone.push((item.clone(), to));
     }
+    super::labels::follow(project, &gone);
     Ok(Done::Trashed(gone))
 }
 
@@ -589,6 +594,7 @@ pub(crate) fn restore_binned(project: &Path, items: &[Binned]) -> Result<Done, S
             }
             break;
         }
+        super::labels::follow(project, &[(b.item.clone(), to.clone())]);
         drop_slot(&b.slot);
         back.push(to);
     }
@@ -616,6 +622,10 @@ pub(crate) fn erase(items: &[Binned]) -> Result<usize, String> {
             std::fs::remove_file(&b.item)
         };
         gone.map_err(|e| format!("Не стереть «{}»: {e}", file_name(&b.item)))?;
+        // Ячейка лежит в `<проект>/.trash/<номер>`.
+        if let Some(project) = b.slot.parent().and_then(Path::parent) {
+            super::labels::erased(project, std::slice::from_ref(&b.item));
+        }
         drop_slot(&b.slot);
         n += 1;
     }
@@ -653,6 +663,7 @@ pub(crate) fn undo(project: &Path, done: Done) -> Result<(Vec<PathBuf>, Redo), S
             }
             for (from, to) in moves.iter().rev() {
                 rename(to, from).map_err(|e| format!("Не вернуть «{}»: {e}", file_name(to)))?;
+                super::labels::follow(project, &[(to.clone(), from.clone())]);
             }
             let back = moves.iter().map(|(f, _)| f.clone()).collect();
             Ok((back, Redo::Move(moves)))
@@ -665,7 +676,7 @@ pub(crate) fn undo(project: &Path, done: Done) -> Result<(Vec<PathBuf>, Redo), S
             Ok((Vec::new(), Redo::Restore(gone)))
         }
         Done::Trashed(gone) => {
-            let back = restore(&gone)?;
+            let back = restore(project, &gone)?;
             Ok((back.clone(), Redo::Trash(back)))
         }
     }
@@ -675,19 +686,20 @@ pub(crate) fn undo(project: &Path, done: Done) -> Result<(Vec<PathBuf>, Redo), S
 pub(crate) fn redo(project: &Path, redo: Redo) -> Result<Done, String> {
     match redo {
         Redo::Move(moves) => move_all(project, moves),
-        Redo::Restore(gone) => restore(&gone).map(Done::Created),
+        Redo::Restore(gone) => restore(project, &gone).map(Done::Created),
         Redo::Trash(paths) => trash(project, &paths),
     }
 }
 
 /// Вернуть из корзины на старые места.
-fn restore(gone: &[(PathBuf, PathBuf)]) -> Result<Vec<PathBuf>, String> {
+fn restore(project: &Path, gone: &[(PathBuf, PathBuf)]) -> Result<Vec<PathBuf>, String> {
     let mut back = Vec::new();
     for (from, at) in gone.iter().rev() {
         if from.exists() {
             return Err(format!("Не вернуть «{}»: имя уже занято", file_name(from)));
         }
         std::fs::rename(at, from).map_err(|e| format!("Не вернуть «{}»: {e}", file_name(from)))?;
+        super::labels::follow(project, &[(at.clone(), from.clone())]);
         if let Some(slot) = at.parent() {
             drop_slot(slot);
         }
@@ -950,9 +962,9 @@ mod tests {
     #[test]
     fn copy_trash_undo_and_conflicts() {
         let t = Tmp::new(&[("assets/a.svg", "1"), ("assets/d/b.svg", "2")]);
-        let made = copy_into(&t.p("assets"), &[t.p("assets/a.svg")]).unwrap();
+        let made = copy_into(&t.0, &t.p("assets"), &[t.p("assets/a.svg")]).unwrap();
         assert!(t.p("assets/a - копия.svg").is_file());
-        assert!(copy_into(&t.p("assets/d"), &[t.p("assets")]).is_err());
+        assert!(copy_into(&t.0, &t.p("assets/d"), &[t.p("assets")]).is_err());
         let (_, again) = undo(&t.0, made).unwrap();
         assert!(!t.p("assets/a - копия.svg").exists());
         redo(&t.0, again).unwrap();

@@ -26,12 +26,10 @@ reyvec-script.workspace = true
 reyvec-sdf.workspace = true
 png.workspace = true
 ron.workspace = true
+serde.workspace = true
 reyvec-vector.workspace = true
 tracing.workspace = true
 winit.workspace = true
-
-[dev-dependencies]
-serde.workspace = true
 
 [lints]
 workspace = true
