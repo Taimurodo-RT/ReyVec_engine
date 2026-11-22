@@ -106,6 +106,11 @@ pub(crate) fn params(kind: &str) -> &'static [(&'static str, &'static str, Param
             ("top", "Радиус вверху", Num(0.0)),
             ("round", "Скругление", Num(0.0)),
         ],
+        "Extrude" => &[
+            ("depth", "Толщина", Num(0.1)),
+            ("round", "Скругление", Num(0.0)),
+        ],
+        "Revolve" => &[("offset", "Отступ от оси", Num(0.0))],
         "Union" | "Subtract" | "Intersect" => &[("smooth", "Плавный шов", Num(0.0))],
         "Mirror" => &[("axis", "Ось", Axis), ("smooth", "Плавный шов", Num(0.0))],
         "Repeat" => &[
@@ -279,6 +284,17 @@ pub(crate) fn read_vec3(
 pub(crate) fn read_word(text: &str, open: Option<usize>, name: &str) -> Option<String> {
     open.and_then(|o| field_text(text, o, name))
         .map(|v| v.trim().to_owned())
+}
+
+/// Строка поля (контур): без кавычек.
+pub(crate) fn read_string(text: &str, open: Option<usize>, name: &str) -> Option<String> {
+    open.and_then(|o| field_text(text, o, name))
+        .and_then(|v| ron::from_str::<String>(v).ok())
+}
+
+/// Строка для файла в кавычках.
+pub(crate) fn quoted(v: &str) -> String {
+    ron::to_string(v).unwrap_or_else(|_| format!("\"{v}\""))
 }
 
 /// Три числа для файла: `(x, y, z)`.
@@ -559,6 +575,36 @@ fn stretch_into(text: &str, part: &Part, f: [f64; 3], patches: &mut Patches) {
             set("radius", num_of("radius", 0.5) * radial);
             set("thickness", num_of("thickness", 0.1) * strongest(&f));
         }
+        "Extrude" | "Revolve" => {
+            let revolve = part.kind == "Revolve";
+            let sx = if revolve { radial } else { f[0] };
+            if let Some(path) = read_string(text, Some(open), "profile")
+                && let Some(mut c) = super::contour::parse(&path)
+            {
+                super::contour::scale(&mut c, sx, f[1]);
+                put(
+                    patches,
+                    text,
+                    open,
+                    "profile",
+                    quoted(&super::contour::to_path(&c)),
+                );
+            }
+            if revolve {
+                let offset = num_of("offset", 0.0);
+                if offset != 0.0 {
+                    put(patches, text, open, "offset", num(offset * radial));
+                }
+            } else {
+                put(
+                    patches,
+                    text,
+                    open,
+                    "depth",
+                    num(num_of("depth", 0.1) * f[2]),
+                );
+            }
+        }
         "Repeat" => {
             let step = read_vec3(text, Some(open), "step", [0.0; 3]);
             let step = std::array::from_fn(|i| step[i] * f[i]);
@@ -713,7 +759,9 @@ pub(crate) fn combine(
 }
 
 /// Новые детали из палитры «+»: вид и текст для файла (на месте `at`).
-pub(crate) const PALETTE: [&str; 6] = ["Box", "Sphere", "Cylinder", "Capsule", "Torus", "Cone"];
+pub(crate) const PALETTE: [&str; 8] = [
+    "Box", "Sphere", "Cylinder", "Capsule", "Torus", "Cone", "Extrude", "Revolve",
+];
 
 /// Текст новой детали `kind` с размером около `size` метров, сдвинутой на `at`.
 pub(crate) fn new_part(kind: &str, size: f64, at: [f64; 3]) -> String {
@@ -726,6 +774,40 @@ pub(crate) fn new_part(kind: &str, size: f64, at: [f64; 3]) -> String {
         "Capsule" => format!("Capsule(height: {s}, radius: {q})"),
         "Torus" => format!("Torus(radius: {h}, thickness: {})", num(size * 0.1)),
         "Cone" => format!("Cone(height: {s}, bottom: {h}, top: 0.0)"),
+        // Плоский контур: квадрат с вырезом сверху — сразу видно, что его можно править.
+        "Extrude" => {
+            let n = |v: f64| num(v * size);
+            format!(
+                "Extrude(profile: \"M {} {} L {} {} L {} {} L {} {} L {} {} L {} {} Z\", depth: {q})",
+                n(-0.5),
+                n(-0.5),
+                n(0.5),
+                n(-0.5),
+                n(0.5),
+                n(0.5),
+                n(0.15),
+                n(0.2),
+                n(-0.15),
+                n(0.2),
+                n(-0.5),
+                n(0.5),
+            )
+        }
+        // Профиль вазы: от оси, по низу, изгибом вверх и обратно к оси.
+        "Revolve" => {
+            let n = |v: f64| num(v * size);
+            format!(
+                "Revolve(profile: \"M 0 {} L {} {} Q {} {} {} {} L 0 {} Z\")",
+                n(-0.5),
+                n(0.35),
+                n(-0.5),
+                n(0.6),
+                n(0.0),
+                n(0.2),
+                n(0.5),
+                n(0.5),
+            )
+        }
         _ => format!("Box(size: ({s}, {s}, {s}))"),
     };
     format!("Move(at: {}, shape: {shape})", triple(at))

@@ -3344,6 +3344,7 @@ dependencies = [
  "egui",
  "egui-winit",
  "glam 0.30.10",
+ "kurbo",
  "reyvec-app",
  "reyvec-gpu",
  "reyvec-scene",

@@ -17,6 +17,7 @@
 
 mod arrange;
 mod assets;
+mod contour;
 mod doc;
 mod endless;
 mod files;
