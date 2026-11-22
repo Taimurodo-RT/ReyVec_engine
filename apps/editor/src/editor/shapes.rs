@@ -163,6 +163,8 @@ pub(crate) struct ShapeView {
     pub hidden: Vec<Vec<usize>>,
     /// Ручки модели на подставке не как в файле (М.6, «Посмотреть»): в файл не пишется.
     pub preview: BTreeMap<String, f32>,
+    /// Замер цены модели (М.7) в своём потоке.
+    pub cost: super::cost::CostJob,
     /// Радиус подставки.
     stand: f32,
 }
@@ -199,6 +201,7 @@ impl ShapeView {
             text: String::new(),
             hidden: Vec::new(),
             preview: BTreeMap::new(),
+            cost: super::cost::CostJob::default(),
             stand: 0.15,
         })
     }
@@ -231,6 +234,9 @@ impl ShapeView {
             }
         };
         let frame = scene.frame(0.0);
+        if let Some(model) = frame.shapes.last() {
+            self.cost.start(model.clone());
+        }
         let Some((lo, hi)) = frame.shapes.last().and_then(|s| s.bounds_box()) else {
             self.error = Some("модель бесконечная (плоскость): на подставку не встаёт".into());
             return None;
