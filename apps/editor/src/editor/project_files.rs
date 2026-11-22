@@ -13,6 +13,8 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) const ROOTS: [&str; 2] = ["scenes", "assets"];
 /// Скрытая папка, куда уезжает удалённое.
 const TRASH: &str = ".trash";
+/// Записка в ячейке корзины: откуда удалили (путь от проекта, через «/»).
+const FROM: &str = ".откуда";
 /// Окончание файла модели формы: «имя.shape.ron» — одно имя, а не «имя.shape» + «.ron».
 const DOUBLE_EXT: [&str; 1] = [".shape.ron"];
 /// Ссылка на модель пишется без окончания: `Use(model: "завод/конвейер")`.
@@ -483,9 +485,141 @@ pub(crate) fn trash(project: &Path, items: &[PathBuf]) -> Result<Done, String> {
             }
             return Err(format!("Не удалить «{}»: {e}", file_name(item)));
         }
+        if let Ok(rel) = item.strip_prefix(project) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            let _ = std::fs::write(slot.join(FROM), rel);
+        }
         gone.push((item.clone(), to));
     }
     Ok(Done::Trashed(gone))
+}
+
+/// Удалённое в корзине: где лежит сейчас, откуда удалили и когда.
+#[derive(Clone, Debug)]
+pub(crate) struct Binned {
+    /// Ячейка корзины (`.trash/<номер>`).
+    pub slot: PathBuf,
+    /// Сам файл или папка в ячейке.
+    pub item: PathBuf,
+    /// Откуда удалили; `None` у удалённого до того, как корзина стала это помнить.
+    pub from: Option<PathBuf>,
+    pub when: Option<std::time::SystemTime>,
+    pub folder: bool,
+    pub size: u64,
+}
+
+/// Что лежит в корзине проекта, недавно удалённое первым.
+pub(crate) fn trash_list(project: &Path) -> Vec<Binned> {
+    let Ok(slots) = std::fs::read_dir(project.join(TRASH)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for slot in slots.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        let note = slot.join(FROM);
+        let from = std::fs::read_to_string(&note)
+            .ok()
+            .map(|rel| project.join(rel.trim()));
+        let Ok(inner) = std::fs::read_dir(&slot) else {
+            continue;
+        };
+        for item in inner.flatten().map(|e| e.path()) {
+            if file_name(&item) == FROM {
+                continue;
+            }
+            let meta = std::fs::metadata(&item).ok();
+            let when = std::fs::metadata(&note)
+                .or_else(|_| std::fs::metadata(&slot))
+                .and_then(|m| m.modified())
+                .ok();
+            out.push(Binned {
+                folder: item.is_dir(),
+                size: size_of(&item),
+                slot: slot.clone(),
+                from: from.clone().filter(|_| meta.is_some()),
+                item,
+                when,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.when.cmp(&a.when).then_with(|| a.item.cmp(&b.item)));
+    out
+}
+
+/// Размер файла или всего в папке.
+fn size_of(p: &Path) -> u64 {
+    if p.is_dir() {
+        std::fs::read_dir(p)
+            .map(|d| d.flatten().map(|e| size_of(&e.path())).sum())
+            .unwrap_or(0)
+    } else {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+}
+
+/// Куда вернуть: на старое место; если имя там занято — рядом с номером; если старое
+/// место забыто — в `assets`.
+fn restore_target(project: &Path, b: &Binned) -> PathBuf {
+    let name = file_name(&b.item);
+    let want = b
+        .from
+        .clone()
+        .unwrap_or_else(|| project.join(ROOTS[1]).join(&name));
+    let dir = want
+        .parent()
+        .map_or_else(|| project.to_path_buf(), Path::to_path_buf);
+    if want.exists() {
+        free_name(&dir, &name)
+    } else {
+        want
+    }
+}
+
+/// Вернуть из корзины выбранное (отмена унесёт его обратно в корзину).
+pub(crate) fn restore_binned(project: &Path, items: &[Binned]) -> Result<Done, String> {
+    let mut back = Vec::new();
+    for b in items {
+        let to = restore_target(project, b);
+        let moved = to
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::rename(&b.item, &to));
+        if let Err(e) = moved {
+            if back.is_empty() {
+                return Err(format!("Не вернуть «{}»: {e}", file_name(&b.item)));
+            }
+            break;
+        }
+        drop_slot(&b.slot);
+        back.push(to);
+    }
+    Ok(Done::Created(back))
+}
+
+/// Пустую ячейку корзины убрать вместе с запиской.
+fn drop_slot(slot: &Path) {
+    let only_note = std::fs::read_dir(slot)
+        .map(|d| d.flatten().all(|e| file_name(&e.path()) == FROM))
+        .unwrap_or(false);
+    if only_note {
+        let _ = std::fs::remove_file(slot.join(FROM));
+        let _ = std::fs::remove_dir(slot);
+    }
+}
+
+/// Стереть насовсем (без отмены). Возвращает, сколько стёрто.
+pub(crate) fn erase(items: &[Binned]) -> Result<usize, String> {
+    let mut n = 0;
+    for b in items {
+        let gone = if b.item.is_dir() {
+            std::fs::remove_dir_all(&b.item)
+        } else {
+            std::fs::remove_file(&b.item)
+        };
+        gone.map_err(|e| format!("Не стереть «{}»: {e}", file_name(&b.item)))?;
+        drop_slot(&b.slot);
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// Как повторить отменённое (Ctrl+Y).
@@ -555,7 +689,7 @@ fn restore(gone: &[(PathBuf, PathBuf)]) -> Result<Vec<PathBuf>, String> {
         }
         std::fs::rename(at, from).map_err(|e| format!("Не вернуть «{}»: {e}", file_name(from)))?;
         if let Some(slot) = at.parent() {
-            let _ = std::fs::remove_dir(slot);
+            drop_slot(slot);
         }
         back.push(from.clone());
     }
@@ -838,6 +972,42 @@ mod tests {
         let (_, p2) = create(&t.p("assets"), "Новая папка", None).unwrap();
         assert_eq!(file_name(&p), "Новая папка");
         assert_eq!(file_name(&p2), "Новая папка 2");
+    }
+
+    /// Корзина помнит, откуда удалили; возвращает на место, а если имя занято — рядом.
+    #[test]
+    fn trash_lists_restores_and_erases() {
+        let t = Tmp::new(&[
+            ("assets/svg/a.svg", "1"),
+            ("assets/d/b.svg", "2"),
+            ("scenes/c.ron", "3"),
+        ]);
+        trash(&t.0, &[t.p("assets/svg/a.svg")]).unwrap();
+        trash(&t.0, &[t.p("assets/d"), t.p("scenes/c.ron")]).unwrap();
+        let bin = trash_list(&t.0);
+        assert_eq!(bin.len(), 3);
+        let find = |name: &str| bin.iter().find(|b| file_name(&b.item) == name).unwrap();
+        assert_eq!(
+            find("a.svg").from.as_deref(),
+            Some(t.p("assets/svg/a.svg").as_path())
+        );
+        assert!(find("d").folder);
+        assert_eq!(find("d").size, 1);
+        // На месте a.svg уже новый файл: возвращается рядом под другим именем.
+        std::fs::write(t.p("assets/svg/a.svg"), "new").unwrap();
+        let done = restore_binned(&t.0, &[find("a.svg").clone(), find("d").clone()]).unwrap();
+        assert_eq!(t.read("assets/svg/a 2.svg"), "1");
+        assert_eq!(t.read("assets/d/b.svg"), "2");
+        assert_eq!(trash_list(&t.0).len(), 1);
+        // Отмена возвращения уносит обратно в корзину.
+        undo(&t.0, done).unwrap();
+        assert!(!t.p("assets/d").exists());
+        assert_eq!(trash_list(&t.0).len(), 3);
+        // Стереть насовсем: в корзине пусто, пустых ячеек не остаётся.
+        assert_eq!(erase(&trash_list(&t.0)).unwrap(), 3);
+        assert!(trash_list(&t.0).is_empty());
+        let left = std::fs::read_dir(t.p(TRASH)).unwrap().count();
+        assert_eq!(left, 0);
     }
 
     #[test]

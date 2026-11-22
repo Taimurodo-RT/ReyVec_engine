@@ -21,7 +21,12 @@ use super::assets::{PREFABS, is_space_scene, kind_of};
 use super::project_files::{self as pf, Done, NewKind, ROOTS};
 use super::shapes::is_shape;
 use super::theme::*;
-use super::thumbs::Thumbs;
+use super::thumbs::{self, Thumbs};
+
+mod bin;
+
+/// Во сколько раз крупнее своего размера можно показать миниатюру в панели сведений.
+const THUMB_STRETCH: f32 = 1.25;
 
 /// Как часто перечитывать открытую папку: файлы могли поменять в другой программе.
 const REFRESH_S: f64 = 1.5;
@@ -188,6 +193,15 @@ pub(crate) struct Explorer {
     scroll_to: bool,
     /// Файлы бросили на звено адреса: перенести после рисования.
     pending_drop: Option<(Vec<PathBuf>, PathBuf)>,
+    /// Открыта корзина вместо папки (Э.4).
+    in_bin: bool,
+    /// Что лежит в корзине и что в ней выбрано.
+    bin: Vec<pf::Binned>,
+    bin_picked: Vec<PathBuf>,
+    /// Сколько в корзине, для дерева (сбрасывается при перечитывании папки).
+    bin_counted: Option<usize>,
+    /// Окно «Стереть насовсем?» и что стереть.
+    erasing: Option<Vec<pf::Binned>>,
     out: Vec<Out>,
 }
 
@@ -231,6 +245,11 @@ impl Explorer {
             note: None,
             scroll_to: false,
             pending_drop: None,
+            in_bin: false,
+            bin: Vec::new(),
+            bin_picked: Vec::new(),
+            bin_counted: None,
+            erasing: None,
             out: Vec::new(),
         }
     }
@@ -243,6 +262,7 @@ impl Explorer {
     pub(crate) fn refresh(&mut self) {
         self.listed_at = None;
         self.used = None;
+        self.bin_counted = None;
     }
 
     /// Открытая папка.
@@ -269,6 +289,7 @@ impl Explorer {
 
     /// Открыть папку (запомнив прошлую для «назад»).
     pub(crate) fn go(&mut self, dir: PathBuf) {
+        self.close_bin();
         if dir == self.dir {
             return;
         }
@@ -296,6 +317,9 @@ impl Explorer {
     }
 
     fn go_back(&mut self) {
+        if self.in_bin {
+            return self.close_bin();
+        }
         if let Some(d) = self.back.pop() {
             let cur = std::mem::replace(&mut self.dir, d);
             self.forward.push(cur);
@@ -790,6 +814,7 @@ impl Explorer {
         if paths.is_empty() {
             return;
         }
+        self.close_bin();
         if let Some(dir) = paths[0].parent()
             && dir != self.dir
         {
@@ -889,8 +914,17 @@ impl Explorer {
         }
         if self.listed_at.is_none_or(|t| now - t > REFRESH_S) {
             self.list(now);
+            self.bin_counted = None;
+            if self.in_bin {
+                self.reload_bin();
+            }
         }
-        let per_row = self.keys(ui, busy);
+        let per_row = if self.in_bin {
+            self.bin_keys(ui);
+            1
+        } else {
+            self.keys(ui, busy)
+        };
         self.thumbs.poll(ui.ctx());
         let frame = Frame::NONE.fill(PANEL);
         egui::Panel::top("explorer-nav")
@@ -907,7 +941,13 @@ impl Explorer {
                     .fill(BAR)
                     .inner_margin(Margin::symmetric(GAP_XL as i8, 0)),
             )
-            .show(ui, |ui| self.command_bar(ui, busy));
+            .show(ui, |ui| {
+                if self.in_bin {
+                    self.bin_commands(ui);
+                } else {
+                    self.command_bar(ui, busy);
+                }
+            });
         egui::Panel::bottom("explorer-status")
             .exact_size(28.0)
             .resizable(false)
@@ -931,6 +971,8 @@ impl Explorer {
                         if let Some(root) = self.project.clone() {
                             self.tree_row(ui, &root, 0, busy);
                         }
+                        ui.add_space(GAP_M);
+                        self.bin_tree_row(ui, busy);
                     });
             });
         egui::Panel::right("explorer-details")
@@ -942,7 +984,13 @@ impl Explorer {
                 egui::ScrollArea::vertical()
                     .id_salt("explorer-details")
                     .auto_shrink(false)
-                    .show(ui, |ui| self.details(ui));
+                    .show(ui, |ui| {
+                        if self.in_bin {
+                            self.bin_details(ui);
+                        } else {
+                            self.details(ui);
+                        }
+                    });
             });
         egui::CentralPanel::default()
             .frame(
@@ -950,9 +998,16 @@ impl Explorer {
                     .fill(BG)
                     .inner_margin(Margin::same(GAP_XL as i8)),
             )
-            .show(ui, |ui| self.files(ui, busy, per_row));
+            .show(ui, |ui| {
+                if self.in_bin {
+                    self.bin_files(ui);
+                } else {
+                    self.files(ui, busy, per_row);
+                }
+            });
         let ctx = ui.ctx().clone();
         self.create_dialog(&ctx);
+        self.erase_dialog(&ctx);
         std::mem::take(&mut self.out)
     }
 
@@ -1077,7 +1132,7 @@ impl Explorer {
                 ui,
                 Glyph::Back,
                 "Назад (Alt+←, Backspace)",
-                !self.back.is_empty(),
+                self.in_bin || !self.back.is_empty(),
             )
             .clicked()
             {
@@ -1127,7 +1182,8 @@ impl Explorer {
                         let (r, _) = ui.allocate_exact_size(vec2(16.0, 20.0), Sense::hover());
                         paint_glyph(ui.painter(), r.center(), Glyph::Search, MUTED);
                         let hint = format!("Поиск в «{}»", self.dir_title());
-                        let edit = ui.add(
+                        let edit = ui.add_enabled(
+                            !self.in_bin,
                             egui::TextEdit::singleline(&mut self.search)
                                 .id(egui::Id::unique("explorer-search"))
                                 .hint_text(hint)
@@ -1155,6 +1211,14 @@ impl Explorer {
         let Some(root) = self.project.clone() else {
             return;
         };
+        if self.in_bin {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Проект").color(TEXT_DIM));
+                ui.label(RichText::new("›").color(MUTED));
+                ui.label(RichText::new("Корзина").color(TEXT));
+            });
+            return;
+        }
         let mut chain = vec![self.dir.clone()];
         let mut p = self.dir.clone();
         while p != root {
@@ -1523,7 +1587,7 @@ impl Explorer {
                         let selected = self.selected.contains(&item.path);
                         let pic = item
                             .has_thumb()
-                            .then(|| self.thumbs.get(&item.path, now))
+                            .then(|| self.thumbs.get(&item.path, now, false))
                             .flatten();
                         let r = if list {
                             row(ui, item, selected, self.renaming_text(&item.path), pic)
@@ -1896,12 +1960,21 @@ impl Explorer {
     }
 
     fn one_details(&mut self, ui: &mut Ui, item: &Item) {
-        // Большая плитка-образец вида файла.
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 120.0), Sense::hover());
+        // Большая плитка-образец вида файла. Миниатюра модели растёт вместе с шириной
+        // панели, но не больше, чем позволяет картинка (иначе станет мыльной).
         let pic = item
             .has_thumb()
-            .then(|| self.thumbs.get(&item.path, ui.input(|i| i.time)))
+            .then(|| self.thumbs.get(&item.path, ui.input(|i| i.time), true))
             .flatten();
+        let width = ui.available_width();
+        let height = match pic {
+            Some(_) => {
+                let most = thumbs::SIZE as f32 * THUMB_STRETCH / ui.ctx().pixels_per_point();
+                (width - 2.0 * GAP_S).min(most).max(120.0 - 2.0 * GAP_S) + 2.0 * GAP_S
+            }
+            None => 120.0,
+        };
+        let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
         thumb(ui.painter(), rect, item, false, pic);
         ui.add_space(GAP_L);
         heading(ui, &item.name);
@@ -2007,10 +2080,14 @@ impl Explorer {
 
     fn status(&mut self, ui: &mut Ui) {
         ui.horizontal_centered(|ui| {
-            let n = self.items.len();
+            let (n, picked) = if self.in_bin {
+                (self.bin.len(), self.bin_picked.len())
+            } else {
+                (self.items.len(), self.selected.len())
+            };
             let mut text = things_word(n);
-            if !self.selected.is_empty() {
-                text.push_str(&format!("  ·  выбрано {}", self.selected.len()));
+            if picked > 0 {
+                text.push_str(&format!("  ·  выбрано {picked}"));
             }
             if let Some((items, cut)) = &self.clipboard {
                 text.push_str(&format!(
@@ -2676,6 +2753,80 @@ mod tests {
         ctx.set_fonts(reyvec_app::for_editor::fonts());
         super::super::theme::apply(&ctx);
         ctx
+    }
+
+    /// Корзина: удалённое видно, Enter возвращает, Ctrl+Z уносит обратно, Delete и
+    /// «Стереть» стирают насовсем, Escape возвращает к папке.
+    #[test]
+    fn bin_restores_undoes_and_erases() {
+        let t = project(&[("assets/a.svg", "<svg/>"), ("assets/b.svg", "<svg/>")]);
+        let ctx = ctx();
+        let mut ex = Explorer::new(Some(&t.0));
+        let mut time = 0.0;
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        ex.selected = vec![t.0.join("assets/a.svg"), t.0.join("assets/b.svg")];
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Delete, Modifiers::NONE)],
+        );
+        assert!(!t.0.join("assets/a.svg").exists());
+        ex.open_bin();
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        assert_eq!(ex.bin.len(), 2);
+        let a_in_bin = ex
+            .bin
+            .iter()
+            .find(|b| pf::file_name(&b.item) == "a.svg")
+            .unwrap()
+            .item
+            .clone();
+        ex.bin_picked = vec![a_in_bin];
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Enter, Modifiers::NONE)],
+        );
+        assert!(t.0.join("assets/a.svg").is_file(), "вернулся на место");
+        assert_eq!(ex.bin.len(), 1);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Z, Modifiers::COMMAND)],
+        );
+        assert!(!t.0.join("assets/a.svg").exists(), "Ctrl+Z унёс обратно");
+        assert!(ex.in_bin, "корзина осталась открытой");
+        assert_eq!(ex.bin.len(), 2);
+        // Delete спрашивает, «Стереть» стирает; Ctrl+Z потом не ломается.
+        ex.bin_picked = ex.bin.iter().map(|b| b.item.clone()).collect();
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Delete, Modifiers::NONE)],
+        );
+        assert!(ex.erasing.is_some());
+        let items = ex.erasing.take().unwrap();
+        ex.erase_now(&items);
+        assert!(ex.bin.is_empty());
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Z, Modifiers::COMMAND)],
+        );
+        assert!(!t.0.join("assets/a.svg").exists());
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Escape, Modifiers::NONE)],
+        );
+        assert!(!ex.in_bin);
+        assert_eq!(ex.dir(), t.0.join("assets"));
     }
 
     #[test]
