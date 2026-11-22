@@ -150,15 +150,6 @@ float3 shade_lit(float2 screen, float4 g, float4 shadows, int2 px, int sub)
         albedo *= mesh_tint(px, sub, g.y);
     float glow = asfloat(pc.scene[m + 4]);
     float3 n = oct_decode(g.zw);
-    uint debug_view = pc.scene[11] & 0xE0u;
-    if (debug_view == 32u)
-        return float3(shadows.x, shadows.y, shadows.z);
-    if (debug_view == 64u)
-        return albedo;
-    if (debug_view == 128u)
-        return n * 0.5 + 0.5;
-    if (debug_view == 160u)
-        return float3(saturate(dot(n, SUN)), frac(t), g.y / 64.0);
     if (grid_on)
     {
         // Сколько метров пола в пикселе: соседний луч пересекается с той же плоскостью.

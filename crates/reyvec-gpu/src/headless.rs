@@ -829,8 +829,6 @@ pub(crate) mod tests {
         pub(super) static EDGE_FAR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
         /// Сглаживание 3D по картинке вместо лучей краёв (8.12а); по умолчанию выключено.
         pub(super) static POST_AA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        /// ВРЕМЕННО: отладочный вид освещения (биты 32/64/128 слова 11).
-        pub(crate) static DEBUG_VIEW: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         /// Режим «треугольники» для 3D (8.20б).
         pub(super) static TRIANGLES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Тени моделей от плоскостей граней, как до 8.15 (обычно — от кирпичей поля).
@@ -1817,6 +1815,68 @@ pub(crate) mod tests {
         assert!(
             map_strong * 10 < pixels,
             "карта солнца сильно меняет {map_strong} пикселей из {pixels}"
+        );
+    }
+
+    /// Ящики завода вблизи (снимок Романа, 8.20к): в режиме «треугольники» на гранях,
+    /// видных вскользь, нормаль сетки переворачивалась внутрь, и куски граней чернели.
+    /// Тёмных пикселей на ящике не больше, чем у лучей.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn triangles_boxes_have_no_black_wedges() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let space = include_str!("../../../scenes/3d/factory.ron").replacen(
+            "camera: Some((eye: (0.0, 22.0, 30.0), look_at: (0.0, 0.0, 2.0))),",
+            "camera: Some((eye: (-3.3, 1.8, 19.2), look_at: (-1.785, 0.676, 16.867))),",
+            1,
+        );
+        assert!(
+            space.contains("-3.3, 1.8"),
+            "камера завода в файле сменилась"
+        );
+        let scene = HeadlessScene {
+            width: 960,
+            height: 505,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(space.into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        // Ящик в кадре 960×505 и почти чёрные пиксели на нём.
+        let dark = |image: &FrameImage| {
+            let mut count = 0;
+            for y in 205..315 {
+                for x in 450..575 {
+                    let i = (y * image.width as usize + x) * 4;
+                    if image.rgba[i..i + 3].iter().all(|&c| c < 25) {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+        let rays = render_headless(&options, &scene).expect("кадр лучами");
+        TRIANGLES.set(true);
+        let triangles = render_headless(&options, &scene);
+        TRIANGLES.set(false);
+        let triangles = triangles.expect("кадр треугольниками");
+        let (rays, triangles) = (dark(&rays.image), dark(&triangles.image));
+        eprintln!("ящик завода: тёмных пикселей лучами {rays}, треугольниками {triangles}");
+        assert!(
+            triangles <= rays + 20,
+            "лучами {rays}, треугольниками {triangles}"
         );
     }
 
@@ -3270,73 +3330,5 @@ pub(crate) mod tests {
         );
 
         assert_eq!(validation_error_count(), 0, "ошибки валидации Vulkan");
-    }
-
-    /// ВРЕМЕННО: чёрные клинья на ящиках завода (снимок Романа).
-    #[test]
-    #[ignore = "нужен драйвер Vulkan"]
-    fn zz_debug_factory_boxes() {
-        let options = GpuOptions {
-            validation: true,
-            gpu: None,
-        };
-        let space = include_str!("../../../scenes/3d/factory.ron").replacen(
-            "camera: Some((eye: (0.0, 22.0, 30.0), look_at: (0.0, 0.0, 2.0))),",
-            "camera: Some((eye: (-3.3, 1.8, 19.2), look_at: (-1.785, 0.676, 16.867))),",
-            1,
-        );
-        assert!(space.contains("-3.3, 1.8"));
-        let scene = HeadlessScene {
-            width: 960,
-            height: 505,
-            time: 1.0,
-            shader_error: false,
-            scene: DemoScene::Space,
-            msaa: Msaa::X4,
-            perceptual_edges: false,
-            fill: crate::FillMode::default(),
-            zoom: false,
-            files: crate::UserFiles {
-                space: Some(space.into()),
-                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
-                ..Default::default()
-            },
-            cascades: false,
-        };
-        let dump = |name: &str, image: &FrameImage| {
-            let (x0, y0, w, h) = (330usize, 150usize, 340usize, 200usize);
-            let mut hex = String::new();
-            for y in y0..y0 + h {
-                for x in x0..x0 + w {
-                    let i = (y * image.width as usize + x) * 4;
-                    for c in 0..3 {
-                        hex.push_str(&format!("{:02x}", image.rgba[i + c]));
-                    }
-                }
-            }
-            for chunk in hex.as_bytes().chunks(4000) {
-                eprintln!("RGB-{name} {w} {h} {}", std::str::from_utf8(chunk).unwrap());
-            }
-        };
-        let rays = render_headless(&options, &scene).expect("лучи");
-        dump("rays", &rays.image);
-        TRIANGLES.set(true);
-        for (name, view, maps) in [
-            ("tri", 0, true),
-            ("tri_nomaps", 0, false),
-            ("shadows", 32, true),
-            ("albedo", 64, true),
-            ("normal", 128, true),
-            ("misc", 160, true),
-        ] {
-            DEBUG_VIEW.set(view);
-            NO_SHADOW_MAPS.set(!maps);
-            let frame = render_headless(&options, &scene).expect("кадр");
-            dump(name, &frame.image);
-        }
-        DEBUG_VIEW.set(0);
-        NO_SHADOW_MAPS.set(false);
-        TRIANGLES.set(false);
-        panic!("отладочный вывод");
     }
 }

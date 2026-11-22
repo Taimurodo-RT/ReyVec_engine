@@ -137,10 +137,16 @@ uint4 mesh_point(MeshOut input)
     float2 s = float2(input.position.x / size.x * 2.0 - 1.0, 1.0 - input.position.y / size.y * 2.0);
     Ray ray = screen_ray(s);
     float t = dot(input.world - ray.origin, ray.dir);
-    float3 n = dot(input.normal, input.normal) > 1e-8
-        ? normalize(input.normal)
-        : normalize(cross(ddx(input.world), ddy(input.world)));
-    if (dot(n, ray.dir) > 0.0)
+    // Сторона треугольника, обращённая к камере.
+    float3 face = normalize(cross(ddx(input.world), ddy(input.world)));
+    if (dot(face, ray.dir) > 0.0)
+        face = -face;
+    float3 n = dot(input.normal, input.normal) > 1e-8 ? normalize(input.normal) : face;
+    // Нормаль переворачивается, только если она с другой стороны треугольника (модель,
+    // видимая с изнанки). До 8.20к сравнивали с лучом: на гранях, видных вскользь,
+    // нормаль угла, наклонённая к скруглению, смотрела чуть от камеры — и переворачивалась
+    // внутрь формы. Чёрные клинья на ящиках, ползущие при полёте камеры.
+    if (dot(n, face) < 0.0)
         n = -n;
     return uint4(pack_mesh(t, input.material, n), 0, 0);
 }

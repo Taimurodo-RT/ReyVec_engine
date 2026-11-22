@@ -4001,10 +4001,6 @@ impl Demo {
                     if field_ao {
                         crate::space::set_ao_field_only(&mut packed.words);
                     }
-                    #[cfg(test)]
-                    {
-                        packed.words[11] |= crate::headless::tests::DEBUG_VIEW.get();
-                    }
                     if sun_draws.iter().any(|d| !d.is_empty()) {
                         crate::space::set_sun_maps(&mut packed.words, &sun_maps);
                         self.sun_draws = sun_draws;
