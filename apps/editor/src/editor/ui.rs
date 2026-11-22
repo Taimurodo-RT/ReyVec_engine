@@ -229,6 +229,10 @@ pub(crate) struct ShapeInfo<'a> {
     pub preview: &'a std::collections::BTreeMap<String, f32>,
     /// Цена модели (М.7): `None` — ещё считается.
     pub cost: Option<Result<super::cost::ShapeCost, String>>,
+    /// Открыта сцена 3D, а не модель (М.8): части первого уровня — её предметы.
+    pub scene: bool,
+    /// Папка, где лежит `models` (для ручек моделей в сцене).
+    pub root: &'a std::path::Path,
 }
 
 /// Ручки как в файле (для подставок в тестах и без «Посмотреть»).
@@ -340,6 +344,8 @@ pub(crate) struct EditorUi {
     contour: ContourUi,
     /// Карточка «Ручки модели» (М.6).
     params: ParamsUi,
+    /// Имя предмета сцены 3D в поле правки (скобка предмета, текст), М.8.
+    object_name: Option<(usize, String)>,
     /// Деталь под правой кнопкой: для неё меню на подставке.
     shape_menu: Option<Vec<usize>>,
 }
@@ -407,6 +413,7 @@ impl EditorUi {
             gizmo_mode: GizmoMode::Move,
             contour: ContourUi::default(),
             params: ParamsUi::default(),
+            object_name: None,
             shape_menu: None,
         }
     }
@@ -842,6 +849,13 @@ impl EditorUi {
             tracing::info!("Деталь закреплена: сначала снимите замок в иерархии");
             return;
         }
+        // Предмет сцены 3D (М.8) — запись в списке предметов: обёртки ему нельзя.
+        if shape_edit::is_scene(&root)
+            && path.len() <= 1
+            && matches!(cmd, PartCmd::Wrap(_) | PartCmd::Unwrap | PartCmd::Split)
+        {
+            return;
+        }
         let sibling = |d: isize| {
             let (&last, up) = path.split_last()?;
             let i = last.checked_add_signed(d)?;
@@ -901,6 +915,10 @@ impl EditorUi {
     /// где ручки и какая под мышью.
     fn shape_gizmo(&mut self, ui: &mut Ui, shape: &ShapeInfo) -> Option<Gizmo> {
         let path = self.shape_selected.clone();
+        // У сцены 3D вся сцена ручек не имеет: двигают её предметы.
+        if shape.scene && path.is_empty() {
+            return None;
+        }
         let screen = self.shape_screen(ui, shape);
         let to_screen = |w: glam::Vec3| -> Option<Pos2> {
             let aspect = screen.width() / screen.height().max(1.0);
@@ -1059,8 +1077,9 @@ impl EditorUi {
                 }
             }
         }
-        // Общий размер детали — квадрат у её середины (в режиме «размер»).
-        if mode == GizmoMode::Size {
+        // Общий размер детали — квадрат у её середины (в режиме «размер»). У предмета
+        // сцены 3D своего масштаба нет: только растяжение по осям.
+        if mode == GizmoMode::Size && !(shape.scene && path.len() == 1) {
             let r = Rect::from_center_size(o + vec2(14.0, -14.0), vec2(10.0, 10.0));
             let near = hover.is_some_and(|p| r.expand(3.0).contains(p));
             let h = Handle::Scale;
@@ -1210,6 +1229,21 @@ impl EditorUi {
         let Some(part) = root.at(&path) else { return };
         let parent = path.split_last().and_then(|(_, up)| root.at(up));
         let materials = shape_edit::materials(text);
+        let scene = shape_edit::is_scene(&root);
+        // Предмет сцены 3D (М.8): у него имя, место и материал по имени.
+        let object = scene && path.len() == 1;
+        if scene && path.is_empty() {
+            ui.label(RichText::new("Сцена 3D").size(FONT_TITLE).color(TEXT));
+            ui.label(
+                RichText::new(format!(
+                    "Предметов: {}. Выберите предмет щелчком в окне или в иерархии.",
+                    root.children.len()
+                ))
+                .color(MUTED)
+                .size(FONT_SMALL),
+            );
+            return;
+        }
         if self.part_locked(&path) {
             ui.label(
                 RichText::new("Деталь закреплена (замок в иерархии): числа не правятся")
@@ -1230,6 +1264,12 @@ impl EditorUi {
                 .color(TEXT),
         );
         ui.add_space(GAP_M);
+        if object && let Some(o) = part.moved {
+            object_card(ui, &mut self.object_name, text, o, &materials, &mut send);
+        }
+        if part.kind == "Use" {
+            use_card(ui, text, part, shape.root, &mut send, &mut end);
+        }
         // Свои числа части.
         let own = shape_edit::params(&part.kind);
         if !own.is_empty() {
@@ -1346,7 +1386,7 @@ impl EditorUi {
                     }
                 }
             });
-            if !materials.is_empty() {
+            if !materials.is_empty() && !object {
                 let now = part
                     .painted
                     .map(|o| shape_edit::read_num(text, Some(o), "material", 0.0).round() as usize);
@@ -1380,8 +1420,16 @@ impl EditorUi {
         if end {
             self.actions.push(Action::EndEdit);
         }
-        // Новая деталь.
+        // Новая деталь. В предмет сцены 3D — только внутрь его объединения: сам предмет
+        // не форма, его не вырезать и не пересечь.
         let mut new = None;
+        if object {
+            if part.list.is_none() {
+                self.object_tail(ui, text, part);
+                return;
+            }
+            self.shape_combine = shape_edit::Combine::Add;
+        }
         let combine = &mut self.shape_combine;
         card(ui, "Новая деталь", |ui| {
             ui.horizontal(|ui| {
@@ -1444,8 +1492,22 @@ impl EditorUi {
         {
             self.shape_command(text, PartCmd::Remove);
         }
-        self.params_card(ui, shape);
-        self.cost_card(ui, shape);
+        if !scene {
+            self.params_card(ui, shape);
+            self.cost_card(ui, shape);
+        }
+    }
+
+    /// Конец инспектора у предмета сцены 3D без своего списка деталей: только «Убрать».
+    fn object_tail(&mut self, ui: &mut Ui, text: &str, part: &shape_edit::Part) {
+        if part.removable
+            && ui
+                .button(RichText::new("Убрать предмет").color(BAD))
+                .on_hover_text("Убрать предмет из сцены (Delete, Ctrl+Z вернёт)")
+                .clicked()
+        {
+            self.shape_command(text, PartCmd::Remove);
+        }
     }
 
     /// Карточка «Цена модели» (М.7): сколько модель стоит лучу и какая у неё сетка для
@@ -1846,9 +1908,13 @@ impl EditorUi {
                 .layout(Layout::left_to_right(Align::Center)),
             |ui| {
                 ui.label(
-                    RichText::new(format!("Форма: {}", shape.name))
-                        .size(FONT_CHIP)
-                        .color(TEXT),
+                    RichText::new(if shape.scene {
+                        format!("Сцена 3D: {}", shape.name)
+                    } else {
+                        format!("Форма: {}", shape.name)
+                    })
+                    .size(FONT_CHIP)
+                    .color(TEXT),
                 );
                 ui.add_space(GAP_XL);
                 ui.spacing_mut().item_spacing.x = GAP_XS;
@@ -4553,6 +4619,190 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
+/// Карточка «Предмет» у предмета сцены 3D (М.8): имя и материал по имени. `o` — скобка
+/// предмета.
+fn object_card(
+    ui: &mut Ui,
+    naming: &mut Option<(usize, String)>,
+    text: &str,
+    o: usize,
+    materials: &[String],
+    send: &mut impl FnMut(Result<String, ron_edit::EditError>, bool),
+) {
+    let name = shape_edit::read_string(text, Some(o), "name").unwrap_or_default();
+    let now = shape_edit::read_string(text, Some(o), "material").unwrap_or_default();
+    card(ui, "Предмет", |ui| {
+        ui.horizontal(|ui| {
+            prop(ui, "Имя");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let mut buf = match naming {
+                    Some((at, b)) if *at == o => b.clone(),
+                    _ => name.clone(),
+                };
+                let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(170.0));
+                if r.has_focus() {
+                    *naming = Some((o, buf.clone()));
+                }
+                if r.lost_focus() {
+                    *naming = None;
+                    if buf != name {
+                        send(
+                            ron_edit::set_field_at(text, o, "name", &shape_edit::quoted(&buf)),
+                            true,
+                        );
+                    }
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            prop(ui, "Материал");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                egui::ComboBox::from_id_salt("object-material")
+                    .selected_text(&now)
+                    .show_ui(ui, |ui| {
+                        for m in materials {
+                            if ui.selectable_label(*m == now, m).clicked() && *m != now {
+                                send(
+                                    ron_edit::set_field_at(
+                                        text,
+                                        o,
+                                        "material",
+                                        &shape_edit::quoted(m),
+                                    ),
+                                    true,
+                                );
+                            }
+                        }
+                    });
+            });
+        });
+    });
+}
+
+/// Карточка «Модель» у ссылки `Use` (М.8): какая модель и её ручки (М.6) у этой копии.
+fn use_card(
+    ui: &mut Ui,
+    text: &str,
+    part: &shape_edit::Part,
+    root: &Path,
+    send: &mut impl FnMut(Result<String, ron_edit::EditError>, bool),
+    end: &mut bool,
+) {
+    let Some(model) = shape_edit::read_string(text, part.open, "model") else {
+        return;
+    };
+    let file = reyvec_sdf::shape_model::model_path(root, &model)
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let params = file.as_deref().map(model_params::read).unwrap_or_default();
+    let values: std::collections::BTreeMap<String, f32> = part
+        .open
+        .and_then(|o| {
+            let s = text.as_bytes();
+            let f = ron_edit::fields(s, o)?
+                .into_iter()
+                .find(|f| f.name == "params")?;
+            ron::from_str(&text[f.value]).ok()
+        })
+        .unwrap_or_default();
+    card(ui, "Модель", |ui| {
+        ui.label(RichText::new(&model).color(TEXT));
+        if file.is_none() {
+            ui.label(
+                RichText::new("Файл модели не прочитать")
+                    .color(BAD)
+                    .size(FONT_SMALL),
+            );
+        }
+        for p in &params {
+            ui.horizontal(|ui| {
+                prop(ui, &p.name);
+                let mut v = values.get(&p.name).copied().unwrap_or(p.value);
+                ui.spacing_mut().slider_width = 130.0;
+                let r = ui
+                    .add(egui::Slider::new(&mut v, p.min..=p.max))
+                    .on_hover_text(format!("Ручка модели; в её файле {}", p.value));
+                if r.changed() {
+                    let mut m = values.clone();
+                    if v == p.value {
+                        m.remove(&p.name);
+                    } else {
+                        m.insert(p.name.clone(), v);
+                    }
+                    let commit = !r.dragged();
+                    send(write_use_params(text, part, &m), commit);
+                }
+                *end |= r.drag_stopped();
+                if values.contains_key(&p.name)
+                    && ui
+                        .small_button("↺")
+                        .on_hover_text("Как в файле модели")
+                        .clicked()
+                {
+                    let mut m = values.clone();
+                    m.remove(&p.name);
+                    send(write_use_params(text, part, &m), true);
+                }
+            });
+        }
+    });
+}
+
+/// Ручки копии модели в `Use`: пустые — поле `params` убирается.
+fn write_use_params(
+    text: &str,
+    part: &shape_edit::Part,
+    values: &std::collections::BTreeMap<String, f32>,
+) -> Result<String, ron_edit::EditError> {
+    let open = part
+        .open
+        .ok_or_else(|| ron_edit::EditError("у ссылки нет скобок".into()))?;
+    if values.is_empty() {
+        let s = text.as_bytes();
+        let f = ron_edit::fields(s, open).ok_or_else(|| ron_edit::EditError("поля".into()))?;
+        let Some(k) = f.iter().position(|f| f.name == "params") else {
+            return Ok(text.to_owned());
+        };
+        // Вместе с запятой перед полем: `Use(model: "…")`.
+        return Ok(match k.checked_sub(1) {
+            Some(prev) => format!("{}{}", &text[..f[prev].value.end], &text[f[k].value.end..]),
+            None => ron_edit::remove_span(text, f[k].name_start, f[k].value.end),
+        });
+    }
+    let list: Vec<String> = values
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}: {}",
+                shape_edit::quoted(k),
+                ron_edit::num(f64::from(*v))
+            )
+        })
+        .collect();
+    let value = format!("{{{}}}", list.join(", "));
+    let s = text.as_bytes();
+    let f = ron_edit::fields(s, open).ok_or_else(|| ron_edit::EditError("поля".into()))?;
+    Ok(match f.iter().find(|f| f.name == "params") {
+        Some(found) => format!(
+            "{}{value}{}",
+            &text[..found.value.start],
+            &text[found.value.end..]
+        ),
+        None => {
+            // После `model`: `Use(model: "…", params: {…})`.
+            let m = f
+                .iter()
+                .find(|f| f.name == "model")
+                .ok_or_else(|| ron_edit::EditError("у ссылки нет model".into()))?;
+            format!(
+                "{}, params: {value}{}",
+                &text[..m.value.end],
+                &text[m.value.end..]
+            )
+        }
+    })
+}
+
 /// Карточка «Ручки модели» (М.6).
 #[derive(Default)]
 struct ParamsUi {
@@ -5087,6 +5337,10 @@ struct ShapeTree<'a> {
 impl ShapeTree<'_> {
     fn rows(&mut self, ui: &mut Ui, part: &shape_edit::Part, path: &mut Vec<usize>) {
         let mut title = shape_edit::label(&part.kind).to_owned();
+        // Предмет сцены 3D (М.8) — по имени.
+        if let Some(name) = part.name.as_deref().filter(|n| !n.is_empty()) {
+            title = format!("{name} · {title}");
+        }
         if let Some(o) = part.painted {
             let m = shape_edit::read_num(self.text, Some(o), "material", 0.0).round() as usize;
             if let Some(name) = self.materials.get(m) {
@@ -5219,42 +5473,46 @@ impl ShapeTree<'_> {
         let down = part.removable && sibling(1) == Some(true);
         item(ui, up, "Выше в списке", "", PartCmd::Up);
         item(ui, down, "Ниже в списке", "", PartCmd::Down);
-        ui.menu_button("Обернуть", |ui| {
-            let step = super::shapes::part_bounds(self.text, path)
-                .map_or(0.3, |(lo, hi)| f64::from((hi.x - lo.x) * 1.25).max(0.05));
-            let step = (step * 100.0).round() / 100.0;
-            item(
-                ui,
-                true,
-                "В объединение",
-                "",
-                PartCmd::Wrap(shape_edit::Wrap::Union),
-            );
-            item(
-                ui,
-                true,
-                "В зеркало (две половины)",
-                "",
-                PartCmd::Wrap(shape_edit::Wrap::Mirror),
-            );
-            item(
-                ui,
-                true,
-                "В повтор (ряд копий)",
-                "",
-                PartCmd::Wrap(shape_edit::Wrap::Repeat(step)),
-            );
+        // Предмет сцены 3D (М.8) — запись списка предметов, а не форма: его не обернуть.
+        let object = shape_edit::is_scene(self.root) && path.len() <= 1;
+        ui.add_enabled_ui(!object, |ui| {
+            ui.menu_button("Обернуть", |ui| {
+                let step = super::shapes::part_bounds(self.text, path)
+                    .map_or(0.3, |(lo, hi)| f64::from((hi.x - lo.x) * 1.25).max(0.05));
+                let step = (step * 100.0).round() / 100.0;
+                item(
+                    ui,
+                    true,
+                    "В объединение",
+                    "",
+                    PartCmd::Wrap(shape_edit::Wrap::Union),
+                );
+                item(
+                    ui,
+                    true,
+                    "В зеркало (две половины)",
+                    "",
+                    PartCmd::Wrap(shape_edit::Wrap::Mirror),
+                );
+                item(
+                    ui,
+                    true,
+                    "В повтор (ряд копий)",
+                    "",
+                    PartCmd::Wrap(shape_edit::Wrap::Repeat(step)),
+                );
+            })
         });
         item(
             ui,
-            shape_edit::can_unwrap(part),
+            !object && shape_edit::can_unwrap(part),
             "Снять обёртку",
             "",
             PartCmd::Unwrap,
         );
         item(
             ui,
-            shape_edit::can_split(part),
+            !object && shape_edit::can_split(part),
             "Разделить повтор",
             "",
             PartCmd::Split,
@@ -5454,6 +5712,8 @@ mod tests {
             text: "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Sphere(radius: 0.3), Box(size: (0.2, 0.2, 0.2))]))",
             preview: &NO_PREVIEW,
             cost: None,
+            scene: false,
+            root: std::path::Path::new("."),
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         assert!(ui.take_actions().is_empty(), "без нажатий нет действий");
@@ -5485,6 +5745,8 @@ mod tests {
             text,
             preview: &NO_PREVIEW,
             cost: None,
+            scene: false,
+            root: std::path::Path::new("."),
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         let vp = ui.viewport().expect("окно подставки");
@@ -5557,6 +5819,8 @@ mod tests {
             text,
             preview: &NO_PREVIEW,
             cost: None,
+            scene: false,
+            root: std::path::Path::new("."),
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         // Середина экрана — шар (камера смотрит на него).
@@ -5776,6 +6040,32 @@ mod tests {
             panic!("точка не добавилась: {added:?}");
         };
         assert_eq!(contour::parse(&added).unwrap()[0].nodes.len(), 5, "{added}");
+    }
+
+    #[test]
+    fn copy_params_are_written_into_use() {
+        use std::collections::BTreeMap;
+        let text = r#"(format: "reyvec-space", version: 1, materials: [(name: "лента", color: (0.1, 0.1, 0.1))],
+    objects: [
+        (name: "конвейер", material: "лента", at: (1.0, 0.0, 0.0), shape: Use(model: "завод/конвейер")),
+    ])"#;
+        let root = shape_edit::parse(text).unwrap();
+        let part = root.at(&[0]).unwrap();
+        assert_eq!(part.kind, "Use");
+        let values = BTreeMap::from([("длина".to_string(), 2.4f32)]);
+        let t = write_use_params(text, part, &values).unwrap();
+        assert!(
+            t.contains(r#"Use(model: "завод/конвейер", params: {"длина": 2.4})"#),
+            "{t}"
+        );
+        let file: reyvec_sdf::space_file::SpaceFile = ron::from_str(&t).unwrap();
+        let reyvec_sdf::Shape3::Use { params, .. } = &file.objects[0].shape else {
+            panic!()
+        };
+        assert_eq!(params.get("длина"), Some(&2.4));
+        let root = shape_edit::parse(&t).unwrap();
+        let back = write_use_params(&t, root.at(&[0]).unwrap(), &BTreeMap::new()).unwrap();
+        assert!(back.contains(r#"Use(model: "завод/конвейер")"#), "{back}");
     }
 
     #[test]
@@ -6202,6 +6492,8 @@ mod tests {
                     text: &rack,
                     preview: &NO_PREVIEW,
                     cost: Some(rack_cost.clone()),
+                    scene: false,
+                    root: std::path::Path::new("."),
                 });
             }
             let mut out = None;

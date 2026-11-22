@@ -6,12 +6,14 @@
 //! сверху), показ одной детали крупно и свободный полёт клавишами. Сохранили файл
 //! модели (в блокноте или другой программе) — подставка перечитывает его сама.
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use glam::Vec3;
-use reyvec_sdf::shape_model::ModelFile;
+use reyvec_sdf::shape_model::{ModelFile, Resolver};
+use reyvec_sdf::space_file::SpaceFile;
 use reyvec_sdf::{Camera3D, Shape3, SpaceScene};
 
 /// Окончание файла модели формы.
@@ -165,6 +167,8 @@ pub(crate) struct ShapeView {
     pub preview: BTreeMap<String, f32>,
     /// Замер цены модели (М.7) в своём потоке.
     pub cost: super::cost::CostJob,
+    /// Открыта сцена 3D (М.8), а не модель: рисуется сама сцена, без подставки.
+    pub scene: bool,
     /// Радиус подставки.
     stand: f32,
 }
@@ -172,12 +176,22 @@ pub(crate) struct ShapeView {
 impl ShapeView {
     /// Модель из файла `path`. Ошибка — файл не в папке `models`.
     pub(crate) fn open(path: PathBuf) -> Result<Self, String> {
-        let (root, name) = model_of(&path).ok_or_else(|| {
-            format!(
-                "{} — не модель формы: файл *.shape.ron должен лежать в папке models",
-                path.display()
-            )
-        })?;
+        let file = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        let scene = !is_shape(file);
+        let (root, name) = if scene {
+            // Сцена 3D (М.8): модели ищутся в папке models рядом с её файлом.
+            let dir = path
+                .parent()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+            (dir, file.trim_end_matches(".ron").to_owned())
+        } else {
+            model_of(&path).ok_or_else(|| {
+                format!(
+                    "{} — не модель формы: файл *.shape.ron должен лежать в папке models",
+                    path.display()
+                )
+            })?
+        };
         Ok(Self {
             path,
             name,
@@ -194,7 +208,7 @@ impl ShapeView {
             shift: Vec3::ZERO,
             goal: None,
             free: false,
-            spin: true,
+            spin: !scene,
             last: Instant::now(),
             error: None,
             framed: false,
@@ -202,6 +216,7 @@ impl ShapeView {
             hidden: Vec::new(),
             preview: BTreeMap::new(),
             cost: super::cost::CostJob::default(),
+            scene,
             stand: 0.15,
         })
     }
@@ -218,6 +233,9 @@ impl ShapeView {
             }
         }
         self.checked = Instant::now();
+        if self.scene {
+            return self.load_scene();
+        }
         // Сначала модель в начале координат: узнать, какого она размера.
         let probe = stand_text(
             &use_model(&self.name, &BTreeMap::new()),
@@ -265,8 +283,48 @@ impl ShapeView {
         Some(self.stand_scene())
     }
 
-    /// Сцена подставки с моделью как сейчас (без спрятанных деталей).
+    /// Сцена 3D (М.8): прочитать, раскрыть модели для выбора мышью, поставить камеру
+    /// по размеру сцены.
+    fn load_scene(&mut self) -> Option<String> {
+        let scene = match SpaceScene::parse_in(&self.text, Some(&self.root)) {
+            Ok(s) => s,
+            Err(e) => {
+                self.error = Some(e);
+                return None;
+            }
+        };
+        remember_models(&self.text, &self.root);
+        // Коробка всех конечных предметов (пол-плоскость не в счёт).
+        let frame = scene.frame(0.0);
+        let mut bounds: Option<(Vec3, Vec3)> = None;
+        for b in frame.shapes.iter().filter_map(Shape3::bounds_box) {
+            bounds = Some(bounds.map_or(b, |(lo, hi)| (lo.min(b.0), hi.max(b.1))));
+        }
+        let (lo, hi) = bounds.unwrap_or((Vec3::splat(-1.0), Vec3::splat(1.0)));
+        let radius = ((hi - lo) * 0.5).length().max(0.5);
+        self.center = (lo + hi) * 0.5;
+        self.shift = Vec3::ZERO;
+        if !self.framed {
+            self.distance = radius * FRAME * 0.6;
+            self.target = self.center;
+            self.near = radius * 0.05;
+            self.goal = None;
+            self.framed = true;
+        }
+        self.radius = radius;
+        self.error = None;
+        self.hidden.retain(|p| {
+            super::shape_edit::parse(&self.text).is_ok_and(|r| r.at(p).is_some_and(|x| x.removable))
+        });
+        Some(self.stand_scene())
+    }
+
+    /// Сцена подставки с моделью как сейчас (без спрятанных деталей). У сцены 3D — она
+    /// сама без спрятанных предметов и деталей.
     pub(crate) fn stand_scene(&self) -> String {
+        if self.scene {
+            return without_in_text(&self.text, &self.hidden);
+        }
         let values = self.preview_values();
         let (model, materials) = if self.hidden.is_empty() {
             (use_model(&self.name, &values), String::new())
@@ -492,6 +550,125 @@ impl ShapeView {
     }
 }
 
+thread_local! {
+    /// Модели сцены 3D, раскрытые при её чтении (М.8): ссылка `Use` текстом → дерево.
+    /// По ним выбор мышью и рамки находят детали моделей в сцене.
+    static MODELS: RefCell<HashMap<String, Shape3>> = RefCell::new(HashMap::new());
+    /// Последний текст и его форма целиком: стрелки спрашивают её несколько раз за кадр.
+    static WHOLE: RefCell<Option<(String, Option<Shape3>)>> = const { RefCell::new(None) };
+}
+
+/// Раскрыть и запомнить модели, на которые ссылается сцена `text` из папки `dir`.
+fn remember_models(text: &str, dir: &Path) {
+    let Ok(file) = ron::from_str::<SpaceFile>(text) else {
+        return;
+    };
+    let mut uses = Vec::new();
+    for o in &file.objects {
+        collect_uses(&o.shape, &mut uses);
+    }
+    let mut materials = Vec::new();
+    MODELS.with_borrow_mut(|m| {
+        for u in uses {
+            let Ok(key) = ron::to_string(&u) else {
+                continue;
+            };
+            if m.contains_key(&key) {
+                continue;
+            }
+            let mut shape = u.clone();
+            let mut r = Resolver::new(Some(dir), &mut materials);
+            if r.resolve(&mut shape).is_ok() {
+                m.insert(key, shape);
+            }
+        }
+    });
+    WHOLE.with_borrow_mut(|w| *w = None);
+}
+
+fn collect_uses(shape: &Shape3, out: &mut Vec<Shape3>) {
+    if matches!(shape, Shape3::Use { .. }) {
+        out.push(shape.clone());
+        return;
+    }
+    let mut i = 0;
+    while let Some(c) = child(shape, i, &mut Vec::new()) {
+        collect_uses(c, out);
+        i += 1;
+    }
+}
+
+/// Ссылки на модели заменяются запомненными деревьями.
+fn with_models(shape: &mut Shape3) {
+    if matches!(shape, Shape3::Use { .. }) {
+        let key = ron::to_string(&*shape).unwrap_or_default();
+        if let Some(m) = MODELS.with_borrow(|m| m.get(&key).cloned()) {
+            *shape = m;
+        }
+        return;
+    }
+    let mut i = 0;
+    while let Some(c) = child_mut(shape, i) {
+        with_models(c);
+        i += 1;
+    }
+}
+
+/// Вся форма файла: у модели — её дерево, у сцены 3D (М.8) — объединение предметов,
+/// каждый в своём сдвиге (место и поворот предмета), ссылки на модели раскрыты.
+fn whole(text: &str) -> Option<Shape3> {
+    if let Some(w) = WHOLE.with_borrow(|w| {
+        w.as_ref()
+            .filter(|(t, _)| t == text)
+            .map(|(_, s)| s.clone())
+    }) {
+        return w;
+    }
+    let shape = if let Ok(f) = ModelFile::parse(text) {
+        Some(f.shape)
+    } else {
+        ron::from_str::<SpaceFile>(text)
+            .ok()
+            .map(|f| Shape3::Union {
+                shapes: f
+                    .objects
+                    .into_iter()
+                    .map(|o| {
+                        let mut shape = o.shape;
+                        with_models(&mut shape);
+                        Shape3::Move {
+                            at: o.at,
+                            turn: o.turn,
+                            scale: 1.0,
+                            shape: Box::new(shape),
+                        }
+                    })
+                    .collect(),
+                smooth: 0.0,
+            })
+    };
+    WHOLE.with_borrow_mut(|w| *w = Some((text.to_owned(), shape.clone())));
+    shape
+}
+
+/// Сцена 3D без спрятанных предметов и деталей (текстом).
+fn without_in_text(text: &str, hidden: &[Vec<usize>]) -> String {
+    let mut paths = hidden.to_vec();
+    paths.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = text.to_owned();
+    for p in &paths {
+        let Ok(root) = super::shape_edit::parse(&out) else {
+            break;
+        };
+        if let Some(part) = root.at(p)
+            && let Ok(t) = super::shape_edit::remove(&out, part)
+        {
+            out = t;
+        }
+    }
+    out
+}
+
 /// Материалов у подставки до материалов модели (пол, подставка, форма).
 const STAND_MATERIALS: u32 = 3;
 
@@ -679,8 +856,8 @@ fn placed(node: &Shape3, around: &[Around], copies: bool) -> Shape3 {
 /// модели: со всеми сдвигами вокруг неё. Копии зеркала и повтора не входят — коробка
 /// самой детали. `None` — модель не читается или у детали нет размера (ссылка `Use`).
 pub(crate) fn part_bounds(text: &str, path: &[usize]) -> Option<(Vec3, Vec3)> {
-    let file = ModelFile::parse(text).ok()?;
-    let (node, around) = walk(&file.shape, path)?;
+    let shape = whole(text)?;
+    let (node, around) = walk(&shape, path)?;
     // Ссылка на другую модель здесь не раскрыта: у неё коробка в точку.
     placed(node, &around, false)
         .bounds_box()
@@ -689,8 +866,8 @@ pub(crate) fn part_bounds(text: &str, path: &[usize]) -> Option<(Vec3, Vec3)> {
 
 /// Переход из координат родителя детали (где записано её `at`) в координаты модели.
 pub(crate) fn parent_frame(text: &str, path: &[usize]) -> Option<glam::Affine3A> {
-    let file = ModelFile::parse(text).ok()?;
-    let (_, around) = walk(&file.shape, path)?;
+    let shape = whole(text)?;
+    let (_, around) = walk(&shape, path)?;
     let mut m = glam::Affine3A::IDENTITY;
     for a in &around {
         if let Around::Move((at, turn, scale)) = *a {
@@ -714,15 +891,17 @@ pub(crate) fn pick(
     dir: Vec3,
     far: f32,
 ) -> Option<Vec<usize>> {
-    let file = ModelFile::parse(text).ok()?;
+    let shape = whole(text)?;
     let mut sorted = hidden.to_vec();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
-    let mut whole = file.shape.clone();
+    let mut whole = shape.clone();
     for p in &sorted {
         remove_part(&mut whole, p);
     }
-    let (lo, hi) = whole.bounds_box()?;
-    let eps = ((hi - lo).max_element() * 2e-4).max(1e-5);
+    // У сцены с полом-плоскостью коробки нет: точность — как у сцены в десятки метров.
+    let eps = whole
+        .bounds_box()
+        .map_or(2e-3, |(lo, hi)| ((hi - lo).max_element() * 2e-4).max(1e-5));
     let mut t = 0.0;
     let mut hit = None;
     for _ in 0..400 {
@@ -746,7 +925,7 @@ pub(crate) fn pick(
             continue;
         }
         if part.children.is_empty() {
-            if let Some((node, around)) = walk(&file.shape, &path) {
+            if let Some((node, around)) = walk(&shape, &path) {
                 let d = placed(node, &around, true).distance(p).abs();
                 if d < f32::MAX && best.as_ref().is_none_or(|(b, _)| d < *b) {
                     best = Some((d, path.clone()));
@@ -889,6 +1068,50 @@ mod tests {
 
     fn scenes() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenes/3d")
+    }
+
+    #[test]
+    fn space_scene_opens_picks_and_moves_objects() {
+        let path = scenes().join("forge.ron");
+        let mut view = ShapeView::open(path).expect("сцена");
+        assert!(view.scene && !view.spin);
+        assert_eq!(view.name, "forge");
+        let text = view.load().expect("сцена читается");
+        assert!(view.error.is_none());
+        assert_eq!(text, view.text, "сцена рисуется как есть");
+        let root = super::super::shape_edit::parse(&view.text).unwrap();
+        assert!(super::super::shape_edit::is_scene(&root));
+        let file: SpaceFile = ron::from_str(&view.text).unwrap();
+        assert_eq!(root.children.len(), file.objects.len());
+        // Наковальня — ссылка на модель: у неё есть рамка (модель раскрыта), и луч сверху
+        // в её середину выбирает её.
+        let i = file
+            .objects
+            .iter()
+            .position(
+                |o| matches!(&o.shape, Shape3::Use { model, .. } if model.ends_with("наковальня")),
+            )
+            .expect("наковальня");
+        assert_eq!(root.children[i].kind, "Use");
+        assert_eq!(
+            root.children[i].name.as_deref(),
+            Some(file.objects[i].name.as_str())
+        );
+        let (lo, hi) = part_bounds(&view.text, &[i]).expect("рамка модели");
+        let mid = (lo + hi) * 0.5;
+        let top = Vec3::new(mid.x, hi.y + 3.0, mid.z);
+        let hit = pick(&view.text, &[], top, Vec3::NEG_Y, 50.0).expect("попали");
+        assert_eq!(hit[0], i, "{hit:?}");
+        // Сдвиг предмета пишется в его at, сцена читается.
+        let part = root.at(&[i]).unwrap();
+        let moved = super::super::shape_edit::set_moved(&view.text, part, "at", "(1.5, 0.0, -2.0)")
+            .unwrap();
+        let back: SpaceFile = ron::from_str(&moved).unwrap();
+        assert_eq!(back.objects[i].at, [1.5, 0.0, -2.0]);
+        // Спрятанный предмет пропадает из сцены, остальные на месте.
+        view.hidden = vec![vec![i]];
+        let without: SpaceFile = ron::from_str(&view.stand_scene()).unwrap();
+        assert_eq!(without.objects.len(), file.objects.len() - 1);
     }
 
     #[test]
