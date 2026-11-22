@@ -122,6 +122,18 @@ impl Item {
     }
 }
 
+/// Окно «Создать»: в какую папку, имя без окончания, вид, первый ли кадр.
+#[derive(Clone, Debug)]
+pub(crate) struct Creating {
+    pub dir: PathBuf,
+    pub name: String,
+    pub kind: NewKind,
+    /// Имя ещё не трогали: при смене вида оно меняется на имя по виду.
+    touched: bool,
+    first: bool,
+    error: Option<String>,
+}
+
 /// Файлы, которые тащат мышью внутри проводника.
 #[derive(Clone, Debug)]
 struct Dragged(Vec<PathBuf>);
@@ -152,6 +164,12 @@ pub(crate) struct Explorer {
     /// Переименование: файл, текст, первый ли кадр (тогда выделить имя без окончания).
     renaming: Option<(PathBuf, String, bool)>,
     undo: Vec<Done>,
+    /// Отменённое, которое можно повторить (Ctrl+Y); новое действие его стирает.
+    redo: Vec<pf::Redo>,
+    /// Окно «Создать»: куда, имя и вид.
+    pub(crate) creating: Option<Creating>,
+    /// Рамка выделения мышью: откуда тянут (точка экрана) и выбранное до неё (с Ctrl).
+    band: Option<(Pos2, Vec<PathBuf>)>,
     /// Где используется выбранный: для какого файла посчитано и что нашлось.
     used: Option<(PathBuf, Vec<(PathBuf, usize)>)>,
     /// Последнее сообщение внизу: текст и ошибка ли.
@@ -195,6 +213,9 @@ impl Explorer {
             search: String::new(),
             renaming: None,
             undo: Vec::new(),
+            redo: Vec::new(),
+            creating: None,
+            band: None,
             used: None,
             note: None,
             scroll_to: false,
@@ -351,6 +372,12 @@ impl Explorer {
 
     /// Запомнить сделанное для отмены и перечитать папки.
     fn did(&mut self, done: Done) {
+        self.redo.clear();
+        self.remember(done);
+    }
+
+    /// Запомнить для отмены, не трогая повтор.
+    fn remember(&mut self, done: Done) {
         self.undo.push(done);
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
@@ -485,6 +512,10 @@ impl Explorer {
 
     fn delete(&mut self, busy: &Busy) {
         let items = self.selected.clone();
+        self.delete_items(items, busy);
+    }
+
+    fn delete_items(&mut self, items: Vec<PathBuf>, busy: &Busy) {
         if items.is_empty() {
             return;
         }
@@ -514,10 +545,13 @@ impl Explorer {
     }
 
     fn paste(&mut self, busy: &Busy) {
+        self.paste_into(self.dir.clone(), busy);
+    }
+
+    fn paste_into(&mut self, dir: PathBuf, busy: &Busy) {
         let Some((items, cut)) = self.clipboard.clone() else {
             return;
         };
-        let dir = self.dir.clone();
         if self.is_root(&dir) {
             return self.say(
                 "Прямо в «Проект» класть нельзя: откройте scenes или assets",
@@ -541,26 +575,214 @@ impl Explorer {
         }
     }
 
-    fn create(&mut self, kind: NewKind) {
-        let dir = self.dir.clone();
+    /// Открыть окно «Создать» для папки `dir`.
+    pub(crate) fn ask_create(&mut self, dir: PathBuf, kind: NewKind) {
         if self.is_root(&dir) {
             return self.say(
                 "Прямо в «Проект» класть нельзя: откройте scenes или assets",
                 true,
             );
         }
-        match pf::create(&dir, kind.file_name(), kind.text()) {
-            Ok((done, path)) => {
-                self.did(done);
-                self.search.clear();
-                // Сразу дать новое имя, как в проводнике Windows.
-                self.selected = vec![path.clone()];
-                self.anchor = Some(path.clone());
-                self.renaming = Some((path.clone(), pf::file_name(&path), true));
-                self.scroll_to = true;
+        self.renaming = None;
+        self.creating = Some(Creating {
+            dir,
+            name: kind.stem().to_owned(),
+            kind,
+            touched: false,
+            first: true,
+            error: None,
+        });
+    }
+
+    /// Создать из окна: имя без окончания и вид. Ошибка — что сказать в окне.
+    fn create_named(&mut self, dir: &Path, stem: &str, kind: NewKind) -> Result<(), String> {
+        let name = format!("{}{}", stem.trim(), kind.ext());
+        pf::check_name(&name)?;
+        if dir.join(&name).exists() {
+            return Err(format!("В «{}» уже есть «{name}»", pf::file_name(dir)));
+        }
+        let (done, path) = pf::create(dir, &name, kind.text())?;
+        self.did(done);
+        self.search.clear();
+        if dir != self.dir {
+            self.go(dir.to_path_buf());
+        }
+        self.selected = vec![path.clone()];
+        self.anchor = Some(path);
+        self.scroll_to = true;
+        self.say(format!("Создано: «{name}»"), false);
+        Ok(())
+    }
+
+    /// Окно «Создать»: вид значками и имя; Enter — создать, Esc — закрыть.
+    fn create_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut c) = self.creating.take() else {
+            return;
+        };
+        let mut make = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::unique("explorer-create")).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.label(
+                RichText::new(format!("Создать в «{}»", pf::file_name(&c.dir)))
+                    .size(FONT_HEADING)
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(GAP_L);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(GAP_M, GAP_M);
+                for kind in NewKind::ALL {
+                    let on = c.kind == kind;
+                    let (_, color) = kind_of(kind.file_name(), kind == NewKind::Folder, false);
+                    let (rect, r) = ui.allocate_exact_size(vec2(84.0, 64.0), Sense::click());
+                    let p = ui.painter();
+                    p.rect(
+                        rect,
+                        RADIUS_M,
+                        if on {
+                            SELECT_BG
+                        } else if r.hovered() {
+                            HOVER
+                        } else {
+                            CARD
+                        },
+                        Stroke::new(LINE, if on { SELECT } else { BORDER_STRONG }),
+                        egui::StrokeKind::Inside,
+                    );
+                    let top = rect.center() - vec2(0.0, 10.0);
+                    if kind == NewKind::Folder {
+                        paint_folder(p, top, 1.1, color);
+                    } else {
+                        p.rect_filled(Rect::from_center_size(top, vec2(16.0, 16.0)), 3, color);
+                    }
+                    p.text(
+                        rect.center() + vec2(0.0, 16.0),
+                        Align2::CENTER_CENTER,
+                        kind.label(),
+                        FontId::proportional(FONT_SMALL),
+                        if on { Color32::WHITE } else { TEXT_DIM },
+                    );
+                    if r.clicked() {
+                        c.kind = kind;
+                        if !c.touched {
+                            c.name = kind.stem().to_owned();
+                        }
+                        c.first = true;
+                    }
+                }
+            });
+            ui.add_space(GAP_L);
+            ui.horizontal(|ui| {
+                let ext = c.kind.ext();
+                let id = egui::Id::unique("explorer-create-name");
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut c.name)
+                        .id(id)
+                        .desired_width(460.0 - 90.0)
+                        .hint_text("Имя"),
+                );
+                ui.label(RichText::new(ext).monospace().color(MUTED));
+                if edit.changed() {
+                    c.touched = true;
+                    c.error = None;
+                }
+                if c.first {
+                    // Имя выделено целиком: печать сразу заменяет его.
+                    c.first = false;
+                    edit.request_focus();
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+                        let n = c.name.chars().count();
+                        state
+                            .cursor
+                            .set_char_range(Some(egui::text::CCursorRange::two(
+                                egui::text::CCursor::new(0),
+                                egui::text::CCursor::new(n),
+                            )));
+                        state.store(ui.ctx(), id);
+                    }
+                }
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    make = true;
+                }
+            });
+            if let Some(e) = &c.error {
+                ui.label(RichText::new(e).small().color(BAD));
+            }
+            ui.add_space(GAP_L);
+            ui.horizontal(|ui| {
+                let b = egui::Button::new(RichText::new("Создать").color(ON_ACCENT)).fill(ACCENT);
+                if ui.add(b).clicked() {
+                    make = true;
+                }
+                if ui.button("Отмена").clicked() {
+                    close = true;
+                }
+                ui.label(
+                    RichText::new("Enter — создать, Esc — закрыть")
+                        .small()
+                        .color(MUTED),
+                );
+            });
+        });
+        if modal.should_close() {
+            close = true;
+        }
+        // Поле имени отдаёт клавиатуру, как только окно закрылось: иначе первый Ctrl+Z
+        // после окна достался бы пустому полю.
+        let unfocus = |ctx: &egui::Context| {
+            ctx.memory_mut(|m| m.surrender_focus(egui::Id::unique("explorer-create-name")));
+        };
+        if make {
+            let dir = c.dir.clone();
+            match self.create_named(&dir, &c.name, c.kind) {
+                Ok(()) => return unfocus(ctx),
+                Err(e) => {
+                    c.error = Some(e);
+                    c.first = true;
+                }
+            }
+        }
+        if close {
+            unfocus(ctx);
+        } else {
+            self.creating = Some(c);
+        }
+    }
+
+    /// Повторить отменённое (Ctrl+Y).
+    fn redo(&mut self) {
+        let (Some(again), Some(project)) = (self.redo.pop(), self.project.clone()) else {
+            return self.say("Повторять нечего", false);
+        };
+        match pf::redo(&project, again) {
+            Ok(done) => {
+                let select = match &done {
+                    Done::Moved { moves, .. } => moves.iter().map(|(_, t)| t.clone()).collect(),
+                    Done::Created(paths) => paths.clone(),
+                    Done::Trashed(_) => Vec::new(),
+                };
+                self.remember(done);
+                self.say("Повторено", false);
+                self.show(select);
+                self.out.push(Out::Changed);
+                self.refresh();
             }
             Err(e) => self.say(e, true),
         }
+    }
+
+    /// Открыть папку первого из путей и выбрать их.
+    fn show(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(dir) = paths[0].parent()
+            && dir != self.dir
+        {
+            self.go(dir.to_path_buf());
+        }
+        self.selected = paths;
+        self.scroll_to = true;
     }
 
     fn undo(&mut self) {
@@ -568,16 +790,10 @@ impl Explorer {
             return self.say("Отменять нечего", false);
         };
         match pf::undo(&project, done) {
-            Ok(back) => {
+            Ok((back, again)) => {
                 self.say("Отменено", false);
-                if !back.is_empty() {
-                    if let Some(dir) = back[0].parent()
-                        && dir != self.dir
-                    {
-                        self.go(dir.to_path_buf());
-                    }
-                    self.selected = back;
-                }
+                self.redo.push(again);
+                self.show(back);
                 self.out.push(Out::Changed);
                 self.refresh();
             }
@@ -720,6 +936,8 @@ impl Explorer {
                     .inner_margin(Margin::same(GAP_XL as i8)),
             )
             .show(ui, |ui| self.files(ui, busy, per_row));
+        let ctx = ui.ctx().clone();
+        self.create_dialog(&ctx);
         std::mem::take(&mut self.out)
     }
 
@@ -730,7 +948,7 @@ impl Explorer {
             .unwrap_or(1)
             .max(1);
         let ctx = ui.ctx().clone();
-        if ctx.egui_wants_keyboard_input() {
+        if ctx.egui_wants_keyboard_input() || self.creating.is_some() {
             // Пока печатают имя или поиск, клавиши принадлежат полю.
             return per_row;
         }
@@ -748,7 +966,14 @@ impl Explorer {
         });
         let k = |m: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(m, key));
         if k(Modifiers::COMMAND | Modifiers::SHIFT, Key::N) {
-            self.create(NewKind::Folder);
+            self.ask_create(self.dir.clone(), NewKind::Folder);
+        }
+        if k(Modifiers::COMMAND, Key::N) {
+            let kind = self.creating.as_ref().map_or(NewKind::Folder, |c| c.kind);
+            self.ask_create(self.dir.clone(), kind);
+        }
+        if k(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z) || k(Modifiers::COMMAND, Key::Y) {
+            self.redo();
         }
         if k(Modifiers::COMMAND, Key::Z) {
             self.undo();
@@ -970,15 +1195,14 @@ impl Explorer {
             let can_make = !self.is_root(&self.dir);
             ui.add_enabled_ui(can_make, |ui| {
                 let label = RichText::new("+  Создать").color(ON_ACCENT);
-                ui.scope(|ui| {
-                    let w = &mut ui.visuals_mut().widgets;
-                    w.inactive.weak_bg_fill = ACCENT;
-                    w.hovered.weak_bg_fill = ACCENT.gamma_multiply(0.9);
-                    w.open.weak_bg_fill = ACCENT;
-                    ui.menu_button(label, |ui| self.new_menu(ui));
-                })
-                .response
-                .on_disabled_hover_text(
+                let b = egui::Button::new(label).fill(ACCENT);
+                let r = ui
+                    .add(b)
+                    .on_hover_text("Новая папка, сцена, модель или скрипт (Ctrl+N)");
+                if r.clicked() {
+                    self.ask_create(self.dir.clone(), NewKind::Folder);
+                }
+                r.on_disabled_hover_text(
                     "Откройте scenes или assets: прямо в «Проект» класть нельзя",
                 );
             });
@@ -1019,6 +1243,16 @@ impl Explorer {
             .clicked()
             {
                 self.undo();
+            }
+            if icon(
+                ui,
+                Glyph::Redo,
+                "Повторить отменённое (Ctrl+Y)",
+                !self.redo.is_empty(),
+            )
+            .clicked()
+            {
+                self.redo();
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = GAP_XS;
@@ -1072,28 +1306,6 @@ impl Explorer {
         self.sort = by;
         self.desc = desc;
         sort_items(&mut self.items, by, desc);
-    }
-
-    fn new_menu(&mut self, ui: &mut Ui) {
-        for kind in NewKind::ALL {
-            let (_, color) = kind_of(kind.file_name(), kind == NewKind::Folder, false);
-            let r = ui.horizontal(|ui| {
-                let (r, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
-                ui.painter().rect_filled(
-                    Rect::from_center_size(r.center(), vec2(8.0, 8.0)),
-                    2,
-                    color,
-                );
-                ui.button(kind.label())
-            });
-            if r.inner.clicked() {
-                self.create(kind);
-                ui.close();
-            }
-            if kind == NewKind::Folder {
-                ui.separator();
-            }
-        }
     }
 
     /// Строка дерева папок и раскрытые под ней.
@@ -1159,6 +1371,7 @@ impl Explorer {
         if let Some(d) = response.dnd_release_payload::<Dragged>() {
             self.move_into(d.0.clone(), dir, busy);
         }
+        response.context_menu(|ui| self.tree_menu(ui, dir, busy));
         if self.open.contains(dir) {
             for s in subs {
                 self.tree_row(ui, &s, depth + 1, busy);
@@ -1166,16 +1379,94 @@ impl Explorer {
         }
     }
 
+    /// Меню папки в дереве: открыть, создать, вставить, переименовать, удалить.
+    fn tree_menu(&mut self, ui: &mut Ui, dir: &Path, busy: &Busy) {
+        let root = self.is_root(dir);
+        let fixed = self.is_fixed(dir);
+        if ui.button("Открыть").clicked() {
+            self.go(dir.to_path_buf());
+            ui.close();
+        }
+        if ui
+            .add_enabled(!root, egui::Button::new("Создать здесь…"))
+            .clicked()
+        {
+            self.ask_create(dir.to_path_buf(), NewKind::Folder);
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                !root && self.clipboard.is_some(),
+                egui::Button::new("Вставить сюда"),
+            )
+            .clicked()
+        {
+            self.paste_into(dir.to_path_buf(), busy);
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(
+                !fixed,
+                egui::Button::new("Переименовать").shortcut_text("F2"),
+            )
+            .clicked()
+            && let Some(parent) = dir.parent()
+        {
+            // Имя правится в списке папки выше, как в проводнике Windows.
+            self.go(parent.to_path_buf());
+            self.selected = vec![dir.to_path_buf()];
+            self.renaming = Some((dir.to_path_buf(), pf::file_name(dir), true));
+            self.scroll_to = true;
+            ui.close();
+        }
+        if ui
+            .add_enabled(!fixed, egui::Button::new("Удалить").shortcut_text("Delete"))
+            .clicked()
+        {
+            self.delete_items(vec![dir.to_path_buf()], busy);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Показать в проводнике Windows").clicked() {
+            self.out.push(Out::Reveal(dir.to_path_buf()));
+            ui.close();
+        }
+    }
+
     /// Плитки или список файлов открытой папки.
     fn files(&mut self, ui: &mut Ui, busy: &Busy, per_row: usize) {
         let full = ui.max_rect();
-        // Пустое место: щелчок снимает выбор, правая кнопка — меню папки, сюда можно
-        // бросить файлы из дерева... (бросают на папки и в дерево).
-        let bg = ui.interact(full, egui::Id::unique("explorer-bg"), Sense::click());
+        // Пустое место: щелчок снимает выбор, правая кнопка — меню папки, тянуть мышью —
+        // рамка выделения (с Ctrl — добавить к выбранному).
+        let bg = ui.interact(
+            full,
+            egui::Id::unique("explorer-bg"),
+            Sense::click_and_drag(),
+        );
         if bg.clicked() {
             self.selected.clear();
             self.renaming = None;
         }
+        if bg.drag_started_by(egui::PointerButton::Primary)
+            && let Some(at) = bg.interact_pointer_pos()
+        {
+            let keep = if ui.input(|i| i.modifiers.command) {
+                self.selected.clone()
+            } else {
+                Vec::new()
+            };
+            self.band = Some((at, keep));
+            self.renaming = None;
+        }
+        if !bg.dragged() {
+            self.band = None;
+        }
+        let band = self.band.as_ref().and_then(|(from, keep)| {
+            let to = ui.input(|i| i.pointer.latest_pos())?;
+            Some((Rect::from_two_pos(*from, to), keep.clone()))
+        });
+        let mut rects: Vec<(PathBuf, Rect)> = Vec::new();
         bg.context_menu(|ui| self.folder_menu(ui, busy));
         if self.items.is_empty() {
             let text = if self.search.trim().is_empty() {
@@ -1226,6 +1517,7 @@ impl Explorer {
                         if scroll_to && selected {
                             r.scroll_to_me(None);
                         }
+                        rects.push((item.path.clone(), r.rect));
                         // Тащить: выбранные (или только этот, если он не выбран).
                         if r.dragged() {
                             let pack = if selected {
@@ -1273,6 +1565,19 @@ impl Explorer {
                     });
                 }
             });
+        if let Some((rect, keep)) = band {
+            let p = ui.painter();
+            p.rect_filled(rect, 2, SELECT.gamma_multiply(0.12));
+            p.rect_stroke(rect, 2, Stroke::new(LINE, SELECT), egui::StrokeKind::Inside);
+            let mut picked = keep;
+            for (path, r) in rects {
+                if r.intersects(rect) && !picked.contains(&path) {
+                    picked.push(path);
+                }
+            }
+            self.anchor = picked.last().cloned();
+            self.selected = picked;
+        }
         if let Some((path, name)) = rename_done {
             self.rename(path, name, busy);
         }
@@ -1398,6 +1703,16 @@ impl Explorer {
             self.out.push(Out::OpenFile(item.path.clone()));
             ui.close();
         }
+        if item.folder
+            && !self.is_root(&item.path)
+            && ui
+                .add(egui::Button::new("Создать здесь…"))
+                .on_hover_text("Новая папка, сцена, модель или скрипт в этой папке")
+                .clicked()
+        {
+            self.ask_create(item.path.clone(), NewKind::Folder);
+            ui.close();
+        }
         ui.separator();
         if ui
             .add_enabled(
@@ -1463,9 +1778,16 @@ impl Explorer {
 
     fn folder_menu(&mut self, ui: &mut Ui, busy: &Busy) {
         let can_make = !self.is_root(&self.dir);
-        ui.add_enabled_ui(can_make, |ui| {
-            ui.menu_button("Создать", |ui| self.new_menu(ui));
-        });
+        if ui
+            .add_enabled(
+                can_make,
+                egui::Button::new("Создать…").shortcut_text("Ctrl+N"),
+            )
+            .clicked()
+        {
+            self.ask_create(self.dir.clone(), NewKind::Folder);
+            ui.close();
+        }
         if ui
             .add_enabled(
                 can_make && self.clipboard.is_some(),
@@ -2082,6 +2404,7 @@ enum Glyph {
     Rename,
     Trash,
     Undo,
+    Redo,
     Folder,
     Tiles,
     List,
@@ -2165,6 +2488,16 @@ fn paint_glyph(p: &egui::Painter, c: Pos2, g: Glyph, color: Color32) {
                 .collect();
             p.line(pts, s);
             p.line(vec![v(-6.0, -6.0), v(-3.0, -3.5), v(-6.5, -1.5)], s);
+        }
+        Glyph::Redo => {
+            let pts: Vec<Pos2> = (0..=16)
+                .map(|i| {
+                    let t = -1.6 + i as f32 / 16.0 * 3.2;
+                    c + vec2(-(t.sin() * 5.0 + 1.0), -t.cos() * 4.5 + 1.0)
+                })
+                .collect();
+            p.line(pts, s);
+            p.line(vec![v(6.0, -6.0), v(3.0, -3.5), v(6.5, -1.5)], s);
         }
         Glyph::Folder => paint_folder(p, c, 0.85, color),
         Glyph::Tiles => {
@@ -2385,8 +2718,63 @@ mod tests {
             &mut time,
             vec![key(Key::N, Modifiers::COMMAND | Modifiers::SHIFT)],
         );
-        assert!(t.0.join("assets/Новая папка").is_dir());
-        assert!(ex.renaming.is_some());
+        // Окно «Создать»: имя выделено, печать заменяет его, Enter создаёт.
+        assert_eq!(ex.creating.as_ref().map(|c| c.kind), Some(NewKind::Folder));
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![egui::Event::Text("ящики".into())],
+        );
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Enter, Modifiers::NONE)],
+        );
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        assert!(t.0.join("assets/ящики").is_dir());
+        assert!(ex.creating.is_none());
+        // Модель с тем же именем через окно: вид меняется, окончание дописывается.
+        ex.ask_create(t.0.join("assets"), NewKind::Shape);
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![egui::Event::Text("m".into())],
+        );
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Enter, Modifiers::NONE)],
+        );
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        // «m.shape.ron» уже есть: окно остаётся и говорит почему.
+        let c = ex.creating.as_ref().expect("окно открыто");
+        assert!(
+            c.error.as_deref().is_some_and(|e| e.contains("уже есть")),
+            "{c:?}"
+        );
+        ex.creating = None;
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        // Отмена убирает папку, повтор (Ctrl+Y) возвращает её.
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Z, Modifiers::COMMAND)],
+        );
+        assert!(!t.0.join("assets/ящики").exists(), "{:?}", ex.note);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Y, Modifiers::COMMAND)],
+        );
+        assert!(t.0.join("assets/ящики").is_dir());
         // Поиск находит во вложенных папках.
         ex.search = "room".into();
         ex.go(t.0.clone());
@@ -2395,6 +2783,51 @@ mod tests {
         frame(&ctx, &mut ex, &mut time, vec![]);
         let names: Vec<_> = ex.items().iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["room.ron"]);
+    }
+
+    /// Рамка мышью с пустого места выбирает плитки, которых коснулась.
+    #[test]
+    fn band_selects_tiles() {
+        let t = project(&[
+            ("assets/a.svg", ""),
+            ("assets/b.svg", ""),
+            ("assets/c.svg", ""),
+        ]);
+        let ctx = ctx();
+        let mut ex = Explorer::new(Some(&t.0));
+        let mut time = 0.0;
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let start = pos2(900.0, 600.0);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![egui::Event::PointerMoved(start)],
+        );
+        frame(&ctx, &mut ex, &mut time, vec![button(start, true)]);
+        for p in [pos2(850.0, 500.0), pos2(500.0, 300.0), pos2(380.0, 150.0)] {
+            frame(&ctx, &mut ex, &mut time, vec![egui::Event::PointerMoved(p)]);
+        }
+        // Рамка от (380, 150) до (900, 600) задевает вторую и третью плитки, но не первую.
+        let mut got: Vec<_> = ex.selected.iter().map(|p| pf::file_name(p)).collect();
+        got.sort();
+        assert_eq!(got, ["b.svg", "c.svg"]);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![button(pos2(380.0, 150.0), false)],
+        );
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        assert!(ex.band.is_none());
+        assert_eq!(ex.selected.len(), 2);
     }
 
     #[test]
