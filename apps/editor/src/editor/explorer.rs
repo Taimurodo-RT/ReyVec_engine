@@ -24,6 +24,7 @@ use super::theme::*;
 use super::thumbs::{self, Thumbs};
 
 mod bin;
+mod marks;
 
 /// Во сколько раз крупнее своего размера можно показать миниатюру в панели сведений.
 const THUMB_STRETCH: f32 = 1.25;
@@ -204,6 +205,12 @@ pub(crate) struct Explorer {
     bin_counted: Option<usize>,
     /// Окно «Стереть насовсем?» и что стереть.
     erasing: Option<Vec<pf::Binned>>,
+    /// Цветные метки проекта (Э.5), перечитываются вместе с папкой.
+    labels: super::labels::Labels,
+    /// Открыт список всех файлов с меткой вместо папки.
+    label_view: Option<u8>,
+    /// Окно «Названия меток»: правки названий.
+    naming: Option<Vec<String>>,
     out: Vec<Out>,
 }
 
@@ -252,6 +259,9 @@ impl Explorer {
             bin_picked: Vec::new(),
             bin_counted: None,
             erasing: None,
+            labels: super::labels::Labels::default(),
+            label_view: None,
+            naming: None,
             out: Vec::new(),
         }
     }
@@ -263,6 +273,7 @@ impl Explorer {
     /// Перечитать папку в следующем кадре.
     pub(crate) fn refresh(&mut self) {
         self.listed_at = None;
+        self.reload_labels();
         self.used = None;
         self.bin_counted = None;
     }
@@ -292,7 +303,11 @@ impl Explorer {
     /// Открыть папку (запомнив прошлую для «назад»).
     pub(crate) fn go(&mut self, dir: PathBuf) {
         self.close_bin();
+        let from_label = self.label_view.take().is_some();
         if dir == self.dir {
+            if from_label {
+                self.after_go();
+            }
             return;
         }
         let prev = std::mem::replace(&mut self.dir, dir);
@@ -321,6 +336,9 @@ impl Explorer {
     fn go_back(&mut self) {
         if self.in_bin {
             return self.close_bin();
+        }
+        if self.label_view.is_some() {
+            return self.close_label();
         }
         if let Some(d) = self.back.pop() {
             let cur = std::mem::replace(&mut self.dir, d);
@@ -355,22 +373,31 @@ impl Explorer {
                 None => break,
             }
         }
-        let mut items: Vec<Item> = if !self.search.trim().is_empty() {
-            let q = self.search.trim().to_lowercase();
-            let mut found = Vec::new();
-            find(&self.dir, &q, &mut found, 0);
-            found.into_iter().filter_map(Item::read).collect()
-        } else if self.is_root(&self.dir) {
-            ROOTS
-                .iter()
-                .filter_map(|r| Item::read(self.dir.join(r)))
-                .collect()
-        } else {
-            read_dir(&self.dir)
-                .into_iter()
-                .filter_map(Item::read)
-                .collect()
-        };
+        self.reload_labels();
+        let mut items: Vec<Item> =
+            if let (Some(i), Some(project)) = (self.label_view, &self.project) {
+                let mut found = self.labels.with(project, i);
+                if !self.search.trim().is_empty() {
+                    let q = self.search.trim().to_lowercase();
+                    found.retain(|p| pf::file_name(p).to_lowercase().contains(&q));
+                }
+                found.into_iter().filter_map(Item::read).collect()
+            } else if !self.search.trim().is_empty() {
+                let q = self.search.trim().to_lowercase();
+                let mut found = Vec::new();
+                find(&self.dir, &q, &mut found, 0);
+                found.into_iter().filter_map(Item::read).collect()
+            } else if self.is_root(&self.dir) {
+                ROOTS
+                    .iter()
+                    .filter_map(|r| Item::read(self.dir.join(r)))
+                    .collect()
+            } else {
+                read_dir(&self.dir)
+                    .into_iter()
+                    .filter_map(Item::read)
+                    .collect()
+            };
         sort_items(&mut items, self.sort, self.desc);
         self.items = items;
         // Выбранные, которых больше нет, снимаются.
@@ -603,7 +630,10 @@ impl Explorer {
             self.clipboard = None;
             return;
         }
-        match pf::copy_into(&dir, &items) {
+        let Some(project) = self.project.clone() else {
+            return;
+        };
+        match pf::copy_into(&project, &dir, &items) {
             Ok(done) => {
                 if let Done::Created(made) = &done {
                     self.selected = made.clone();
@@ -977,6 +1007,7 @@ impl Explorer {
                         }
                         ui.add_space(GAP_M);
                         self.bin_tree_row(ui, busy);
+                        self.label_tree(ui);
                     });
             });
         egui::Panel::right("explorer-details")
@@ -1012,6 +1043,7 @@ impl Explorer {
         let ctx = ui.ctx().clone();
         self.create_dialog(&ctx);
         self.erase_dialog(&ctx);
+        self.labels_dialog(&ctx);
         std::mem::take(&mut self.out)
     }
 
@@ -1022,7 +1054,7 @@ impl Explorer {
             .unwrap_or(1)
             .max(1);
         let ctx = ui.ctx().clone();
-        if ctx.egui_wants_keyboard_input() || self.creating.is_some() {
+        if ctx.egui_wants_keyboard_input() || self.creating.is_some() || self.naming.is_some() {
             // Пока печатают имя или поиск, клавиши принадлежат полю.
             return per_row;
         }
@@ -1102,6 +1134,21 @@ impl Explorer {
         }
         if k(Modifiers::COMMAND, Key::F) {
             ctx.memory_mut(|m| m.request_focus(egui::Id::unique("explorer-search")));
+        }
+        // Ctrl+1…7 — поставить или снять метку (Э.5).
+        const DIGITS: [Key; super::labels::COUNT] = [
+            Key::Num1,
+            Key::Num2,
+            Key::Num3,
+            Key::Num4,
+            Key::Num5,
+            Key::Num6,
+            Key::Num7,
+        ];
+        for (i, key) in DIGITS.into_iter().enumerate() {
+            if k(Modifiers::COMMAND, key) {
+                self.toggle_label(i as u8);
+            }
         }
         let row = if self.view == ViewKind::Tiles {
             per_row as isize
@@ -1203,7 +1250,9 @@ impl Explorer {
     }
 
     fn dir_title(&self) -> String {
-        if self.is_root(&self.dir) {
+        if let Some(i) = self.label_view {
+            self.label_title(i)
+        } else if self.is_root(&self.dir) {
             "Проект".into()
         } else {
             pf::file_name(&self.dir)
@@ -1220,6 +1269,14 @@ impl Explorer {
                 ui.label(RichText::new("Проект").color(TEXT_DIM));
                 ui.label(RichText::new("›").color(MUTED));
                 ui.label(RichText::new("Корзина").color(TEXT));
+            });
+            return;
+        }
+        if let Some(i) = self.label_view {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Проект").color(TEXT_DIM));
+                ui.label(RichText::new("›").color(MUTED));
+                ui.label(RichText::new(self.label_title(i)).color(TEXT));
             });
             return;
         }
@@ -1396,7 +1453,7 @@ impl Explorer {
         let subs = self.subdirs(dir);
         let (rect, response) =
             ui.allocate_exact_size(vec2(ui.available_width(), ROW_HEIGHT), Sense::click());
-        let current = *dir == self.dir;
+        let current = *dir == self.dir && self.label_view.is_none();
         let hovering = response.dnd_hover_payload::<Dragged>().is_some();
         if current {
             ui.painter().rect_filled(rect, RADIUS_S, SELECT_BG);
@@ -1553,7 +1610,9 @@ impl Explorer {
         let mut rects: Vec<(PathBuf, Rect)> = Vec::new();
         bg.context_menu(|ui| self.folder_menu(ui, busy));
         if self.items.is_empty() {
-            let text = if self.search.trim().is_empty() {
+            let text = if self.label_view.is_some() {
+                "С этой меткой файлов больше нет"
+            } else if self.search.trim().is_empty() {
                 "Папка пуста. «Создать» — новая папка или ассет"
             } else {
                 "Ничего не нашлось"
@@ -1561,7 +1620,17 @@ impl Explorer {
             ui.label(RichText::new(text).color(MUTED));
             return;
         }
-        if !self.search.trim().is_empty() {
+        if self.label_view.is_some() {
+            ui.label(
+                RichText::new(format!(
+                    "{} — файлы из всех папок проекта: {}",
+                    self.dir_title(),
+                    self.items.len()
+                ))
+                .color(MUTED),
+            );
+            ui.add_space(GAP_M);
+        } else if !self.search.trim().is_empty() {
             ui.label(
                 RichText::new(format!(
                     "Найдено в «{}» и вложенных папках: {}",
@@ -1593,10 +1662,12 @@ impl Explorer {
                             .has_thumb()
                             .then(|| self.thumbs.get(&item.path, now, false))
                             .flatten();
+                        let marks = self.marks(&item.path);
+                        let renaming = self.renaming_text(&item.path);
                         let r = if list {
-                            row(ui, item, selected, self.renaming_text(&item.path), pic)
+                            row(ui, item, selected, renaming, pic, &marks)
                         } else {
-                            tile(ui, item, selected, self.renaming_text(&item.path), pic)
+                            tile(ui, item, selected, renaming, pic, &marks)
                         };
                         let (r, edit) = r;
                         if let Some(edit) = edit {
@@ -1825,12 +1896,14 @@ impl Explorer {
             && ui.button("Вставить в эту папку").clicked()
         {
             let dir = item.path.clone();
-            if let Some((items, cut)) = self.clipboard.clone() {
+            if let Some((items, cut)) = self.clipboard.clone()
+                && let Some(project) = self.project.clone()
+            {
                 if cut {
                     self.move_into(items, &dir, busy);
                     self.clipboard = None;
                 } else {
-                    match pf::copy_into(&dir, &items) {
+                    match pf::copy_into(&project, &dir, &items) {
                         Ok(done) => self.did(done),
                         Err(e) => self.say(e, true),
                     }
@@ -1858,6 +1931,7 @@ impl Explorer {
             ui.close();
         }
         ui.separator();
+        ui.menu_button("Метки", |ui| self.label_menu(ui));
         if ui.button("Показать в проводнике Windows").clicked() {
             self.out.push(Out::Reveal(item.path.clone()));
             ui.close();
@@ -1962,6 +2036,7 @@ impl Explorer {
                 fact(ui, "Файлов", &(many.len() - dirs).to_string());
                 let total: u64 = many.iter().map(|i| i.size).sum();
                 fact(ui, "Размер файлов", &size_text(total));
+                self.label_picker(ui);
             }
         }
     }
@@ -2022,6 +2097,7 @@ impl Explorer {
                 self.out.push(Out::Reveal(item.path.clone()));
             }
         });
+        self.label_picker(ui);
         // Где используется (считается раз на выбор: просмотр всех .ron проекта).
         if self.used.as_ref().is_none_or(|(p, _)| p != &item.path)
             && let Some(project) = &self.project
@@ -2340,6 +2416,7 @@ fn row(
     selected: bool,
     renaming: bool,
     pic: Option<egui::TextureId>,
+    marks: &[u8],
 ) -> (egui::Response, Option<Rect>) {
     let (rect, r) = ui.allocate_exact_size(
         vec2(ui.available_width(), ROW_HEIGHT),
@@ -2374,13 +2451,16 @@ fn row(
         pos2(cols[0].right() - GAP_L, rect.bottom() - 2.0),
     );
     if !renaming {
-        p.text(
+        let r = p.text(
             pos2(name_rect.left(), rect.center().y),
             Align2::LEFT_CENTER,
             &item.name,
             FontId::proportional(FONT_BODY),
             if selected { Color32::WHITE } else { TEXT },
         );
+        // Метки — сразу за именем.
+        let right = r.right() + GAP_M + marks.len() as f32 * 7.0 + 2.0;
+        marks::paint_marks(p, pos2(right, rect.center().y), marks, Color32::TRANSPARENT);
     }
     let cells = [
         capital(item.kind),
@@ -2410,6 +2490,7 @@ fn tile(
     selected: bool,
     renaming: bool,
     pic: Option<egui::TextureId>,
+    marks: &[u8],
 ) -> (egui::Response, Option<Rect>) {
     let (rect, r) = ui.allocate_exact_size(TILE, Sense::click_and_drag());
     let p = ui.painter();
@@ -2420,6 +2501,8 @@ fn tile(
     }
     let t = Rect::from_min_size(rect.min, vec2(rect.width(), THUMB_H));
     thumb(p, t, item, r.hovered(), pic);
+    // Метки — в правом верхнем углу образца.
+    marks::paint_marks(p, t.right_top() + vec2(-6.0, 11.0), marks, CARD);
     let name_rect = Rect::from_min_max(
         pos2(rect.left() - 2.0, t.bottom() + GAP_S),
         pos2(rect.right() + 2.0, t.bottom() + GAP_S + 22.0),
@@ -2760,6 +2843,71 @@ mod tests {
         ctx.set_fonts(reyvec_app::for_editor::fonts());
         super::super::theme::apply(&ctx);
         ctx
+    }
+
+    /// Метки (Э.5): Ctrl+1 ставит и снимает, метка видна в списке «Метки» и едет с файлом
+    /// при переименовании, удалении в корзину, отмене и копировании.
+    #[test]
+    fn labels_follow_files() {
+        let t = project(&[
+            ("assets/a.svg", "<svg/>"),
+            ("assets/d/b.svg", "<svg/>"),
+            ("scenes/note.txt", ""),
+        ]);
+        let ctx = ctx();
+        let mut ex = Explorer::new(Some(&t.0));
+        let mut time = 0.0;
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        let a = t.0.join("assets/a.svg");
+        ex.selected = vec![a.clone(), t.0.join("assets/d")];
+        let ctrl = |k| key(k, Modifiers::COMMAND);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![ctrl(Key::Num1), ctrl(Key::Num4)],
+        );
+        assert_eq!(ex.marks(&a), vec![0, 3]);
+        frame(&ctx, &mut ex, &mut time, vec![ctrl(Key::Num1)]);
+        assert_eq!(ex.marks(&a), vec![3], "второй Ctrl+1 снимает");
+        assert!(t.0.join(super::super::labels::FILE).is_file());
+
+        // Список «Зелёная»: файл и папка из разных мест.
+        ex.open_label(3);
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        assert_eq!(ex.items.len(), 2);
+        assert_eq!(ex.dir_title(), "Метка «Зелёная»");
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Backspace, Modifiers::NONE)],
+        );
+        assert!(ex.label_view.is_none(), "Backspace — назад к папке");
+
+        // Переименовали — метка у нового имени; отмена вернула.
+        let busy = Busy::default();
+        ex.rename(a.clone(), "a2.svg".into(), &busy);
+        let a2 = t.0.join("assets/a2.svg");
+        assert_eq!(ex.marks(&a2), vec![3]);
+        assert!(ex.marks(&a).is_empty());
+        ex.undo();
+        assert_eq!(ex.marks(&a), vec![3]);
+
+        // В корзину и обратно.
+        ex.delete_items(vec![a.clone()], &busy);
+        assert!(ex.marks(&a).is_empty());
+        assert_eq!(ex.labels.counts()[3], 1, "в корзине не считается");
+        ex.undo();
+        assert_eq!(ex.marks(&a), vec![3]);
+
+        // Копия с той же меткой; внутренность папки тоже переезжает.
+        ex.clipboard = Some((vec![a.clone()], false));
+        ex.paste_into(t.0.join("assets/d"), &busy);
+        assert_eq!(ex.marks(&t.0.join("assets/d/a.svg")), vec![3]);
+        ex.move_into(vec![t.0.join("assets/d")], &t.0.join("scenes"), &busy);
+        assert_eq!(ex.marks(&t.0.join("scenes/d/a.svg")), vec![3]);
+        assert_eq!(ex.marks(&t.0.join("scenes/d")), vec![3]);
     }
 
     /// Корзина: удалённое видно, Enter возвращает, Ctrl+Z уносит обратно, Delete и

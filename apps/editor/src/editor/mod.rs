@@ -26,6 +26,7 @@ mod endless;
 mod explorer;
 mod files;
 mod geom;
+mod labels;
 mod layout;
 mod luau_text;
 mod model_params;

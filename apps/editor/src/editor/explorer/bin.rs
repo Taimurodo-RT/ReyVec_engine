@@ -11,6 +11,7 @@ impl Explorer {
             return;
         }
         self.in_bin = true;
+        self.label_view = None;
         self.bin_picked.clear();
         self.renaming = None;
         self.band = None;
