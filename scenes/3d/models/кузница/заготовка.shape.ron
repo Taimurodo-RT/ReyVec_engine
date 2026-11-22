@@ -5,7 +5,7 @@
     format: "reyvec-shape",
     version: 1,
     materials: [
-        (name: "раскалённое", color: (1.0, 0.36, 0.08), glow: 2.0),
+        (name: "раскалённое", color: (0.95, 0.32, 0.06), glow: 0.9),
     ],
     shape: Paint(material: 0, shape: Clay(file: "кузница/заготовка.clay")),
 )
