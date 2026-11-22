@@ -23,6 +23,8 @@ use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
 use super::outline::{self, Kind};
 use super::overlay::{self, Overlay, ViewMode};
 use super::parts;
+use super::ron_edit;
+use super::shape_edit;
 use super::theme::*;
 use super::viewport::{self, TOOLBAR_HEIGHT, Tool, View, Viewport};
 
@@ -156,6 +158,12 @@ pub(crate) enum Action {
     ShapeSpin(bool),
     /// Камера подставки как при открытии.
     ShapeHome,
+    /// Новый текст файла модели на подставке (М.3). `commit: false` — число ещё тянут
+    /// мышью (в историю правка попадёт одним шагом, когда отпустят).
+    ShapeText {
+        text: String,
+        commit: bool,
+    },
 }
 
 /// Модель на подставке «Форм» (М.2).
@@ -166,6 +174,8 @@ pub(crate) struct ShapeInfo<'a> {
     pub spin: bool,
     /// Ошибка в файле модели.
     pub error: Option<&'a str>,
+    /// Текст файла модели (из него — дерево частей и числа инспектора).
+    pub text: &'a str,
 }
 
 /// Что интерфейсу показать в этом кадре.
@@ -257,6 +267,10 @@ pub(crate) struct EditorUi {
     ruler: Option<([f64; 2], [f64; 2])>,
     /// Какие сообщения показывает консоль.
     log_filter: LogFilter,
+    /// Выбранная часть модели во «Формах» (путь в дереве частей).
+    shape_selected: Vec<usize>,
+    /// Как новая деталь из палитры складывается с выбранной.
+    shape_combine: shape_edit::Combine,
 }
 
 /// Фильтр консоли.
@@ -314,6 +328,8 @@ impl EditorUi {
             pinned: None,
             ruler: None,
             log_filter: LogFilter::All,
+            shape_selected: Vec::new(),
+            shape_combine: shape_edit::Combine::Add,
         }
     }
 
@@ -648,6 +664,247 @@ impl EditorUi {
         }
         if esc && self.vp.drag.is_none() {
             self.selected = None;
+        }
+    }
+
+    /// Дерево частей модели на подставке (М.3): строка на деталь, щелчок выбирает.
+    fn shape_tree(&mut self, ui: &mut Ui, info: &Info) {
+        let Some(shape) = &info.shape else { return };
+        let root = match shape_edit::parse(shape.text) {
+            Ok(r) => r,
+            Err(e) => {
+                ui.label(RichText::new(format!("Не разобрать модель: {e}")).color(BAD));
+                return;
+            }
+        };
+        if root.at(&self.shape_selected).is_none() {
+            self.shape_selected.clear();
+        }
+        let materials = shape_edit::materials(shape.text);
+        ui.label(
+            RichText::new(format!("Модель {}", shape.name))
+                .color(MUTED)
+                .size(FONT_SMALL),
+        );
+        ui.add_space(GAP_M);
+        let mut pick = None;
+        shape_rows(
+            ui,
+            shape.text,
+            &root,
+            &mut Vec::new(),
+            &self.shape_selected,
+            &materials,
+            &mut pick,
+        );
+        if let Some(p) = pick {
+            self.shape_selected = p;
+        }
+    }
+
+    /// Числа выбранной части модели (М.3): положение, поворот, цвет, свои размеры,
+    /// плавный шов; новая деталь из палитры; убрать деталь.
+    fn shape_inspector(&mut self, ui: &mut Ui, info: &Info) {
+        let Some(shape) = &info.shape else { return };
+        let text = shape.text;
+        let Ok(root) = shape_edit::parse(text) else {
+            ui.label(RichText::new("Модель не разобрать: правьте файл в блокноте").color(BAD));
+            return;
+        };
+        let path = self.shape_selected.clone();
+        let Some(part) = root.at(&path) else { return };
+        let parent = path.split_last().and_then(|(_, up)| root.at(up));
+        let materials = shape_edit::materials(text);
+        let actions = &mut self.actions;
+        let mut send = |r: Result<String, ron_edit::EditError>, commit: bool| match r {
+            Ok(text) => actions.push(Action::ShapeText { text, commit }),
+            Err(e) => tracing::warn!("Модель не правится: {e}"),
+        };
+        let mut end = false;
+        ui.label(
+            RichText::new(shape_edit::label(&part.kind))
+                .size(FONT_TITLE)
+                .color(TEXT),
+        );
+        ui.add_space(GAP_M);
+        // Свои числа части.
+        for &(field, name, param) in shape_edit::params(&part.kind) {
+            ui.horizontal(|ui| {
+                prop(ui, name);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| match param {
+                    shape_edit::Param::Num(d) => {
+                        let v = shape_edit::read_num(text, part.open, field, d);
+                        match num_field(ui, v, 0.005, None, "", true) {
+                            Some(FieldEdit::Value(x, commit)) => send(
+                                shape_edit::set(text, part, field, &ron_edit::num(x.max(0.0))),
+                                commit,
+                            ),
+                            Some(FieldEdit::End) => end = true,
+                            None => {}
+                        }
+                    }
+                    shape_edit::Param::Count(d) => {
+                        let v = shape_edit::read_num(text, part.open, field, f64::from(d));
+                        let mut n = v.round().clamp(1.0, 64.0) as u32;
+                        if ui
+                            .add(egui::DragValue::new(&mut n).range(1..=64).speed(0.1))
+                            .changed()
+                        {
+                            send(shape_edit::set(text, part, field, &n.to_string()), true);
+                        }
+                    }
+                    shape_edit::Param::Axis => {
+                        let now = shape_edit::read_word(text, part.open, field)
+                            .unwrap_or_else(|| "X".into());
+                        for a in ["Z", "Y", "X"] {
+                            if ui.selectable_label(now == a, a).clicked() && now != a {
+                                send(shape_edit::set(text, part, field, a), true);
+                            }
+                        }
+                    }
+                    shape_edit::Param::Vec3(d) => {
+                        let v = shape_edit::read_vec3(text, part.open, field, d);
+                        if let Some(e) = vec3_fields(ui, v, 0.005) {
+                            match e {
+                                (Some((x, commit)), _) => send(
+                                    shape_edit::set(text, part, field, &shape_edit::triple(x)),
+                                    commit,
+                                ),
+                                (None, true) => end = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            });
+        }
+        // Место и цвет детали (её сдвиг и цвет вокруг).
+        if part.kind != "Move" {
+            ui.add_space(GAP_M);
+            for (field, name, speed, default) in [
+                ("at", "Положение", 0.005, [0.0; 3]),
+                ("turn", "Поворот, °", 0.5, [0.0; 3]),
+            ] {
+                ui.horizontal(|ui| {
+                    prop(ui, name);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let v = shape_edit::read_vec3(text, part.moved, field, default);
+                        match vec3_fields(ui, v, speed) {
+                            Some((Some((x, commit)), _)) => send(
+                                shape_edit::set_moved(text, part, field, &shape_edit::triple(x)),
+                                commit,
+                            ),
+                            Some((None, true)) => end = true,
+                            _ => {}
+                        }
+                    });
+                });
+            }
+            if !materials.is_empty() {
+                let now = part
+                    .painted
+                    .map(|o| shape_edit::read_num(text, Some(o), "material", 0.0).round() as usize);
+                let name = |m: Option<usize>| {
+                    m.map_or("как у предмета", |i| {
+                        materials.get(i).map_or("?", String::as_str)
+                    })
+                };
+                ui.horizontal(|ui| {
+                    prop(ui, "Цвет");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        egui::ComboBox::from_id_salt("shape-paint")
+                            .selected_text(name(now))
+                            .show_ui(ui, |ui| {
+                                for m in std::iter::once(None).chain((0..materials.len()).map(Some))
+                                {
+                                    if ui.selectable_label(now == m, name(m)).clicked() && now != m
+                                    {
+                                        send(shape_edit::set_paint(text, part, m), true);
+                                    }
+                                }
+                            });
+                    });
+                });
+            }
+        }
+        if end {
+            self.actions.push(Action::EndEdit);
+        }
+        // Новая деталь.
+        ui.add_space(GAP_L);
+        ui.separator();
+        ui.label(RichText::new("Новая деталь").color(TEXT_DIM));
+        ui.horizontal(|ui| {
+            use shape_edit::Combine;
+            for (c, name, hint) in [
+                (Combine::Add, "Добавить", "Деталь добавляется к модели"),
+                (
+                    Combine::Cut,
+                    "Вырезать",
+                    "Деталь вырезается из выбранной части",
+                ),
+                (
+                    Combine::Intersect,
+                    "Пересечь",
+                    "От выбранной остаётся общее с деталью",
+                ),
+            ] {
+                ui.selectable_value(&mut self.shape_combine, c, name)
+                    .on_hover_text(hint);
+            }
+        });
+        // Новая деталь там же, где выбранная (в своём списке части — в её середине).
+        let at = if shape_edit::goes_inside(part, self.shape_combine) {
+            [0.0; 3]
+        } else {
+            shape_edit::read_vec3(text, part.moved, "at", [0.0; 3])
+        };
+        let mut new = None;
+        ui.horizontal_wrapped(|ui| {
+            for kind in shape_edit::PALETTE {
+                if ui
+                    .button(format!("+ {}", shape_edit::label(kind)))
+                    .on_hover_text("Новая деталь там же, где выбранная; дальше двигайте числами")
+                    .clicked()
+                {
+                    new = Some(kind);
+                }
+            }
+        });
+        if let Some(kind) = new {
+            let item = shape_edit::new_part(kind, 0.2, at);
+            match shape_edit::combine(text, part, parent, self.shape_combine, &item) {
+                Ok(t) => {
+                    // Новая деталь — последняя в списке, куда легла: выбрать её.
+                    if let Ok(r) = shape_edit::parse(&t) {
+                        self.shape_selected = newest(&root, &r, &path);
+                    }
+                    self.actions.push(Action::ShapeText {
+                        text: t,
+                        commit: true,
+                    });
+                }
+                Err(e) => tracing::warn!("Деталь не добавилась: {e}"),
+            }
+        }
+        if part.removable {
+            ui.add_space(GAP_M);
+            if ui
+                .button(RichText::new("Убрать деталь").color(BAD))
+                .on_hover_text("Убрать выбранную деталь из модели (Ctrl+Z вернёт)")
+                .clicked()
+            {
+                match shape_edit::remove(text, part) {
+                    Ok(t) => {
+                        self.shape_selected.pop();
+                        self.actions.push(Action::ShapeText {
+                            text: t,
+                            commit: true,
+                        });
+                    }
+                    Err(e) => tracing::warn!("{e}"),
+                }
+            }
         }
     }
 
@@ -1079,6 +1336,8 @@ impl EditorUi {
                 .auto_shrink(false)
                 .stick_to_bottom(tab == Tab::Console)
                 .show(ui, |ui| match tab {
+                    Tab::Hierarchy if info.shape.is_some() => self.shape_tree(ui, info),
+                    Tab::Inspector if info.shape.is_some() => self.shape_inspector(ui, info),
                     Tab::Hierarchy => self.hierarchy(ui, info),
                     Tab::Inspector => self.inspector(ui, info),
                     Tab::Console => console(ui, &self.log, self.log_filter),
@@ -2916,6 +3175,87 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
+/// Строки дерева частей модели (М.3).
+fn shape_rows(
+    ui: &mut Ui,
+    text: &str,
+    part: &shape_edit::Part,
+    path: &mut Vec<usize>,
+    selected: &[usize],
+    materials: &[String],
+    pick: &mut Option<Vec<usize>>,
+) {
+    let mut title = shape_edit::label(&part.kind).to_owned();
+    if let Some(o) = part.painted {
+        let m = shape_edit::read_num(text, Some(o), "material", 0.0).round() as usize;
+        if let Some(name) = materials.get(m) {
+            title = format!("{title} · {name}");
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(path.len() as f32 * 14.0);
+        if ui
+            .selectable_label(path.as_slice() == selected, title)
+            .clicked()
+        {
+            *pick = Some(path.clone());
+        }
+    });
+    for (i, c) in part.children.iter().enumerate() {
+        path.push(i);
+        shape_rows(ui, text, c, path, selected, materials, pick);
+        path.pop();
+    }
+}
+
+/// Новые три числа и отпустили ли их.
+type Vec3Edit = Option<([f64; 3], bool)>;
+
+/// Три числа в строку (x, y, z справа налево). Возвращает новое значение (и отпустили
+/// ли его) или конец перетаскивания.
+fn vec3_fields(ui: &mut Ui, v: [f64; 3], speed: f64) -> Option<(Vec3Edit, bool)> {
+    let marks = [SELECT, GOOD, BAD];
+    let mut out = None;
+    for (k, i) in [2usize, 1, 0].into_iter().enumerate() {
+        match num_field(ui, v[i], speed, Some(marks[k]), "", true) {
+            Some(FieldEdit::Value(x, commit)) => {
+                let mut n = v;
+                n[i] = x;
+                out = Some((Some((n, commit)), false));
+            }
+            Some(FieldEdit::End) => out = out.or(Some((None, true))),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Путь новой детали: первая часть нового дерева, которой не было в старом (по порядку
+/// обхода), иначе прежний путь.
+fn newest(old: &shape_edit::Part, new: &shape_edit::Part, fallback: &[usize]) -> Vec<usize> {
+    fn walk(p: &shape_edit::Part, path: &mut Vec<usize>, out: &mut Vec<(Vec<usize>, usize)>) {
+        out.push((path.clone(), p.children.len()));
+        for (i, c) in p.children.iter().enumerate() {
+            path.push(i);
+            walk(c, path, out);
+            path.pop();
+        }
+    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    walk(old, &mut Vec::new(), &mut a);
+    walk(new, &mut Vec::new(), &mut b);
+    // Деталь легла последней в чей-то список: у этой части детей стало больше.
+    for (path, n) in &b {
+        let before = a.iter().find(|(p, _)| p == path).map(|x| x.1);
+        if before.is_some_and(|m| *n > m) && *n > 0 {
+            let mut p = path.clone();
+            p.push(n - 1);
+            return p;
+        }
+    }
+    fallback.to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3039,6 +3379,7 @@ mod tests {
             name: "склад/стеллаж",
             spin: true,
             error: Some("нет такого файла"),
+            text: "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Sphere(radius: 0.3), Box(size: (0.2, 0.2, 0.2))]))",
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         assert!(ui.take_actions().is_empty(), "без нажатий нет действий");
@@ -3355,17 +3696,22 @@ mod tests {
         // Время только растёт: egui считает по нему анимации и частоту кадров.
         let mut clock = 0.0f64;
         // Мир, Мир во время игры, Ассеты, Сюжет, Логика и Мир с раскрытым меню «ReyVec → Вид».
-        for (ws, play, menu) in [
-            (START_WORKSPACE, PlayState::Edit, false),
-            (START_WORKSPACE, PlayState::Playing, false),
-            (1, PlayState::Edit, false),
-            (0, PlayState::Edit, false),
-            (3, PlayState::Edit, false),
-            (5, PlayState::Edit, false),
+        // Стеллаж склада для «Форм» (М.3): выбрана коробка ящика.
+        let rack =
+            std::fs::read_to_string(root.join("scenes/3d/models/склад/стеллаж.shape.ron")).unwrap();
+        for (ws, play, menu, shape) in [
+            (START_WORKSPACE, PlayState::Edit, false, false),
+            (START_WORKSPACE, PlayState::Playing, false, false),
+            (1, PlayState::Edit, false, false),
+            (0, PlayState::Edit, false, false),
+            (3, PlayState::Edit, false, false),
+            (5, PlayState::Edit, false, false),
             // Пауза в «Мире» снимается с профайлером внизу: широкая панель, много колонок.
-            (START_WORKSPACE, PlayState::Paused, false),
-            (START_WORKSPACE, PlayState::Edit, true),
+            (START_WORKSPACE, PlayState::Paused, false, false),
+            (START_WORKSPACE, PlayState::Edit, true, false),
+            (START_WORKSPACE, PlayState::Edit, false, true),
         ] {
+            ui.shape_selected = vec![3, 0];
             if play == PlayState::Paused {
                 ui.tabs[ws][Side::Bottom.index()] = 2;
             }
@@ -3411,6 +3757,14 @@ mod tests {
             info.view = Some(hero_view(&file, hero));
             info.dirty = true;
             info.hidden = &hidden;
+            if shape {
+                info.shape = Some(ShapeInfo {
+                    name: "склад/стеллаж",
+                    spin: true,
+                    error: None,
+                    text: &rack,
+                });
+            }
             let mut out = None;
             for frame in 0..12u32 {
                 let mut events = Vec::new();
@@ -3532,7 +3886,11 @@ mod tests {
                 rgba,
             };
             let menu = if menu { "-меню" } else { "" };
-            let name = format!("{}-{:?}{menu}.png", WORKSPACES[ws].name, play);
+            let name = if shape {
+                "Формы-стеллаж.png".to_owned()
+            } else {
+                format!("{}-{:?}{menu}.png", WORKSPACES[ws].name, play)
+            };
             reyvec_app::snapshot::save_png(&out_dir.join(name), &image).unwrap();
         }
     }

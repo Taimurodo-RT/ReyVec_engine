@@ -21,14 +21,14 @@ impl std::fmt::Display for EditError {
 
 /// Поле структуры: где имя и где значение (байты текста).
 #[derive(Clone, Debug)]
-struct Field {
-    name: String,
-    name_start: usize,
-    value: std::ops::Range<usize>,
+pub(crate) struct Field {
+    pub name: String,
+    pub name_start: usize,
+    pub value: std::ops::Range<usize>,
 }
 
 /// Пропускает пробелы и комментарии.
-fn skip_ws(s: &[u8], mut i: usize) -> usize {
+pub(crate) fn skip_ws(s: &[u8], mut i: usize) -> usize {
     loop {
         while i < s.len() && s[i].is_ascii_whitespace() {
             i += 1;
@@ -101,7 +101,7 @@ fn string_end(s: &[u8], i: usize) -> Option<usize> {
 
 /// Конец значения, начинающегося в `i`: скобки целиком, строка, число или имя (а за
 /// именем — его скобки: `Some(…)`, `Rect(…)`).
-fn value_end(s: &[u8], i: usize) -> Option<usize> {
+pub(crate) fn value_end(s: &[u8], i: usize) -> Option<usize> {
     match s.get(i)? {
         b'(' | b'[' | b'{' => group_end(s, i),
         b'"' => string_end(s, i),
@@ -161,7 +161,7 @@ fn group_end(s: &[u8], open: usize) -> Option<usize> {
 }
 
 /// Поля структуры в скобках, открытых в `open`.
-fn fields(s: &[u8], open: usize) -> Option<Vec<Field>> {
+pub(crate) fn fields(s: &[u8], open: usize) -> Option<Vec<Field>> {
     let mut out = Vec::new();
     let mut i = skip_ws(s, open + 1);
     loop {
@@ -195,7 +195,7 @@ fn fields(s: &[u8], open: usize) -> Option<Vec<Field>> {
 }
 
 /// Начала элементов списка в скобках `[`, открытых в `open`.
-fn items(s: &[u8], open: usize) -> Option<Vec<usize>> {
+pub(crate) fn items(s: &[u8], open: usize) -> Option<Vec<usize>> {
     let mut out = Vec::new();
     let mut i = skip_ws(s, open + 1);
     loop {
@@ -302,7 +302,12 @@ fn owner_open(s: &[u8], path: &[usize]) -> Result<usize, EditError> {
 }
 
 /// Поле `field` структуры в скобках, открытых в `open`.
-fn set_field_at(text: &str, open: usize, field: &str, value: &str) -> Result<String, EditError> {
+pub(crate) fn set_field_at(
+    text: &str,
+    open: usize,
+    field: &str,
+    value: &str,
+) -> Result<String, EditError> {
     let s = text.as_bytes();
     let f = fields(s, open).ok_or_else(|| EditError("не разобрать поля предмета".into()))?;
     let mut out = String::with_capacity(text.len() + value.len() + 16);
@@ -376,7 +381,7 @@ pub(crate) fn remove_node(text: &str, path: &[usize]) -> Result<String, EditErro
 
 /// Вырезает кусок `open..end` (элемент списка или поле), запятую за ним и комментарий в
 /// конце строки; если он занимал свои строки — строки целиком.
-fn remove_span(text: &str, open: usize, end: usize) -> String {
+pub(crate) fn remove_span(text: &str, open: usize, end: usize) -> String {
     let s = text.as_bytes();
     let spaces = |mut i: usize| {
         while i < s.len() && matches!(s[i], b' ' | b'\t') {
@@ -505,6 +510,18 @@ pub(crate) fn insert_item(
         let t = set_field_at(text, owner, field, "[]")?;
         return insert_item(&t, path, field, index, item);
     };
+    insert_item_at(text, open, index, item)
+}
+
+/// Вставляет элемент в список, открытый скобкой `[` в `open`, на место `index` (дальше
+/// конца — в конец), с отступом соседей.
+pub(crate) fn insert_item_at(
+    text: &str,
+    open: usize,
+    index: usize,
+    item: &str,
+) -> Result<String, EditError> {
+    let s = text.as_bytes();
     let close = group_end(s, open).ok_or_else(|| EditError("не закрыт список".into()))? - 1;
     let it = items(s, open).ok_or_else(|| EditError("не разобрать список предметов".into()))?;
     let base = indent_of(s, open).to_owned();

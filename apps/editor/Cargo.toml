@@ -20,9 +20,13 @@ reyvec-app.workspace = true
 reyvec-gpu.workspace = true
 reyvec-scene.workspace = true
 reyvec-sdf.workspace = true
+ron.workspace = true
 reyvec-vector.workspace = true
 tracing.workspace = true
 winit.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
 
 [lints]
 workspace = true
