@@ -408,8 +408,12 @@ impl Editor {
                 self.shape_undo.push(back);
                 None
             }
-            Action::ToClay(path) => {
-                self.turn_to_clay(&path);
+            Action::ToClay { path, room } => {
+                self.turn_to_clay(&path, room);
+                None
+            }
+            Action::ClayGrow { file, room } => {
+                self.clay_grow(&file, room);
                 None
             }
             Action::ClayDab(dab) => {
@@ -591,7 +595,8 @@ impl Editor {
                 | Action::Redo
                 | Action::EndEdit
                 | Action::CancelEdit
-                | Action::ToClay(_)
+                | Action::ToClay { .. }
+                | Action::ClayGrow { .. }
                 | Action::ClayDab(_)
                 | Action::ClayEnd => return self.shape_action(action),
                 // Правки сцены, пока открыта модель, сцену не трогают (Delete, Ctrl+C…).
@@ -616,8 +621,11 @@ impl Editor {
             return;
         };
         match action {
-            Action::ShapeText { .. } | Action::ToClay(_) | Action::ClayDab(_) | Action::ClayEnd => {
-            }
+            Action::ShapeText { .. }
+            | Action::ToClay { .. }
+            | Action::ClayGrow { .. }
+            | Action::ClayDab(_)
+            | Action::ClayEnd => {}
             Action::Play | Action::Simulate => {
                 if self.shape.take().is_some() {
                     // Играют в сцену, а не в модель на подставке.

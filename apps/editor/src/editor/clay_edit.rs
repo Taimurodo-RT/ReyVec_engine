@@ -112,8 +112,15 @@ pub(crate) struct Turned {
 }
 
 /// Превратить деталь `path` модели `model` (текст `text`, папка с `models` — `root`)
-/// в глину. Ошибка — почему нельзя.
-pub(crate) fn turn(text: &str, path: &[usize], root: &Path, model: &str) -> Result<Turned, String> {
+/// в глину; `room` — запас вокруг формы долей её длинной стороны (глине есть куда
+/// нарастать). Ошибка — почему нельзя.
+pub(crate) fn turn(
+    text: &str,
+    path: &[usize],
+    root: &Path,
+    model: &str,
+    room: f32,
+) -> Result<Turned, String> {
     let tree = shape_edit::parse(text).map_err(|e| e.0)?;
     let part = tree.at(path).ok_or("детали нет")?;
     if !can_turn(part) {
@@ -127,7 +134,10 @@ pub(crate) fn turn(text: &str, path: &[usize], root: &Path, model: &str) -> Resu
         ron::from_str(&text[span.clone()]).map_err(|e| format!("деталь не читается: {e}"))?;
     let mut materials = Vec::new();
     Resolver::new(Some(root), &mut materials).resolve(&mut shape)?;
-    let brick = Brick::from_shape(&shape, MAX_SIDE)?;
+    let longest = shape
+        .bounds_box()
+        .map_or(0.0, |(lo, hi)| (hi - lo).max_element());
+    let brick = Brick::from_shape_padded(&shape, MAX_SIDE, longest * room)?;
     let file = free_name(root, model);
     let path = clay_path(root, &file)?;
     let new = format!(
@@ -142,6 +152,16 @@ pub(crate) fn turn(text: &str, path: &[usize], root: &Path, model: &str) -> Resu
         path,
         brick,
     })
+}
+
+/// Глина `brick` в коробке шире на `room` её длинной стороны с каждой стороны: точек
+/// столько же, клетка крупнее.
+pub(crate) fn grown(brick: &Brick, room: f32) -> Result<Brick, String> {
+    let (lo, hi) = brick.bounds_box();
+    let shape = Shape3::Brick {
+        brick: BrickRef(Arc::new(brick.duplicate())),
+    };
+    Brick::from_shape_padded(&shape, MAX_SIDE, (hi - lo).max_element() * room)
 }
 
 /// Записать глину в файл (папки создаются).
@@ -232,11 +252,11 @@ impl super::Editor {
 
     /// Деталь `path` открытой модели — в глину: файл глины рядом с моделью, в тексте
     /// модели `Clay` на месте детали (одним шагом истории).
-    pub(super) fn turn_to_clay(&mut self, path: &[usize]) {
+    pub(super) fn turn_to_clay(&mut self, path: &[usize], room: f32) {
         let Some(shape) = self.shape.as_ref() else {
             return;
         };
-        let turned = match turn(&shape.text, path, &shape.root, &shape.name) {
+        let turned = match turn(&shape.text, path, &shape.root, &shape.name, room) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!("В глину не превратить: {e}");
@@ -253,6 +273,29 @@ impl super::Editor {
             text: turned.text,
             commit: true,
         });
+    }
+
+    /// Коробка глины шире (запас `room`): одним шагом истории.
+    pub(super) fn clay_grow(&mut self, file: &str, room: f32) {
+        self.clay_end();
+        let Some(old) = brick(file) else {
+            return;
+        };
+        let wide = match grown(&old.0, room) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Глину не расширить: {e}");
+                return;
+            }
+        };
+        let bytes = wide.to_clay_bytes();
+        put(file, wide);
+        self.write_clay(file, &bytes);
+        self.shape_undo.push(ShapeStep::Clay {
+            file: file.to_owned(),
+            bytes: old.0.to_clay_bytes(),
+        });
+        self.shape_redo.clear();
     }
 
     /// Мазок кисти: глина в памяти сразу новая, в файл и движку — не чаще
@@ -344,7 +387,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("models/кузница")).unwrap();
         let tree = shape_edit::parse(MODEL).unwrap();
         assert!(can_turn(tree.at(&[0]).unwrap()));
-        let t = turn(MODEL, &[0], &dir, "кузница/брусок").unwrap();
+        let t = turn(MODEL, &[0], &dir, "кузница/брусок", 0.0).unwrap();
         assert_eq!(t.file, "кузница/брусок-глина.clay");
         // Сдвиг и цвет остались, вместо коробки — глина.
         assert!(
@@ -383,6 +426,12 @@ mod tests {
         let after = brick(&t.file).unwrap().0.sample(top + Vec3::Y * 0.03);
         assert!(after < before, "{before} → {after}");
         assert_ne!(s.bytes(), s.before);
+        // Расширенная коробка шире, форма та же.
+        let b = brick(&t.file).unwrap();
+        let wide = grown(&b.0, 0.25).unwrap();
+        let ((lo, hi), (wlo, whi)) = (b.0.bounds_box(), wide.bounds_box());
+        assert!(wlo.x < lo.x && whi.x > hi.x);
+        assert!(wide.sample(Vec3::ZERO) < 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
