@@ -26,6 +26,8 @@ pub(crate) struct ClayUi {
     last: Option<Vec3>,
     /// Кнопку держат: проход идёт.
     stroke: bool,
+    /// Запас коробки глины вокруг формы (доля длинной стороны).
+    pub room: f32,
 }
 
 impl Default for ClayUi {
@@ -37,8 +39,63 @@ impl Default for ClayUi {
             strength: 0.5,
             last: None,
             stroke: false,
+            room: 0.2,
         }
     }
+}
+
+/// Кисти по порядку на кнопках.
+pub(super) const BRUSHES: [Brush; 3] = [Brush::Add, Brush::Push, Brush::Smooth];
+
+/// Кнопка-значок кисти: поверхность с бугром, с ямкой или ровная после волн.
+pub(super) fn brush_button(ui: &mut Ui, brush: Brush, on: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 24.0), egui::Sense::click());
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(rect, RADIUS_S, ACCENT.gamma_multiply(0.25));
+    } else if resp.hovered() {
+        painter.rect_filled(rect, RADIUS_S, HOVER);
+    }
+    let col = if on || resp.hovered() { TEXT } else { MUTED };
+    let stroke = Stroke::new(1.5, col);
+    let c = rect.center();
+    // Линия поверхности слева направо, высота по точке.
+    let line = |h: &dyn Fn(f32) -> f32| -> Vec<Pos2> {
+        (0..=16)
+            .map(|k| {
+                let x = -9.0 + k as f32 * 18.0 / 16.0;
+                c + egui::vec2(x, 4.0 - h(x))
+            })
+            .collect()
+    };
+    let bump = |x: f32, s: f32| (1.0 - (x / 5.0).powi(2)).max(0.0) * s;
+    match brush {
+        Brush::Add => {
+            painter.add(egui::Shape::line(line(&|x| bump(x, 7.0)), stroke));
+        }
+        Brush::Push => {
+            painter.add(egui::Shape::line(line(&|x| -bump(x, 5.0) + 3.0), stroke));
+        }
+        Brush::Smooth => {
+            painter.add(egui::Shape::line(
+                line(&|x| {
+                    if x < 0.0 {
+                        (x * 1.4).sin() * 3.0 + 3.0
+                    } else {
+                        3.0
+                    }
+                }),
+                stroke,
+            ));
+        }
+    }
+    resp
+}
+
+/// Подсказка к кнопке кисти: имя и что делает.
+pub(super) fn brush_hint(b: Brush) -> String {
+    let (name, hint) = brush_name(b);
+    format!("{name}: {hint}")
 }
 
 /// Кисть по-человечески.
@@ -73,26 +130,40 @@ impl EditorUi {
 
     /// Карточка глины у выбранной детали: у глины — кисть, у остальных — «Превратить».
     pub(super) fn clay_card(&mut self, ui: &mut Ui, text: &str, part: &Part, path: &[usize]) {
+        let room_slider = |ui: &mut Ui, room: &mut f32| {
+            ui.add(
+                egui::Slider::new(room, 0.05..=1.0)
+                    .text("запас")
+                    .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
+            )
+            .on_hover_text(
+                "Насколько коробка глины шире формы с каждой стороны (доля длинной \
+                 стороны): за край коробки глина не нарастает. Точек в сетке столько же, \
+                 поэтому чем больше запас, тем крупнее клетка и мягче мелкие детали",
+            );
+        };
         if let Some(file) = clay_edit::file_of(text, part) {
             let c = &mut self.clay;
+            let mut grow = false;
             card(ui, "Лепка", |ui| {
                 ui.checkbox(&mut c.on, "Лепить кистью").on_hover_text(
                     "Левая кнопка на глине лепит. Выключите, чтобы снова тянуть ручки",
                 );
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP_XS;
-                    for b in [Brush::Add, Brush::Push, Brush::Smooth] {
-                        let (name, hint) = brush_name(b);
-                        if ui
-                            .selectable_label(c.brush == b, name)
-                            .on_hover_text(hint)
+                    for b in BRUSHES {
+                        if brush_button(ui, b, c.brush == b)
+                            .on_hover_text(brush_name(b).1)
                             .clicked()
                         {
                             c.brush = b;
                         }
                     }
+                    ui.add_space(GAP_M);
+                    ui.label(RichText::new(brush_name(c.brush).0).color(TEXT));
                 });
-                let cell = clay_edit::brick(&file).map_or(0.0, |b| b.0.cell());
+                let brick = clay_edit::brick(&file);
+                let cell = brick.as_ref().map_or(0.0, |b| b.0.cell());
                 ui.add(
                     egui::Slider::new(&mut c.size, 1.5..=16.0)
                         .text("размер")
@@ -103,27 +174,51 @@ impl EditorUi {
                         .text("сила")
                         .custom_formatter(|v, _| format!("{:.0} %", v * 100.0)),
                 );
-                ui.label(
-                    RichText::new(
-                        "Левая кнопка — лепить. С Ctrl — наоборот (нарастить ↔ вдавить), \
-                         с Shift — сгладить. Колесо с Alt — размер. Ctrl+Z отменяет проход",
+                ui.add_space(GAP_S);
+                if let Some(b) = &brick {
+                    let (lo, hi) = b.0.bounds_box();
+                    let d = (hi - lo) * 100.0;
+                    ui.label(
+                        RichText::new(format!(
+                            "Коробка глины {:.0}×{:.0}×{:.0} см, клетка {:.1} мм",
+                            d.x,
+                            d.y,
+                            d.z,
+                            cell * 1000.0
+                        ))
+                        .color(MUTED)
+                        .size(FONT_SMALL),
+                    );
+                }
+                room_slider(ui, &mut c.room);
+                grow = ui
+                    .button("Расширить коробку")
+                    .on_hover_text(
+                        "Коробка глины станет шире на запас с каждой стороны: можно \
+                         нарастить дальше. Ctrl+Z вернёт как было",
                     )
-                    .color(MUTED)
-                    .size(FONT_SMALL),
-                );
+                    .clicked();
                 ui.label(
-                    RichText::new(format!("Файл: models/{file}"))
+                    RichText::new(format!("Файл: models/{file}. Клавиши — в значке «?»"))
                         .color(MUTED)
                         .size(FONT_SMALL),
                 );
             });
+            if grow {
+                self.actions.push(Action::ClayGrow {
+                    file,
+                    room: self.clay.room,
+                });
+            }
             return;
         }
         if !clay_edit::can_turn(part) {
             return;
         }
         let mut turn = false;
+        let room = &mut self.clay.room;
         card(ui, "Глина", |ui| {
+            room_slider(ui, room);
             turn = ui
                 .button("Превратить в глину")
                 .on_hover_text(
@@ -133,7 +228,10 @@ impl EditorUi {
                 .clicked();
         });
         if turn {
-            self.actions.push(Action::ToClay(path.to_vec()));
+            self.actions.push(Action::ToClay {
+                path: path.to_vec(),
+                room: self.clay.room,
+            });
         }
     }
 

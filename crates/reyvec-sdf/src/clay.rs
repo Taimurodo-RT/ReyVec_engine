@@ -55,10 +55,18 @@ impl Brick {
     /// Сетка расстояний до формы `shape` (готовой: без `Use` и `Clay`), не больше `side`
     /// точек по длинной стороне. Ошибка — форма бесконечна или пуста.
     pub fn from_shape(shape: &Shape3, side: u32) -> Result<Brick, String> {
+        Self::from_shape_padded(shape, side, 0.0)
+    }
+
+    /// Как [`Brick::from_shape`], но коробка сетки шире формы на `extra` с каждой
+    /// стороны: глине есть куда нарастать (точек столько же, клетка крупнее).
+    pub fn from_shape_padded(shape: &Shape3, side: u32, extra: f32) -> Result<Brick, String> {
         let side = side.clamp(2 * PAD_CELLS + 4, MAX_SIDE);
         let (lo, hi) = shape
             .bounds_box()
             .ok_or("форма бесконечна: в глину не превратить")?;
+        let extra = Vec3::splat(extra.max(0.0));
+        let (lo, hi) = (lo - extra, hi + extra);
         let longest = (hi - lo).max_element();
         if !(longest > 0.0 && longest.is_finite()) {
             return Err("форма пуста: в глину не превратить".into());
@@ -374,6 +382,19 @@ mod tests {
             offset: 0.0,
         };
         assert!(Brick::from_shape(&plane, 32).is_err());
+    }
+
+    #[test]
+    fn padded_clay_has_room_to_grow() {
+        let ball = Shape3::Sphere { radius: 0.5 };
+        let tight = Brick::from_shape(&ball, 32).unwrap();
+        let wide = Brick::from_shape_padded(&ball, 32, 0.5).unwrap();
+        let (lo, hi) = tight.bounds_box();
+        let (wlo, whi) = wide.bounds_box();
+        assert!(wlo.x < lo.x - 0.4 && whi.y > hi.y + 0.4);
+        assert!(wide.cell() > tight.cell());
+        // Форма та же: на поверхности шара около нуля.
+        assert!(wide.sample(Vec3::new(0.5, 0.0, 0.0)).abs() < wide.cell());
     }
 
     #[test]

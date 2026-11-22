@@ -35,6 +35,12 @@ const FREE_PITCH: f32 = 1.5;
 const ORBIT_PER_POINT: f32 = 0.008;
 /// Сдвиг середины на точку перетаскивания, в долях расстояния до неё.
 const PAN_PER_POINT: f32 = 0.0016;
+/// Сцена 3D (М.8): поворот камеры на точку мыши — спокойнее, чем у модели.
+const SCENE_TURN: f32 = 0.004;
+/// Сцена 3D: скорость полёта клавишами, метров в секунду (Shift — втрое).
+const SCENE_FLY: f32 = 3.0;
+/// Сцена 3D: шаг колеса в полёте, метров.
+const SCENE_WHEEL: f32 = 0.6;
 /// Во сколько раз дальше радиуса шара вокруг модели (или детали) встаёт камера, чтобы
 /// всё было в кадре с полями (угол обзора 60°).
 const FRAME: f32 = 2.4;
@@ -207,7 +213,9 @@ impl ShapeView {
             near: 1.0,
             shift: Vec3::ZERO,
             goal: None,
-            free: false,
+            // Сцену смотрят изнутри: камера поворачивается на месте и летает, как в
+            // других редакторах (модель — вокруг её середины).
+            free: scene,
             spin: !scene,
             last: Instant::now(),
             error: None,
@@ -449,13 +457,18 @@ impl ShapeView {
         self.spin = false;
         self.goal = None;
         let eye = self.eye();
-        self.yaw -= dx * ORBIT_PER_POINT;
+        let per = if self.scene {
+            SCENE_TURN
+        } else {
+            ORBIT_PER_POINT
+        };
+        self.yaw -= dx * per;
         let (lo, hi) = if self.free {
             (-FREE_PITCH, FREE_PITCH)
         } else {
             PITCH_RANGE
         };
-        self.pitch = (self.pitch + dy * ORBIT_PER_POINT).clamp(lo, hi);
+        self.pitch = (self.pitch + dy * per).clamp(lo, hi);
         if self.free {
             self.target = eye - self.offset() * self.distance;
         }
@@ -480,7 +493,13 @@ impl ShapeView {
         self.spin = false;
         self.goal = None;
         let c = self.camera_now();
-        let speed = (self.radius * 1.6).max(0.3);
+        // У сцены скорость своя, в метрах: по её размеру (десятки метров) камера
+        // проскакивала предметы.
+        let speed = if self.scene {
+            SCENE_FLY
+        } else {
+            (self.radius * 1.6).max(0.3)
+        };
         self.target += (c.right() * d.x + Vec3::Y * d.y + c.forward() * d.z) * speed * seconds;
     }
 
@@ -490,7 +509,12 @@ impl ShapeView {
         if self.free {
             let forward = -self.offset();
             self.goal = None;
-            self.target += forward * steps * (self.radius * 0.15).max(0.02);
+            let step = if self.scene {
+                SCENE_WHEEL
+            } else {
+                (self.radius * 0.15).max(0.02)
+            };
+            self.target += forward * steps * step;
             return;
         }
         let g = self.goal.take();
@@ -1130,6 +1154,14 @@ mod tests {
         assert_eq!(view.name, "forge");
         let text = view.load().expect("сцена читается");
         assert!(view.error.is_none());
+        // Камера сцены поворачивается на месте и летает 3 м/с, а не по размеру сцены.
+        assert!(view.free);
+        let eye = view.camera_now().eye;
+        view.fly([0.0, 0.0, 1.0], 1.0);
+        let moved = (view.camera_now().eye - eye).length();
+        assert!((moved - SCENE_FLY).abs() < 1e-3, "{moved}");
+        view.orbit(100.0, 0.0);
+        assert!((view.camera_now().eye - eye).length() - moved < 1e-3);
         assert_eq!(text, view.text, "сцена рисуется как есть");
         let root = super::super::shape_edit::parse(&view.text).unwrap();
         assert!(super::super::shape_edit::is_scene(&root));

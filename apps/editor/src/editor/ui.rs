@@ -179,7 +179,16 @@ pub(crate) enum Action {
         commit: bool,
     },
     /// Превратить деталь модели по пути в глину (М.9б).
-    ToClay(Vec<usize>),
+    ToClay {
+        path: Vec<usize>,
+        /// Запас вокруг формы долей её длинной стороны.
+        room: f32,
+    },
+    /// Коробку глины шире на долю её длинной стороны (М.9б).
+    ClayGrow {
+        file: String,
+        room: f32,
+    },
     /// Мазок кисти по глине (М.9б).
     ClayDab(super::clay_edit::Dab),
     /// Кисть отпустили: проход по глине — один шаг истории.
@@ -2018,6 +2027,8 @@ impl EditorUi {
             Sense::click_and_drag(),
         );
         self.viewport_hovered = response.hovered() || response.dragged();
+        // Пока лепят глину (М.9б), левая кнопка у кисти: ручек нет.
+        let sculpting = self.clay_file(shape).is_some();
         // Режимы ручек детали — столбик значков у левого края окна.
         let tools = Rect::from_min_size(
             rect.left_top() + vec2(12.0, 72.0),
@@ -2031,6 +2042,18 @@ impl EditorUi {
                 .layout(Layout::top_down(Align::Center)),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
+                // Пока лепят глину (М.9б), в столбике — кисти, а не ручки.
+                if sculpting {
+                    for b in clay::BRUSHES {
+                        if clay::brush_button(ui, b, self.clay.brush == b)
+                            .on_hover_text(clay::brush_hint(b))
+                            .clicked()
+                        {
+                            self.clay.brush = b;
+                        }
+                    }
+                    return;
+                }
                 for m in GizmoMode::ALL {
                     if gizmo_button(ui, m, self.gizmo_mode == m)
                         .on_hover_text(m.hint())
@@ -2045,8 +2068,6 @@ impl EditorUi {
         // сдвинуть.
         // Ручки модели не как в файле (М.6, «Посмотреть»): на подставке не то, что в
         // тексте, поэтому стрелки деталей спрятаны.
-        // Пока лепят глину (М.9б), левая кнопка у кисти: ручек нет.
-        let sculpting = self.clay_file(shape).is_some();
         let gizmo = if shape.preview.is_empty() && !sculpting {
             self.shape_gizmo(ui, shape)
         } else {
@@ -2113,38 +2134,86 @@ impl EditorUi {
             }
         }
         let painter = ui.painter_at(rect);
-        let camera = "Камера: правая кнопка — повернуть (щелчок — меню детали), с ней W A S D — \
-                      лететь, Q E — вниз и вверх, Shift — быстрее. Средняя — сдвинуть, \
-                      колесо — ближе, F — выбранное крупно. Esc — назад к сцене";
-        let hint = if shape.free {
-            "Полёт: правая кнопка — оглядеться, W A S D — лететь, Q E — вниз и вверх, \
-             Shift — быстрее, колесо — вперёд-назад. Esc — назад к сцене"
-                .to_owned()
+        // Подсказка по клавишам — значок «?»: при наведении сразу всплывает список.
+        let tools: &[(&str, &str)] = if sculpting {
+            &[
+                ("Левая на глине", "лепить кистью"),
+                ("Ctrl", "наоборот: нарастить ↔ вдавить"),
+                ("Shift", "сгладить"),
+                ("Alt + колесо", "размер кисти"),
+                ("Левая мимо глины", "выбрать другую деталь"),
+            ]
         } else if shape.scene {
-            format!(
-                "Левая — выбрать предмет и тянуть его ручки: W — двигать, E — повернуть, \
-                 R — размер. Кружки — лампы: тянуть по полу, с Shift — вверх. Модели \
-                 перетаскивайте из «Ассетов».\n{camera}"
-            )
-        } else if sculpting {
-            format!(
-                "Лепка: левая на глине — кисть, с Ctrl — наоборот, с Shift — сгладить, \
-                 Alt+колесо — размер кисти. Левая мимо глины — выбрать другую деталь.\n{camera}"
-            )
+            &[
+                ("Левая", "выбрать предмет и тянуть его ручки"),
+                ("W / E / R", "ручки: двигать / повернуть / размер"),
+                ("Кружки", "лампы: тянуть по полу, с Shift — вверх"),
+                ("Из «Ассетов»", "перетащить модель в окно"),
+            ]
         } else {
-            format!(
-                "Левая — выбрать деталь и тянуть её ручки: W — двигать, E — повернуть, \
-                 R — размер.\n{camera}"
-            )
+            &[
+                ("Левая", "выбрать деталь и тянуть её ручки"),
+                ("W / E / R", "ручки: двигать / повернуть / размер"),
+            ]
         };
-        // Подсказка по клавишам — значок «?»: текст всплывает при наведении.
+        let camera: &[(&str, &str)] = if shape.free {
+            &[
+                ("Правая", "оглядеться (щелчок — меню детали)"),
+                ("W A S D", "лететь"),
+                ("Q / E", "вниз / вверх"),
+                ("Shift", "быстрее"),
+                ("Колесо", "вперёд / назад"),
+                ("Средняя", "сдвинуть"),
+            ]
+        } else {
+            &[
+                ("Правая", "повернуть вокруг (щелчок — меню детали)"),
+                ("Правая + W A S D", "лететь"),
+                ("Q / E", "вниз / вверх"),
+                ("Shift", "быстрее"),
+                ("Средняя", "сдвинуть"),
+                ("Колесо", "ближе / дальше"),
+            ]
+        };
+        let common: &[(&str, &str)] = &[
+            ("F", "выбранное крупно"),
+            ("Ctrl+Z / Ctrl+Y", "отменить / вернуть"),
+            ("Esc", "назад к сцене"),
+        ];
         let help = Rect::from_min_size(rect.left_top() + vec2(12.0, 12.0), vec2(26.0, 26.0));
-        let r = ui
-            .interact(help, ui.scope_id().with("shape-help"), Sense::hover())
-            .on_hover_ui(|ui| {
-                ui.set_max_width(420.0);
-                ui.label(&hint);
-            });
+        let r = ui.interact(help, ui.scope_id().with("shape-help"), Sense::hover());
+        if r.hovered() {
+            egui::Area::new(ui.scope_id().with("shape-help-list"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(help.right_top() + vec2(GAP_M, 0.0))
+                .interactable(false)
+                .show(ui.ctx(), |ui| {
+                    Frame::popup(ui.style()).show(ui, |ui| {
+                        for (title, rows) in [
+                            (if sculpting { "Лепка" } else { "Мышь" }, tools),
+                            ("Камера", camera),
+                            ("Ещё", common),
+                        ] {
+                            ui.label(RichText::new(title).color(TEXT).size(FONT_CHIP).strong());
+                            egui::Grid::new(("shape-help", title))
+                                .num_columns(2)
+                                .spacing(vec2(GAP_L, GAP_XS))
+                                .show(ui, |ui| {
+                                    for (key, what) in rows {
+                                        ui.label(
+                                            RichText::new(*key).color(ACCENT).size(FONT_SMALL),
+                                        );
+                                        ui.label(
+                                            RichText::new(*what).color(TEXT_DIM).size(FONT_SMALL),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                            ui.add_space(GAP_S);
+                        }
+                    });
+                });
+        }
         painter.circle(
             help.center(),
             12.0,
