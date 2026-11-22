@@ -236,6 +236,8 @@ impl ShapeView {
         if self.scene {
             return self.load_scene();
         }
+        // Глина деталей (М.9б): для выбора мышью и кисти.
+        super::clay_edit::remember(&self.text, &self.root);
         // Сначала модель в начале координат: узнать, какого она размера.
         let probe = stand_text(
             &use_model(&self.name, &BTreeMap::new()),
@@ -624,7 +626,8 @@ fn whole(text: &str) -> Option<Shape3> {
     }) {
         return w;
     }
-    let shape = if let Ok(f) = ModelFile::parse(text) {
+    let shape = if let Ok(mut f) = ModelFile::parse(text) {
+        with_clay(&mut f.shape);
         Some(f.shape)
     } else {
         ron::from_str::<SpaceFile>(text)
@@ -649,6 +652,26 @@ fn whole(text: &str) -> Option<Shape3> {
     };
     WHOLE.with_borrow_mut(|w| *w = Some((text.to_owned(), shape.clone())));
     shape
+}
+
+/// Забыть форму целиком: глина поменялась, а текст тот же (М.9б).
+pub(crate) fn forget_whole() {
+    WHOLE.with_borrow_mut(|w| *w = None);
+}
+
+/// Глина (М.9) заменяется сеткой из памяти `clay_edit`: её видят выбор мышью и кисть.
+fn with_clay(shape: &mut Shape3) {
+    if let Shape3::Clay { file } = shape {
+        if let Some(brick) = super::clay_edit::brick(file) {
+            *shape = Shape3::Brick { brick };
+        }
+        return;
+    }
+    let mut i = 0;
+    while let Some(c) = child_mut(shape, i) {
+        with_clay(c);
+        i += 1;
+    }
 }
 
 /// Сцена 3D без спрятанных предметов и деталей (текстом).
@@ -864,12 +887,26 @@ pub(crate) fn part_bounds(text: &str, path: &[usize]) -> Option<(Vec3, Vec3)> {
         .filter(|(lo, hi)| (*hi - *lo).max_element() > 1e-6)
 }
 
+/// Переход из координат самой детали (внутри её сдвига) в координаты модели: в них
+/// лежит глина детали (М.9б).
+pub(crate) fn part_frame(text: &str, path: &[usize]) -> Option<glam::Affine3A> {
+    let shape = whole(text)?;
+    let (node, mut around) = walk(&shape, path)?;
+    unwrap(node, &mut around);
+    Some(frame_of(&around))
+}
+
 /// Переход из координат родителя детали (где записано её `at`) в координаты модели.
 pub(crate) fn parent_frame(text: &str, path: &[usize]) -> Option<glam::Affine3A> {
     let shape = whole(text)?;
     let (_, around) = walk(&shape, path)?;
+    Some(frame_of(&around))
+}
+
+/// Все сдвиги снаружи внутрь одним переходом.
+fn frame_of(around: &[Around]) -> glam::Affine3A {
     let mut m = glam::Affine3A::IDENTITY;
-    for a in &around {
+    for a in around {
         if let Around::Move((at, turn, scale)) = *a {
             let r = glam::Mat3A::from(reyvec_sdf::shape3d::rotation(turn));
             m *= glam::Affine3A {
@@ -878,7 +915,7 @@ pub(crate) fn parent_frame(text: &str, path: &[usize]) -> Option<glam::Affine3A>
             };
         }
     }
-    Some(m)
+    m
 }
 
 /// Точка, где луч `origin + dir·t` встречает модель или сцену без спрятанных деталей

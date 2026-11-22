@@ -17,6 +17,7 @@
 
 mod arrange;
 mod assets;
+mod clay_edit;
 mod contour;
 mod cost;
 mod doc;
@@ -167,6 +168,8 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         shape: None,
         shape_undo: Vec::new(),
         shape_redo: Vec::new(),
+        clay_stroke: None,
+        clay_written: Instant::now(),
         shape_drag: None,
         shape_pending: None,
         shape_written: Instant::now(),
@@ -256,8 +259,11 @@ struct Editor {
     /// Открытая во «Формах» модель (М.2): движок рисует её на подставке вместо сцены.
     shape: Option<shapes::ShapeView>,
     /// История правок модели (М.3): тексты файла до правки.
-    shape_undo: Vec<String>,
-    shape_redo: Vec<String>,
+    shape_undo: Vec<clay_edit::ShapeStep>,
+    shape_redo: Vec<clay_edit::ShapeStep>,
+    /// Проход кистью по глине, который ещё тянут (М.9б).
+    clay_stroke: Option<clay_edit::Stroke>,
+    clay_written: Instant,
     /// Текст модели до правки, которую ещё тянут мышью.
     shape_drag: Option<String>,
     /// Правка модели, которую ещё не записали (пишется не чаще [`PREVIEW_INTERVAL`]).
@@ -338,6 +344,7 @@ impl Editor {
         }
         tracing::info!("Формы: модель {}", shape.name);
         self.shape = Some(shape);
+        self.clay_stroke = None;
         self.shape_undo.clear();
         self.shape_redo.clear();
         self.shape_drag = None;
@@ -366,15 +373,16 @@ impl Editor {
                 self.shape_pending.take()
             }
             Action::ShapeText { text, commit: true } => {
-                self.shape_undo
-                    .push(self.shape_drag.take().unwrap_or(current));
+                self.shape_undo.push(clay_edit::ShapeStep::Text(
+                    self.shape_drag.take().unwrap_or(current),
+                ));
                 self.shape_redo.clear();
                 self.shape_pending = None;
                 Some(text)
             }
             Action::EndEdit => match self.shape_drag.take() {
                 Some(before) => {
-                    self.shape_undo.push(before);
+                    self.shape_undo.push(clay_edit::ShapeStep::Text(before));
                     self.shape_redo.clear();
                     self.shape_pending.take()
                 }
@@ -388,15 +396,29 @@ impl Editor {
                 let Some(before) = self.shape_undo.pop() else {
                     return;
                 };
-                self.shape_redo.push(current);
-                Some(before)
+                let back = self.shape_step(before, current);
+                self.shape_redo.push(back);
+                None
             }
             Action::Redo => {
                 let Some(after) = self.shape_redo.pop() else {
                     return;
                 };
-                self.shape_undo.push(current);
-                Some(after)
+                let back = self.shape_step(after, current);
+                self.shape_undo.push(back);
+                None
+            }
+            Action::ToClay(path) => {
+                self.turn_to_clay(&path);
+                None
+            }
+            Action::ClayDab(dab) => {
+                self.clay_dab(&dab);
+                None
+            }
+            Action::ClayEnd => {
+                self.clay_end();
+                None
             }
             _ => None,
         };
@@ -568,7 +590,10 @@ impl Editor {
                 | Action::Undo
                 | Action::Redo
                 | Action::EndEdit
-                | Action::CancelEdit => return self.shape_action(action),
+                | Action::CancelEdit
+                | Action::ToClay(_)
+                | Action::ClayDab(_)
+                | Action::ClayEnd => return self.shape_action(action),
                 // Правки сцены, пока открыта модель, сцену не трогают (Delete, Ctrl+C…).
                 Action::Edit { .. }
                 | Action::Save
@@ -591,7 +616,8 @@ impl Editor {
             return;
         };
         match action {
-            Action::ShapeText { .. } => {}
+            Action::ShapeText { .. } | Action::ToClay(_) | Action::ClayDab(_) | Action::ClayEnd => {
+            }
             Action::Play | Action::Simulate => {
                 if self.shape.take().is_some() {
                     // Играют в сцену, а не в модель на подставке.
@@ -681,6 +707,7 @@ impl Editor {
             }
             Action::OpenShape(path) => self.open_shape(path),
             Action::CloseShape => {
+                self.clay_end();
                 if let Some(t) = self.shape_pending.take() {
                     self.write_shape(&t);
                 }
