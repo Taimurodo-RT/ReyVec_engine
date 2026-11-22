@@ -142,6 +142,7 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         gpu_ms: None,
         gpu_avg: reyvec_gpu::GpuTimingAverage::default(),
         gpu_passes: Vec::new(),
+        scene_post_aa: None,
         adapter: String::new(),
         error: None,
         closing: false,
@@ -220,6 +221,9 @@ struct Editor {
     /// Замеры видеокарты за секунду и самые долгие проходы (весь кадр первым).
     gpu_avg: reyvec_gpu::GpuTimingAverage,
     gpu_passes: Vec<(&'static str, f64)>,
+    /// Сглаживание по картинке у сцены до открытия «Форм» (на подставке оно включается,
+    /// после закрытия возвращается как было).
+    scene_post_aa: Option<bool>,
     adapter: String,
     error: Option<AppError>,
     closing: bool,
@@ -318,6 +322,11 @@ impl Editor {
         }
         r.set_scene(DemoScene::Space);
         r.set_space_camera(shape.camera());
+        // Края лучами — самый дорогой проход на подставке: сглаживаем по картинке.
+        if self.scene_post_aa.is_none() {
+            self.scene_post_aa = Some(r.post_aa());
+            r.set_post_aa(true);
+        }
         tracing::info!("Формы: модель {}", shape.name);
         self.shape = Some(shape);
         self.shape_undo.clear();
@@ -672,6 +681,9 @@ impl Editor {
                 };
                 if self.shape.take().is_some() {
                     r.set_scene(DemoScene::File);
+                    if let Some(on) = self.scene_post_aa.take() {
+                        r.set_post_aa(on);
+                    }
                     tracing::info!("Формы закрыты, снова сцена");
                 }
             }
@@ -684,6 +696,17 @@ impl Editor {
             Action::SpaceScale(scale) => {
                 r.set_space_scale(scale);
                 tracing::info!("Разрешение 3D: {}", scale.title());
+            }
+            Action::PostAa(on) => {
+                r.set_post_aa(on);
+                tracing::info!(
+                    "Сглаживание 3D: {}",
+                    if on {
+                        "по картинке"
+                    } else {
+                        "лучами"
+                    }
+                );
             }
             Action::SpaceTriangles(on) => {
                 r.set_space_triangles(on);
@@ -1228,6 +1251,7 @@ impl Editor {
                 hidden: &s.hidden,
                 scale: renderer.space_scale(),
                 triangles: renderer.space_triangles(),
+                post_aa: renderer.post_aa(),
                 passes: &self.gpu_passes,
                 camera: s.camera_now(),
                 shift: s.shift.into(),

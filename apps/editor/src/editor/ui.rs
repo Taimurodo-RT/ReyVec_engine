@@ -163,6 +163,8 @@ pub(crate) enum Action {
     SpaceScale(reyvec_gpu::SpaceScale),
     /// Режим «треугольники»: формы рисуются сетками (быстрее на слабых видеокартах).
     SpaceTriangles(bool),
+    /// Сглаживание 3D по картинке (`true`) или лучами по краям.
+    PostAa(bool),
     /// Новый текст файла модели на подставке (М.3). `commit: false` — число ещё тянут
     /// мышью (в историю правка попадёт одним шагом, когда отпустят).
     ShapeText {
@@ -205,6 +207,8 @@ pub(crate) struct ShapeInfo<'a> {
     /// Разрешение 3D-кадра и режим «треугольники».
     pub scale: reyvec_gpu::SpaceScale,
     pub triangles: bool,
+    /// Сглаживание 3D по картинке вместо краёв лучами.
+    pub post_aa: bool,
     /// Самые долгие проходы видеокарты за последнюю секунду, мс (и весь кадр).
     pub passes: &'a [(&'static str, f64)],
     /// Камера подставки в этом кадре (для выбора щелчком и стрелок).
@@ -833,6 +837,7 @@ impl EditorUi {
             }
             PartCmd::Wrap(how) => (Ok(shape_edit::wrap_in(text, part, how)), path.clone()),
             PartCmd::Unwrap => (shape_edit::unwrap(text, part), path.clone()),
+            PartCmd::Split => (shape_edit::split_repeat(text, part), path.clone()),
             PartCmd::Remove => {
                 let mut p = path.clone();
                 p.pop();
@@ -3246,6 +3251,17 @@ fn quality_menu(ui: &mut Ui, shape: &ShapeInfo, actions: &mut Vec<Action>) {
             {
                 actions.push(Action::SpaceTriangles(tri));
             }
+            let mut aa = shape.post_aa;
+            if ui
+                .checkbox(&mut aa, "Сглаживание по картинке")
+                .on_hover_text(
+                    "Края сглаживаются по готовой картинке, а не лучами: кадр заметно \
+                     дешевле, тонкие края чуть мягче",
+                )
+                .changed()
+            {
+                actions.push(Action::PostAa(aa));
+            }
         },
     )
     .response
@@ -3962,6 +3978,7 @@ enum PartCmd {
     Down,
     Wrap(shape_edit::Wrap),
     Unwrap,
+    Split,
     Remove,
 }
 
@@ -4155,6 +4172,13 @@ impl ShapeTree<'_> {
             "",
             PartCmd::Unwrap,
         );
+        item(
+            ui,
+            shape_edit::can_split(part),
+            "Разделить повтор",
+            "",
+            PartCmd::Split,
+        );
         ui.separator();
         item(ui, part.removable, "Удалить", "Delete", PartCmd::Remove);
         if let Some(cmd) = pick {
@@ -4341,6 +4365,7 @@ mod tests {
             hidden: &[],
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
+            post_aa: false,
             passes: &[],
             camera: reyvec_sdf::Camera3D::default(),
             shift: [0.0; 3],
@@ -4368,6 +4393,7 @@ mod tests {
             hidden: &[],
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
+            post_aa: false,
             passes: &[],
             camera: reyvec_sdf::Camera3D::default(),
             shift: [0.0; 3],
@@ -4436,6 +4462,7 @@ mod tests {
             hidden: &[],
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
+            post_aa: false,
             passes: &[],
             camera,
             shift: [0.0; 3],
@@ -4904,6 +4931,7 @@ mod tests {
                     hidden: &[],
                     scale: reyvec_gpu::SpaceScale::Full,
                     triangles: false,
+                    post_aa: false,
                     passes: &[],
                     camera: reyvec_sdf::Camera3D::default(),
                     shift: [0.0; 3],
