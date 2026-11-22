@@ -31,6 +31,8 @@ pub(crate) struct Part {
     /// `shapes`, у вырезания — `cut`).
     pub list: Option<usize>,
     pub children: Vec<Part>,
+    /// Имя предмета сцены 3D (М.8): у деталей моделей его нет.
+    pub name: Option<String>,
 }
 
 impl Part {
@@ -61,6 +63,7 @@ pub(crate) fn label(kind: &str) -> &str {
         "Extrude" => "Выдавливание",
         "Revolve" => "Выточка",
         "Animate" => "Движение",
+        "Scene" => "Сцена",
         other => other,
     }
 }
@@ -151,11 +154,23 @@ fn field_start(s: &[u8], open: usize, name: &str) -> Option<usize> {
 
 /// Часть, записанная с позиции `start`.
 fn part(s: &[u8], start: usize, removable: bool, depth: usize) -> Option<Part> {
+    part_in(s, start, removable, depth, None)
+}
+
+/// Часть с позиции `start`; `moved` — её сдвиг уже найден снаружи (место предмета
+/// сцены 3D), тогда `Move` в начале формы — своя часть.
+fn part_in(
+    s: &[u8],
+    start: usize,
+    removable: bool,
+    depth: usize,
+    mut moved: Option<usize>,
+) -> Option<Part> {
     if depth > 64 {
         return None;
     }
     let outer = start..value_end(s, start)?;
-    let (mut moved, mut painted) = (None, None);
+    let mut painted = None;
     let mut at = start;
     let (kind, open) = loop {
         let (name, open) = head(s, at)?;
@@ -198,6 +213,7 @@ fn part(s: &[u8], start: usize, removable: bool, depth: usize) -> Option<Part> {
         removable,
         list,
         children,
+        name: None,
     })
 }
 
@@ -207,13 +223,48 @@ fn root_open(s: &[u8]) -> Option<usize> {
     (s.get(i) == Some(&b'(')).then_some(i)
 }
 
-/// Дерево частей модели из текста файла.
+/// Дерево частей модели из текста файла. У сцены 3D (М.8) корень — сама сцена, его
+/// части — предметы: место предмета (`at`, `turn`) — его «сдвиг», дальше его форма.
 pub(crate) fn parse(text: &str) -> Result<Part, EditError> {
     let s = text.as_bytes();
     let err = |m: &str| EditError(m.into());
     let root = root_open(s).ok_or_else(|| err("файл модели не начинается со скобки"))?;
-    let start = field_start(s, root, "shape").ok_or_else(|| err("в модели нет поля shape"))?;
-    part(s, start, false, 0).ok_or_else(|| err("не разобрать форму модели"))
+    if let Some(start) = field_start(s, root, "shape") {
+        return part(s, start, false, 0).ok_or_else(|| err("не разобрать форму модели"));
+    }
+    let list = field_start(s, root, "objects")
+        .filter(|&l| s.get(l) == Some(&b'['))
+        .ok_or_else(|| err("в файле нет ни формы shape, ни предметов objects"))?;
+    let mut children = Vec::new();
+    for it in items(s, list).ok_or_else(|| err("не разобрать список предметов"))?
+    {
+        let bad = || err("не разобрать предмет сцены");
+        if s.get(it) != Some(&b'(') {
+            return Err(bad());
+        }
+        let shape = field_start(s, it, "shape").ok_or_else(bad)?;
+        let mut p = part_in(s, shape, true, 1, Some(it)).ok_or_else(bad)?;
+        p.outer = it..value_end(s, it).ok_or_else(bad)?;
+        p.name = field_start(s, it, "name")
+            .and_then(|v| ron::from_str::<String>(&text[v..value_end(s, v)?]).ok());
+        children.push(p);
+    }
+    Ok(Part {
+        kind: "Scene".into(),
+        open: None,
+        outer: list..value_end(s, list).ok_or_else(|| err("не закрыт список предметов"))?,
+        moved: None,
+        painted: None,
+        removable: false,
+        list: None,
+        children,
+        name: None,
+    })
+}
+
+/// Файл — сцена 3D, а не модель (М.8).
+pub(crate) fn is_scene(part: &Part) -> bool {
+    part.kind == "Scene"
 }
 
 /// Имена материалов модели по порядку (номер в `Paint` — номер здесь).

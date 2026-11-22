@@ -82,7 +82,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 );
             }
             "--shape" => {
-                out.shape = Some(it.next().ok_or("после --shape нужен файл .shape.ron")?);
+                out.shape = Some(
+                    it.next()
+                        .ok_or("после --shape нужен файл модели .shape.ron или сцены 3D .ron")?,
+                );
             }
             "--seconds" => out.seconds = Some(seconds("--seconds", it.next())?),
             "--snapshot-after" => {

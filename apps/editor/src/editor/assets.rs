@@ -121,7 +121,8 @@ impl Assets {
         self.root.as_ref()
     }
 
-    /// Рисует вкладку; возвращает файл модели формы, по которому дважды щёлкнули.
+    /// Рисует вкладку; возвращает файл модели формы или сцены 3D, по которому дважды
+    /// щёлкнули.
     pub(crate) fn draw(&mut self, ui: &mut Ui) -> Option<PathBuf> {
         let Some(root) = &self.root else {
             ui.label(RichText::new("Папка проекта не найдена").color(MUTED));
@@ -184,6 +185,13 @@ impl Assets {
                                     if r.double_clicked() {
                                         opened = Some(dir.path.join(f));
                                     }
+                                } else if !prefabs
+                                    && f.to_lowercase().ends_with(".ron")
+                                    && r.double_clicked()
+                                    && is_space_scene(&dir.path.join(f))
+                                {
+                                    // Сцена 3D (М.8) открывается, как модель: в окне сцены.
+                                    opened = Some(dir.path.join(f));
                                 }
                             }
                         });
@@ -297,6 +305,11 @@ pub(crate) struct AssetFile(pub PathBuf);
 
 /// Папка заготовок в `assets`.
 pub(crate) const PREFABS: &str = "prefabs";
+
+/// Файл — сцена 3D (формат `reyvec-space`), а не сцена 2D.
+pub(crate) fn is_space_scene(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|t| t.contains("\"reyvec-space\""))
+}
 
 /// Заготовка: предмет, записанный в свой файл `.ron` в папке `assets/prefabs`.
 fn is_prefab(name: &str) -> bool {

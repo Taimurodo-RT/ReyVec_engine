@@ -1277,6 +1277,8 @@ impl Editor {
                 text: &s.text,
                 preview: &s.preview,
                 cost: s.cost.result(),
+                scene: s.scene,
+                root: &s.root,
             }),
         };
         let input = state.take_egui_input(window);
