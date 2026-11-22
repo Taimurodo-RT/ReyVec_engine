@@ -40,6 +40,63 @@ pub const CALL_BACKSTOP_MS: u64 = 1000;
 /// Память всех скриптов вместе.
 pub const MEMORY_LIMIT: usize = 64 << 20;
 
+/// Поле таблицы `me` или `hero`: имя, что значит и кто его пишет. Редактор кода
+/// показывает эти списки в подсказках, так что новое поле, которое движок даёт скрипту,
+/// нужно описать здесь (тест `described_fields_match_engine` следит за этим).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Field {
+    pub name: &'static str,
+    pub about: &'static str,
+    /// Пишет скрипт (движок читает после вызова); иначе — даёт движок.
+    pub by_script: bool,
+}
+
+const fn given(name: &'static str, about: &'static str) -> Field {
+    Field {
+        name,
+        about,
+        by_script: false,
+    }
+}
+
+const fn written(name: &'static str, about: &'static str) -> Field {
+    Field {
+        name,
+        about,
+        by_script: true,
+    }
+}
+
+/// Поля `me`: что движок пишет перед вызовом [`Scripts::run`] и что читает после.
+pub const ME_FIELDS: &[Field] = &[
+    given(
+        "x",
+        "где предмет по X, метры; скрипт предмета может записать новое место",
+    ),
+    given("y", "где предмет по Y, метры; можно записать новое место"),
+    given("vx", "скорость по X, м/с"),
+    given("vy", "скорость по Y, м/с"),
+    given("on_ground", "стоит на земле"),
+    given("wall", "стена сбоку: -1 слева, 1 справа, 0 нет"),
+    given("hp", "здоровье"),
+    given("alive", "цел (не разбит)"),
+    given("touching", "касается героя"),
+    given("time", "время сцены, секунды"),
+    written("move", "бег: от -1 (влево) до 1 (вправо)"),
+    written("jump", "прыгнуть в этом шаге"),
+    written("hidden", "не виден"),
+    written("collected", "подобран: движок один раз даёт звон и блёстки"),
+];
+
+/// Поля `hero` (только для чтения).
+pub const HERO_FIELDS: &[Field] = &[
+    given("x", "где герой по X, метры"),
+    given("y", "где герой по Y, метры"),
+    given("vx", "скорость героя по X"),
+    given("vy", "скорость героя по Y"),
+    given("striking", "герой бьёт"),
+];
+
 /// Номер загруженного скрипта.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScriptId(usize);
@@ -307,6 +364,7 @@ impl Scripts {
             let called = update.call::<()>((me.clone(), h, dt));
             self.disarm();
             called?;
+            // Что здесь читается из `me`, описано в ME_FIELDS (подсказки редактора).
             let num = |k: &str| me.raw_get::<Option<f64>>(k).map(|v| v.unwrap_or(0.0));
             let flag = |k: &str| me.raw_get::<Option<bool>>(k).map(|v| v.unwrap_or(false));
             Ok(ActorOut {
@@ -398,6 +456,52 @@ mod tests {
             hp: 3,
             ..ActorIn::default()
         }
+    }
+
+    /// Всё, что движок кладёт в `me` и `hero`, описано в ME_FIELDS и HERO_FIELDS, а
+    /// описанное, что даёт движок, действительно приходит.
+    #[test]
+    fn described_fields_match_engine() {
+        let mut s = Scripts::new();
+        let id = s.load_text(
+            "fields.luau",
+            r#"
+            function update(me, hero, dt)
+                local a, b = {}, {}
+                for k in pairs(me) do table.insert(a, k) end
+                for k in pairs(hero) do table.insert(b, k) end
+                table.sort(a)
+                table.sort(b)
+                error("me=" .. table.concat(a, ",") .. ";hero=" .. table.concat(b, ",") .. ";")
+            end
+            "#,
+        );
+        let actor = s.actor(id).unwrap();
+        s.run(&actor, &input(), &HeroIn::default(), 0.016);
+        let err = s.errors().join("");
+        let list = |key: &str| -> Vec<String> {
+            let at = err.find(key).unwrap() + key.len();
+            let end = at + err[at..].find(';').unwrap();
+            err[at..end].split(',').map(str::to_owned).collect()
+        };
+        let named = |fields: &[Field]| -> Vec<&str> { fields.iter().map(|f| f.name).collect() };
+        for k in list("me=") {
+            assert!(
+                named(ME_FIELDS).contains(&k.as_str()),
+                "поле me.{k} не описано в ME_FIELDS"
+            );
+        }
+        for f in ME_FIELDS.iter().filter(|f| !f.by_script) {
+            assert!(
+                list("me=").contains(&f.name.to_owned()),
+                "me.{} не приходит",
+                f.name
+            );
+        }
+        let hero = list("hero=");
+        let mut described: Vec<String> = HERO_FIELDS.iter().map(|f| f.name.to_owned()).collect();
+        described.sort();
+        assert_eq!(hero, described);
     }
 
     #[test]
