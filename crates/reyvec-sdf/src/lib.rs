@@ -13,6 +13,7 @@
 
 pub mod brick3d;
 pub mod camera3d;
+pub mod clay;
 pub mod field3d;
 pub mod grid3d;
 pub mod layer_bake;

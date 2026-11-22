@@ -296,6 +296,11 @@ impl SpaceScene {
                 .map_err(|e| format!("{label}: {e}"))?;
         }
         let model_files = resolver.files;
+        // Глина (М.9) — кирпичи в формах предметов: их картинки грузит видеокарта.
+        let mut bricks: Vec<BrickRef> = Vec::new();
+        for o in &file.objects {
+            collect_bricks(&o.shape, &mut bricks);
+        }
         let material_names: Vec<String> = file.materials.iter().map(|m| m.name.clone()).collect();
         let mut materials = Vec::new();
         for m in &file.materials {
@@ -329,8 +334,9 @@ impl SpaceScene {
         let mut notes = Vec::new();
         let mut textures = Vec::new();
         let mut texture_keys: Vec<(std::path::PathBuf, usize)> = Vec::new();
-        let mut bricks: Vec<BrickRef> = Vec::new();
         let mut brick_keys: Vec<String> = Vec::new();
+        // Кирпичи моделей — после кирпичей глины: номер ключа + `clay_bricks`.
+        let clay_bricks = bricks.len();
         for (i, m) in file.meshes.iter().enumerate() {
             let label = if m.name.is_empty() {
                 format!("модель {}", i + 1)
@@ -450,7 +456,7 @@ impl SpaceScene {
             }
             let brick = if m.shadow {
                 let made = match brick_keys.iter().position(|k| *k == brick_key) {
-                    Some(at) => Some(bricks[at].clone()),
+                    Some(at) => Some(bricks[clay_bricks + at].clone()),
                     None => {
                         let all: Vec<[Vec3; 3]> = parts
                             .iter()
@@ -703,6 +709,30 @@ fn names(materials: &[MaterialEntry]) -> String {
     }
 }
 
+/// Кирпичи в форме (глина М.9 после чтения сцены), каждый один раз.
+fn collect_bricks(shape: &Shape3, out: &mut Vec<BrickRef>) {
+    match shape {
+        Shape3::Brick { brick } => {
+            if !out.contains(brick) {
+                out.push(brick.clone());
+            }
+        }
+        Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => {
+            shapes.iter().for_each(|s| collect_bricks(s, out));
+        }
+        Shape3::Subtract { base, cut, .. } => {
+            collect_bricks(base, out);
+            cut.iter().for_each(|s| collect_bricks(s, out));
+        }
+        Shape3::Move { shape, .. }
+        | Shape3::Paint { shape, .. }
+        | Shape3::Animate { shape, .. }
+        | Shape3::Mirror { shape, .. }
+        | Shape3::Repeat { shape, .. } => collect_bricks(shape, out),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,7 +965,9 @@ mod tests {
         let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
         let text = include_str!("../../../scenes/3d/forge.ron");
         let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
-        assert_eq!(scene.model_files.len(), 5, "{:?}", scene.model_files);
+        // Шесть моделей и файл глины заготовки (М.9): её кирпич грузит видеокарта.
+        assert_eq!(scene.model_files.len(), 7, "{:?}", scene.model_files);
+        assert_eq!(scene.bricks.len(), 1);
         assert!(
             scene
                 .material_names

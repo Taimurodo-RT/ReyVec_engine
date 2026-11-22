@@ -170,6 +170,10 @@ pub enum Shape3 {
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         params: std::collections::BTreeMap<String, f32>,
     },
+    /// Глина (М.9, [`crate::clay`]): сетка расстояний из файла `models/<file>`
+    /// (`"кузница/заготовка.clay"`), которую мнут кистями в редакторе. Как `Use`,
+    /// раскрывается при чтении сцены — в [`Shape3::Brick`] без отступа внутрь.
+    Clay { file: String },
 }
 
 fn one() -> f32 {
@@ -373,7 +377,7 @@ impl Shape3 {
                 smooth,
                 shape,
             } => Self::repeat_union(*count, *step, *smooth, shape).distance(p),
-            Self::Use { .. } => f32::MAX,
+            Self::Use { .. } | Self::Clay { .. } => f32::MAX,
         }
     }
 
@@ -572,7 +576,7 @@ impl Shape3 {
                 smooth,
                 shape,
             } => Self::repeat_union(*count, *step, *smooth, shape).bounds(),
-            Self::Use { .. } => Some((Vec3::ZERO, 0.0)),
+            Self::Use { .. } | Self::Clay { .. } => Some((Vec3::ZERO, 0.0)),
         }
     }
 }
@@ -686,7 +690,7 @@ impl Shape3 {
                 smooth,
                 shape,
             } => Self::repeat_union(*count, *step, *smooth, shape).bounds_box(),
-            Self::Use { .. } => Some((Vec3::ZERO, Vec3::ZERO)),
+            Self::Use { .. } | Self::Clay { .. } => Some((Vec3::ZERO, Vec3::ZERO)),
         }
     }
 }
@@ -905,7 +909,9 @@ pub enum CompileError {
     Empty,
     #[error("форма слишком большая: больше {MAX_PROGRAM_WORDS} слов (много выдавленных фигур?)")]
     TooLong,
-    #[error("модель «{0}» не подставлена: ссылки Use раскрывает чтение файла сцены")]
+    #[error(
+        "модель или глина «{0}» не подставлена: ссылки Use и Clay раскрывает чтение файла сцены"
+    )]
     Unresolved(String),
     #[error("повтор на {0} копий, больше {MAX_REPEAT} не бывает")]
     TooManyCopies(u32),
@@ -1169,6 +1175,7 @@ fn emit(
             )
         }
         Shape3::Use { model, .. } => Err(CompileError::Unresolved(model.clone())),
+        Shape3::Clay { file } => Err(CompileError::Unresolved(file.clone())),
     }
 }
 

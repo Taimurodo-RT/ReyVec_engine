@@ -1115,7 +1115,15 @@ mod tests {
         let (lo, hi) = part_bounds(&view.text, &[i]).expect("рамка модели");
         let mid = (lo + hi) * 0.5;
         let top = Vec3::new(mid.x, hi.y + 3.0, mid.z);
-        let hit = pick(&view.text, &[], top, Vec3::NEG_Y, 50.0).expect("попали");
+        // На наковальне лежит заготовка: прячем её, чтобы луч дошёл до наковальни.
+        let billet = file
+            .objects
+            .iter()
+            .position(
+                |o| matches!(&o.shape, Shape3::Use { model, .. } if model.ends_with("заготовка")),
+            )
+            .expect("заготовка");
+        let hit = pick(&view.text, &[vec![billet]], top, Vec3::NEG_Y, 50.0).expect("попали");
         assert_eq!(hit[0], i, "{hit:?}");
         // Сдвиг предмета пишется в его at, сцена читается.
         let part = root.at(&[i]).unwrap();

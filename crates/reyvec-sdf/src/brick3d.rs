@@ -50,19 +50,22 @@ pub const INSET_CELLS: f32 = 1.0;
 /// (`inset`), полоса.
 pub const BRICK_PRIM_WORDS: usize = 8;
 /// Номер картинки «ещё не загружена».
-const NO_TEXTURE: u32 = u32::MAX;
+pub(crate) const NO_TEXTURE: u32 = u32::MAX;
 
 /// Запечённая сетка расстояний модели (в координатах модели).
 pub struct Brick {
     /// Угол сетки: точка (i, j, k) — в `corner + (i + 0.5, j + 0.5, k + 0.5) · cell`.
-    corner: Vec3,
-    cell: f32,
-    size: [u32; 3],
+    pub(crate) corner: Vec3,
+    pub(crate) cell: f32,
+    pub(crate) size: [u32; 3],
     /// half float, X быстрее всего, потом Y, потом Z — так же лежит картинка: строка
     /// `j + k · ny`.
-    values: Vec<u16>,
+    pub(crate) values: Vec<u16>,
+    /// На сколько клеток поверхность внутри сетки: у заменителя модели
+    /// [`INSET_CELLS`], у глины (М.9, [`crate::clay`]) — 0.
+    pub(crate) inset_cells: f32,
     /// Номер картинки в общем списке видеокарты (ставит загрузка, [`Brick::set_texture`]).
-    texture: AtomicU32,
+    pub(crate) texture: AtomicU32,
 }
 
 impl std::fmt::Debug for Brick {
@@ -187,6 +190,7 @@ impl Brick {
                 cell,
                 size,
                 values,
+                inset_cells: INSET_CELLS,
                 texture: AtomicU32::new(NO_TEXTURE),
             }),
             open.len(),
@@ -205,7 +209,7 @@ impl Brick {
 
     /// На сколько заменитель внутри модели, м.
     pub fn inset(&self) -> f32 {
-        INSET_CELLS * self.cell
+        self.inset_cells * self.cell
     }
 
     /// Полоса точного расстояния, м.
