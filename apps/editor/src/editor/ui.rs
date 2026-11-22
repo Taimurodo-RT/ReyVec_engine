@@ -19,8 +19,9 @@ use super::arrange;
 use super::assets::{AssetFile, Assets};
 use super::contour;
 use super::doc::{Change, Edit};
+use super::explorer::{self, Explorer};
 use super::geom;
-use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
+use super::layout::{ASSETS_WORKSPACE, START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
 use super::model_params;
 use super::outline::{self, Kind};
 use super::overlay::{self, Overlay, ViewMode};
@@ -158,6 +159,10 @@ pub(crate) enum Action {
     },
     /// Открыть модель формы на подставке (М.2, двойной щелчок в Ассетах).
     OpenShape(std::path::PathBuf),
+    /// Открыть файл программой Windows (проводник «Ассетов»).
+    OpenFile(std::path::PathBuf),
+    /// Показать файл или папку в проводнике Windows.
+    ShowInFolder(std::path::PathBuf),
     /// Закрыть подставку, вернуться к сцене.
     CloseShape,
     /// Камера подставки: повернуть, сдвинуть, приблизить, готовый вид, деталь крупно.
@@ -291,6 +296,8 @@ pub(crate) struct Info<'a> {
     pub scenes: &'a [std::path::PathBuf],
     /// Есть автосохранение, которое можно вернуть.
     pub can_restore: bool,
+    /// Файл сцены «Мира» (его не переносят и не удаляют в проводнике).
+    pub scene_path: Option<&'a Path>,
     /// Камера отцеплена от героя во время игры (F8).
     pub ejected: bool,
     /// Скорость игры.
@@ -310,6 +317,10 @@ pub(crate) struct EditorUi {
     open: HashSet<Vec<usize>>,
     log: VecDeque<(Color32, String)>,
     assets: Assets,
+    /// Проводник «Ассетов» на всё окно (Э.1).
+    explorer: Explorer,
+    /// В прошлом кадре вместо сцены был проводник: сцену можно не рисовать.
+    files_shown: bool,
     /// Где сцена в прошлом кадре (точки интерфейса).
     viewport: Option<Rect>,
     viewport_hovered: bool,
@@ -408,6 +419,8 @@ impl EditorUi {
             open: HashSet::new(),
             log: VecDeque::new(),
             assets: Assets::scan(project),
+            explorer: Explorer::new(project),
+            files_shown: false,
             viewport: None,
             viewport_hovered: false,
             actions: Vec::new(),
@@ -445,6 +458,24 @@ impl EditorUi {
     /// Папки проекта поменялись (записали заготовку): перечитать Ассеты.
     pub(crate) fn rescan_assets(&mut self, project: Option<&Path>) {
         self.assets.rescan(project);
+        self.explorer.refresh();
+    }
+
+    /// Открыть пространство по имени.
+    pub(crate) fn open_workspace(&mut self, name: &str) {
+        if let Some(i) = WORKSPACES.iter().position(|w| w.name == name) {
+            self.workspace = i;
+        }
+    }
+
+    /// Вместо сцены сейчас проводник «Ассетов»: движку незачем рисовать сцену крупно.
+    pub(crate) fn scene_hidden(&self) -> bool {
+        self.files_shown
+    }
+
+    /// Открыто пространство «Ассеты» и в нём не открыт редактор ассета: видно проводник.
+    fn files_mode(&self, info: &Info) -> bool {
+        WORKSPACES[self.workspace].name == ASSETS_WORKSPACE && info.shape.is_none()
     }
 
     /// Что попросили сделать с прошлого вызова.
@@ -550,7 +581,30 @@ impl EditorUi {
                     .inner_margin(Margin::symmetric(GAP_XL as i8, 0)),
             )
             .show(ui, |ui| status_bar(ui, info, &self.status));
+        // «Играть» из «Ассетов» — игру видно только в «Мире».
+        if self.files_mode(info)
+            && self
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Play | Action::Simulate))
+        {
+            self.open_workspace("Мир");
+        }
         let ws = &WORKSPACES[self.workspace];
+        self.files_shown = self.files_mode(info);
+        if self.files_shown {
+            // Проводник на всё место между верхней и нижней полосами: сцены и панелей нет.
+            self.viewport = None;
+            self.viewport_hovered = false;
+            egui::CentralPanel::no_frame().show(ui, |ui| self.files(ui, info));
+            if info.frameless && !info.maximized {
+                self.window_edges(&ctx);
+            }
+            if self.asking_close {
+                self.close_dialog(&ctx, info);
+            }
+            return;
+        }
         let panel_frame = Frame::NONE.fill(PANEL);
         // Одни и те же панели у всех пространств: размер, который потянули мышью,
         // сохраняется при переходе между вкладками.
@@ -578,6 +632,39 @@ impl EditorUi {
         }
         if self.asking_close {
             self.close_dialog(&ctx, info);
+        }
+    }
+
+    /// Проводник «Ассетов» и то, что он просит.
+    fn files(&mut self, ui: &mut Ui, info: &Info) {
+        let busy = explorer::Busy {
+            scene: info.scene_path,
+            scene_dirty: info.dirty,
+        };
+        for out in self.explorer.draw(ui, &busy) {
+            match out {
+                explorer::Out::OpenShape(p) => {
+                    if info.play == PlayState::Edit {
+                        self.actions.push(Action::OpenShape(p));
+                    } else {
+                        self.push_log([(
+                            BAD,
+                            "Во время игры ассет не открыть: сначала «Стоп»".to_owned(),
+                        )]);
+                    }
+                }
+                explorer::Out::OpenScene(p) => {
+                    self.actions.push(Action::OpenScene(p));
+                    self.open_workspace("Мир");
+                }
+                explorer::Out::OpenFile(p) => self.actions.push(Action::OpenFile(p)),
+                explorer::Out::Reveal(p) => self.actions.push(Action::ShowInFolder(p)),
+                explorer::Out::Log(c, t) => self.push_log([(c, t)]),
+                explorer::Out::Changed => {
+                    let project = self.explorer.project().map(Path::to_path_buf);
+                    self.assets.rescan(project.as_deref());
+                }
+            }
         }
     }
 
@@ -631,6 +718,10 @@ impl EditorUi {
             self.actions.push(Action::Stop);
         } else if esc && info.shape.is_some() && !ctx.egui_wants_keyboard_input() {
             self.actions.push(Action::CloseShape);
+            return;
+        }
+        // В проводнике свои клавиши (Ctrl+C, Delete, F2…): они про файлы, а не про сцену.
+        if self.files_mode(info) {
             return;
         }
         if info.play != PlayState::Edit {
@@ -5768,6 +5859,7 @@ mod tests {
             can_paste: false,
             scenes: &[],
             can_restore: false,
+            scene_path: None,
             ejected: false,
             time_scale: 1.0,
             simulating: false,
@@ -5800,12 +5892,18 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut ui = EditorUi::new(Some(&root));
 
-        for ws in 0..WORKSPACES.len() {
+        for (ws, space) in WORKSPACES.iter().enumerate() {
             ui.workspace = ws;
             for play in [PlayState::Edit, PlayState::Playing, PlayState::Paused] {
                 frame(&ctx, &mut ui, &info(Some(&file), play), Vec::new());
                 frame(&ctx, &mut ui, &info(None, play), Vec::new());
             }
+            if space.name == ASSETS_WORKSPACE {
+                // Во «Ассетах» без открытого ассета — проводник вместо сцены.
+                assert!(ui.viewport().is_none() && ui.scene_hidden());
+                continue;
+            }
+            assert!(!ui.scene_hidden());
             let view = ui.viewport().expect("есть место для сцены");
             assert!(view.width() > 600.0 && view.height() > 300.0, "{view:?}");
             assert!(view.top() >= TITLE_HEIGHT);
@@ -6892,6 +6990,14 @@ mod tests {
             } else {
                 Vec::new()
             };
+            if ws == 1 {
+                // Проводник «Ассетов» (Э.1): модели цеха списком, выбран конвейер — справа
+                // видно, в какой сцене он используется.
+                let dir = root.join("scenes/3d/models/завод");
+                ui.explorer.go(dir.clone());
+                ui.explorer.view = explorer::ViewKind::List;
+                ui.explorer.selected = vec![dir.join("конвейер.shape.ron")];
+            }
             if ws == 5 {
                 // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.
                 ui.frames = (0..FRAME_HISTORY)

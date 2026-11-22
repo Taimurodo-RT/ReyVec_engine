@@ -4,6 +4,7 @@
 //! Флаги:
 //! - `--scene-file <файл.ron>`: какую сцену открыть (по умолчанию `scenes/first-room.ron`);
 //! - `--shape <файл.shape.ron>`: сразу открыть модель во «Формах» (для проверок);
+//! - `--assets`: сразу открыть «Ассеты» с проводником файлов (для проверок);
 //! - `--window-frame`: обычная рамка окна Windows вместо своей верхней полосы;
 //! - `--gpu <номер или часть названия>`: выбрать видеокарту;
 //! - `--no-vsync`: без вертикальной синхронизации;
@@ -27,6 +28,7 @@ const HELP: &str = "\
 
   --scene-file <файл.ron>  какую сцену открыть (по умолчанию scenes\\first-room.ron)
   --shape <файл>         сразу открыть модель во «Формах»
+  --assets               сразу открыть «Ассеты» (проводник файлов проекта)
   --window-frame         обычная рамка окна Windows вместо своей верхней полосы
   --gpu <номер|имя>      выбрать видеокарту, например --gpu radeon
   --no-vsync             без вертикальной синхронизации
@@ -51,6 +53,7 @@ struct Args {
     gpu: Option<String>,
     scene_file: Option<String>,
     shape: Option<String>,
+    assets: bool,
     seconds: Option<f64>,
     frames: Option<u64>,
     snapshot: Option<String>,
@@ -74,6 +77,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--window-frame" => out.window_frame = true,
             "--no-vsync" => out.no_vsync = true,
             "--validation" => out.validation = true,
+            "--assets" => out.assets = true,
             "--gpu" => out.gpu = Some(it.next().ok_or("после --gpu нужен номер или название")?),
             "--scene-file" => {
                 out.scene_file = Some(
@@ -175,6 +179,7 @@ fn main() -> ExitCode {
             let p = PathBuf::from(p);
             std::path::absolute(&p).unwrap_or(p)
         }),
+        assets: args.assets,
         project,
         max_seconds: args.seconds,
         max_frames: args.frames,

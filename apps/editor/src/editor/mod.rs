@@ -22,6 +22,7 @@ mod contour;
 mod cost;
 mod doc;
 mod endless;
+mod explorer;
 mod files;
 mod geom;
 mod layout;
@@ -29,6 +30,7 @@ mod model_params;
 mod outline;
 mod overlay;
 mod parts;
+mod project_files;
 mod ron_edit;
 mod shape_edit;
 mod shapes;
@@ -60,6 +62,8 @@ use ui::{Action, EditorUi, Info, PlayState};
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
 /// Во сколько раз приближает один щелчок колеса мыши.
 const ZOOM_STEP: f64 = 1.2;
+/// Сторона кадра сцены, пока её закрывает проводник «Ассетов», пикселей.
+const HIDDEN_SCENE_PX: u32 = 64;
 /// Пока тянут ручку, сцена в движке пересобирается не чаще этого.
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(60);
 
@@ -79,6 +83,8 @@ pub struct EditorConfig {
     pub scene_file: Option<PathBuf>,
     /// Модель, которую сразу открыть во «Формах» (`--shape`).
     pub shape: Option<PathBuf>,
+    /// Сразу открыть «Ассеты» с проводником (`--assets`, для проверок).
+    pub assets: bool,
     /// Папка проекта (в ней `assets` и `scenes`), для вкладки «Ассеты».
     pub project: Option<PathBuf>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -714,6 +720,8 @@ impl Editor {
                 }
             }
             Action::OpenShape(path) => self.open_shape(path),
+            Action::OpenFile(path) => open_in_system(&path, false),
+            Action::ShowInFolder(path) => open_in_system(&path, true),
             Action::CloseShape => {
                 self.clay_end();
                 if let Some(t) = self.shape_pending.take() {
@@ -1238,6 +1246,9 @@ impl Editor {
             if let Some(path) = self.config.shape.clone() {
                 self.open_shape(path);
             }
+            if self.config.assets {
+                self.ui.open_workspace(layout::ASSETS_WORKSPACE);
+            }
         }
         self.ui.push_log(reyvec_app::for_editor::take_log());
 
@@ -1297,6 +1308,7 @@ impl Editor {
             can_paste: self.clipboard.is_some(),
             scenes: &self.scenes,
             can_restore: self.restore.is_some(),
+            scene_path: self.config.scene_file.as_deref(),
             ejected: self.ejected,
             time_scale: self.time_scale,
             simulating: self.simulating,
@@ -1359,6 +1371,14 @@ impl Editor {
                 px(r.bottom()).saturating_sub(y),
             ]
         });
+        // Во «Ассетах» сцену закрывает проводник: рисовать её маленькой, чтобы видеокарта
+        // не работала зря (кадр сцены всё равно никто не видит).
+        let view_rect = view_rect.or(self.ui.scene_hidden().then_some([
+            0,
+            0,
+            HIDDEN_SCENE_PX,
+            HIDDEN_SCENE_PX,
+        ]));
         renderer.set_view_rect(view_rect);
         let size = window.inner_size();
         // В правке и на паузе анимация сцены стоит: кадр тот же, движку меньше работы.
@@ -1658,6 +1678,37 @@ impl AnimClock {
         }
         self.last = now;
         self.time
+    }
+}
+
+/// Открыть файл программой Windows или показать его в проводнике (`reveal`).
+fn open_in_system(path: &std::path::Path, reveal: bool) {
+    let started = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let mut c = std::process::Command::new("explorer.exe");
+            // Кавычки вокруг пути — сами: «/select,» должен стоять вне них.
+            if reveal {
+                c.raw_arg(format!("/select,\"{}\"", path.display()));
+            } else {
+                c.raw_arg(format!("\"{}\"", path.display()));
+            }
+            c.spawn()
+        }
+        #[cfg(not(windows))]
+        {
+            let target = if reveal {
+                path.parent().unwrap_or(path)
+            } else {
+                path
+            };
+            std::process::Command::new("xdg-open").arg(target).spawn()
+        }
+    };
+    match started {
+        Ok(_) => tracing::info!("Открываю «{}»", path.display()),
+        Err(e) => tracing::warn!("Не открыть «{}»: {e}", path.display()),
     }
 }
 
