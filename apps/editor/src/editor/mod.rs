@@ -72,6 +72,8 @@ pub struct EditorConfig {
     pub frameless: bool,
     /// Файл сцены, который открыть.
     pub scene_file: Option<PathBuf>,
+    /// Модель, которую сразу открыть во «Формах» (`--shape`).
+    pub shape: Option<PathBuf>,
     /// Папка проекта (в ней `assets` и `scenes`), для вкладки «Ассеты».
     pub project: Option<PathBuf>,
     /// Закрыть окно через столько секунд (для автопроверок).
@@ -1185,6 +1187,9 @@ impl Editor {
             }
             self.center_on_viewport();
             self.centered = true;
+            if let Some(path) = self.config.shape.clone() {
+                self.open_shape(path);
+            }
         }
         self.ui.push_log(reyvec_app::for_editor::take_log());
 
@@ -1252,6 +1257,7 @@ impl Editor {
                 scale: renderer.space_scale(),
                 triangles: renderer.space_triangles(),
                 post_aa: renderer.post_aa(),
+                in_view: renderer.view_rect_supported(),
                 passes: &self.gpu_passes,
                 camera: s.camera_now(),
                 shift: s.shift.into(),
@@ -1286,6 +1292,19 @@ impl Editor {
             }
         }
 
+        // На подставке 3D рисуется только в окне просмотра, не под панелями.
+        let ppp = out.pixels_per_point;
+        let view_rect = self.shape.as_ref().and(self.ui.viewport()).map(|r| {
+            let px = |v: f32| (v * ppp).round().max(0.0) as u32;
+            let (x, y) = (px(r.left()), px(r.top()));
+            [
+                x,
+                y,
+                px(r.right()).saturating_sub(x),
+                px(r.bottom()).saturating_sub(y),
+            ]
+        });
+        renderer.set_view_rect(view_rect);
         let size = window.inner_size();
         let time = self.start.elapsed().as_secs_f32();
         match renderer.render([size.width, size.height], time, Some(ui_frame)) {
