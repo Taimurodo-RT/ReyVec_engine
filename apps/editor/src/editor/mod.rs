@@ -18,6 +18,7 @@
 mod arrange;
 mod assets;
 mod contour;
+mod cost;
 mod doc;
 mod endless;
 mod files;
@@ -1234,6 +1235,9 @@ impl Editor {
             .and_then(SceneDoc::error)
             .map(ToOwned::to_owned)
             .or(engine_error);
+        if let Some(s) = self.shape.as_mut() {
+            s.cost.tick();
+        }
         let info = Info {
             play: self.play,
             maximized: window.is_maximized(),
@@ -1272,6 +1276,7 @@ impl Editor {
                 error: s.error.as_deref().or(shape_error.as_deref()),
                 text: &s.text,
                 preview: &s.preview,
+                cost: s.cost.result(),
             }),
         };
         let input = state.take_egui_input(window);

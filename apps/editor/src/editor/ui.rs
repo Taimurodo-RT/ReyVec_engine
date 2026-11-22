@@ -227,6 +227,8 @@ pub(crate) struct ShapeInfo<'a> {
     pub text: &'a str,
     /// Ручки модели на подставке не как в файле (М.6).
     pub preview: &'a std::collections::BTreeMap<String, f32>,
+    /// Цена модели (М.7): `None` — ещё считается.
+    pub cost: Option<Result<super::cost::ShapeCost, String>>,
 }
 
 /// Ручки как в файле (для подставок в тестах и без «Посмотреть»).
@@ -1443,6 +1445,120 @@ impl EditorUi {
             self.shape_command(text, PartCmd::Remove);
         }
         self.params_card(ui, shape);
+        self.cost_card(ui, shape);
+    }
+
+    /// Карточка «Цена модели» (М.7): сколько модель стоит лучу и какая у неё сетка для
+    /// режима «Треугольники»; кнопка показать модель так, как её видит слабая видеокарта.
+    fn cost_card(&mut self, ui: &mut Ui, shape: &ShapeInfo) {
+        use super::cost::Weight;
+        let mut triangles = None;
+        card(ui, "Цена модели", |ui| {
+            let line = |ui: &mut Ui, name: &str, value: String, hint: &str| {
+                ui.horizontal(|ui| {
+                    prop(ui, name);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(value).color(TEXT))
+                            .on_hover_text(hint);
+                    });
+                });
+            };
+            match &shape.cost {
+                None => {
+                    ui.label(RichText::new("Считаю…").color(MUTED));
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(e).color(BAD).size(FONT_SMALL));
+                }
+                Some(Ok(c)) => {
+                    let color = match c.weight {
+                        Weight::Light => GOOD,
+                        Weight::Medium => ACCENT,
+                        Weight::Heavy => BAD,
+                    };
+                    ui.label(
+                        RichText::new(format!("● Для лучей модель {}", c.weight.title()))
+                            .color(color),
+                    )
+                    .on_hover_text(
+                        "Зелёная — до 8 примитивов на шаг луча, жёлтая — до 24, красная — больше \
+                         (или программа почти во весь предел)",
+                    );
+                    line(
+                        ui,
+                        "Примитивов",
+                        c.prims.to_string(),
+                        "Частей в программе для видеокарты: каждая копия повтора и зеркала отдельно",
+                    );
+                    line(
+                        ui,
+                        "На шаг луча",
+                        format!("{:.1}, до {}", c.mean, c.worst),
+                        "Сколько примитивов видеокарта считает за один шаг луча рядом с моделью: \
+                         далёкие группы деталей пропускаются целиком",
+                    );
+                    line(
+                        ui,
+                        "Слов программы",
+                        format!("{} из {}", c.words, reyvec_sdf::shape3d::MAX_PROGRAM_WORDS),
+                        "Длина программы формы; больше предела модель не соберётся",
+                    );
+                    match c.mesh {
+                        Some(m) => {
+                            line(
+                                ui,
+                                "Сетка",
+                                format!("{} треуг.", m.triangles),
+                                "Режим «Треугольники» (для слабых видеокарт) рисует модель этой сеткой",
+                            );
+                            line(
+                                ui,
+                                "Клетка сетки",
+                                format!("{:.1} см", m.cell * 100.0),
+                                "Детали тоньше клетки в сетке могут пропасть, острые кромки чуть скругляются",
+                            );
+                            line(
+                                ui,
+                                "Отход сетки",
+                                format!("{:.1} мм", m.error * 1000.0),
+                                "Насколько сетка отходит от настоящей формы в худшем месте",
+                            );
+                            line(
+                                ui,
+                                "Строится",
+                                format!("{:.0} мс", m.ms),
+                                "Сколько процессор строит сетку при чтении сцены (один раз на модель)",
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                RichText::new("Сетки нет: модель пустая или бесконечная")
+                                    .color(MUTED)
+                                    .size(FONT_SMALL),
+                            );
+                        }
+                    }
+                }
+            }
+            ui.add_space(GAP_S);
+            let (text, hint) = if shape.triangles {
+                (
+                    "Снова лучами",
+                    "Вернуть обычный вид: модель рисуется лучами",
+                )
+            } else {
+                (
+                    "Как на слабой видеокарте",
+                    "Режим «Треугольники»: модель рисуется своей сеткой, как на встроенной видеокарте",
+                )
+            };
+            if ui.button(text).on_hover_text(hint).clicked() {
+                triangles = Some(!shape.triangles);
+            }
+        });
+        if let Some(t) = triangles {
+            self.actions.push(Action::SpaceTriangles(t));
+        }
     }
 
     /// Карточка «Ручки модели» (М.6): ручки, которые сцена задаёт каждой копии модели,
@@ -5337,6 +5453,7 @@ mod tests {
             error: Some("нет такого файла"),
             text: "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Sphere(radius: 0.3), Box(size: (0.2, 0.2, 0.2))]))",
             preview: &NO_PREVIEW,
+            cost: None,
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         assert!(ui.take_actions().is_empty(), "без нажатий нет действий");
@@ -5367,6 +5484,7 @@ mod tests {
             error: None,
             text,
             preview: &NO_PREVIEW,
+            cost: None,
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         let vp = ui.viewport().expect("окно подставки");
@@ -5438,6 +5556,7 @@ mod tests {
             error: None,
             text,
             preview: &NO_PREVIEW,
+            cost: None,
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         // Середина экрана — шар (камера смотрит на него).
@@ -5997,6 +6116,12 @@ mod tests {
         // Стеллаж склада для «Форм» (М.3): выбрана коробка ящика.
         let rack =
             std::fs::read_to_string(root.join("scenes/3d/models/склад/стеллаж.shape.ron")).unwrap();
+        // Цена стеллажа (М.7) для карточки «Цена модели».
+        let rack_cost = crate::editor::cost::measure(
+            &reyvec_sdf::shape_model::ModelFile::parse(&rack)
+                .unwrap()
+                .shape,
+        );
         for (ws, play, menu, shape) in [
             (START_WORKSPACE, PlayState::Edit, false, false),
             (START_WORKSPACE, PlayState::Playing, false, false),
@@ -6076,6 +6201,7 @@ mod tests {
                     error: None,
                     text: &rack,
                     preview: &NO_PREVIEW,
+                    cost: Some(rack_cost.clone()),
                 });
             }
             let mut out = None;
