@@ -25,6 +25,8 @@ static const uint EDGE_R2 = 3;
 static const uint EDGE_FAR_WORD = 9;
 // Слово заголовка: сколько групп ненадёжных частей (их тени считает «края 3D: тени»).
 static const uint EDGE_SHADOW_GROUPS_WORD = 10;
+// Ненадёжных пикселей на группу «края 3D: тени» (8.24).
+static const uint EDGE_SHADOW_PIXELS = 64;
 // Слово заголовка со счётом каждой части.
 static const uint EDGE_COUNT_WORD[EDGE_LISTS] = { 4, 5, 7, 8 };
 // Порядок групп в запуске «краёв 3D».
