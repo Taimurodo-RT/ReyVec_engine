@@ -31,6 +31,7 @@ mod parts;
 mod ron_edit;
 mod shape_edit;
 mod shapes;
+mod space_edit;
 mod theme;
 mod ui;
 mod viewport;
