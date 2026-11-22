@@ -157,6 +157,11 @@ pub(crate) struct ShapeView {
     framed: bool,
     /// Текст файла модели при последнем чтении или записи (М.3: из него дерево частей).
     pub text: String,
+    /// Детали, спрятанные «глазом» в дереве (пути в дереве `shape_edit`): на подставке их
+    /// нет, в файле они остаются.
+    pub hidden: Vec<Vec<usize>>,
+    /// Радиус подставки.
+    stand: f32,
 }
 
 impl ShapeView {
@@ -189,6 +194,8 @@ impl ShapeView {
             error: None,
             framed: false,
             text: String::new(),
+            hidden: Vec::new(),
+            stand: 0.15,
         })
     }
 
@@ -205,7 +212,7 @@ impl ShapeView {
         }
         self.checked = Instant::now();
         // Сначала модель в начале координат: узнать, какого она размера.
-        let probe = stand_text(&self.name, [0.0; 3], 1.0, None);
+        let probe = stand_text(&use_model(&self.name), "", [0.0; 3], 1.0, None);
         let scene = match SpaceScene::parse_in(&probe, Some(&self.root)) {
             Ok(s) => s,
             Err(e) => {
@@ -234,8 +241,40 @@ impl ShapeView {
             self.framed = true;
         }
         self.radius = radius;
+        self.stand = stand;
         self.error = None;
-        Some(stand_text(&self.name, shift, stand, Some(radius)))
+        self.hidden.retain(|p| {
+            super::shape_edit::parse(&self.text).is_ok_and(|r| r.at(p).is_some_and(|x| x.removable))
+        });
+        Some(self.stand_scene())
+    }
+
+    /// Сцена подставки с моделью как сейчас (без спрятанных деталей).
+    pub(crate) fn stand_scene(&self) -> String {
+        let (model, materials) = if self.hidden.is_empty() {
+            (use_model(&self.name), String::new())
+        } else {
+            match without(&self.text, &self.hidden) {
+                Some(m) => m,
+                None => (use_model(&self.name), String::new()),
+            }
+        };
+        stand_text(
+            &model,
+            &materials,
+            self.shift.into(),
+            self.stand,
+            Some(self.radius),
+        )
+    }
+
+    /// Спрятать деталь на подставке или показать снова. Ответ — новая сцена подставки.
+    pub(crate) fn set_hidden(&mut self, path: &[usize], hide: bool) -> String {
+        self.hidden.retain(|p| p != path);
+        if hide {
+            self.hidden.push(path.to_vec());
+        }
+        self.stand_scene()
     }
 
     /// Записать новый текст модели (правка из редактора, М.3) и перечитать её; ответ —
@@ -384,12 +423,6 @@ impl ShapeView {
         });
     }
 
-    /// Камера как при открытии, вращение снова идёт.
-    pub(crate) fn home(&mut self) {
-        self.view(ShapeAngle::Overview);
-        self.spin = true;
-    }
-
     /// Показать крупно деталь по пути `path` в дереве частей (`shape_edit`): камера
     /// плавно встаёт так, чтобы деталь была целиком в кадре, и ходит вокруг неё. Пустой
     /// путь — вся модель. `false` — у детали не узнать размер (ссылка на другую модель).
@@ -422,6 +455,126 @@ impl ShapeView {
         if !free {
             self.pitch = self.pitch.clamp(PITCH_RANGE.0, PITCH_RANGE.1);
         }
+    }
+}
+
+/// Материалов у подставки до материалов модели (пол, подставка, форма).
+const STAND_MATERIALS: u32 = 3;
+
+/// Форма модели ссылкой на её файл.
+fn use_model(name: &str) -> String {
+    format!("Use(model: \"{name}\")")
+}
+
+/// Модель без деталей `hidden` прямо текстом формы (номера цветов сдвинуты за материалы
+/// подставки) и её материалы для списка подставки. `None` — модель не читается.
+fn without(text: &str, hidden: &[Vec<usize>]) -> Option<(String, String)> {
+    let mut file = ModelFile::parse(text).ok()?;
+    let mut paths = hidden.to_vec();
+    // С конца: сначала поздние и вложенные, тогда номера ранних не съезжают.
+    paths.sort_unstable_by(|a, b| b.cmp(a));
+    for p in &paths {
+        remove_part(&mut file.shape, p);
+    }
+    shift_paint(&mut file.shape, STAND_MATERIALS);
+    let shape = ron::to_string(&file.shape).ok()?;
+    let materials = super::shape_edit::material_items(text).join(",\n        ");
+    let materials = if materials.is_empty() {
+        materials
+    } else {
+        materials + ","
+    };
+    Some((shape, materials))
+}
+
+/// Убирает деталь по пути (последний в списке своей части не убирается: пустое
+/// объединение не нарисовать).
+fn remove_part(root: &mut Shape3, path: &[usize]) {
+    let Some((&last, up)) = path.split_last() else {
+        return;
+    };
+    let mut node = root;
+    for &i in up {
+        node = unwrap_mut(node);
+        let Some(next) = child_mut(node, i) else {
+            return;
+        };
+        node = next;
+    }
+    match unwrap_mut(node) {
+        Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. }
+            if shapes.len() > 1 && last < shapes.len() =>
+        {
+            shapes.remove(last);
+        }
+        Shape3::Subtract { cut, .. } if last >= 1 && last - 1 < cut.len() => {
+            cut.remove(last - 1);
+        }
+        _ => {}
+    }
+}
+
+/// [`unwrap`] для правки.
+fn unwrap_mut(node: &mut Shape3) -> &mut Shape3 {
+    fn go(node: &mut Shape3, moved: bool, painted: bool) -> &mut Shape3 {
+        let what = match node {
+            Shape3::Move { .. } if !moved => 1,
+            Shape3::Paint { .. } if !painted => 2,
+            _ => 0,
+        };
+        match (what, node) {
+            (1, Shape3::Move { shape, .. }) => go(shape, true, painted),
+            (2, Shape3::Paint { shape, .. }) => go(shape, moved, true),
+            (_, n) => n,
+        }
+    }
+    go(node, false, false)
+}
+
+/// [`child`] для правки.
+fn child_mut(node: &mut Shape3, i: usize) -> Option<&mut Shape3> {
+    match node {
+        Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => shapes.get_mut(i),
+        Shape3::Subtract { base, cut, .. } => {
+            if i == 0 {
+                Some(base)
+            } else {
+                cut.get_mut(i - 1)
+            }
+        }
+        Shape3::Move { shape, .. }
+        | Shape3::Paint { shape, .. }
+        | Shape3::Mirror { shape, .. }
+        | Shape3::Repeat { shape, .. }
+        | Shape3::Animate { shape, .. }
+            if i == 0 =>
+        {
+            Some(shape)
+        }
+        _ => None,
+    }
+}
+
+/// Номера цветов `Paint` модели сдвигаются на `base` (материалы модели стоят в сцене
+/// подставки после её своих).
+fn shift_paint(shape: &mut Shape3, base: u32) {
+    match shape {
+        Shape3::Paint { material, shape } => {
+            *material += base;
+            shift_paint(shape, base);
+        }
+        Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => {
+            shapes.iter_mut().for_each(|s| shift_paint(s, base));
+        }
+        Shape3::Subtract { base: b, cut, .. } => {
+            shift_paint(b, base);
+            cut.iter_mut().for_each(|s| shift_paint(s, base));
+        }
+        Shape3::Move { shape, .. }
+        | Shape3::Animate { shape, .. }
+        | Shape3::Mirror { shape, .. }
+        | Shape3::Repeat { shape, .. } => shift_paint(shape, base),
+        _ => {}
     }
 }
 
@@ -523,7 +676,13 @@ fn modified(path: &Path) -> Option<SystemTime> {
 /// Текст сцены подставки: пол, круглая подставка радиусом `stand`, модель `name`,
 /// сдвинутая на `shift`, и лампы по размеру модели `radius` (нет — для замера размера,
 /// без ламп).
-fn stand_text(name: &str, shift: [f32; 3], stand: f32, radius: Option<f32>) -> String {
+fn stand_text(
+    model: &str,
+    materials: &str,
+    shift: [f32; 3],
+    stand: f32,
+    radius: Option<f32>,
+) -> String {
     let lamps = radius.map_or_else(String::new, |r| {
         let r = r.max(0.3);
         let key = [r * 1.6, r * 2.6, r * 2.0];
@@ -548,19 +707,20 @@ fn stand_text(name: &str, shift: [f32; 3], stand: f32, radius: Option<f32>) -> S
     format: "reyvec-space",
     version: 1,
     materials: [
-        (name: "пол", color: (0.26, 0.27, 0.29), grid: true),
-        (name: "подставка", color: (0.42, 0.43, 0.46)),
-        (name: "форма", color: (0.80, 0.80, 0.78)),
+        (name: "подставка: пол", color: (0.26, 0.27, 0.29), grid: true),
+        (name: "подставка: круг", color: (0.42, 0.43, 0.46)),
+        (name: "подставка: форма", color: (0.80, 0.80, 0.78)),
+        {materials}
     ],
     lamps: [
         {lamps}
     ],
     objects: [
-        (name: "пол", material: "пол", shape: Plane(normal: (0.0, 1.0, 0.0), offset: -0.03)),
-        (name: "подставка", material: "подставка", at: (0.0, -0.015, 0.0),
+        (name: "пол", material: "подставка: пол", shape: Plane(normal: (0.0, 1.0, 0.0), offset: -0.03)),
+        (name: "подставка", material: "подставка: круг", at: (0.0, -0.015, 0.0),
             shape: Cylinder(height: 0.03, radius: {stand:.4}, round: 0.005)),
-        (name: "модель", material: "форма", at: ({x:.4}, {y:.4}, {z:.4}),
-            shape: Use(model: "{name}")),
+        (name: "модель", material: "подставка: форма", at: ({x:.4}, {y:.4}, {z:.4}),
+            shape: {model}),
     ],
 )
 "#
@@ -624,8 +784,8 @@ mod tests {
             view.zoom(1.0);
         }
         assert!(view.distance >= view.radius * 0.6 - 1e-4);
-        view.home();
-        assert!(view.spin);
+        view.view(ShapeAngle::Overview);
+        assert!(!view.spin, "общий вид вращение не включает");
         view.step(1.0);
         assert!((view.pitch - HOME_PITCH).abs() < 1e-3);
     }
@@ -717,5 +877,35 @@ mod tests {
         assert!((lo - Vec3::new(0.9, -0.1, -0.1)).length() < 1e-4);
         assert!(part_bounds(&text, &[2]).is_none(), "у ссылки нет размера");
         assert!(part_bounds(&text, &[5]).is_none());
+    }
+
+    #[test]
+    fn hidden_parts_leave_the_stand_but_stay_in_the_file() {
+        let path = scenes().join("models/склад/стеллаж.shape.ron");
+        let mut view = ShapeView::open(path.clone()).unwrap();
+        let full = view.load().expect("стеллаж");
+        let dir = view.root.clone();
+        let count = |text: &str| {
+            let scene =
+                SpaceScene::parse_in(text, Some(&dir)).unwrap_or_else(|e| panic!("{e}\n{text}"));
+            let frame = scene.frame(0.0);
+            let shape = frame.shapes.last().unwrap().clone();
+            (format!("{shape:?}").matches("Box {").count(), scene)
+        };
+        let (boxes, _) = count(&full);
+        let root = super::super::shape_edit::parse(&view.text).unwrap();
+        let first = (0..root.children.len())
+            .find(|&i| root.children[i].removable)
+            .expect("деталь в списке");
+        let hidden = view.set_hidden(&[first], true);
+        let (fewer, scene) = count(&hidden);
+        assert!(fewer < boxes, "{fewer} < {boxes}");
+        // Цвета модели на месте: материалы подставки и модели вместе.
+        let model_materials = super::super::shape_edit::materials(&view.text).len();
+        assert_eq!(scene.materials.len(), 3 + model_materials);
+        // Показать снова — сцена как была; файл не тронут.
+        let back = view.set_hidden(&[first], false);
+        assert_eq!(back, full);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), view.text);
     }
 }

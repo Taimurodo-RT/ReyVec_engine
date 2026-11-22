@@ -233,6 +233,22 @@ pub(crate) fn materials(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Материалы модели текстом, как они записаны в файле (для сцены подставки).
+pub(crate) fn material_items(text: &str) -> Vec<String> {
+    let s = text.as_bytes();
+    let Some(list) = root_open(s).and_then(|r| field_start(s, r, "materials")) else {
+        return Vec::new();
+    };
+    if s.get(list) != Some(&b'[') {
+        return Vec::new();
+    }
+    items(s, list)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|it| Some(text[it..value_end(s, it)?].to_owned()))
+        .collect()
+}
+
 /// Текст значения поля `name` в скобках `open`.
 fn field_text<'a>(text: &'a str, open: usize, name: &str) -> Option<&'a str> {
     let s = text.as_bytes();
