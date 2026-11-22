@@ -117,6 +117,9 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         scene_file_label: None,
         space_watcher: None,
         space_file_label: None,
+        space_files: Vec::new(),
+        space_file_names: Vec::new(),
+        space_file_now: None,
         modifiers: ModifiersState::empty(),
         gamepads: crate::gamepad::Gamepads::new(),
         game_ui: crate::game_ui::GameUi::new(),
@@ -183,6 +186,10 @@ struct App {
     /// Слежка за файлом сцены «3D» (7.5) и его путь для панели.
     space_watcher: Option<reyvec_scene::SceneWatcher>,
     space_file_label: Option<String>,
+    /// Файлы сцен «3D» папки текущего: пути, названия для панели и какой открыт.
+    space_files: Vec<std::path::PathBuf>,
+    space_file_names: Vec<String>,
+    space_file_now: Option<usize>,
     /// Зажатые Shift, Ctrl и другие (для Shift+U).
     modifiers: ModifiersState,
     /// Геймпады (6.3).
@@ -260,6 +267,13 @@ impl App {
             }
         }
         if let Some(path) = &self.config.space_file {
+            self.space_files = space_files_beside(path);
+            self.space_file_names = self
+                .space_files
+                .iter()
+                .map(|p| space_file_name(p))
+                .collect();
+            self.space_file_now = self.space_files.iter().position(|p| same_file(p, path));
             match reyvec_scene::SceneWatcher::with_models(path) {
                 Ok(w) => {
                     self.space_file_label = Some(w.path().display().to_string());
@@ -317,6 +331,35 @@ impl App {
                 self.fly.release();
                 r.set_scene(scene);
                 tracing::info!("Сцена: {}", scene.title());
+            }
+            PanelAction::SpaceFile(i) => {
+                let Some(path) = self.space_files.get(i).cloned() else {
+                    return;
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        tracing::info!("Сцена 3D: файл {}", path.display());
+                        match reyvec_scene::SceneWatcher::with_models(&path) {
+                            Ok(w) => {
+                                self.space_file_label = Some(w.path().display().to_string());
+                                self.space_watcher = Some(w);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Не удалось следить за файлом сцены 3D {}: {e}",
+                                    path.display()
+                                );
+                                self.space_watcher = None;
+                                self.space_file_label = Some(path.display().to_string());
+                            }
+                        }
+                        self.space_file_now = Some(i);
+                        self.fly.release();
+                        r.set_space_file(&text);
+                        r.set_scene(DemoScene::Space);
+                    }
+                    Err(e) => tracing::warn!("Не прочитать {}: {e}", path.display()),
+                }
             }
             PanelAction::Msaa(msaa) => r.set_msaa(msaa),
             PanelAction::LoadPicture(background) => {
@@ -689,6 +732,8 @@ impl App {
                 space: (renderer.scene() == DemoScene::Space)
                     .then(|| space_text(&renderer.space_camera(), self.fly.speed)),
                 space_file: self.space_file_label.as_deref(),
+                space_files: &self.space_file_names,
+                space_file_now: self.space_file_now,
                 space_error: renderer.space_error(),
                 space_objects: renderer.space_objects(),
                 space_culling: renderer.space_culling(),
@@ -1686,6 +1731,55 @@ fn run_console(console: &mut crate::console::Console, logic: Option<&reyvec_scen
     }
 }
 
+/// Файлы сцен «3D» (`.ron`) в папке файла `path`, по названию; сам файл — среди них.
+fn space_files_beside(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Some(dir) = path.parent() else {
+        return vec![path.to_path_buf()];
+    };
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "ron"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !files.iter().any(|p| same_file(p, path)) {
+        files.push(path.to_path_buf());
+    }
+    files.sort_by_key(|p| space_file_name(p));
+    files
+}
+
+/// Один и тот же файл (пути могут быть записаны по-разному).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Название сцены «3D» на панели: у примеров проекта — по-русски, у своих — имя файла.
+fn space_file_name(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let known = match stem.as_str() {
+        "space" => "пример",
+        "factory" => "завод",
+        "warehouse" => "склад",
+        "forge" => "кузница",
+        "models" => "модели glTF",
+        "mixed" => "смесь",
+        "stress" => "нагрузка",
+        "vector" => "векторы в 3D",
+        _ => return stem,
+    };
+    known.to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1719,5 +1813,32 @@ mod tests {
             .expect("прошло полсекунды");
         assert!(title.contains("4 FPS"), "{title}");
         assert_eq!(s.frames_since_title, 0);
+    }
+
+    /// Кнопки сцен «3D» (8.21): все примеры папки `scenes/3d`, открытый — среди них,
+    /// названия примеров по-русски.
+    #[test]
+    fn space_files_list_the_folder() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scenes/3d");
+        let space = dir.join("space.ron");
+        let files = super::space_files_beside(&space);
+        let names: Vec<String> = files.iter().map(|p| super::space_file_name(p)).collect();
+        for name in ["пример", "завод", "склад", "кузница"] {
+            assert!(names.iter().any(|n| n == name), "нет «{name}» в {names:?}");
+        }
+        assert!(
+            files
+                .iter()
+                .all(|p| p.extension().is_some_and(|e| e == "ron"))
+        );
+        assert_eq!(
+            files.iter().filter(|p| super::same_file(p, &space)).count(),
+            1,
+            "открытый файл ровно один раз"
+        );
+        assert_eq!(
+            super::space_file_name(std::path::Path::new("мой.ron")),
+            "мой"
+        );
     }
 }
