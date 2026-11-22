@@ -470,6 +470,80 @@ pub(crate) fn unwrap(text: &str, part: &Part) -> Result<String, EditError> {
     ))
 }
 
+/// Повтор, который можно разделить на отдельные детали.
+pub(crate) fn can_split(part: &Part) -> bool {
+    part.kind == "Repeat" && part.open.is_some() && part.children.len() == 1
+}
+
+/// Делит повтор на отдельные детали: `Repeat(count: n, step: s, shape: X)` становится
+/// объединением из `n` копий `X`, каждая на своём месте (`k · s`). Копии больше не
+/// связаны: каждую можно выбрать, сдвинуть и поменять. Сдвиг и цвет самого повтора
+/// остаются на объединении.
+pub(crate) fn split_repeat(text: &str, part: &Part) -> Result<String, EditError> {
+    let err = || EditError("повтор не разделить".into());
+    let (true, Some(open)) = (can_split(part), part.open) else {
+        return Err(err());
+    };
+    let head = text[..open].trim_end();
+    let start = head.len().checked_sub(part.kind.len()).ok_or_else(err)?;
+    if head[start..] != part.kind {
+        return Err(err());
+    }
+    let end = value_end(text.as_bytes(), start).ok_or_else(err)?;
+    let count = read_num(text, Some(open), "count", 1.0)
+        .round()
+        .clamp(1.0, f64::from(reyvec_sdf::shape3d::MAX_REPEAT)) as u32;
+    let step = read_vec3(text, Some(open), "step", [0.0; 3]);
+    let smooth = read_num(text, Some(open), "smooth", 0.0);
+    let child = &part.children[0];
+    let at = read_vec3(text, child.moved, "at", [0.0; 3]);
+    let mut copies = Vec::new();
+    for k in 0..count {
+        let k = f64::from(k);
+        let place = [
+            at[0] + step[0] * k,
+            at[1] + step[1] * k,
+            at[2] + step[2] * k,
+        ];
+        let copy = match child.moved {
+            // У детали свой сдвиг: место копии — в нём же.
+            Some(o) => {
+                let moved = set_field_at(text, o, "at", &triple(place))?;
+                let grow = moved.len() as isize - text.len() as isize;
+                let end = (child.outer.end as isize + grow) as usize;
+                moved[child.outer.start..end].to_owned()
+            }
+            None if k == 0.0 => text[child.outer.clone()].to_owned(),
+            None => format!(
+                "Move(at: {}, shape: {})",
+                triple(place),
+                &text[child.outer.clone()]
+            ),
+        };
+        copies.push(copy);
+    }
+    let line = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let indent: String = text[line..start]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    let inner = format!("{indent}    ");
+    let list = copies
+        .iter()
+        .map(|c| format!("\n{inner}{c},"))
+        .collect::<String>();
+    let smooth = if smooth != 0.0 {
+        format!(", smooth: {}", num(smooth))
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "{}Union(shapes: [{list}\n{indent}]{smooth}){}",
+        &text[..start],
+        &text[end..]
+    ))
+}
+
 /// Как сложить новую деталь с выбранной частью.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Combine {
@@ -744,5 +818,43 @@ mod tests {
             "{t}"
         );
         reparse(&t);
+    }
+
+    #[test]
+    fn split_repeat_makes_separate_parts_in_the_same_places() {
+        let model = "(\n    shape: Union(shapes: [\n        // ряд ящиков\n        \
+                     Move(at: (0.0, 1.0, 0.0), shape: Repeat(count: 3, step: (0.5, 0.0, 0.0), \
+                     smooth: 0.02, shape: Move(at: (0.1, 0.0, 0.0), shape: Box(size: (0.2, 0.2, 0.2))))),\n        \
+                     Repeat(count: 2, step: (0.0, 0.0, 0.4), shape: Sphere(radius: 0.1)),\n    ]),\n)\n";
+        let before = reparse(model);
+        let root = parse(model).unwrap();
+        let boxes = root.at(&[0]).unwrap();
+        let balls = root.at(&[1]).unwrap();
+        assert!(can_split(boxes) && can_split(balls) && !can_split(&root));
+        let t = split_repeat(model, boxes).unwrap();
+        let r = parse(&t).unwrap();
+        let row = r.at(&[0]).unwrap();
+        assert_eq!(row.kind, "Union");
+        assert!(row.moved.is_some(), "сдвиг повтора остался на объединении");
+        assert_eq!(row.children.len(), 3);
+        assert!(t.contains("Move(at: (1.1, 0.0, 0.0), shape: Box"), "{t}");
+        assert!(t.contains("smooth: 0.02"), "{t}");
+        assert!(t.contains("// ряд ящиков"));
+        let t = split_repeat(&t, parse(&t).unwrap().at(&[1]).unwrap()).unwrap();
+        let r = parse(&t).unwrap();
+        assert_eq!(r.at(&[1]).unwrap().children.len(), 2);
+        assert!(t.contains("Move(at: (0.0, 0.0, 0.4), shape: Sphere"), "{t}");
+        let after = reparse(&t);
+        for p in [
+            glam::Vec3::new(0.0, 1.0, 0.0),
+            glam::Vec3::new(0.6, 1.1, 0.05),
+            glam::Vec3::new(1.2, 0.9, -0.1),
+            glam::Vec3::new(0.0, 0.0, 0.45),
+            glam::Vec3::new(-0.3, 0.4, 0.2),
+        ] {
+            let (a, b) = (before.distance(p), after.distance(p));
+            assert!((a - b).abs() < 1e-5, "{p}: {a} против {b}");
+        }
+        assert!(split_repeat(model, &root).is_err());
     }
 }
