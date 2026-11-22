@@ -16,7 +16,7 @@ use egui::{
     Stroke, Ui, pos2, vec2,
 };
 
-use super::luau_text::{self, HERO, Hint, ME, Problem, Tok};
+use super::luau_text::{self, HERO, Hint, ME, Problem, Tok, Warning};
 use super::project_files as pf;
 use super::theme::*;
 
@@ -37,12 +37,23 @@ pub(crate) enum CodeOut {
     Log(Color32, String),
 }
 
+/// Поиск и замена (Ctrl+F, Ctrl+H).
+#[derive(Clone, Debug, Default)]
+struct Find {
+    query: String,
+    replace: String,
+    /// Показана строка замены.
+    replacing: bool,
+    /// Поставить фокус в поле поиска в следующем кадре.
+    focus: bool,
+}
+
 /// Список подсказки под курсором.
 #[derive(Clone, Debug)]
 struct Popup {
     /// Где начинается набираемое слово (байт).
     at: usize,
-    items: Vec<&'static str>,
+    items: Vec<String>,
     pick: usize,
 }
 
@@ -52,6 +63,13 @@ pub(crate) struct CodeEditor {
     pub(crate) text: String,
     saved: String,
     problem: Option<Problem>,
+    /// Похоже на опечатку (С.2).
+    warnings: Vec<Warning>,
+    find: Option<Find>,
+    /// Окошко «Перейти к строке» (Ctrl+G) и что в нём набрано.
+    goto_input: Option<String>,
+    /// Показать место: строка (с 1) и что выделить (байты).
+    jump: Option<(usize, std::ops::Range<usize>)>,
     /// Текст, который уже проверен.
     checked: Option<String>,
     edited_at: f64,
@@ -59,8 +77,6 @@ pub(crate) struct CodeEditor {
     /// Окно «Сохранить правки?» перед закрытием.
     asking_close: bool,
     popup: Option<Popup>,
-    /// Попросили перейти к строке (с 1).
-    goto: Option<usize>,
     used: Option<Vec<(PathBuf, usize)>>,
     /// Где курсор: строка и столбец (с 1).
     at: (usize, usize),
@@ -77,12 +93,15 @@ impl CodeEditor {
             saved: text.clone(),
             text,
             problem: None,
+            warnings: Vec::new(),
+            find: None,
+            goto_input: None,
+            jump: None,
             checked: None,
             edited_at: f64::NEG_INFINITY,
             lua: mlua::Lua::new(),
             asking_close: false,
             popup: None,
-            goto: None,
             used: None,
             at: (1, 1),
             out: Vec::new(),
@@ -152,7 +171,11 @@ impl CodeEditor {
         if self.checked.is_some() && now - self.edited_at < CHECK_AFTER_S {
             return;
         }
-        self.problem = luau_text::check(&self.lua, &self.name(), &self.text);
+        self.problem = luau_text::check(&self.lua, &self.name(), &self.text).map(|mut p| {
+            p.text = luau_text::russian(&p.text);
+            p
+        });
+        self.warnings = luau_text::warnings(&self.text);
         self.checked = Some(self.text.clone());
     }
 
@@ -165,10 +188,25 @@ impl CodeEditor {
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
                 self.save_or_say();
             }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+                self.open_find(&ctx, false);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::H)) {
+                self.open_find(&ctx, true);
+            }
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::G)) {
+                self.goto_input = Some(String::new());
+            }
             if self.popup.is_none()
                 && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
             {
-                self.ask_close();
+                if self.find.is_some() || self.goto_input.is_some() {
+                    self.find = None;
+                    self.goto_input = None;
+                    ctx.memory_mut(|m| m.request_focus(self.text_id()));
+                } else {
+                    self.ask_close();
+                }
             }
         }
         egui::Panel::top("code-bar")
@@ -260,12 +298,30 @@ impl CodeEditor {
                             .sense(Sense::click()),
                     );
                     if p.line > 0 && r.on_hover_text("Перейти к строке").clicked() {
-                        self.goto = Some(p.line);
+                        self.go_line(p.line);
                     }
                 }
-                None => {
-                    ui.label(RichText::new("Ошибок нет").small().color(GOOD));
-                }
+                None => match self.warnings.first().cloned() {
+                    Some(w) => {
+                        let more = if self.warnings.len() > 1 {
+                            format!("  (и ещё {})", self.warnings.len() - 1)
+                        } else {
+                            String::new()
+                        };
+                        let text = format!("Строка {}: {}{more}", w.line, w.text);
+                        let r = ui.add(
+                            egui::Label::new(RichText::new(text).small().color(WARN))
+                                .truncate()
+                                .sense(Sense::click()),
+                        );
+                        if r.on_hover_text("Показать это место").clicked() {
+                            self.jump = Some((w.line, w.range.clone()));
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new("Ошибок нет").small().color(GOOD));
+                    }
+                },
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
@@ -294,9 +350,9 @@ impl CodeEditor {
             .color(TEXT_DIM),
         );
         ui.add_space(GAP_L);
-        hint_list(ui, "me — этот предмет", &ME, true);
+        hint_list(ui, "me — этот предмет", ME, true);
         ui.add_space(GAP_L);
-        hint_list(ui, "hero — герой", &HERO, false);
+        hint_list(ui, "hero — герой", HERO, false);
         ui.add_space(GAP_L);
         ui.label(RichText::new("dt — шаг игры, секунды").color(TEXT));
         ui.add_space(GAP_XL);
@@ -336,6 +392,212 @@ impl CodeEditor {
         }
     }
 
+    /// Перейти к строке: курсор в её начало.
+    fn go_line(&mut self, line: usize) {
+        let at = line_start(&self.text, line);
+        self.jump = Some((line, at..at));
+    }
+
+    /// Открыть поиск: искать выделенное, если оно в одну строку.
+    fn open_find(&mut self, ctx: &egui::Context, replacing: bool) {
+        let picked = egui::TextEdit::load_state(ctx, self.text_id())
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| {
+                let (a, b) = (r.primary.index.0, r.secondary.index.0);
+                let (a, b) = (byte_of(&self.text, a.min(b)), byte_of(&self.text, a.max(b)));
+                self.text[a..b].to_owned()
+            })
+            .filter(|t| !t.is_empty() && !t.contains('\n'));
+        let find = self.find.get_or_insert_with(Find::default);
+        if let Some(t) = picked {
+            find.query = t;
+        }
+        find.replacing |= replacing;
+        find.focus = true;
+    }
+
+    /// Где в тексте найденное (байты).
+    fn found(&self) -> Vec<std::ops::Range<usize>> {
+        match &self.find {
+            Some(f) if !f.query.is_empty() => self
+                .text
+                .match_indices(f.query.as_str())
+                .map(|(i, m)| i..i + m.len())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Следующее (или прошлое) найденное от курсора: выделить и показать.
+    fn find_next(&mut self, ctx: &egui::Context, back: bool) {
+        let found = self.found();
+        if found.is_empty() {
+            return;
+        }
+        let at = egui::TextEdit::load_state(ctx, self.text_id())
+            .and_then(|s| s.cursor.char_range())
+            .map_or(0, |r| byte_of(&self.text, r.primary.index.0));
+        let pick = if back {
+            found.iter().rev().find(|r| r.end < at).or(found.last())
+        } else {
+            found.iter().find(|r| r.start >= at).or(found.first())
+        };
+        if let Some(r) = pick.cloned() {
+            let line = self.text[..r.start].matches('\n').count() + 1;
+            self.jump = Some((line, r));
+        }
+    }
+
+    /// Полоса поиска и замены над кодом.
+    fn find_bar(&mut self, ui: &mut Ui) {
+        let Some(mut find) = self.find.clone() else {
+            return;
+        };
+        let ctx = ui.ctx().clone();
+        let n = self.found().len();
+        let mut next = None;
+        let mut replace_one = false;
+        let mut replace_all = false;
+        let mut close = false;
+        Frame::NONE
+            .fill(PANEL)
+            .inner_margin(Margin::symmetric(GAP_XL as i8, GAP_M as i8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Найти").small().color(MUTED));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut find.query)
+                            .id(egui::Id::unique("code-find"))
+                            .desired_width(220.0),
+                    );
+                    if find.focus {
+                        r.request_focus();
+                        find.focus = false;
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        next = Some(ui.input(|i| i.modifiers.shift));
+                        r.request_focus();
+                    }
+                    let count = if find.query.is_empty() {
+                        String::new()
+                    } else if n == 0 {
+                        "не найдено".to_owned()
+                    } else {
+                        format!("найдено: {n}")
+                    };
+                    ui.label(
+                        RichText::new(count)
+                            .small()
+                            .color(if n == 0 { BAD } else { MUTED }),
+                    );
+                    if ui
+                        .small_button("↑")
+                        .on_hover_text("Прошлое (Shift+Enter)")
+                        .clicked()
+                    {
+                        next = Some(true);
+                    }
+                    if ui
+                        .small_button("↓")
+                        .on_hover_text("Следующее (Enter)")
+                        .clicked()
+                    {
+                        next = Some(false);
+                    }
+                    if !find.replacing && ui.small_button("Заменить…").clicked() {
+                        find.replacing = true;
+                    }
+                    if ui
+                        .small_button("✕")
+                        .on_hover_text("Закрыть (Esc)")
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+                if find.replacing {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("На").small().color(MUTED));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut find.replace)
+                                .id(egui::Id::unique("code-replace"))
+                                .desired_width(220.0),
+                        );
+                        if ui
+                            .small_button("Заменить")
+                            .on_hover_text("Выделенное найденное")
+                            .clicked()
+                        {
+                            replace_one = true;
+                        }
+                        if ui.small_button("Заменить все").clicked() {
+                            replace_all = true;
+                        }
+                    });
+                }
+            });
+        if close {
+            self.find = None;
+            return;
+        }
+        self.find = Some(find.clone());
+        if replace_all && n > 0 {
+            self.text = self.text.replace(&find.query, &find.replace);
+            self.edited_at = ui.input(|i| i.time);
+            self.out
+                .push(CodeOut::Log(TEXT_DIM, format!("Заменено: {n}")));
+        } else if replace_one {
+            let picked = egui::TextEdit::load_state(&ctx, self.text_id())
+                .and_then(|s| s.cursor.char_range())
+                .map(|r| {
+                    let (a, b) = (r.primary.index.0, r.secondary.index.0);
+                    (byte_of(&self.text, a.min(b)), byte_of(&self.text, a.max(b)))
+                });
+            if let Some((a, b)) = picked
+                && self.text[a..b] == find.query
+            {
+                self.text.replace_range(a..b, &find.replace);
+                self.place_cursor(&ctx, self.text_id(), a + find.replace.len());
+                self.edited_at = ui.input(|i| i.time);
+            }
+            self.find_next(&ctx, false);
+        } else if let Some(back) = next {
+            self.find_next(&ctx, back);
+        }
+    }
+
+    /// Окошко «Перейти к строке».
+    fn goto_bar(&mut self, ui: &mut Ui) {
+        let Some(mut text) = self.goto_input.clone() else {
+            return;
+        };
+        let mut go = None;
+        Frame::NONE
+            .fill(PANEL)
+            .inner_margin(Margin::symmetric(GAP_XL as i8, GAP_M as i8))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Перейти к строке").small().color(MUTED));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut text)
+                            .id(egui::Id::unique("code-goto"))
+                            .desired_width(80.0),
+                    );
+                    if !r.has_focus() && !r.lost_focus() {
+                        r.request_focus();
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        go = text.trim().parse::<usize>().ok();
+                    }
+                });
+            });
+        self.goto_input = Some(text);
+        if let Some(line) = go {
+            self.goto_input = None;
+            self.go_line(line.max(1));
+        }
+    }
+
     /// Код: номера строк, текст с подсветкой, подсветка строки с ошибкой, подсказка.
     fn code(&mut self, ui: &mut Ui) {
         let id = self.text_id();
@@ -349,16 +611,39 @@ impl CodeEditor {
         let digits = lines.to_string().len().max(2);
         let char_w = ui.fonts_mut(|f| f.glyph_width(&font, '0'));
         let gutter_w = digits as f32 * char_w + 2.0 * GAP_XL;
-        let goto = self.goto.take();
+        self.find_bar(ui);
+        self.goto_bar(ui);
+        let found = self.found();
+        let jump = self.jump.take();
         let mut scroll = egui::ScrollArea::both()
             .id_salt("code-scroll")
             .auto_shrink(false);
-        if let Some(line) = goto {
+        if let Some((line, _)) = &jump {
+            let line = *line;
             // Строку с ошибкой — в середину окна.
             let y = (line.saturating_sub(1) as f32 * row_h - ui.available_height() / 2.0).max(0.0);
             scroll = scroll.vertical_scroll_offset(y);
         }
         let problem_line = self.problem.as_ref().map_or(0, |p| p.line);
+        let warn_lines: Vec<usize> = self.warnings.iter().map(|w| w.line).collect();
+        let warn_ranges: Vec<std::ops::Range<usize>> =
+            self.warnings.iter().map(|w| w.range.clone()).collect();
+        // Что подсветить у курсора (по прошлому кадру): то же имя и пару блока.
+        let cursor_byte = egui::TextEdit::load_state(ui.ctx(), id)
+            .and_then(|s| s.cursor.char_range())
+            .filter(|r| r.primary.index == r.secondary.index)
+            .map(|r| byte_of(&self.text, r.primary.index.0));
+        let (same, pair) = match cursor_byte.filter(|_| focused) {
+            Some(at) => (
+                luau_text::word_at(&self.text, at)
+                    .map(|(w, _)| luau_text::same_words(&self.text, &w))
+                    .filter(|v| v.len() > 1)
+                    .unwrap_or_default(),
+                luau_text::pair_at(&self.text, at),
+            ),
+            None => (Vec::new(), None),
+        };
+        let mut hover_text = None;
         let mut edited = false;
         let mut cursor_after = None;
         let mut popup_at = None;
@@ -385,6 +670,47 @@ impl CodeEditor {
                 edited = output.response.changed();
                 cursor_after = output.cursor_range;
                 let p = ui.painter();
+                // Подсветка мест: прямоугольник куска текста (в одну строку).
+                let galley = output.galley.clone();
+                let origin = output.galley_pos;
+                let text_now = self.text.clone();
+                let rect_of = |r: &std::ops::Range<usize>| {
+                    let a = text_now[..r.start.min(text_now.len())].chars().count();
+                    let b = text_now[..r.end.min(text_now.len())].chars().count();
+                    let ra = galley.pos_from_cursor(CCursor::new(a));
+                    let rb = galley.pos_from_cursor(CCursor::new(b));
+                    Rect::from_min_max(origin + ra.min.to_vec2(), origin + vec2(rb.max.x, ra.max.y))
+                };
+                for r in &found {
+                    p.rect_filled(rect_of(r), 2, ACCENT.gamma_multiply(0.22));
+                }
+                for r in &same {
+                    p.rect_filled(rect_of(r), 2, SELECT.gamma_multiply(0.22));
+                }
+                if let Some((a, b)) = &pair {
+                    for r in [a, b] {
+                        p.rect_stroke(
+                            rect_of(r).expand(1.0),
+                            2,
+                            Stroke::new(LINE, ACCENT),
+                            egui::StrokeKind::Outside,
+                        );
+                    }
+                }
+                for r in &warn_ranges {
+                    zigzag(p, rect_of(r), WARN);
+                }
+                // Подсказка при наведении на слово.
+                if let Some(pos) = output.response.hover_pos() {
+                    let c = galley.cursor_from_pos(pos - origin);
+                    let at = byte_of(&self.text, c.index.0);
+                    hover_text = luau_text::hover(&self.text, at).or_else(|| {
+                        self.warnings
+                            .iter()
+                            .find(|w| w.range.start <= at && at < w.range.end)
+                            .map(|w| w.text.clone())
+                    });
+                }
                 p.rect_filled(gutter, 0, PANEL);
                 // Номера строк: по строкам раскладки (перенос выключен — строка = ряд).
                 let mut line = 1;
@@ -395,6 +721,8 @@ impl CodeEditor {
                     if new_line {
                         let color = if line == problem_line {
                             BAD
+                        } else if warn_lines.contains(&line) {
+                            WARN
                         } else if line == cur_line {
                             TEXT
                         } else {
@@ -426,9 +754,21 @@ impl CodeEditor {
                 }
             });
         });
-        if let Some(line) = goto {
-            self.place_cursor(ui, id, line_start(&self.text, line));
+        if let Some((_, range)) = jump {
+            self.select(ui.ctx(), id, range);
             ui.memory_mut(|m| m.request_focus(id));
+        }
+        if let Some(text) = hover_text {
+            egui::Tooltip::always_open(
+                ui.ctx().clone(),
+                ui.layer_id(),
+                egui::Id::unique("code-hover"),
+                egui::PopupAnchor::Pointer,
+            )
+            .show(|ui| {
+                ui.set_max_width(360.0);
+                ui.label(RichText::new(text).small());
+            });
         }
         if edited {
             self.edited_at = ui.input(|i| i.time);
@@ -483,36 +823,124 @@ impl CodeEditor {
                 let popup = self.popup.take().unwrap_or_else(|| unreachable!());
                 let at = byte_of(&self.text, range.primary.index.0);
                 self.text
-                    .replace_range(popup.at..at, popup.items[popup.pick]);
+                    .replace_range(popup.at..at, &popup.items[popup.pick]);
                 let end = popup.at + popup.items[popup.pick].len();
-                self.place_cursor(ui, id, end);
+                self.place_cursor(ui.ctx(), id, end);
                 self.edited_at = ui.input(|i| i.time);
             }
             return;
         }
         let one = range.primary.index.0 == range.secondary.index.0;
+        let (sel_a, sel_b) = {
+            let (a, b) = (range.primary.index.0, range.secondary.index.0);
+            (byte_of(&self.text, a.min(b)), byte_of(&self.text, a.max(b)))
+        };
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Slash)) {
+            let (text, end) = luau_text::toggle_comment(&self.text, sel_a, sel_b);
+            self.text = text;
+            self.place_cursor(&ctx, id, end);
+            self.edited_at = ui.input(|i| i.time);
+            return;
+        }
+        // Скобки и кавычки закрываются сами; выделенное берётся в них.
+        let typed = ctx.input_mut(|i| {
+            let at = i.events.iter().position(|e| {
+                matches!(e, egui::Event::Text(t) if matches!(t.as_str(), "(" | "[" | "{" | "\"" | "'" | ")" | "]" | "}"))
+            })?;
+            match i.events.remove(at) {
+                egui::Event::Text(t) => Some(t),
+                _ => None,
+            }
+        });
+        if let Some(t) = typed {
+            self.type_pair(&ctx, id, &t, sel_a, sel_b);
+            self.edited_at = ui.input(|i| i.time);
+        }
         if one && k(Key::Tab) {
             let at = byte_of(&self.text, range.primary.index.0);
             self.text.insert_str(at, "    ");
-            self.place_cursor(ui, id, at + 4);
+            self.place_cursor(ui.ctx(), id, at + 4);
             self.edited_at = ui.input(|i| i.time);
         }
         if one && k(Key::Enter) {
             let at = byte_of(&self.text, range.primary.index.0);
-            let line = &self.text[line_start_of(&self.text, at)..at];
-            let insert = format!("\n{}", luau_text::next_indent(line));
+            let line = self.text[line_start_of(&self.text, at)..at].to_owned();
+            let indent = luau_text::next_indent(&line);
+            let base: String = line
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            let code = line.split("--").next().unwrap_or("").trim_end();
+            let opens_block = code.ends_with("then")
+                || code.ends_with("do")
+                || (code.contains("function") && code.ends_with(')'));
+            let rest_empty = self.text[at..]
+                .split('\n')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .is_empty();
+            let insert = format!("\n{indent}");
             self.text.insert_str(at, &insert);
-            self.place_cursor(ui, id, at + insert.len());
+            // Новый блок без end: end ставится сам, курсор — внутрь блока.
+            if opens_block && rest_empty && luau_text::needs_end(&self.text) {
+                self.text
+                    .insert_str(at + insert.len(), &format!("\n{base}end"));
+            }
+            self.place_cursor(&ctx, id, at + insert.len());
             self.edited_at = ui.input(|i| i.time);
         }
     }
 
+    /// Набрали скобку или кавычку.
+    fn type_pair(&mut self, ctx: &egui::Context, id: egui::Id, t: &str, a: usize, b: usize) {
+        let close = match t {
+            "(" => Some(")"),
+            "[" => Some("]"),
+            "{" => Some("}"),
+            "\"" | "'" => Some(t),
+            _ => None,
+        };
+        let next = self.text[b..].chars().next();
+        // Закрывающая, а следом уже такая же: просто шагнуть через неё.
+        if a == b
+            && next.is_some_and(|c| c.to_string() == t)
+            && (close.is_none() || close == Some(t))
+        {
+            self.place_cursor(ctx, id, b + t.len());
+            return;
+        }
+        match close {
+            Some(c) if a != b => {
+                let inner = self.text[a..b].to_owned();
+                self.text.replace_range(a..b, &format!("{t}{inner}{c}"));
+                self.select(ctx, id, a + t.len()..b + t.len());
+            }
+            // Пара только перед пробелом, концом строки или закрывающей.
+            Some(c) if next.is_none_or(|n| n.is_whitespace() || ")]},".contains(n)) => {
+                self.text.insert_str(a, &format!("{t}{c}"));
+                self.place_cursor(ctx, id, a + t.len());
+            }
+            _ => {
+                self.text.replace_range(a..b, t);
+                self.place_cursor(ctx, id, a + t.len());
+            }
+        }
+    }
+
     /// Поставить курсор на байт `at`.
-    fn place_cursor(&self, ui: &Ui, id: egui::Id, at: usize) {
-        let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-        let c = CCursor::new(self.text[..at.min(self.text.len())].chars().count());
-        state.cursor.set_char_range(Some(CCursorRange::one(c)));
-        state.store(ui.ctx(), id);
+    fn place_cursor(&self, ctx: &egui::Context, id: egui::Id, at: usize) {
+        self.select(ctx, id, at..at);
+    }
+
+    /// Выделить кусок (байты).
+    fn select(&self, ctx: &egui::Context, id: egui::Id, r: std::ops::Range<usize>) {
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+        let chars = |b: usize| CCursor::new(self.text[..b.min(self.text.len())].chars().count());
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::two(chars(r.start), chars(r.end))));
+        state.store(ctx, id);
     }
 
     /// Список подсказки под курсором; щелчок выбирает.
@@ -533,10 +961,10 @@ impl CodeEditor {
                             let about = ME
                                 .iter()
                                 .chain(HERO.iter())
-                                .find(|h| h.name == *name)
+                                .find(|h| h.name == name.as_str())
                                 .map_or("", |h| h.about);
                             let picked = i == popup.pick;
-                            let text = RichText::new(*name).monospace().color(if picked {
+                            let text = RichText::new(name.as_str()).monospace().color(if picked {
                                 Color32::WHITE
                             } else {
                                 TEXT
@@ -565,8 +993,8 @@ impl CodeEditor {
             && let Some(range) = state.cursor.char_range()
         {
             let at = byte_of(&self.text, range.primary.index.0);
-            self.text.replace_range(popup.at..at, popup.items[i]);
-            self.place_cursor(ui, id, popup.at + popup.items[i].len());
+            self.text.replace_range(popup.at..at, &popup.items[i]);
+            self.place_cursor(ui.ctx(), id, popup.at + popup.items[i].len());
             self.popup = None;
             ui.memory_mut(|m| m.request_focus(id));
         }
@@ -632,7 +1060,7 @@ fn hint_list(ui: &mut Ui, title: &str, hints: &[Hint], legend: bool) {
     for h in hints {
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = GAP_M;
-            let color = if h.write { ACCENT } else { SELECT };
+            let color = if h.by_script { ACCENT } else { SELECT };
             let (r, _) = ui.allocate_exact_size(vec2(84.0, 16.0), Sense::hover());
             ui.painter().text(
                 r.left_center(),
@@ -646,11 +1074,34 @@ fn hint_list(ui: &mut Ui, title: &str, hints: &[Hint], legend: bool) {
     }
     if legend {
         ui.label(
+            RichText::new("Свои поля можно хранить тут же: me.home, me.dir")
+                .small()
+                .color(TEXT_DIM),
+        );
+        ui.label(
             RichText::new("синие даёт движок, оранжевые пишет скрипт")
                 .small()
                 .color(MUTED),
         );
     }
+}
+
+/// Цвет предупреждения (похоже на опечатку).
+const WARN: Color32 = FILE_SOUND;
+
+/// Волнистая черта под куском текста.
+fn zigzag(p: &egui::Painter, r: Rect, color: Color32) {
+    let y = r.bottom() - 1.0;
+    let step = 3.0;
+    let mut x = r.left();
+    let mut up = true;
+    let mut points = vec![pos2(x, y)];
+    while x < r.right() {
+        x = (x + step).min(r.right());
+        points.push(pos2(x, if up { y - 2.0 } else { y }));
+        up = !up;
+    }
+    p.add(egui::Shape::line(points, Stroke::new(LINE, color)));
 }
 
 /// Цвет куска кода.
@@ -771,19 +1222,24 @@ mod tests {
         ctx.memory_mut(|m| m.request_focus(ed.text_id()));
         let end = ed.text.len();
         frame(&ctx, &mut ed, &mut t, vec![]);
-        ed.place_cursor(&ctx_ui_dummy(&ctx), ed.text_id(), end);
+        ed.place_cursor(&ctx, ed.text_id(), end);
         frame(
             &ctx,
             &mut ed,
             &mut t,
             vec![key(Key::Enter, Modifiers::NONE)],
         );
-        assert!(ed.text.ends_with("then\n        "), "{:?}", ed.text);
+        // Новый if без end: end ставится сам, курсор внутри блока.
+        assert!(
+            ed.text.ends_with("then\n        \n    end"),
+            "{:?}",
+            ed.text
+        );
         // «me.mo» — подсказка «move», Enter вставляет.
         frame(&ctx, &mut ed, &mut t, vec![Event::Text("me.mo".into())]);
         assert_eq!(
             ed.popup.as_ref().map(|p| p.items.clone()),
-            Some(vec!["move"])
+            Some(vec!["move".to_owned()])
         );
         frame(
             &ctx,
@@ -791,14 +1247,12 @@ mod tests {
             &mut t,
             vec![key(Key::Enter, Modifiers::NONE)],
         );
-        assert!(ed.text.ends_with("me.move"), "{:?}", ed.text);
+        assert!(ed.text.ends_with("me.move\n    end"), "{:?}", ed.text);
         assert!(ed.popup.is_none());
-        frame(
-            &ctx,
-            &mut ed,
-            &mut t,
-            vec![Event::Text(" = 1\n    end\nend".into())],
-        );
+        frame(&ctx, &mut ed, &mut t, vec![Event::Text(" = 1".into())]);
+        let end = ed.text.len();
+        ed.place_cursor(&ctx, ed.text_id(), end);
+        frame(&ctx, &mut ed, &mut t, vec![Event::Text("\nend".into())]);
         // Проверка ждёт, пока перестанут печатать.
         for _ in 0..10 {
             frame(&ctx, &mut ed, &mut t, vec![]);
@@ -828,13 +1282,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Ui для вызова помощников вне кадра.
-    fn ctx_ui_dummy(ctx: &egui::Context) -> Ui {
-        Ui::new(
-            ctx.clone(),
-            egui::Id::unique("code-test-ui"),
-            egui::UiBuilder::new(),
-        )
+    /// Скобки закрываются сами, Ctrl+/ комментирует строку, Ctrl+H меняет все, Ctrl+G
+    /// ставит курсор на строку, опечатка в поле видна предупреждением.
+    #[test]
+    fn pairs_comment_find_goto_and_warnings() {
+        let dir = std::env::temp_dir().join(format!("reyvec-code2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("монета.luau");
+        std::fs::write(&file, "function update(me, hero, dt)\n    me.y = 1\nend\n").unwrap();
+        let ctx = ctx();
+        let mut ed = CodeEditor::open(&file, Some(&dir)).unwrap();
+        let mut t = 0.0;
+        let id = ed.text_id();
+        frame(&ctx, &mut ed, &mut t, vec![]);
+        ctx.memory_mut(|m| m.request_focus(id));
+        frame(&ctx, &mut ed, &mut t, vec![]);
+        // В конец второй строки: «print(» даёт «print()», курсор внутри.
+        let at = ed.text.find(" = 1").unwrap() + 4;
+        ed.place_cursor(&ctx, id, at);
+        frame(&ctx, &mut ed, &mut t, vec![Event::Text(" print".into())]);
+        frame(&ctx, &mut ed, &mut t, vec![Event::Text("(".into())]);
+        frame(&ctx, &mut ed, &mut t, vec![Event::Text("me.mvoe".into())]);
+        frame(&ctx, &mut ed, &mut t, vec![Event::Text(")".into())]);
+        assert!(
+            ed.text.contains("me.y = 1 print(me.mvoe)\n"),
+            "{:?}",
+            ed.text
+        );
+        for _ in 0..10 {
+            frame(&ctx, &mut ed, &mut t, vec![]);
+        }
+        assert_eq!(ed.problem, None);
+        assert_eq!(ed.warnings.len(), 1);
+        assert!(ed.warnings[0].text.contains("move"), "{:?}", ed.warnings);
+        // Ctrl+/ — строка закомментирована, ещё раз — обратно.
+        let before = ed.text.clone();
+        frame(
+            &ctx,
+            &mut ed,
+            &mut t,
+            vec![key(Key::Slash, Modifiers::COMMAND)],
+        );
+        assert!(ed.text.contains("    -- me.y = 1"), "{:?}", ed.text);
+        frame(
+            &ctx,
+            &mut ed,
+            &mut t,
+            vec![key(Key::Slash, Modifiers::COMMAND)],
+        );
+        assert_eq!(ed.text, before);
+        // Ctrl+H: «mvoe» на «move» везде.
+        frame(&ctx, &mut ed, &mut t, vec![key(Key::H, Modifiers::COMMAND)]);
+        let f = ed.find.as_mut().unwrap();
+        assert!(f.replacing);
+        f.query = "mvoe".into();
+        f.replace = "move".into();
+        assert_eq!(ed.found().len(), 1);
+        ed.text = ed.text.replace("mvoe", "move");
+        for _ in 0..10 {
+            frame(&ctx, &mut ed, &mut t, vec![]);
+        }
+        assert!(ed.warnings.is_empty());
+        frame(
+            &ctx,
+            &mut ed,
+            &mut t,
+            vec![key(Key::Escape, Modifiers::NONE)],
+        );
+        assert!(
+            ed.find.is_none() && !ed.asking_close,
+            "Esc закрывает поиск, а не скрипт"
+        );
+        // Ctrl+G 3 Enter — курсор в начале третьей строки.
+        frame(&ctx, &mut ed, &mut t, vec![key(Key::G, Modifiers::COMMAND)]);
+        frame(&ctx, &mut ed, &mut t, vec![]);
+        frame(&ctx, &mut ed, &mut t, vec![Event::Text("3".into())]);
+        frame(
+            &ctx,
+            &mut ed,
+            &mut t,
+            vec![key(Key::Enter, Modifiers::NONE)],
+        );
+        frame(&ctx, &mut ed, &mut t, vec![]);
+        frame(&ctx, &mut ed, &mut t, vec![]);
+        assert!(ed.goto_input.is_none());
+        assert_eq!(ed.at.0, 3, "курсор на третьей строке");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
