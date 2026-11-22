@@ -101,6 +101,20 @@ pub fn model_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(dir.join("models").join(format!("{name}{EXTENSION}")))
 }
 
+/// Путь к файлу глины `name` (`"кузница/заготовка.clay"`) для сцены из папки `dir`.
+pub fn clay_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(name);
+    let plain = name.ends_with(crate::clay::EXTENSION)
+        && rel.components().all(|c| matches!(c, Component::Normal(_)));
+    if !plain {
+        return Err(format!(
+            "глина «{name}»: имя файла *.clay без «..» и без начала с корня, например \
+             \"кузница/заготовка.clay\""
+        ));
+    }
+    Ok(dir.join("models").join(name))
+}
+
 /// Подставляет модели в формы одной сцены: читает каждый файл один раз и дописывает
 /// материалы моделей в список сцены.
 pub struct Resolver<'a> {
@@ -111,7 +125,9 @@ pub struct Resolver<'a> {
     read: HashMap<String, (Shape3, Vec<ModelParam>)>,
     /// Модель с ручками → готовое дерево.
     done: HashMap<(String, Vec<(String, u32)>), Shape3>,
-    /// Файлы прочитанных моделей (для слежки за сохранением).
+    /// Глина (М.9) по имени файла: один кирпич на файл, сколько бы копий ни было.
+    clay: HashMap<String, crate::brick3d::BrickRef>,
+    /// Файлы прочитанных моделей и глины (для слежки за сохранением).
     pub files: Vec<PathBuf>,
 }
 
@@ -124,6 +140,7 @@ impl<'a> Resolver<'a> {
             materials,
             read: HashMap::new(),
             done: HashMap::new(),
+            clay: HashMap::new(),
             files: Vec::new(),
         }
     }
@@ -138,6 +155,11 @@ impl<'a> Resolver<'a> {
             Shape3::Use { model, params } => {
                 let (model, params) = (model.clone(), params.clone());
                 *shape = self.load(&model, &params, chain)?;
+                Ok(())
+            }
+            Shape3::Clay { file } => {
+                let brick = self.clay(&file.clone())?;
+                *shape = Shape3::Brick { brick };
                 Ok(())
             }
             Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => {
@@ -193,6 +215,22 @@ impl<'a> Resolver<'a> {
         walked.map_err(|e| format!("модель «{name}»: {e}"))?;
         self.done.insert(key, shape.clone());
         Ok(shape)
+    }
+
+    /// Глина из файла `models/<name>`: читается один раз.
+    fn clay(&mut self, name: &str) -> Result<crate::brick3d::BrickRef, String> {
+        if let Some(b) = self.clay.get(name) {
+            return Ok(b.clone());
+        }
+        let path = clay_path(&self.dir, name)?;
+        let bytes = std::fs::read(&path)
+            .map_err(|e| format!("глина «{name}»: не прочитать {}: {e}", path.display()))?;
+        let brick = crate::brick3d::Brick::from_clay_bytes(&bytes)
+            .map_err(|e| format!("глина «{name}»: {e}"))?;
+        let b = crate::brick3d::BrickRef(std::sync::Arc::new(brick));
+        self.files.push(path);
+        self.clay.insert(name.to_string(), b.clone());
+        Ok(b)
     }
 
     /// Файл модели: читается один раз, его материалы дописываются в список сцены.
@@ -454,6 +492,46 @@ mod tests {
         assert!(e.contains("нет ручки «ширина», есть: длина"), "{e}");
         let e = one(r#"(material: "лента", shape: Use(model: "плохой"))"#).unwrap_err();
         assert!(e.contains("модель «плохой»") && e.contains("[5]"), "{e}");
+    }
+
+    #[test]
+    fn clay_is_read_once_and_its_brick_goes_to_the_scene() {
+        let t = TempScene::new(
+            "clay",
+            &[(
+                "кузница/заготовка",
+                "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [\
+                 Clay(file: \"кузница/заготовка.clay\"), \
+                 Move(at: (0.5, 0, 0), shape: Clay(file: \"кузница/заготовка.clay\"))]))",
+            )],
+        );
+        let ball = crate::brick3d::Brick::from_shape(&Shape3::Sphere { radius: 0.1 }, 32).unwrap();
+        let path = clay_path(&t.0, "кузница/заготовка.clay").unwrap();
+        std::fs::write(&path, ball.to_clay_bytes()).unwrap();
+        let text = scene(
+            "(name: \"сталь\", color: (0.5, 0.5, 0.5))",
+            "(material: \"сталь\", shape: Use(model: \"кузница/заготовка\")), \
+             (material: \"сталь\", at: (0, 1, 0), shape: Clay(file: \"кузница/заготовка.clay\"))",
+        );
+        let s = SpaceScene::parse_in(&text, Some(&t.0)).unwrap();
+        // Один файл — один кирпич на видеокарту, сколько бы копий ни было.
+        assert_eq!(s.bricks.len(), 1);
+        assert!(s.model_files.contains(&path));
+        let frame = s.frame(0.0);
+        let d = frame.shapes[1].distance(Vec3::new(0.0, 1.1, 0.0));
+        assert!(d.abs() < 0.01, "{d}");
+        // Плохое имя и плохой файл — понятные ошибки.
+        let bad = scene(
+            "(name: \"сталь\", color: (0.5, 0.5, 0.5))",
+            "(material: \"сталь\", shape: Clay(file: \"../x.clay\"))",
+        );
+        assert!(
+            SpaceScene::parse_in(&bad, Some(&t.0))
+                .unwrap_err()
+                .contains("глина")
+        );
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(SpaceScene::parse_in(&text, Some(&t.0)).is_err());
     }
 
     #[test]
