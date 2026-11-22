@@ -140,6 +140,7 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         watcher: None,
         controls: Controls::load(&controls_path()),
         start: Instant::now(),
+        anim: AnimClock::default(),
         frames: 0,
         stats_at: Instant::now(),
         stats_frames: 0,
@@ -218,6 +219,8 @@ struct Editor {
     /// Клавиши героя из настроек игрока (`controls.ron`), как в песочнице.
     controls: Controls,
     start: Instant,
+    /// Время анимации сцены: идёт только в игре и симуляции.
+    anim: AnimClock,
     frames: u64,
     stats_at: Instant,
     stats_frames: u32,
@@ -1323,7 +1326,8 @@ impl Editor {
         });
         renderer.set_view_rect(view_rect);
         let size = window.inner_size();
-        let time = self.start.elapsed().as_secs_f32();
+        // В правке и на паузе анимация сцены стоит: кадр тот же, движку меньше работы.
+        let time = self.anim.tick(self.play == PlayState::Playing);
         match renderer.render([size.width, size.height], time, Some(ui_frame)) {
             Ok(FrameStatus::Presented) => {
                 self.frames += 1;
@@ -1584,9 +1588,60 @@ fn engine_text(text: &str, hidden: &HashSet<Vec<usize>>) -> String {
     out
 }
 
+/// Часы анимации сцены (покачивания, круги, вращения): идут, только пока играют или
+/// симулируют. В правке сцена замирает на последнем кадре игры, а движок не пересчитывает
+/// движущиеся предметы каждый кадр.
+#[derive(Debug)]
+struct AnimClock {
+    time: f32,
+    last: Instant,
+}
+
+impl Default for AnimClock {
+    fn default() -> Self {
+        Self {
+            time: 0.0,
+            last: Instant::now(),
+        }
+    }
+}
+
+impl AnimClock {
+    /// Время для этого кадра; `running` — идёт ли сейчас время сцены.
+    fn tick(&mut self, running: bool) -> f32 {
+        self.tick_at(Instant::now(), running)
+    }
+
+    fn tick_at(&mut self, now: Instant, running: bool) -> f32 {
+        if running {
+            // Долгий кадр (окно тянули, отладчик) не перескакивает анимацию.
+            let dt = now
+                .saturating_duration_since(self.last)
+                .as_secs_f32()
+                .min(0.25);
+            self.time += dt;
+        }
+        self.last = now;
+        self.time
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scene_animation_stands_still_while_editing() {
+        let mut c = AnimClock::default();
+        let t0 = c.last;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(c.tick_at(at(100), false), 0.0);
+        assert!((c.tick_at(at(200), true) - 0.1).abs() < 1e-6);
+        assert!((c.tick_at(at(300), true) - 0.2).abs() < 1e-6);
+        // Стоп: время замирает и после не прыгает на простой.
+        assert!((c.tick_at(at(5000), false) - 0.2).abs() < 1e-6);
+        assert!((c.tick_at(at(5100), true) - 0.3).abs() < 1e-6);
+    }
 
     #[test]
     fn hidden_nodes_leave_engine_text() {
