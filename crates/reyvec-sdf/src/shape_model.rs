@@ -26,12 +26,17 @@
 //! именами `«модель/материал»` (один раз на модель), а номера в `Paint` сдвигаются.
 //! Части модели без `Paint` красятся материалом предмета сцены, как обычно. Модель может
 //! ссылаться на другие модели (вложенность не глубже [`MAX_NESTING`], без кругов).
+//!
+//! Ручки (М.6, [`crate::shape_param`]): `Use(model: "имя", params: {"длина": 2.4})`
+//! берёт копию дерева модели и сдвигает связанные с ручками числа. Копии с одинаковыми
+//! ручками раскрываются один раз.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::shape_param::ModelParam;
 use crate::shape3d::Shape3;
 use crate::space_file::MaterialEntry;
 
@@ -50,6 +55,9 @@ pub struct ModelFile {
     pub version: u32,
     #[serde(default)]
     pub materials: Vec<MaterialEntry>,
+    /// Ручки модели (М.6, [`crate::shape_param`]).
+    #[serde(default)]
+    pub params: Vec<ModelParam>,
     pub shape: Shape3,
 }
 
@@ -76,6 +84,7 @@ impl ModelFile {
                 file.materials.len()
             ));
         }
+        crate::shape_param::check(&file.shape, &file.params)?;
         Ok(file)
     }
 }
@@ -97,8 +106,11 @@ pub fn model_path(dir: &Path, name: &str) -> Result<PathBuf, String> {
 pub struct Resolver<'a> {
     dir: PathBuf,
     materials: &'a mut Vec<MaterialEntry>,
-    /// Модель → её дерево с уже сдвинутыми номерами материалов и раскрытыми ссылками.
-    done: HashMap<String, Shape3>,
+    /// Модель → её дерево из файла (номера материалов уже сдвинуты, ссылки внутри не
+    /// раскрыты) и её ручки.
+    read: HashMap<String, (Shape3, Vec<ModelParam>)>,
+    /// Модель с ручками → готовое дерево.
+    done: HashMap<(String, Vec<(String, u32)>), Shape3>,
     /// Файлы прочитанных моделей (для слежки за сохранением).
     pub files: Vec<PathBuf>,
 }
@@ -110,6 +122,7 @@ impl<'a> Resolver<'a> {
         Self {
             dir: dir.map_or_else(|| PathBuf::from("."), Path::to_path_buf),
             materials,
+            read: HashMap::new(),
             done: HashMap::new(),
             files: Vec::new(),
         }
@@ -122,9 +135,9 @@ impl<'a> Resolver<'a> {
 
     fn walk(&mut self, shape: &mut Shape3, chain: &mut Vec<String>) -> Result<(), String> {
         match shape {
-            Shape3::Use { model } => {
-                let model = model.clone();
-                *shape = self.load(&model, chain)?;
+            Shape3::Use { model, params } => {
+                let (model, params) = (model.clone(), params.clone());
+                *shape = self.load(&model, &params, chain)?;
                 Ok(())
             }
             Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => {
@@ -143,8 +156,20 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn load(&mut self, name: &str, chain: &mut Vec<String>) -> Result<Shape3, String> {
-        if let Some(done) = self.done.get(name) {
+    fn load(
+        &mut self,
+        name: &str,
+        values: &BTreeMap<String, f32>,
+        chain: &mut Vec<String>,
+    ) -> Result<Shape3, String> {
+        let key = (
+            name.to_string(),
+            values
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_bits()))
+                .collect(),
+        );
+        if let Some(done) = self.done.get(&key) {
             return Ok(done.clone());
         }
         if chain.iter().any(|n| n == name) {
@@ -159,25 +184,36 @@ impl<'a> Resolver<'a> {
                 chain.join(" → ")
             ));
         }
-        let path = model_path(&self.dir, name)?;
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("модель «{name}»: не прочитать {}: {e}", path.display()))?;
-        let file = ModelFile::parse(&text).map_err(|e| format!("модель «{name}»: {e}"))?;
-        self.files.push(path);
-        let base = self.materials.len() as u32;
-        for m in &file.materials {
-            let mut m = m.clone();
-            m.name = format!("{name}/{}", m.name);
-            self.materials.push(m);
-        }
-        let mut shape = file.shape;
-        shift_paint(&mut shape, base);
+        let (mut shape, params) = self.read(name)?.clone();
+        crate::shape_param::apply(&mut shape, &params, values)
+            .map_err(|e| format!("модель «{name}»: {e}"))?;
         chain.push(name.to_string());
         let walked = self.walk(&mut shape, chain);
         chain.pop();
         walked.map_err(|e| format!("модель «{name}»: {e}"))?;
-        self.done.insert(name.to_string(), shape.clone());
+        self.done.insert(key, shape.clone());
         Ok(shape)
+    }
+
+    /// Файл модели: читается один раз, его материалы дописываются в список сцены.
+    fn read(&mut self, name: &str) -> Result<&(Shape3, Vec<ModelParam>), String> {
+        if !self.read.contains_key(name) {
+            let path = model_path(&self.dir, name)?;
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("модель «{name}»: не прочитать {}: {e}", path.display()))?;
+            let file = ModelFile::parse(&text).map_err(|e| format!("модель «{name}»: {e}"))?;
+            self.files.push(path);
+            let base = self.materials.len() as u32;
+            for m in &file.materials {
+                let mut m = m.clone();
+                m.name = format!("{name}/{}", m.name);
+                self.materials.push(m);
+            }
+            let mut shape = file.shape;
+            shift_paint(&mut shape, base);
+            self.read.insert(name.to_string(), (shape, file.params));
+        }
+        Ok(&self.read[name])
     }
 }
 
@@ -230,6 +266,7 @@ fn max_paint(shape: &Shape3, worst: &mut Option<u32>) {
 mod tests {
     use super::*;
     use crate::SpaceScene;
+    use glam::Vec3;
 
     /// Временная папка сцены с файлами моделей; удаляется в конце теста.
     struct TempScene(PathBuf);
@@ -368,9 +405,62 @@ mod tests {
     }
 
     #[test]
+    fn copies_with_different_params() {
+        let model = r#"(format: "reyvec-shape", version: 1,
+            params: [(name: "длина", value: 3.6, min: 1.2, max: 6.0, links: [
+                (part: [0], field: "size.x", per: 1.0),
+                (part: [1], field: "at.x", per: -0.5),
+            ])],
+            shape: Union(shapes: [Box(size: (3.6, 0.12, 0.8)),
+                Move(at: (-1.6, -0.33, 0), shape: Box(size: (0.08, 0.6, 0.08)))]))"#;
+        let short = r#"(format: "reyvec-shape", version: 1, shape: Union(shapes: [
+            Box(size: (2.4, 0.12, 0.8)),
+            Move(at: (-1.0, -0.33, 0), shape: Box(size: (0.08, 0.6, 0.08)))]))"#;
+        let bad = r#"(format: "reyvec-shape", version: 1,
+            params: [(name: "длина", value: 1, min: 0, max: 2, links: [
+                (part: [5], field: "at.x", per: 1.0)])],
+            shape: Sphere(radius: 1))"#;
+        let tmp = TempScene::new(
+            "params",
+            &[("конвейер", model), ("короткий", short), ("плохой", bad)],
+        );
+        let mat = r#"(name: "лента", color: (0.1, 0.1, 0.1))"#;
+        let text = scene(
+            mat,
+            r#"(material: "лента", shape: Use(model: "конвейер", params: {"длина": 2.4})),
+               (material: "лента", shape: Use(model: "короткий")),
+               (material: "лента", shape: Use(model: "конвейер"))"#,
+        );
+        let s = SpaceScene::parse_in(&text, Some(&tmp.0)).unwrap();
+        let f = s.frame(0.0);
+        let close = |a: &Shape3, b: &Shape3| {
+            let pts = [
+                Vec3::new(1.15, 0.0, 0.0),
+                Vec3::new(-1.0, -0.4, 0.0),
+                Vec3::ZERO,
+            ];
+            pts.iter()
+                .all(|&p| (a.distance(p) - b.distance(p)).abs() < 1e-4)
+        };
+        assert!(close(&f.shapes[0], &f.shapes[1]), "ручка укоротила копию");
+        assert!(
+            !close(&f.shapes[0], &f.shapes[2]),
+            "другая копия той же длины, что в файле"
+        );
+        assert_eq!(s.model_files.len(), 2);
+        let one = |obj: &str| SpaceScene::parse_in(&scene(mat, obj), Some(&tmp.0));
+        let e = one(r#"(material: "лента", shape: Use(model: "конвейер", params: {"ширина": 1}))"#)
+            .unwrap_err();
+        assert!(e.contains("нет ручки «ширина», есть: длина"), "{e}");
+        let e = one(r#"(material: "лента", shape: Use(model: "плохой"))"#).unwrap_err();
+        assert!(e.contains("модель «плохой»") && e.contains("[5]"), "{e}");
+    }
+
+    #[test]
     fn unresolved_use_does_not_compile() {
         let e = crate::shape3d::compile(&Shape3::Use {
             model: "станок".into(),
+            params: BTreeMap::new(),
         })
         .unwrap_err();
         assert!(e.to_string().contains("станок"), "{e}");

@@ -1,8 +1,17 @@
-// Конвейер: лента 3,6 м и четыре ножки. Модель цеха factory.ron, собрана скриптом factory.py (CC0).
+// Конвейер: лента 3,6 м и четыре ножки, ручка «длина». Модель цеха factory.ron, собрана скриптом factory.py (CC0).
 // Цвет даёт предмет сцены (material), поэтому своих материалов у модели нет.
 (
     format: "reyvec-shape",
     version: 1,
+    params: [
+        (name: "длина", value: 3.6, min: 1.2, max: 6.0, links: [
+            (part: [0], field: "size.x", per: 1.0),
+            (part: [1], field: "at.x", per: -0.5),
+            (part: [2], field: "at.x", per: -0.5),
+            (part: [3], field: "at.x", per: 0.5),
+            (part: [4], field: "at.x", per: 0.5),
+        ]),
+    ],
     shape: Union(shapes: [
         Box(size: (3.60, 0.12, 0.80), round: 0.02),
         Move(at: (-1.60, -0.33, -0.30), shape: Box(size: (0.08, 0.60, 0.08))),

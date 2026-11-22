@@ -46,16 +46,38 @@ def union(parts):
 models = {}
 
 
-def model(name, shape, about):
-    models[name] = (shape, about)
+def model(name, shape, about, params=""):
+    models[name] = (shape, about, params)
     return f'Use(model: "{name}")'
+
+
+def use(name, **values):
+    """Use of a model with its own parameter values (step M.6)."""
+    vals = ", ".join(f'"{k}": {f(v)}' for k, v in values.items())
+    return f'Use(model: "{name}", params: {{{vals}}})'
+
+
+# The conveyor has a "длина" (length) parameter: the belt grows, the legs move apart.
+CONVEYOR_PARAMS = """    params: [
+        (name: "длина", value: 3.6, min: 1.2, max: 6.0, links: [
+            (part: [0], field: "size.x", per: 1.0),
+            (part: [1], field: "at.x", per: -0.5),
+            (part: [2], field: "at.x", per: -0.5),
+            (part: [3], field: "at.x", per: 0.5),
+            (part: [4], field: "at.x", per: 0.5),
+        ]),
+    ],
+"""
+# Conveyor lengths along a line: the same model, different copies.
+CONVEYOR_LENGTHS = (3.6, 3.0, 2.4)
 
 
 CONVEYOR = model(
     "завод/конвейер",
     union([box((3.6, 0.12, 0.8), 0.02)]
           + [move((dx, -0.33, dz), box((0.08, 0.6, 0.08))) for dx in (-1.6, 1.6) for dz in (-0.3, 0.3)]),
-    "Конвейер: лента 3,6 м и четыре ножки.",
+    "Конвейер: лента 3,6 м и четыре ножки, ручка «длина».",
+    CONVEYOR_PARAMS,
 )
 FAN = model("завод/вентилятор", union([box((0.9, 0.04, 0.12)), box((0.12, 0.04, 0.9))]),
             "Вентилятор: две лопасти крестом.")
@@ -98,7 +120,9 @@ for line in range(LINES):
             f'mesh: Model(file: "models/machine.glb")),'
         )
         # Conveyor: belt and four legs, one object.
-        obj(f"конвейер {tag}", "лента", (x, 0.66, z), CONVEYOR)
+        length = CONVEYOR_LENGTHS[k % len(CONVEYOR_LENGTHS)]
+        conveyor = CONVEYOR if length == 3.6 else use("завод/конвейер", длина=length)
+        obj(f"конвейер {tag}", "лента", (x, 0.66, z), conveyor)
         # Two crates riding the belt back and forth (out of phase).
         for c, shift in enumerate((-0.8, 0.8)):
             period = 4.0 + (k % 5) * 0.37
@@ -181,7 +205,8 @@ header = f"""// Сцена-нагрузка этапа 8 (задача 8.7): ц�
 // в кадре и сколько стоит подготовка кадра на процессоре. Править лучше скрипт.
 // Конвейер, вентилятор, стеллаж и погрузчик — модели форм (М.0): каждая записана один раз в
 // models/завод/*.shape.ron, а предметы ссылаются на неё через Use(model: "завод/…").
-// Правка файла модели сразу меняет все её копии в цеху.
+// Правка файла модели сразу меняет все её копии в цеху. У конвейера есть ручка «длина» (М.6):
+// Use(model: "завод/конвейер", params: {{"длина": 2.40}}) — та же модель, лента короче.
 (
     format: "reyvec-space",
     version: 1,
@@ -202,7 +227,7 @@ text = header + "\n".join(objects) + "\n    ],\n\n    meshes: [\n" + "\n".join(m
 here = os.path.dirname(os.path.abspath(__file__))
 with open(os.path.join(here, "factory.ron"), "w", encoding="utf-8") as out:
     out.write(text)
-for name, (shape, about) in models.items():
+for name, (shape, about, params) in models.items():
     path = os.path.join(here, "models", *name.split("/")) + ".shape.ron"
     os.makedirs(os.path.dirname(path), exist_ok=True)
     assert shape.endswith("])")
@@ -213,7 +238,7 @@ for name, (shape, about) in models.items():
 (
     format: "reyvec-shape",
     version: 1,
-    shape: {pretty},
+{params}    shape: {pretty},
     ]),
 )
 """)
