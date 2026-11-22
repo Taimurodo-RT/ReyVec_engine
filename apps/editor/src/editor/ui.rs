@@ -21,6 +21,7 @@ use super::contour;
 use super::doc::{Change, Edit};
 use super::geom;
 use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
+use super::model_params;
 use super::outline::{self, Kind};
 use super::overlay::{self, Overlay, ViewMode};
 use super::parts;
@@ -160,6 +161,8 @@ pub(crate) enum Action {
     ShapeCamera(ShapeCam),
     /// Спрятать деталь модели на подставке (`true`) или показать (в файл не пишется).
     ShapeHide(Vec<usize>, bool),
+    /// Ручки модели на подставке (М.6, «Посмотреть»): имя → значение, в файл не пишется.
+    ShapePreview(std::collections::BTreeMap<String, f32>),
     /// Разрешение 3D-кадра (во «Формах» — меню «Качество»).
     SpaceScale(reyvec_gpu::SpaceScale),
     /// Режим «треугольники»: формы рисуются сетками (быстрее на слабых видеокартах).
@@ -222,7 +225,13 @@ pub(crate) struct ShapeInfo<'a> {
     pub error: Option<&'a str>,
     /// Текст файла модели (из него — дерево частей и числа инспектора).
     pub text: &'a str,
+    /// Ручки модели на подставке не как в файле (М.6).
+    pub preview: &'a std::collections::BTreeMap<String, f32>,
 }
+
+/// Ручки как в файле (для подставок в тестах и без «Посмотреть»).
+#[cfg(test)]
+static NO_PREVIEW: std::collections::BTreeMap<String, f32> = std::collections::BTreeMap::new();
 
 /// Что интерфейсу показать в этом кадре.
 pub(crate) struct Info<'a> {
@@ -327,6 +336,8 @@ pub(crate) struct EditorUi {
     gizmo_mode: GizmoMode,
     /// Окно контура выдавливания и выточки (М.5).
     contour: ContourUi,
+    /// Карточка «Ручки модели» (М.6).
+    params: ParamsUi,
     /// Деталь под правой кнопкой: для неё меню на подставке.
     shape_menu: Option<Vec<usize>>,
 }
@@ -393,6 +404,7 @@ impl EditorUi {
             gizmo_drag: None,
             gizmo_mode: GizmoMode::Move,
             contour: ContourUi::default(),
+            params: ParamsUi::default(),
             shape_menu: None,
         }
     }
@@ -1430,6 +1442,273 @@ impl EditorUi {
         {
             self.shape_command(text, PartCmd::Remove);
         }
+        self.params_card(ui, shape);
+    }
+
+    /// Карточка «Ручки модели» (М.6): ручки, которые сцена задаёт каждой копии модели,
+    /// «Посмотреть» на подставке и обучение ручки.
+    fn params_card(&mut self, ui: &mut Ui, shape: &ShapeInfo) {
+        use std::collections::BTreeMap;
+        let text = shape.text;
+        let params = model_params::read(text);
+        let st = &mut self.params;
+        if st.teach.as_ref().is_some_and(|t| t.model != shape.name) {
+            st.teach = None;
+        }
+        let mut write: Option<Vec<reyvec_sdf::shape_param::ModelParam>> = None;
+        let mut set_text: Option<String> = None;
+        let mut preview: Option<BTreeMap<String, f32>> = None;
+        let mut end = false;
+        let mut new_text = None;
+        card(ui, "Ручки модели", |ui| {
+            if let Some(t) = &st.teach {
+                ui.label(
+                    RichText::new(format!("Учим ручку «{}» = {}", t.name, t.target)).color(ACCENT),
+                );
+                ui.label(
+                    RichText::new(
+                        "Двигайте и растягивайте детали, пока модель не станет такой, какой \
+                         должна быть при этом значении. Детали не добавляйте и не убирайте.",
+                    )
+                    .color(MUTED)
+                    .size(FONT_SMALL),
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Запомнить")
+                        .on_hover_text("Изменённые числа связываются с ручкой, модель в файле возвращается к прежнему значению")
+                        .clicked()
+                    {
+                        match model_params::learn(&t.before, text, &t.name, t.target) {
+                            Ok(l) => {
+                                st.note = Some((format!("Ручка «{}»: связано чисел {}", t.name, l.links), false));
+                                new_text = Some(l.text);
+                            }
+                            Err(e) => st.note = Some((e, true)),
+                        }
+                    }
+                    if ui.button("Отмена").on_hover_text("Вернуть модель, как была до обучения").clicked() {
+                        set_text = Some(t.before.clone());
+                        st.note = None;
+                    }
+                });
+            } else {
+                if params.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Ручка — число, которое сцена задаёт каждой копии модели по-своему: \
+                             длина конвейера, высота стеллажа.",
+                        )
+                        .color(MUTED)
+                        .size(FONT_SMALL),
+                    );
+                }
+                for (i, p) in params.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    ui.horizontal(|ui| {
+                        let mut buf = match &st.naming {
+                            Some((j, b)) if *j == i => b.clone(),
+                            _ => p.name.clone(),
+                        };
+                        let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(140.0));
+                        if r.has_focus() {
+                            st.naming = Some((i, buf.clone()));
+                        }
+                        if r.lost_focus() {
+                            st.naming = None;
+                            let name = buf.trim();
+                            if !name.is_empty()
+                                && name != p.name
+                                && params.iter().all(|q| q.name != name)
+                            {
+                                let mut ps = params.clone();
+                                ps[i].name = name.to_owned();
+                                write = Some(ps);
+                            }
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .button(RichText::new("✕").color(BAD))
+                                .on_hover_text("Убрать ручку и её связи")
+                                .clicked()
+                            {
+                                let mut ps = params.clone();
+                                ps.remove(i);
+                                write = Some(ps);
+                            }
+                        });
+                    });
+                    let mut q = p.clone();
+                    let mut touched = false;
+                    ui.horizontal(|ui| {
+                        prop(ui, "В файле");
+                        ui.add_enabled_ui(p.links.is_empty(), |ui| {
+                            let r = ui.add(egui::DragValue::new(&mut q.value).speed(0.01).range(q.min..=q.max));
+                            let r = if p.links.is_empty() {
+                                r
+                            } else {
+                                r.on_disabled_hover_text("Значение, под которое нарисована модель. С обученной ручкой не меняется: сначала «Забыть»")
+                            };
+                            touched |= r.changed();
+                            end |= r.drag_stopped();
+                        });
+                        ui.label("от");
+                        let r = ui.add(egui::DragValue::new(&mut q.min).speed(0.01).range(f32::MIN..=q.value));
+                        touched |= r.changed();
+                        end |= r.drag_stopped();
+                        ui.label("до");
+                        let r = ui.add(egui::DragValue::new(&mut q.max).speed(0.01).range(q.value..=f32::MAX));
+                        touched |= r.changed();
+                        end |= r.drag_stopped();
+                    });
+                    if touched {
+                        let mut ps = params.clone();
+                        ps[i] = q;
+                        write = Some(ps);
+                    }
+                    ui.horizontal(|ui| {
+                        prop(ui, "Посмотреть");
+                        ui.spacing_mut().slider_width = 150.0;
+                        let mut v = shape.preview.get(&p.name).copied().unwrap_or(p.value);
+                        let r = ui
+                            .add(egui::Slider::new(&mut v, p.min..=p.max))
+                            .on_hover_text(
+                                "Модель на подставке при другом значении (в файл не пишется)",
+                            );
+                        if r.changed() {
+                            let mut m = shape.preview.clone();
+                            if v == p.value {
+                                m.remove(&p.name);
+                            } else {
+                                m.insert(p.name.clone(), v);
+                            }
+                            preview = Some(m);
+                        }
+                        if shape.preview.contains_key(&p.name)
+                            && ui.small_button("↺").on_hover_text("Как в файле").clicked()
+                        {
+                            let mut m = shape.preview.clone();
+                            m.remove(&p.name);
+                            preview = Some(m);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Связано чисел: {}", p.links.len()))
+                                .color(MUTED)
+                                .size(FONT_SMALL),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if !p.links.is_empty()
+                                && ui.button("Забыть").on_hover_text("Убрать связи ручки с деталями").clicked()
+                            {
+                                let mut ps = params.clone();
+                                ps[i].links.clear();
+                                write = Some(ps);
+                            }
+                            if ui
+                                .button("Научить")
+                                .on_hover_text("Поставить ручку на значение из «Посмотреть» (или на край) и показать мышью, как меняется модель")
+                                .clicked()
+                            {
+                                let seen = shape.preview.get(&p.name).copied().filter(|v| *v != p.value);
+                                let target = seen.unwrap_or(if p.max > p.value { p.max } else { p.min });
+                                let values = BTreeMap::from([(p.name.clone(), target)]);
+                                match model_params::applied(text, &values) {
+                                    Ok(t) if target != p.value => {
+                                        st.teach = Some(Teach {
+                                            model: shape.name.to_owned(),
+                                            name: p.name.clone(),
+                                            before: text.to_owned(),
+                                            target,
+                                        });
+                                        st.note = None;
+                                        set_text = Some(t);
+                                        preview = Some(BTreeMap::new());
+                                    }
+                                    Ok(_) => st.note = Some(("у ручки нет другого значения: раздвиньте «от» и «до»".into(), true)),
+                                    Err(e) => st.note = Some((e, true)),
+                                }
+                            }
+                        });
+                    });
+                }
+                if !shape.preview.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "Ручки не как в файле: стрелки деталей спрятаны, пока не нажмёте «↺»",
+                        )
+                        .color(MUTED)
+                        .size(FONT_SMALL),
+                    );
+                }
+                ui.add_space(GAP_S);
+                if ui
+                    .button("+ Ручка")
+                    .on_hover_text("Новая ручка модели")
+                    .clicked()
+                {
+                    let mut ps = params.clone();
+                    ps.push(model_params::new_param(&params));
+                    write = Some(ps);
+                }
+            }
+            if let Some((note, bad)) = &st.note {
+                ui.label(
+                    RichText::new(note)
+                        .color(if *bad { BAD } else { MUTED })
+                        .size(FONT_SMALL),
+                );
+            }
+        });
+        if let Some(t) = new_text {
+            st.teach = None;
+            set_text = Some(t);
+        }
+        if set_text.is_some()
+            && st
+                .teach
+                .as_ref()
+                .is_some_and(|t| Some(&t.before) == set_text.as_ref())
+        {
+            st.teach = None;
+        }
+        if let Some(ps) = write {
+            match model_params::write(text, &ps) {
+                Ok(t) => {
+                    let committed = !ui.ctx().input(|i| i.pointer.primary_down());
+                    self.actions.push(Action::ShapeText {
+                        text: t,
+                        commit: committed,
+                    });
+                    // Убранные и переименованные ручки уходят из «Посмотреть».
+                    let m: BTreeMap<String, f32> = shape
+                        .preview
+                        .iter()
+                        .filter(|(n, _)| ps.iter().any(|p| &p.name == *n))
+                        .map(|(n, v)| (n.clone(), *v))
+                        .collect();
+                    if m.len() != shape.preview.len() {
+                        preview = Some(m);
+                    }
+                }
+                Err(e) => tracing::warn!("Ручки не записались: {e}"),
+            }
+        }
+        if let Some(t) = set_text {
+            self.actions.push(Action::ShapeText {
+                text: t,
+                commit: true,
+            });
+        }
+        if end {
+            self.actions.push(Action::EndEdit);
+        }
+        if let Some(m) = preview {
+            self.actions.push(Action::ShapePreview(m));
+        }
     }
 
     /// Окно сцены во «Формах» (М.2): движок рисует модель на подставке; сверху полоса с
@@ -1559,7 +1838,13 @@ impl EditorUi {
         );
         // Левая кнопка — выбор и ручки детали (М.4), правая — повернуть, средняя —
         // сдвинуть.
-        let gizmo = self.shape_gizmo(ui, shape);
+        // Ручки модели не как в файле (М.6, «Посмотреть»): на подставке не то, что в
+        // тексте, поэтому стрелки деталей спрятаны.
+        let gizmo = if shape.preview.is_empty() {
+            self.shape_gizmo(ui, shape)
+        } else {
+            None
+        };
         self.shape_pointer(ui, &response, shape, gizmo.as_ref());
         let d = response.drag_delta();
         let camera_drag = response.dragged_by(egui::PointerButton::Secondary)
@@ -4152,6 +4437,25 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
+/// Карточка «Ручки модели» (М.6).
+#[derive(Default)]
+struct ParamsUi {
+    /// Идёт обучение ручки.
+    teach: Option<Teach>,
+    /// Что вышло у «Запомнить» или «Научить» (текст, это ошибка).
+    note: Option<(String, bool)>,
+    /// Имя ручки в поле правки (номер ручки, текст), пока поле не отпустили.
+    naming: Option<(usize, String)>,
+}
+
+/// Обучение ручки: модель, ручка, текст до обучения и значение ручки.
+struct Teach {
+    model: String,
+    name: String,
+    before: String,
+    target: f32,
+}
+
 /// Окно контура в инспекторе (М.5): что тянут и куда смотрит.
 #[derive(Default)]
 struct ContourUi {
@@ -5032,6 +5336,7 @@ mod tests {
             shift: [0.0; 3],
             error: Some("нет такого файла"),
             text: "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Sphere(radius: 0.3), Box(size: (0.2, 0.2, 0.2))]))",
+            preview: &NO_PREVIEW,
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         assert!(ui.take_actions().is_empty(), "без нажатий нет действий");
@@ -5061,6 +5366,7 @@ mod tests {
             shift: [0.0; 3],
             error: None,
             text,
+            preview: &NO_PREVIEW,
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         let vp = ui.viewport().expect("окно подставки");
@@ -5131,6 +5437,7 @@ mod tests {
             shift: [0.0; 3],
             error: None,
             text,
+            preview: &NO_PREVIEW,
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         // Середина экрана — шар (камера смотрит на него).
@@ -5768,6 +6075,7 @@ mod tests {
                     shift: [0.0; 3],
                     error: None,
                     text: &rack,
+                    preview: &NO_PREVIEW,
                 });
             }
             let mut out = None;

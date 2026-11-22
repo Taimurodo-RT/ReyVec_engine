@@ -6,6 +6,7 @@
 //! сверху), показ одной детали крупно и свободный полёт клавишами. Сохранили файл
 //! модели (в блокноте или другой программе) — подставка перечитывает его сама.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -160,6 +161,8 @@ pub(crate) struct ShapeView {
     /// Детали, спрятанные «глазом» в дереве (пути в дереве `shape_edit`): на подставке их
     /// нет, в файле они остаются.
     pub hidden: Vec<Vec<usize>>,
+    /// Ручки модели на подставке не как в файле (М.6, «Посмотреть»): в файл не пишется.
+    pub preview: BTreeMap<String, f32>,
     /// Радиус подставки.
     stand: f32,
 }
@@ -195,6 +198,7 @@ impl ShapeView {
             framed: false,
             text: String::new(),
             hidden: Vec::new(),
+            preview: BTreeMap::new(),
             stand: 0.15,
         })
     }
@@ -212,7 +216,13 @@ impl ShapeView {
         }
         self.checked = Instant::now();
         // Сначала модель в начале координат: узнать, какого она размера.
-        let probe = stand_text(&use_model(&self.name), "", [0.0; 3], 1.0, None);
+        let probe = stand_text(
+            &use_model(&self.name, &BTreeMap::new()),
+            "",
+            [0.0; 3],
+            1.0,
+            None,
+        );
         let scene = match SpaceScene::parse_in(&probe, Some(&self.root)) {
             Ok(s) => s,
             Err(e) => {
@@ -251,12 +261,13 @@ impl ShapeView {
 
     /// Сцена подставки с моделью как сейчас (без спрятанных деталей).
     pub(crate) fn stand_scene(&self) -> String {
+        let values = self.preview_values();
         let (model, materials) = if self.hidden.is_empty() {
-            (use_model(&self.name), String::new())
+            (use_model(&self.name, &values), String::new())
         } else {
-            match without(&self.text, &self.hidden) {
+            match without(&self.text, &self.hidden, &values) {
                 Some(m) => m,
-                None => (use_model(&self.name), String::new()),
+                None => (use_model(&self.name, &values), String::new()),
             }
         };
         stand_text(
@@ -266,6 +277,23 @@ impl ShapeView {
             self.stand,
             Some(self.radius),
         )
+    }
+
+    /// Значения ручек для подставки: только ручки, которые есть в файле, и не равные
+    /// значению из файла.
+    pub(crate) fn preview_values(&self) -> BTreeMap<String, f32> {
+        let params = super::model_params::read(&self.text);
+        self.preview
+            .iter()
+            .filter(|(n, v)| params.iter().any(|p| &p.name == *n && p.value != **v))
+            .map(|(n, v)| (n.clone(), *v))
+            .collect()
+    }
+
+    /// Поставить ручки на подставке (М.6). Ответ — новая сцена подставки.
+    pub(crate) fn set_preview(&mut self, values: BTreeMap<String, f32>) -> String {
+        self.preview = values;
+        self.stand_scene()
     }
 
     /// Спрятать деталь на подставке или показать снова. Ответ — новая сцена подставки.
@@ -462,14 +490,23 @@ impl ShapeView {
 const STAND_MATERIALS: u32 = 3;
 
 /// Форма модели ссылкой на её файл.
-fn use_model(name: &str) -> String {
-    format!("Use(model: \"{name}\")")
+fn use_model(name: &str, values: &BTreeMap<String, f32>) -> String {
+    if values.is_empty() {
+        return format!("Use(model: \"{name}\")");
+    }
+    let values = ron::to_string(values).unwrap_or_default();
+    format!("Use(model: \"{name}\", params: {values})")
 }
 
 /// Модель без деталей `hidden` прямо текстом формы (номера цветов сдвинуты за материалы
 /// подставки) и её материалы для списка подставки. `None` — модель не читается.
-fn without(text: &str, hidden: &[Vec<usize>]) -> Option<(String, String)> {
+fn without(
+    text: &str,
+    hidden: &[Vec<usize>],
+    values: &BTreeMap<String, f32>,
+) -> Option<(String, String)> {
     let mut file = ModelFile::parse(text).ok()?;
+    reyvec_sdf::shape_param::apply(&mut file.shape, &file.params, values).ok()?;
     let mut paths = hidden.to_vec();
     // С конца: сначала поздние и вложенные, тогда номера ранних не съезжают.
     paths.sort_unstable_by(|a, b| b.cmp(a));
