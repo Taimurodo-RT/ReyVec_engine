@@ -886,8 +886,8 @@ mod tests {
         let full = view.load().expect("стеллаж");
         let dir = view.root.clone();
         let count = |text: &str| {
-            let scene = SpaceScene::parse_in(text, Some(&dir))
-                .unwrap_or_else(|e| panic!("{e}\n{text}"));
+            let scene =
+                SpaceScene::parse_in(text, Some(&dir)).unwrap_or_else(|e| panic!("{e}\n{text}"));
             let frame = scene.frame(0.0);
             let shape = frame.shapes.last().unwrap().clone();
             (format!("{shape:?}").matches("Box {").count(), scene)
