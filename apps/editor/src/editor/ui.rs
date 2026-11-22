@@ -17,6 +17,7 @@ use winit::window::ResizeDirection;
 
 use super::arrange;
 use super::assets::{AssetFile, Assets};
+use super::contour;
 use super::doc::{Change, Edit};
 use super::geom;
 use super::layout::{START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
@@ -324,6 +325,8 @@ pub(crate) struct EditorUi {
     gizmo_drag: Option<GizmoDrag>,
     /// Что делают ручки детали: двигать, повернуть, размер.
     gizmo_mode: GizmoMode,
+    /// Окно контура выдавливания и выточки (М.5).
+    contour: ContourUi,
     /// Деталь под правой кнопкой: для неё меню на подставке.
     shape_menu: Option<Vec<usize>>,
 }
@@ -389,6 +392,7 @@ impl EditorUi {
             shape_locked: HashSet::new(),
             gizmo_drag: None,
             gizmo_mode: GizmoMode::Move,
+            contour: ContourUi::default(),
             shape_menu: None,
         }
     }
@@ -1285,6 +1289,29 @@ impl EditorUi {
                     }
                 }
             });
+        }
+        // Контур выдавливания и выточки (М.5).
+        if matches!(part.kind.as_str(), "Extrude" | "Revolve") {
+            let revolve = part.kind == "Revolve";
+            let profile = shape_edit::read_string(text, part.open, "profile").unwrap_or_default();
+            let title = if revolve {
+                "Контур (вращается вокруг оси Y)"
+            } else {
+                "Контур (выдавливается по Z)"
+            };
+            let mut edit = None;
+            let st = &mut self.contour;
+            card(ui, title, |ui| {
+                edit = contour_card(ui, st, &profile, revolve)
+            });
+            match edit {
+                Some(ContourEdit::Path(p, commit)) => send(
+                    shape_edit::set(text, part, "profile", &shape_edit::quoted(&p)),
+                    commit,
+                ),
+                Some(ContourEdit::End) => end = true,
+                None => {}
+            }
         }
         // Место и цвет детали (её сдвиг и цвет вокруг).
         if part.kind != "Move" {
@@ -4125,6 +4152,341 @@ fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
     }
 }
 
+/// Окно контура в инспекторе (М.5): что тянут и куда смотрит.
+#[derive(Default)]
+struct ContourUi {
+    drag: Option<ContourDrag>,
+    /// Точка, для которой открыто меню.
+    menu: Option<contour::Grip>,
+    /// Как контур лежал в окне в последнем кадре.
+    view: Option<ContourView>,
+    /// Над чем нажали кнопку (тянуть начинают чуть позже, курсор уже ушёл).
+    pressed: Option<contour::Grip>,
+}
+
+/// Точку контура тянут: всё считается от контура и вида в начале.
+struct ContourDrag {
+    grip: contour::Grip,
+    contours: Vec<contour::Contour>,
+    start: [f64; 2],
+    view: ContourView,
+    moved: Vec2,
+}
+
+/// Как контур лежит в окне: середина и точек экрана на метр.
+#[derive(Clone, Copy)]
+struct ContourView {
+    rect: Rect,
+    center: [f64; 2],
+    k: f64,
+}
+
+impl ContourView {
+    fn fit(rect: Rect, lo: [f64; 2], hi: [f64; 2]) -> Self {
+        let size = [(hi[0] - lo[0]).max(0.05), (hi[1] - lo[1]).max(0.05)];
+        let k = (f64::from(rect.width()) / size[0]).min(f64::from(rect.height()) / size[1]) * 0.8;
+        Self {
+            rect,
+            center: [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5],
+            k,
+        }
+    }
+
+    fn to_screen(self, p: [f64; 2]) -> Pos2 {
+        let c = self.rect.center();
+        pos2(
+            c.x + ((p[0] - self.center[0]) * self.k) as f32,
+            c.y - ((p[1] - self.center[1]) * self.k) as f32,
+        )
+    }
+
+    fn to_model(self, p: Pos2) -> [f64; 2] {
+        let c = self.rect.center();
+        [
+            self.center[0] + f64::from(p.x - c.x) / self.k,
+            self.center[1] - f64::from(p.y - c.y) / self.k,
+        ]
+    }
+}
+
+/// Что сделали с контуром за кадр.
+#[derive(Debug, PartialEq)]
+enum ContourEdit {
+    /// Новый контур (`false` — точку ещё тянут).
+    Path(String, bool),
+    /// Отпустили точку.
+    End,
+}
+
+/// Шаг сетки: 1, 2 или 5 на степень десяти, не меньше `min` метров.
+fn grid_step(min: f64) -> f64 {
+    let p = 10f64.powf(min.log10().floor());
+    [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * p)
+        .find(|s| *s >= min)
+        .unwrap_or(10.0 * p)
+}
+
+/// Окно контура: сетка в метрах, контур, точки (квадраты) и ручки изгибов (круги).
+/// Точки тянут левой кнопкой (Ctrl — по сантиметру), двойной щелчок по линии ставит
+/// новую точку, правый щелчок по точке — меню: убрать, изгиб или прямой отрезок.
+/// `revolve` — контур выточки: ось вращения — линия X = 0, левее неё контура нет.
+fn contour_card(ui: &mut Ui, st: &mut ContourUi, path: &str, revolve: bool) -> Option<ContourEdit> {
+    let Some(contours) = contour::parse(path) else {
+        ui.label(
+            RichText::new("Контур не разобрать: правьте его в блокноте")
+                .color(BAD)
+                .size(FONT_SMALL),
+        );
+        return None;
+    };
+    let width = ui.available_width();
+    let (rect, resp) =
+        ui.allocate_exact_size(vec2(width, width.min(320.0)), Sense::click_and_drag());
+    let view = match &st.drag {
+        Some(d) => ContourView { rect, ..d.view },
+        None => {
+            let (mut lo, mut hi) = contour::bounds(&contours)?;
+            // Начало координат (и ось выточки) всегда в окне.
+            for i in 0..2 {
+                lo[i] = lo[i].min(0.0);
+                hi[i] = hi[i].max(0.0);
+            }
+            ContourView::fit(rect, lo, hi)
+        }
+    };
+    st.view = Some(view);
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, RADIUS_S, BG);
+    // Сетка.
+    let step = grid_step(24.0 / view.k);
+    let (lo, hi) = (
+        view.to_model(rect.left_bottom()),
+        view.to_model(rect.right_top()),
+    );
+    let grid = Stroke::new(1.0, BORDER);
+    let mut x = (lo[0] / step).floor() * step;
+    while x <= hi[0] {
+        let sx = view.to_screen([x, 0.0]).x;
+        painter.vline(sx, rect.y_range(), grid);
+        x += step;
+    }
+    let mut y = (lo[1] / step).floor() * step;
+    while y <= hi[1] {
+        let sy = view.to_screen([0.0, y]).y;
+        painter.hline(rect.x_range(), sy, grid);
+        y += step;
+    }
+    let o = view.to_screen([0.0, 0.0]);
+    painter.hline(
+        rect.x_range(),
+        o.y,
+        Stroke::new(1.0, MUTED.gamma_multiply(0.6)),
+    );
+    if revolve {
+        // Левее оси контура не бывает: там тень, ось — пунктир.
+        let left = Rect::from_min_max(rect.min, pos2(o.x.max(rect.left()), rect.bottom()));
+        painter.rect_filled(left, 0, BAD.gamma_multiply(0.06));
+        painter.extend(egui::Shape::dashed_line(
+            &[pos2(o.x, rect.top()), pos2(o.x, rect.bottom())],
+            Stroke::new(1.5, ACCENT),
+            6.0,
+            4.0,
+        ));
+        painter.text(
+            pos2(o.x + 4.0, rect.top() + 4.0),
+            egui::Align2::LEFT_TOP,
+            "ось вращения",
+            egui::FontId::proportional(FONT_SMALL),
+            ACCENT,
+        );
+    } else {
+        painter.vline(
+            o.x,
+            rect.y_range(),
+            Stroke::new(1.0, MUTED.gamma_multiply(0.6)),
+        );
+    }
+    painter.text(
+        rect.right_bottom() - vec2(4.0, 4.0),
+        egui::Align2::RIGHT_BOTTOM,
+        format!("клетка {} см", ron_edit::num(step * 100.0)),
+        egui::FontId::proportional(FONT_SMALL),
+        MUTED,
+    );
+    // Контур и линии ручек.
+    for c in &contours {
+        for (ni, n) in c.nodes.iter().enumerate() {
+            let Some(seg) = contour::segment(c, ni) else {
+                continue;
+            };
+            let steps = if n.seg == contour::Seg::Line { 1 } else { 24 };
+            let pts: Vec<Pos2> = contour::sample(seg, steps)
+                .into_iter()
+                .map(|p| view.to_screen(p))
+                .collect();
+            painter.add(egui::Shape::line(pts, Stroke::new(2.0, TEXT)));
+            let prev = if ni > 0 {
+                c.nodes[ni - 1].p
+            } else {
+                c.nodes[c.nodes.len() - 1].p
+            };
+            let thin = Stroke::new(1.0, MUTED);
+            match n.seg {
+                contour::Seg::Line => {}
+                contour::Seg::Quad(q) => {
+                    painter.line_segment([view.to_screen(prev), view.to_screen(q)], thin);
+                    painter.line_segment([view.to_screen(q), view.to_screen(n.p)], thin);
+                }
+                contour::Seg::Cubic(a, b) => {
+                    painter.line_segment([view.to_screen(prev), view.to_screen(a)], thin);
+                    painter.line_segment([view.to_screen(b), view.to_screen(n.p)], thin);
+                }
+            }
+        }
+    }
+    // Точки и ручки.
+    let grips = contour::grips(&contours);
+    let hover = resp.hover_pos().and_then(|h| {
+        grips
+            .iter()
+            .map(|(g, p)| (*g, view.to_screen(*p).distance(h)))
+            .filter(|(_, d)| *d < 9.0)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(g, _)| g)
+    });
+    let active = st.drag.as_ref().map(|d| d.grip).or(hover);
+    for (g, p) in &grips {
+        let s = view.to_screen(*p);
+        let lit = active == Some(*g);
+        if g.kind == 0 {
+            let c = if lit { Color32::WHITE } else { ACCENT };
+            painter.rect_filled(Rect::from_center_size(s, vec2(8.0, 8.0)), 1, c);
+        } else {
+            let c = if lit { Color32::WHITE } else { SELECT };
+            painter.circle_filled(s, 4.0, c);
+        }
+    }
+    if hover.is_some() || st.drag.is_some() {
+        ui.ctx().set_cursor_icon(if st.drag.is_some() {
+            CursorIcon::Grabbing
+        } else {
+            CursorIcon::Grab
+        });
+    }
+    let mut out = None;
+    if resp.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
+        st.pressed = hover;
+    }
+    // Тянут точку или ручку.
+    if resp.drag_started_by(egui::PointerButton::Primary)
+        && let Some(g) = st.pressed.take()
+        && let Some(start) = contour::grip_at(&contours, g)
+    {
+        st.drag = Some(ContourDrag {
+            grip: g,
+            contours: contours.clone(),
+            start,
+            view,
+            moved: Vec2::ZERO,
+        });
+    }
+    if let Some(d) = st.drag.as_mut() {
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            d.moved += resp.drag_delta();
+            let mut p = [
+                d.start[0] + f64::from(d.moved.x) / d.view.k,
+                d.start[1] - f64::from(d.moved.y) / d.view.k,
+            ];
+            if ui.input(|i| i.modifiers.command) {
+                p = p.map(|v| (v * 100.0).round() / 100.0);
+            }
+            if revolve && d.grip.kind == 0 {
+                p[0] = p[0].max(0.0);
+            }
+            let mut c = d.contours.clone();
+            contour::set_grip(&mut c, d.grip, p);
+            out = Some(ContourEdit::Path(contour::to_path(&c), false));
+        } else {
+            st.drag = None;
+            out = Some(ContourEdit::End);
+        }
+    }
+    // Двойной щелчок по линии — новая точка.
+    if resp.double_clicked()
+        && hover.is_none()
+        && let Some(h) = resp.interact_pointer_pos()
+        && let Some((ci, ni, t, dist)) = contour::nearest_segment(&contours, view.to_model(h))
+        && dist * view.k < 10.0
+    {
+        let mut c = contours.clone();
+        if contour::insert(&mut c, ci, ni, t).is_some() {
+            out = Some(ContourEdit::Path(contour::to_path(&c), true));
+        }
+    }
+    // Правый щелчок по точке — её меню.
+    if resp.secondary_clicked() {
+        st.menu = hover.filter(|g| g.kind == 0);
+    }
+    if let Some(g) = st.menu {
+        let seg = contours
+            .get(g.contour)
+            .and_then(|c| c.nodes.get(g.node))
+            .map(|n| n.seg);
+        let has_seg = contours
+            .get(g.contour)
+            .and_then(|c| contour::segment(c, g.node))
+            .is_some();
+        let mut pick = None;
+        resp.context_menu(|ui| {
+            if ui.button("Убрать точку").clicked() {
+                pick = Some(0);
+                ui.close();
+            }
+            let curve = seg.is_some_and(|s| s != contour::Seg::Line);
+            if has_seg {
+                let name = if curve {
+                    "Прямой отрезок к точке"
+                } else {
+                    "Изгиб к точке"
+                };
+                if ui.button(name).clicked() {
+                    pick = Some(if curve { 2 } else { 1 });
+                    ui.close();
+                }
+            }
+        });
+        if let Some(what) = pick {
+            let mut c = contours.clone();
+            let changed = match what {
+                0 => contour::remove(&mut c, g.contour, g.node),
+                1 => {
+                    contour::make_curve(&mut c, g.contour, g.node);
+                    true
+                }
+                _ => {
+                    contour::make_line(&mut c, g.contour, g.node);
+                    true
+                }
+            };
+            if changed {
+                out = Some(ContourEdit::Path(contour::to_path(&c), true));
+            }
+            st.menu = None;
+        }
+    }
+    ui.label(
+        RichText::new(
+            "Тяните точки (Ctrl — по сантиметру); двойной щелчок по линии — новая точка; \
+             правый щелчок по точке — убрать или изогнуть",
+        )
+        .color(MUTED)
+        .size(FONT_SMALL),
+    );
+    out
+}
+
 /// Что делают ручки выбранной детали на подставке.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum GizmoMode {
@@ -4915,6 +5277,107 @@ mod tests {
         .edit(&part, true)
         .unwrap();
         assert!(t.contains("Move(scale: 2.05, shape: Box"), "{t}");
+    }
+
+    #[test]
+    fn contour_points_are_dragged_and_added_with_the_mouse() {
+        let ctx = egui::Context::default();
+        let mut st = ContourUi::default();
+        let mut time = 0.0;
+        let mut run = |st: &mut ContourUi, path: &str, events: Vec<egui::Event>| {
+            time += 0.05;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 500.0))),
+                time: Some(time),
+                events,
+                ..Default::default()
+            };
+            let mut out = None;
+            let mut full = ctx.run_ui(input, |ui| out = contour_card(ui, st, path, true));
+            full.textures_delta.clear();
+            out
+        };
+        let path = "M 0 0 L 0.4 0 L 0.2 0.5 L 0 0.5 Z";
+        assert_eq!(run(&mut st, path, Vec::new()), None);
+        let view = st.view.expect("окно контура");
+        // Тянем правую нижнюю точку вправо на 10 см.
+        let from = view.to_screen([0.4, 0.0]);
+        let to = view.to_screen([0.5, 0.0]);
+        run(&mut st, path, pointer(from, None));
+        run(&mut st, path, pointer(from, Some(true)));
+        let mut last = None;
+        for k in 1..=4 {
+            let at = from + (to - from) * (k as f32 / 4.0);
+            if let Some(e) = run(&mut st, path, pointer(at, None)) {
+                last = Some(e);
+            }
+        }
+        let Some(ContourEdit::Path(moved, false)) = last else {
+            panic!("точка не тянется: {last:?}");
+        };
+        let c = contour::parse(&moved).unwrap();
+        assert!((c[0].nodes[1].p[0] - 0.5).abs() < 0.01, "{moved}");
+        assert_eq!(
+            run(&mut st, path, pointer(to, Some(false))),
+            Some(ContourEdit::End)
+        );
+        assert_eq!(run(&mut st, path, Vec::new()), None);
+        // Точку выточки левее оси не утащить.
+        let left = view.to_screen([-0.3, 0.0]);
+        run(&mut st, path, pointer(from, Some(true)));
+        let mut last = None;
+        for k in 1..=4 {
+            let at = from + (left - from) * (k as f32 / 4.0);
+            if let Some(e) = run(&mut st, path, pointer(at, None)) {
+                last = Some(e);
+            }
+        }
+        run(&mut st, path, pointer(left, Some(false)));
+        run(&mut st, path, Vec::new());
+        let Some(ContourEdit::Path(moved, _)) = last else {
+            panic!("{last:?}");
+        };
+        assert_eq!(contour::parse(&moved).unwrap()[0].nodes[1].p[0], 0.0);
+        // Двойной щелчок по низу — новая точка.
+        let mid = view.to_screen([0.2, 0.0]);
+        let mut added = None;
+        for pressed in [true, false, true, false] {
+            if let Some(e) = run(&mut st, path, pointer(mid, Some(pressed))) {
+                added = Some(e);
+            }
+        }
+        let Some(ContourEdit::Path(added, true)) = added else {
+            panic!("точка не добавилась: {added:?}");
+        };
+        assert_eq!(contour::parse(&added).unwrap()[0].nodes.len(), 5, "{added}");
+    }
+
+    #[test]
+    fn new_extrude_and_revolve_parts_read_and_stretch() {
+        for kind in ["Extrude", "Revolve"] {
+            let item = shape_edit::new_part(kind, 0.2, [0.0; 3]);
+            let text = format!("(shape: Union(shapes: [{item}]))");
+            let root = shape_edit::parse(&text).unwrap();
+            let part = root.at(&[0]).unwrap();
+            let profile = shape_edit::read_string(&text, part.open, "profile").unwrap();
+            assert!(
+                reyvec_sdf::profile2d::Profile::new(&profile).is_ok(),
+                "{profile}"
+            );
+            let t = shape_edit::stretch(&text, part, [2.0, 1.0, 1.0]).unwrap();
+            let r = shape_edit::parse(&t).unwrap();
+            let p = shape_edit::read_string(&t, r.at(&[0]).unwrap().open, "profile").unwrap();
+            let (lo, hi) = contour::bounds(&contour::parse(&p).unwrap()).unwrap();
+            let (lo0, hi0) = contour::bounds(&contour::parse(&profile).unwrap()).unwrap();
+            assert!(
+                ((hi[0] - lo[0]) - 2.0 * (hi0[0] - lo0[0])).abs() < 1e-9,
+                "{t}"
+            );
+            let file = format!("(format: \"reyvec-shape\", version: 1, {}", &t[1..]);
+            if let Err(e) = reyvec_sdf::shape_model::ModelFile::parse(&file) {
+                panic!("{e}\n{file}");
+            }
+        }
     }
 
     fn pointer(pos: Pos2, pressed: Option<bool>) -> Vec<egui::Event> {
