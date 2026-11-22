@@ -6991,11 +6991,11 @@ mod tests {
                 Vec::new()
             };
             if ws == 1 {
-                // Проводник «Ассетов» (Э.1): модели цеха списком, выбран конвейер — справа
-                // видно, в какой сцене он используется.
+                // Проводник «Ассетов» (Э.1): модели цеха плитками с миниатюрами, выбран
+                // конвейер — справа его крупная миниатюра и в какой сцене он используется.
                 let dir = root.join("scenes/3d/models/завод");
                 ui.explorer.go(dir.clone());
-                ui.explorer.view = explorer::ViewKind::List;
+                ui.explorer.view = explorer::ViewKind::Tiles;
                 ui.explorer.selected = vec![dir.join("конвейер.shape.ron")];
             }
             if ws == 5 {
@@ -7033,7 +7033,12 @@ mod tests {
                 });
             }
             let mut out = None;
-            for frame in 0..12u32 {
+            // Ассетам дать время: миниатюры снимаются в своём потоке.
+            let frames: u32 = if ws == 1 { 40 } else { 12 };
+            for frame in 0..frames {
+                if ws == 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
                 let mut events = Vec::new();
                 if menu {
                     let at = |x, y| egui::Event::PointerMoved(pos2(x, y));

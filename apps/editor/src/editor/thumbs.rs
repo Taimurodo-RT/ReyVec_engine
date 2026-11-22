@@ -1,7 +1,8 @@
 //! Миниатюры моделей и сцен 3D для проводника «Ассетов» (Э.3).
 //!
 //! Модель снимается «общим видом» (сверху-сбоку, как на подставке) лучами на процессоре в
-//! своём потоке: картинка 128×128 и сглаживание четырьмя лучами на точку. Готовая
+//! своём потоке: картинка 256×256 и сглаживание четырьмя лучами на точку. Плиткам
+//! проводника идёт уменьшенная вдвое копия (так края не рябят), панели сведений — целая. Готовая
 //! миниатюра лежит в скрытой папке `.thumbs` проекта рядом со списком файлов, из которых
 //! модель собрана (вложенные модели, глина). Снимок обновляется только когда один из этих
 //! файлов сохранили позже снимка; пока новый считается, видна старая миниатюра.
@@ -20,7 +21,7 @@ use reyvec_sdf::space_file::{MaterialEntry, SpaceFile};
 use super::shapes::{child_mut, model_of};
 
 /// Сторона миниатюры, пикселей.
-pub(crate) const SIZE: u32 = 128;
+pub(crate) const SIZE: u32 = 256;
 /// Скрытая папка миниатюр в проекте.
 const DIR: &str = ".thumbs";
 /// Как часто для видимого файла проверять, не сохранили ли его, секунд.
@@ -53,11 +54,22 @@ fn modified(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// Миниатюра свежая: она новее файла и всех, из которых он собран.
+/// Сторона картинки PNG по заголовку (ширина лежит в байтах 16..20).
+fn png_side(path: &Path) -> Option<u32> {
+    use std::io::Read;
+    let mut head = [0u8; 24];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    Some(u32::from_be_bytes([head[16], head[17], head[18], head[19]]))
+}
+
+/// Миниатюра свежая: она нужного размера и новее файла и всех, из которых он собран.
 fn fresh(file: &Path, thumb: &Path) -> bool {
     let Some(made) = modified(thumb) else {
         return false;
     };
+    if png_side(thumb) != Some(SIZE) {
+        return false;
+    }
     let deps = std::fs::read_to_string(deps_path(thumb)).unwrap_or_default();
     std::iter::once(file.to_path_buf())
         .chain(deps.lines().filter(|l| !l.is_empty()).map(PathBuf::from))
@@ -261,6 +273,39 @@ fn save(thumb: &Path, pic: &Picture, deps: &[PathBuf]) -> Result<(), String> {
     std::fs::write(deps_path(thumb), list).map_err(|e| e.to_string())
 }
 
+/// Копия вдвое меньше: каждые 2×2 точки в одну, цвет с учётом прозрачности.
+fn half(pic: &Picture) -> Picture {
+    let n = pic.size as usize;
+    let h = (n / 2).max(1);
+    let mut rgba = vec![0u8; h * h * 4];
+    for y in 0..h {
+        for x in 0..h {
+            let mut c = [0f32; 3];
+            let mut a = 0f32;
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let (sx, sy) = ((2 * x + dx).min(n - 1), (2 * y + dy).min(n - 1));
+                let i = (sy * n + sx) * 4;
+                let pa = f32::from(pic.rgba[i + 3]) / 255.0;
+                for (k, ck) in c.iter_mut().enumerate() {
+                    *ck += f32::from(pic.rgba[i + k]) * pa;
+                }
+                a += pa;
+            }
+            let i = (y * h + x) * 4;
+            if a > 0.0 {
+                for (k, ck) in c.iter().enumerate() {
+                    rgba[i + k] = (ck / a).round() as u8;
+                }
+            }
+            rgba[i + 3] = (a / 4.0 * 255.0).round() as u8;
+        }
+    }
+    Picture {
+        size: h as u32,
+        rgba,
+    }
+}
+
 fn read_png(path: &Path) -> Option<Picture> {
     let file = std::fs::File::open(path).ok()?;
     let mut dec = png::Decoder::new(std::io::BufReader::new(file));
@@ -291,7 +336,8 @@ pub(crate) struct Thumbs {
     project: Option<PathBuf>,
     jobs: Sender<Job>,
     done: Receiver<(PathBuf, Option<Picture>)>,
-    textures: HashMap<PathBuf, egui::TextureHandle>,
+    /// Готовые текстуры: целая (панель сведений) и вдвое меньше (плитки).
+    textures: HashMap<PathBuf, (egui::TextureHandle, egui::TextureHandle)>,
     /// Уже попросили у потока.
     asked: HashSet<PathBuf>,
     /// Когда последний раз смотрели, не сохранили ли файл.
@@ -351,22 +397,28 @@ impl Thumbs {
         while let Ok((file, pic)) = self.done.try_recv() {
             self.asked.remove(&file);
             if let Some(pic) = pic {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [pic.size as usize, pic.size as usize],
-                    &pic.rgba,
-                );
-                let name = format!("миниатюра {}", file.display());
-                let tex = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
-                self.textures.insert(file, tex);
+                let load = |pic: &Picture, what: &str| {
+                    let side = pic.size as usize;
+                    let image = egui::ColorImage::from_rgba_unmultiplied([side, side], &pic.rgba);
+                    let name = format!("миниатюра {what} {}", file.display());
+                    ctx.load_texture(name, image, egui::TextureOptions::LINEAR)
+                };
+                let full = load(&pic, "целая");
+                let small = load(&half(&pic), "малая");
+                self.textures.insert(file, (full, small));
                 ctx.request_repaint();
             }
         }
     }
 
     /// Миниатюра файла, если она есть; заодно просит снять новую, если файл сохранили.
-    pub(crate) fn get(&mut self, file: &Path, now: f64) -> Option<egui::TextureId> {
+    /// `big`: целая картинка для крупного показа, иначе уменьшенная для плиток.
+    pub(crate) fn get(&mut self, file: &Path, now: f64, big: bool) -> Option<egui::TextureId> {
         let project = self.project.as_ref()?;
-        let have = self.textures.get(file).map(egui::TextureHandle::id);
+        let have = self
+            .textures
+            .get(file)
+            .map(|(full, small)| if big { full.id() } else { small.id() });
         let due = self.checked.get(file).is_none_or(|t| now - t > CHECK_S);
         if due && !self.asked.contains(file) {
             self.checked.insert(file.to_path_buf(), now);
@@ -433,6 +485,42 @@ mod tests {
         let (pic, deps) = render(&p.join("scenes/3d/forge.ron")).unwrap();
         assert!(pic.rgba.chunks(4).any(|c| c[3] > 0));
         assert!(!deps.is_empty());
+    }
+
+    /// Уменьшенная копия вдвое меньше, прозрачные точки не темнят край.
+    #[test]
+    fn half_keeps_colour_at_edges() {
+        let mut rgba = vec![0u8; 4 * 4 * 4];
+        // Левый верхний квадрат 2×2: одна точка красная непрозрачная, остальные пустые.
+        rgba[..4].copy_from_slice(&[200, 0, 0, 255]);
+        let small = half(&Picture { size: 4, rgba });
+        assert_eq!(small.size, 2);
+        assert_eq!(&small.rgba[..4], &[200, 0, 0, 64]);
+        assert_eq!(small.rgba[4 * 3 + 3], 0);
+    }
+
+    /// Старая миниатюра другого размера считается несвежей и снимается заново.
+    #[test]
+    fn old_size_thumbnail_is_stale() {
+        let dir = std::env::temp_dir().join(format!("reyvec-thumb-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.shape.ron");
+        std::fs::write(&file, "x").unwrap();
+        let thumb = dir.join("a.png");
+        let old = Picture {
+            size: 128,
+            rgba: vec![0; 128 * 128 * 4],
+        };
+        save(&thumb, &old, &[]).unwrap();
+        assert!(!fresh(&file, &thumb));
+        let new = Picture {
+            size: SIZE,
+            rgba: vec![0; (SIZE * SIZE * 4) as usize],
+        };
+        save(&thumb, &new, &[]).unwrap();
+        assert!(fresh(&file, &thumb));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Миниатюры для просмотра глазами: `target/editor-preview/thumb-*.png`.
