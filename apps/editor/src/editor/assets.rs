@@ -173,14 +173,16 @@ impl Assets {
                             }
                             let prefabs = dir.name == PREFABS;
                             for f in &dir.files {
-                                let drag = droppable(f) || (prefabs && is_prefab(f));
+                                // Модель формы тащат в открытую сцену 3D (М.8б).
+                                let drag = droppable(f) || is_shape(f) || (prefabs && is_prefab(f));
                                 let r = tile(ui, f, false, drag);
                                 if drag {
                                     r.dnd_set_drag_payload(AssetFile(dir.path.join(f)));
                                 }
                                 if is_shape(f) {
                                     let r = r.on_hover_text(
-                                        "Модель формы: двойной щелчок — открыть на подставке",
+                                        "Модель формы: двойной щелчок — открыть на подставке; \
+                                         в открытую сцену 3D её можно перетащить",
                                     );
                                     if r.double_clicked() {
                                         opened = Some(dir.path.join(f));

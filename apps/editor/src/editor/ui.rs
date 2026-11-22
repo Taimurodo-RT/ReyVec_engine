@@ -31,6 +31,8 @@ use super::shapes::ShapeAngle;
 use super::theme::*;
 use super::viewport::{self, TOOLBAR_HEIGHT, Tool, View, Viewport};
 
+mod space;
+
 /// Сколько строк журнала держать в консоли редактора.
 const LOG_LINES: usize = 500;
 /// Ширина края окна без рамки, за который его тянут, точек.
@@ -348,6 +350,8 @@ pub(crate) struct EditorUi {
     object_name: Option<(usize, String)>,
     /// Деталь под правой кнопкой: для неё меню на подставке.
     shape_menu: Option<Vec<usize>>,
+    /// Лампы, материалы и новые предметы сцены 3D (М.8б).
+    space: space::SceneUi,
 }
 
 /// Фильтр консоли.
@@ -415,6 +419,7 @@ impl EditorUi {
             params: ParamsUi::default(),
             object_name: None,
             shape_menu: None,
+            space: space::SceneUi::default(),
         }
     }
 
@@ -674,6 +679,8 @@ impl EditorUi {
                     }
                 }
             }
+            // Выбрана лампа сцены 3D — Delete убирает её.
+            let del = del && !(shape.scene && self.lamp_delete(shape.text));
             for (on, cmd) in [
                 (f, PartCmd::Focus),
                 (dup, PartCmd::Duplicate),
@@ -827,9 +834,13 @@ impl EditorUi {
         }
         if let Some(p) = out.pick {
             self.shape_selected = p;
+            self.space.lamp = None;
         }
         if let Some(cmd) = out.cmd {
             self.shape_command(shape.text, cmd);
+        }
+        if shape.scene {
+            self.lamp_rows(ui, shape.text);
         }
     }
 
@@ -1173,6 +1184,7 @@ impl EditorUi {
             ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }
         if response.clicked_by(egui::PointerButton::Primary) {
+            self.space.lamp = None;
             match pick(response.interact_pointer_pos()) {
                 Some(p) if !self.part_locked(&p) => self.shape_selected = p,
                 Some(_) => {}
@@ -1233,15 +1245,7 @@ impl EditorUi {
         // Предмет сцены 3D (М.8): у него имя, место и материал по имени.
         let object = scene && path.len() == 1;
         if scene && path.is_empty() {
-            ui.label(RichText::new("Сцена 3D").size(FONT_TITLE).color(TEXT));
-            ui.label(
-                RichText::new(format!(
-                    "Предметов: {}. Выберите предмет щелчком в окне или в иерархии.",
-                    root.children.len()
-                ))
-                .color(MUTED)
-                .size(FONT_SMALL),
-            );
+            self.scene_inspector(ui, shape, &root);
             return;
         }
         if self.part_locked(&path) {
@@ -2027,7 +2031,21 @@ impl EditorUi {
         } else {
             None
         };
-        self.shape_pointer(ui, &response, shape, gizmo.as_ref());
+        // Лампы сцены 3D (М.8б) — кружки поверх; мышь сначала им.
+        let dots = if shape.scene {
+            self.lamp_dots(ui, shape, rect)
+        } else {
+            Vec::new()
+        };
+        let lamp_busy = shape.scene
+            && self.gizmo_drag.is_none()
+            && self.lamp_pointer(ui, &response, shape, &dots);
+        if !lamp_busy {
+            self.shape_pointer(ui, &response, shape, gizmo.as_ref());
+        }
+        if shape.scene {
+            self.scene_drop(ui, &response, shape, rect);
+        }
         let d = response.drag_delta();
         let camera_drag = response.dragged_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle);
@@ -2071,6 +2089,9 @@ impl EditorUi {
         let hint = if shape.free {
             "Полёт: правая кнопка — оглядеться, W A S D — лететь, Q E — вниз и вверх, \
              Shift — быстрее. Esc — назад к сцене"
+        } else if shape.scene {
+            "Левая — выбрать предмет и тянуть ручки (W E R), кружки — лампы (Shift — вверх). \
+             Модели — мышью из «Ассетов». Правая — камера, колесо — ближе"
         } else {
             "Левая — выбрать деталь и тянуть её ручки (W двигать, E повернуть, R размер), \
              правая — повернуть камеру (щелчок — меню детали), средняя — сдвинуть, колесо — \
@@ -2084,6 +2105,8 @@ impl EditorUi {
                 &format!("Ошибка в модели: {e}"),
                 BAD,
             );
+        } else {
+            self.scene_note_chip(&painter, rect.left_top() + vec2(12.0, 40.0));
         }
     }
 
@@ -3034,7 +3057,17 @@ impl EditorUi {
         self.viewport_hovered = response.hovered() || response.dragged();
         let painter = ui.painter_at(rect);
         // Рисунок тащат из Ассетов: рамка вокруг сцены, отпустили — новый предмет.
-        if editing && response.dnd_hover_payload::<AssetFile>().is_some() {
+        // Модель формы — не для сцены 2D: её бросают в сцену 3D (М.8б).
+        let not_shape = |f: &AssetFile| {
+            !f.0.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(super::shapes::is_shape)
+        };
+        if editing
+            && response
+                .dnd_hover_payload::<AssetFile>()
+                .is_some_and(|f| not_shape(&f))
+        {
             painter.rect_stroke(
                 rect.shrink(1.0),
                 0,
@@ -3044,6 +3077,7 @@ impl EditorUi {
         }
         if editing
             && let Some(f) = response.dnd_release_payload::<AssetFile>()
+            && not_shape(&f)
             && let (Some(view), Some(m)) = (info.view, response.hover_pos())
         {
             let at = view.to_scene(m).map(|c| (c * 1000.0).round() / 1000.0);
@@ -6066,6 +6100,104 @@ mod tests {
         let root = shape_edit::parse(&t).unwrap();
         let back = write_use_params(&t, root.at(&[0]).unwrap(), &BTreeMap::new()).unwrap();
         assert!(back.contains(r#"Use(model: "завод/конвейер")"#), "{back}");
+    }
+
+    #[test]
+    fn scene_lamps_are_picked_dragged_and_deleted() {
+        let cam = reyvec_sdf::Camera3D::default();
+        let (o, d) = cam.ray([0.0, 0.0], 1.0);
+        let lamp = o + d * 3.0;
+        let text = format!(
+            r##"(format: "reyvec-space", version: 1,
+    materials: [(name: "серый", color: "#808080")],
+    lamps: [(at: ({}, {}, {}), color: "#ffffff", power: 4.0, range: 6.0)],
+    objects: [(name: "ящик", material: "серый", at: (40.0, 0.0, 0.0), shape: Box(size: (0.2, 0.2, 0.2)))],
+)"##,
+            lamp.x, lamp.y, lamp.z
+        );
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Edit);
+        shape_info.shape = Some(ShapeInfo {
+            name: "сцена",
+            spin: false,
+            free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            post_aa: false,
+            in_view: true,
+            passes: &[],
+            camera: cam,
+            shift: [0.0; 3],
+            error: None,
+            text: &text,
+            preview: &NO_PREVIEW,
+            cost: None,
+            scene: true,
+            root: std::path::Path::new("."),
+        });
+        // Раскладка окна устанавливается за пару кадров.
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        let at = ui.viewport().expect("окно сцены").center();
+        // Щелчок по кружку лампы выбирает её.
+        frame(&ctx, &mut ui, &shape_info, pointer(at, Some(true)));
+        frame(&ctx, &mut ui, &shape_info, pointer(at, Some(false)));
+        assert_eq!(ui.space.lamp, Some(0));
+        assert!(ui.shape_selected.is_empty());
+        ui.take_actions();
+        // У выбранной лампы своя карточка в инспекторе: окно сцены могло сдвинуться.
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        let at = ui.viewport().expect("окно сцены").center();
+        // Протяжка вправо двигает лампу по полу: высота та же, x больше.
+        frame(&ctx, &mut ui, &shape_info, pointer(at, Some(true)));
+        for k in 1..=6 {
+            let p = at + vec2(10.0 * k as f32, 0.0);
+            frame(&ctx, &mut ui, &shape_info, pointer(p, None));
+        }
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            pointer(at + vec2(60.0, 0.0), Some(false)),
+        );
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        let acts = ui.take_actions();
+        let moved = acts
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::ShapeText {
+                    text,
+                    commit: false,
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("лампа не сдвинулась: {acts:?} {:?}", ui.space.lamp));
+        assert!(acts.contains(&Action::EndEdit));
+        let file: reyvec_sdf::space_file::SpaceFile = ron::from_str(&moved).unwrap();
+        let now = glam::Vec3::from(file.lamps[0].at);
+        assert!((now.y - lamp.y).abs() < 2e-3, "{now} {lamp}");
+        assert!(now.x > lamp.x + 0.05, "{now} {lamp}");
+        // Delete убирает выбранную лампу.
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            vec![key(egui::Key::Delete, egui::Modifiers::NONE)],
+        );
+        let Some(Action::ShapeText {
+            text: t,
+            commit: true,
+        }) = ui.take_actions().pop()
+        else {
+            panic!("лампа не убралась");
+        };
+        let file: reyvec_sdf::space_file::SpaceFile = ron::from_str(&t).unwrap();
+        assert!(file.lamps.is_empty() && file.objects.len() == 1);
+        assert_eq!(ui.space.lamp, None);
     }
 
     #[test]

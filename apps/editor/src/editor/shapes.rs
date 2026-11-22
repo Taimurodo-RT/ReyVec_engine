@@ -881,17 +881,20 @@ pub(crate) fn parent_frame(text: &str, path: &[usize]) -> Option<glam::Affine3A>
     Some(m)
 }
 
-/// Какую деталь видно по лучу из `origin` вдоль `dir` (координаты модели): луч идёт до
-/// поверхности модели без спрятанных деталей, там берётся ближайшая деталь без вложенных
-/// (с копиями зеркал и повторов). `None` — луч мимо модели.
-pub(crate) fn pick(
+/// Точка, где луч `origin + dir·t` встречает модель или сцену без спрятанных деталей
+/// (М.8б: куда встаёт модель, брошенная из «Ассетов»). `None` — луч мимо.
+pub(crate) fn hit(
     text: &str,
     hidden: &[Vec<usize>],
     origin: Vec3,
     dir: Vec3,
     far: f32,
-) -> Option<Vec<usize>> {
-    let shape = whole(text)?;
+) -> Option<Vec3> {
+    march(&whole(text)?, hidden, origin, dir, far)
+}
+
+/// Шаги луча по форме `shape` без спрятанных частей `hidden`.
+fn march(shape: &Shape3, hidden: &[Vec<usize>], origin: Vec3, dir: Vec3, far: f32) -> Option<Vec3> {
     let mut sorted = hidden.to_vec();
     sorted.sort_unstable_by(|a, b| b.cmp(a));
     let mut whole = shape.clone();
@@ -903,20 +906,32 @@ pub(crate) fn pick(
         .bounds_box()
         .map_or(2e-3, |(lo, hi)| ((hi - lo).max_element() * 2e-4).max(1e-5));
     let mut t = 0.0;
-    let mut hit = None;
     for _ in 0..400 {
         let p = origin + dir * t;
         let d = whole.distance(p);
         if d.abs() < eps {
-            hit = Some(p);
-            break;
+            return Some(p);
         }
         t += d.max(eps * 0.5);
         if t > far {
             break;
         }
     }
-    let p = hit?;
+    None
+}
+
+/// Какую деталь видно по лучу из `origin` вдоль `dir` (координаты модели): луч идёт до
+/// поверхности модели без спрятанных деталей, там берётся ближайшая деталь без вложенных
+/// (с копиями зеркал и повторов). `None` — луч мимо модели.
+pub(crate) fn pick(
+    text: &str,
+    hidden: &[Vec<usize>],
+    origin: Vec3,
+    dir: Vec3,
+    far: f32,
+) -> Option<Vec<usize>> {
+    let shape = whole(text)?;
+    let p = march(&shape, hidden, origin, dir, far)?;
     let tree = super::shape_edit::parse(text).ok()?;
     let mut best: Option<(f32, Vec<usize>)> = None;
     let mut stack = vec![(Vec::new(), &tree)];

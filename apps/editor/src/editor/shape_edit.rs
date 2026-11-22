@@ -816,10 +816,19 @@ pub(crate) const PALETTE: [&str; 8] = [
 
 /// Текст новой детали `kind` с размером около `size` метров, сдвинутой на `at`.
 pub(crate) fn new_part(kind: &str, size: f64, at: [f64; 3]) -> String {
+    format!(
+        "Move(at: {}, shape: {})",
+        triple(at),
+        part_shape(kind, size)
+    )
+}
+
+/// Текст формы новой детали `kind` с размером около `size` метров, без сдвига.
+pub(crate) fn part_shape(kind: &str, size: f64) -> String {
     let s = num(size);
     let h = num(size * 0.5);
     let q = num(size * 0.25);
-    let shape = match kind {
+    match kind {
         "Sphere" => format!("Sphere(radius: {h})"),
         "Cylinder" => format!("Cylinder(height: {s}, radius: {h})"),
         "Capsule" => format!("Capsule(height: {s}, radius: {q})"),
@@ -860,8 +869,7 @@ pub(crate) fn new_part(kind: &str, size: f64, at: [f64; 3]) -> String {
             )
         }
         _ => format!("Box(size: ({s}, {s}, {s}))"),
-    };
-    format!("Move(at: {}, shape: {shape})", triple(at))
+    }
 }
 
 #[cfg(test)]
