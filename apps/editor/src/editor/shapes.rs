@@ -73,6 +73,8 @@ pub(crate) struct ShapeView {
     pub error: Option<String>,
     /// Модель ещё ни разу не прочиталась: камера встанет по ней, когда прочитается.
     framed: bool,
+    /// Текст файла модели при последнем чтении или записи (М.3: из него дерево частей).
+    pub text: String,
 }
 
 impl ShapeView {
@@ -99,6 +101,7 @@ impl ShapeView {
             last: Instant::now(),
             error: None,
             framed: false,
+            text: String::new(),
         })
     }
 
@@ -106,6 +109,13 @@ impl ShapeView {
     /// ([`ShapeView::error`]), движку отдавать нечего.
     pub(crate) fn load(&mut self) -> Option<String> {
         self.modified = modified(&self.path);
+        match std::fs::read_to_string(&self.path) {
+            Ok(t) => self.text = t,
+            Err(e) => {
+                self.error = Some(format!("не прочитать файл: {e}"));
+                return None;
+            }
+        }
         self.checked = Instant::now();
         // Сначала модель в начале координат: узнать, какого она размера.
         let probe = stand_text(&self.name, [0.0; 3], 1.0, None);
@@ -135,6 +145,17 @@ impl ShapeView {
         self.radius = radius;
         self.error = None;
         Some(stand_text(&self.name, shift, stand, Some(radius)))
+    }
+
+    /// Записать новый текст модели (правка из редактора, М.3) и перечитать её; ответ —
+    /// как у [`ShapeView::load`]. Не записалось — текст остаётся прежним, ошибка в
+    /// [`ShapeView::error`].
+    pub(crate) fn write(&mut self, text: &str) -> Option<String> {
+        if let Err(e) = std::fs::write(&self.path, text) {
+            self.error = Some(format!("не записать файл: {e}"));
+            return None;
+        }
+        self.load()
     }
 
     /// Сохранили ли файл модели с прошлого чтения (смотрит не чаще [`CHECK_EVERY`]).

@@ -25,6 +25,7 @@ mod outline;
 mod overlay;
 mod parts;
 mod ron_edit;
+mod shape_edit;
 mod shapes;
 mod theme;
 mod ui;
@@ -151,6 +152,11 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         autosave_at: Instant::now(),
         autosaved: String::new(),
         shape: None,
+        shape_undo: Vec::new(),
+        shape_redo: Vec::new(),
+        shape_drag: None,
+        shape_pending: None,
+        shape_written: Instant::now(),
     };
     event_loop
         .run_app(&mut editor)
@@ -225,6 +231,14 @@ struct Editor {
     autosaved: String,
     /// Открытая во «Формах» модель (М.2): движок рисует её на подставке вместо сцены.
     shape: Option<shapes::ShapeView>,
+    /// История правок модели (М.3): тексты файла до правки.
+    shape_undo: Vec<String>,
+    shape_redo: Vec<String>,
+    /// Текст модели до правки, которую ещё тянут мышью.
+    shape_drag: Option<String>,
+    /// Правка модели, которую ещё не записали (пишется не чаще [`PREVIEW_INTERVAL`]).
+    shape_pending: Option<String>,
+    shape_written: Instant,
 }
 
 impl Editor {
@@ -295,10 +309,96 @@ impl Editor {
         r.set_space_camera(shape.camera());
         tracing::info!("Формы: модель {}", shape.name);
         self.shape = Some(shape);
+        self.shape_undo.clear();
+        self.shape_redo.clear();
+        self.shape_drag = None;
+        self.shape_pending = None;
+    }
+
+    /// Правка модели из инспектора «Форм», её отмена и повтор (М.3). Правка сразу
+    /// пишется в файл модели: подставка показывает её, блокнот видит её.
+    fn shape_action(&mut self, action: Action) {
+        let Some(shape) = self.shape.as_ref() else {
+            return;
+        };
+        let current = shape.text.clone();
+        let next = match action {
+            Action::ShapeText {
+                text,
+                commit: false,
+            } => {
+                if self.shape_drag.is_none() {
+                    self.shape_drag = Some(current);
+                }
+                self.shape_pending = Some(text);
+                if self.shape_written.elapsed() < PREVIEW_INTERVAL {
+                    return;
+                }
+                self.shape_pending.take()
+            }
+            Action::ShapeText { text, commit: true } => {
+                self.shape_undo
+                    .push(self.shape_drag.take().unwrap_or(current));
+                self.shape_redo.clear();
+                self.shape_pending = None;
+                Some(text)
+            }
+            Action::EndEdit => match self.shape_drag.take() {
+                Some(before) => {
+                    self.shape_undo.push(before);
+                    self.shape_redo.clear();
+                    self.shape_pending.take()
+                }
+                None => None,
+            },
+            Action::CancelEdit => {
+                self.shape_pending = None;
+                self.shape_drag.take()
+            }
+            Action::Undo => {
+                let Some(before) = self.shape_undo.pop() else {
+                    return;
+                };
+                self.shape_redo.push(current);
+                Some(before)
+            }
+            Action::Redo => {
+                let Some(after) = self.shape_redo.pop() else {
+                    return;
+                };
+                self.shape_undo.push(current);
+                Some(after)
+            }
+            _ => None,
+        };
+        if let Some(text) = next {
+            self.write_shape(&text);
+        }
+    }
+
+    /// Записать текст модели в её файл и показать на подставке.
+    fn write_shape(&mut self, text: &str) {
+        let (Some(shape), Some(r)) = (self.shape.as_mut(), self.renderer.as_mut()) else {
+            return;
+        };
+        self.shape_written = Instant::now();
+        match shape.write(text) {
+            Some(scene) => r.set_space_file_in(&scene, Some(shape.root.clone())),
+            None => tracing::warn!(
+                "Модель {}: {}",
+                shape.name,
+                shape.error.as_deref().unwrap_or("")
+            ),
+        }
     }
 
     /// Модель на подставке: перечитать сохранённый файл, повернуть камеру.
     fn update_shape(&mut self) {
+        if self.shape_written.elapsed() >= PREVIEW_INTERVAL
+            && let Some(t) = self.shape_pending.take()
+        {
+            self.write_shape(&t);
+        }
         let (Some(shape), Some(r)) = (self.shape.as_mut(), self.renderer.as_mut()) else {
             return;
         };
@@ -433,10 +533,36 @@ impl Editor {
     }
 
     fn apply(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        if self.shape.is_some() {
+            match action {
+                Action::ShapeText { .. }
+                | Action::Undo
+                | Action::Redo
+                | Action::EndEdit
+                | Action::CancelEdit => return self.shape_action(action),
+                // Правки сцены, пока открыта модель, сцену не трогают (Delete, Ctrl+C…).
+                Action::Edit { .. }
+                | Action::Save
+                | Action::Copy { .. }
+                | Action::Paste { .. }
+                | Action::Duplicate(_)
+                | Action::Delete(_)
+                | Action::Move { .. }
+                | Action::DropAsset { .. }
+                | Action::MoveMany(_)
+                | Action::Group(_)
+                | Action::Ungroup(_)
+                | Action::AddPart { .. }
+                | Action::RemovePart { .. }
+                | Action::SavePrefab(_) => return,
+                _ => {}
+            }
+        }
         let (Some(r), Some(w)) = (self.renderer.as_mut(), self.window.clone()) else {
             return;
         };
         match action {
+            Action::ShapeText { .. } => {}
             Action::Play | Action::Simulate => {
                 if self.shape.take().is_some() {
                     // Играют в сцену, а не в модель на подставке.
@@ -531,6 +657,13 @@ impl Editor {
             }
             Action::OpenShape(path) => self.open_shape(path),
             Action::CloseShape => {
+                if let Some(t) = self.shape_pending.take() {
+                    self.write_shape(&t);
+                }
+                self.shape_drag = None;
+                let Some(r) = self.renderer.as_mut() else {
+                    return;
+                };
                 if self.shape.take().is_some() {
                     r.set_scene(DemoScene::File);
                     tracing::info!("Формы закрыты, снова сцена");
@@ -1077,6 +1210,7 @@ impl Editor {
                 name: &s.name,
                 spin: s.spin,
                 error: s.error.as_deref().or(shape_error.as_deref()),
+                text: &s.text,
             }),
         };
         let input = state.take_egui_input(window);

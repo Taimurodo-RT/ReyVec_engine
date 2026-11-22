@@ -3349,6 +3349,8 @@ dependencies = [
  "reyvec-scene",
  "reyvec-sdf",
  "reyvec-vector",
+ "ron",
+ "serde",
  "tracing",
  "winit",
 ]
