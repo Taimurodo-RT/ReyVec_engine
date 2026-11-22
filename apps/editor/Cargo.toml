@@ -22,6 +22,7 @@ mlua = { version = "0.12", features = ["luau", "send"] }
 reyvec-app.workspace = true
 reyvec-gpu.workspace = true
 reyvec-scene.workspace = true
+reyvec-script.workspace = true
 reyvec-sdf.workspace = true
 png.workspace = true
 ron.workspace = true
