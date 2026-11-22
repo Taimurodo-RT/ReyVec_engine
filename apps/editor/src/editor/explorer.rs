@@ -44,6 +44,8 @@ pub(crate) enum Out {
     OpenShape(PathBuf),
     /// Сцену 2D — в «Мир».
     OpenScene(PathBuf),
+    /// Скрипт Luau — в редактор кода (С.1).
+    OpenScript(PathBuf),
     /// Открыть программой Windows (блокнот, просмотр картинок…).
     OpenFile(PathBuf),
     /// Показать в проводнике Windows.
@@ -846,7 +848,9 @@ impl Explorer {
         }
         let name = pf::file_name(path).to_lowercase();
         let prefab = path.parent().is_some_and(|p| pf::file_name(p) == PREFABS);
-        let out = if is_shape(&name) || (name.ends_with(".ron") && is_space_scene(path)) {
+        let out = if name.ends_with(".luau") {
+            Out::OpenScript(path.to_path_buf())
+        } else if is_shape(&name) || (name.ends_with(".ron") && is_space_scene(path)) {
             Out::OpenShape(path.to_path_buf())
         } else if name.ends_with(".ron") && !prefab && is_scene_2d(path) {
             Out::OpenScene(path.to_path_buf())
@@ -1906,7 +1910,10 @@ impl Explorer {
     fn open_kind(&self, path: &Path) -> OpenKind {
         let name = pf::file_name(path).to_lowercase();
         let prefab = path.parent().is_some_and(|p| pf::file_name(p) == PREFABS);
-        if is_shape(&name) || (name.ends_with(".ron") && is_space_scene(path)) {
+        if is_shape(&name)
+            || (name.ends_with(".ron") && is_space_scene(path))
+            || name.ends_with(".luau")
+        {
             OpenKind::Editor
         } else if name.ends_with(".ron") && !prefab && is_scene_2d(path) {
             OpenKind::World
