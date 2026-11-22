@@ -209,6 +209,8 @@ pub(crate) struct ShapeInfo<'a> {
     pub triangles: bool,
     /// Сглаживание 3D по картинке вместо краёв лучами.
     pub post_aa: bool,
+    /// 3D рисуется только в окне просмотра (иначе — на всё окно, под панелями тоже).
+    pub in_view: bool,
     /// Самые долгие проходы видеокарты за последнюю секунду, мс (и весь кадр).
     pub passes: &'a [(&'static str, f64)],
     /// Камера подставки в этом кадре (для выбора щелчком и стрелок).
@@ -853,11 +855,19 @@ impl EditorUi {
         }
     }
 
+    /// Где на экране кадр подставки: окно просмотра или всё окно.
+    fn shape_screen(&self, ui: &Ui, shape: &ShapeInfo) -> Rect {
+        match self.viewport {
+            Some(r) if shape.in_view => r,
+            _ => ui.ctx().content_rect(),
+        }
+    }
+
     /// Стрелки выбранной детали на экране (М.4): откуда и куда идёт каждая ось, и
     /// сколько точек экрана на метр по ней. Рисует рамку детали и стрелки.
     fn shape_gizmo(&mut self, ui: &mut Ui, shape: &ShapeInfo) -> Option<Gizmo> {
         let path = self.shape_selected.clone();
-        let screen = ui.ctx().content_rect();
+        let screen = self.shape_screen(ui, shape);
         let to_screen = |w: glam::Vec3| -> Option<Pos2> {
             let aspect = screen.width() / screen.height().max(1.0);
             let n = shape.camera.project(w, aspect)?;
@@ -967,7 +977,7 @@ impl EditorUi {
         shape: &ShapeInfo,
         gizmo: Option<&Gizmo>,
     ) {
-        let screen = ui.ctx().content_rect();
+        let screen = self.shape_screen(ui, shape);
         let ray = |pos: Pos2| {
             let aspect = screen.width() / screen.height().max(1.0);
             let x = (pos.x - screen.left()) / screen.width() * 2.0 - 1.0;
@@ -4366,6 +4376,7 @@ mod tests {
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
             post_aa: false,
+            in_view: true,
             passes: &[],
             camera: reyvec_sdf::Camera3D::default(),
             shift: [0.0; 3],
@@ -4394,6 +4405,7 @@ mod tests {
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
             post_aa: false,
+            in_view: true,
             passes: &[],
             camera: reyvec_sdf::Camera3D::default(),
             shift: [0.0; 3],
@@ -4463,6 +4475,7 @@ mod tests {
             scale: reyvec_gpu::SpaceScale::Full,
             triangles: false,
             post_aa: false,
+            in_view: true,
             passes: &[],
             camera,
             shift: [0.0; 3],
@@ -4471,7 +4484,7 @@ mod tests {
         });
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         // Середина экрана — шар (камера смотрит на него).
-        let mid = pos2(800.0, 450.0);
+        let mid = ui.viewport().unwrap().center();
         assert!(ui.viewport().unwrap().contains(mid));
         ui.shape_selected = vec![1];
         frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(true)));
@@ -4508,7 +4521,7 @@ mod tests {
         ui.take_actions();
         // Стрелка X: тянем вправо — шар уезжает по X (обёрнут в сдвиг), отпустили — конец
         // правки.
-        let screen = ctx.content_rect();
+        let screen = ui.viewport().expect("окно подставки");
         let p = camera
             .project(
                 glam::Vec3::new(0.12, 0.0, 0.0),
@@ -4516,8 +4529,8 @@ mod tests {
             )
             .unwrap();
         let on_arrow = pos2(
-            (p.x * 0.5 + 0.5) * screen.width(),
-            (0.5 - p.y * 0.5) * screen.height(),
+            screen.left() + (p.x * 0.5 + 0.5) * screen.width(),
+            screen.top() + (0.5 - p.y * 0.5) * screen.height(),
         );
         frame(&ctx, &mut ui, &shape_info, pointer(on_arrow, None));
         frame(&ctx, &mut ui, &shape_info, pointer(on_arrow, Some(true)));
@@ -4932,6 +4945,7 @@ mod tests {
                     scale: reyvec_gpu::SpaceScale::Full,
                     triangles: false,
                     post_aa: false,
+                    in_view: true,
                     passes: &[],
                     camera: reyvec_sdf::Camera3D::default(),
                     shift: [0.0; 3],

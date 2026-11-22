@@ -172,6 +172,11 @@ pub struct WindowRenderer {
     timer: Option<GpuTimer>,
     /// Картинки окна можно копировать (нужно для снимков кадра).
     snapshot_supported: bool,
+    /// Можно ли копировать в картинки окна (нужно окну просмотра, [`Self::set_view_rect`]).
+    copy_to_window: bool,
+    /// Окно просмотра: кадр сцены рисуется только в этом прямоугольнике окна (x, y,
+    /// ширина, высота в пикселях), остальное окно — фон под панели.
+    view_rect: Option<[u32; 4]>,
     snapshot_requested: bool,
     snapshot_pending: Option<PendingSnapshot>,
     snapshot_ready: Option<FrameImage>,
@@ -251,6 +256,8 @@ impl WindowRenderer {
             present_fences: PresentFences::default(),
             timer: None,
             snapshot_supported: false,
+            copy_to_window: false,
+            view_rect: None,
             snapshot_requested: false,
             snapshot_pending: None,
             snapshot_ready: None,
@@ -960,6 +967,27 @@ impl WindowRenderer {
         self.snapshot_ready.take()
     }
 
+    /// Окно просмотра: кадр сцены рисуется только в прямоугольнике `[x, y, ширина,
+    /// высота]` (пиксели окна), а не под панелями редактора — меньше пикселей, кадр
+    /// дешевле. `None` — сцена на всё окно. Видеокарта не умеет копировать в картинки
+    /// окна — сцена тоже на всё окно.
+    pub fn set_view_rect(&mut self, rect: Option<[u32; 4]>) {
+        self.view_rect = rect;
+    }
+
+    /// Умеет ли видеокарта рисовать сцену только в окне просмотра.
+    pub fn view_rect_supported(&self) -> bool {
+        self.copy_to_window
+    }
+
+    /// Прямоугольник, где рисуется сцена в этом кадре (`None` — всё окно).
+    pub fn view_rect(&self) -> Option<[u32; 4]> {
+        if !self.copy_to_window {
+            return None;
+        }
+        view_rect_in(self.view_rect?, [self.extent.width, self.extent.height])
+    }
+
     /// Размер картинки окна в пикселях.
     pub fn extent(&self) -> [u32; 2] {
         [self.extent.width, self.extent.height]
@@ -1107,6 +1135,12 @@ impl WindowRenderer {
         let view = self.views[image_index];
         let render_finished = self.render_finished[image_index];
         let extent = self.extent;
+        let view_rect = self.view_rect();
+        // Сцена рисуется в окно просмотра: её кадр размером с него.
+        let scene_extent = view_rect.map_or(extent, |r| vk::Extent2D {
+            width: r[2],
+            height: r[3],
+        });
 
         // SAFETY: забор кадра дождались, значит его командный буфер свободен.
         // Все объекты принадлежат этому устройству и живы до конца кадра.
@@ -1128,7 +1162,7 @@ impl WindowRenderer {
                     &self.ctx,
                     res,
                     self.frame_index,
-                    extent,
+                    scene_extent,
                     time,
                     shader_error,
                     self.scene,
@@ -1195,7 +1229,15 @@ impl WindowRenderer {
                     },
                     Some(Access::Present),
                 );
-                demo.add_passes(&mut graph, &res.bindless, data, target);
+                match view_rect {
+                    Some(rect) => {
+                        let scene =
+                            graph.create("окно просмотра", scene_extent, self.format.format);
+                        demo.add_passes(&mut graph, &res.bindless, data, scene);
+                        add_view_pass(&mut graph, scene, target, rect);
+                    }
+                    None => demo.add_passes(&mut graph, &res.bindless, data, target),
+                }
                 if let (Some(data), Some(renderer)) = (ui_data, self.ui.as_ref()) {
                     renderer.add_pass(&mut graph, &res.bindless, data, target);
                 }
@@ -1342,11 +1384,17 @@ impl WindowRenderer {
         self.snapshot_supported = caps
             .supported_usage_flags
             .contains(vk::ImageUsageFlags::TRANSFER_SRC);
-        let usage = if self.snapshot_supported {
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC
-        } else {
-            vk::ImageUsageFlags::COLOR_ATTACHMENT
-        };
+        // Копирование в них — для окна просмотра (кадр сцены в части окна).
+        self.copy_to_window = caps
+            .supported_usage_flags
+            .contains(vk::ImageUsageFlags::TRANSFER_DST);
+        let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        if self.snapshot_supported {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        if self.copy_to_window {
+            usage |= vk::ImageUsageFlags::TRANSFER_DST;
+        }
         if extent.width == 0 || extent.height == 0 {
             return Ok(false);
         }
@@ -1581,6 +1629,88 @@ impl Drop for WindowRenderer {
     }
 }
 
+/// Окно просмотра внутри окна `size`: обрезано по окну, `None` — пустое.
+fn view_rect_in(rect: [u32; 4], size: [u32; 2]) -> Option<[u32; 4]> {
+    let [x, y, w, h] = rect;
+    let (x, y) = (x.min(size[0]), y.min(size[1]));
+    let w = w.min(size[0] - x);
+    let h = h.min(size[1] - y);
+    (w > 0 && h > 0).then_some([x, y, w, h])
+}
+
+/// Проход «в окно просмотра»: окно заливается фоном, кадр сцены `scene` копируется в
+/// прямоугольник `rect`. Панели рисуются поверх уже после.
+fn add_view_pass(
+    graph: &mut RenderGraph<'_>,
+    scene: ImageHandle,
+    target: ImageHandle,
+    rect: [u32; 4],
+) {
+    graph.add_pass(
+        "в окно просмотра",
+        &[(scene, Access::TransferSrc), (target, Access::TransferDst)],
+        move |p| {
+            let layers = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .layer_count(1);
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            let region = vk::ImageCopy::default()
+                .src_subresource(layers)
+                .dst_subresource(layers)
+                .dst_offset(vk::Offset3D {
+                    x: rect[0] as i32,
+                    y: rect[1] as i32,
+                    z: 0,
+                })
+                .extent(vk::Extent3D {
+                    width: rect[2],
+                    height: rect[3],
+                    depth: 1,
+                });
+            let black = vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            };
+            let barrier = [vk::ImageMemoryBarrier2::default()
+                .image(p.image(target))
+                .subresource_range(range)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)];
+            // SAFETY: граф перевёл кадр сцены в раскладку чтения копии, картинку окна — в
+            // раскладку записи; прямоугольник обрезан по окну и равен размеру кадра сцены.
+            unsafe {
+                p.device.cmd_clear_color_image(
+                    p.cmd,
+                    p.image(target),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &black,
+                    &[range],
+                );
+                p.device.cmd_pipeline_barrier2(
+                    p.cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&barrier),
+                );
+                p.device.cmd_copy_image(
+                    p.cmd,
+                    p.image(scene),
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    p.image(target),
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+        },
+    );
+}
+
 /// Проход «снимок»: копирует готовую картинку окна в `buffer`, доступный процессору.
 fn add_snapshot_pass(graph: &mut RenderGraph<'_>, target: ImageHandle, buffer: vk::Buffer) {
     graph.add_pass("снимок", &[(target, Access::TransferSrc)], move |p| {
@@ -1708,6 +1838,20 @@ mod tests {
             M::IMMEDIATE
         );
         assert_eq!(choose_present_mode(&[M::FIFO], false), M::FIFO);
+    }
+
+    #[test]
+    fn view_rect_is_clipped_to_the_window() {
+        assert_eq!(
+            view_rect_in([10, 20, 300, 200], [1920, 1080]),
+            Some([10, 20, 300, 200])
+        );
+        assert_eq!(
+            view_rect_in([1800, 1000, 300, 200], [1920, 1080]),
+            Some([1800, 1000, 120, 80])
+        );
+        assert_eq!(view_rect_in([2000, 0, 300, 200], [1920, 1080]), None);
+        assert_eq!(view_rect_in([0, 0, 0, 200], [1920, 1080]), None);
     }
 
     #[test]

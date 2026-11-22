@@ -3,6 +3,7 @@
 //!
 //! Флаги:
 //! - `--scene-file <файл.ron>`: какую сцену открыть (по умолчанию `scenes/first-room.ron`);
+//! - `--shape <файл.shape.ron>`: сразу открыть модель во «Формах» (для проверок);
 //! - `--window-frame`: обычная рамка окна Windows вместо своей верхней полосы;
 //! - `--gpu <номер или часть названия>`: выбрать видеокарту;
 //! - `--no-vsync`: без вертикальной синхронизации;
@@ -25,6 +26,7 @@ const HELP: &str = "\
 Запуск: reyvec-editor [флаги]
 
   --scene-file <файл.ron>  какую сцену открыть (по умолчанию scenes\\first-room.ron)
+  --shape <файл>         сразу открыть модель во «Формах»
   --window-frame         обычная рамка окна Windows вместо своей верхней полосы
   --gpu <номер|имя>      выбрать видеокарту, например --gpu radeon
   --no-vsync             без вертикальной синхронизации
@@ -48,6 +50,7 @@ struct Args {
     validation: bool,
     gpu: Option<String>,
     scene_file: Option<String>,
+    shape: Option<String>,
     seconds: Option<f64>,
     frames: Option<u64>,
     snapshot: Option<String>,
@@ -77,6 +80,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     it.next()
                         .ok_or("после --scene-file нужен путь к файлу сцены .ron")?,
                 );
+            }
+            "--shape" => {
+                out.shape = Some(it.next().ok_or("после --shape нужен файл .shape.ron")?);
             }
             "--seconds" => out.seconds = Some(seconds("--seconds", it.next())?),
             "--snapshot-after" => {
@@ -162,6 +168,10 @@ fn main() -> ExitCode {
         vsync: !args.no_vsync,
         frameless: !args.window_frame,
         scene_file,
+        shape: args.shape.map(|p| {
+            let p = PathBuf::from(p);
+            std::path::absolute(&p).unwrap_or(p)
+        }),
         project,
         max_seconds: args.seconds,
         max_frames: args.frames,
