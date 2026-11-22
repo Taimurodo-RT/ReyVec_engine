@@ -241,6 +241,24 @@ float map_plane(bool sun, float2 q, float2 uv, float side, float2 slope, float h
 }
 
 static const float SUN_MAP_SOFT = 1.0 / 12.0;
+// Сцена «3D» (8.20з): точка для карты сдвигается по нормали на столько точек карты. В
+// карте — плоские треугольники сетки, а нормаль точки — по наклону самой формы: на
+// скруглённых краях и на гранях наискосок к свету плоскость точки расходилась с картой, и
+// поверхность затеняла сама себя («ёлочка» на гранях, чёрные клинья на краях крышек).
+static const float MAP_NORMAL_OFFSET = 1.5;
+
+// Точка `p` в пространстве карты по матрице из слов сцены с `m`.
+float4 map_clip(uint m, float3 p)
+{
+    float4 clip = float4(0.0, 0.0, 0.0, 0.0);
+    for (uint c = 0; c < 4; c++)
+    {
+        float4 column = float4(asfloat(pc.scene[m + 4 * c]), asfloat(pc.scene[m + 4 * c + 1]),
+                               asfloat(pc.scene[m + 4 * c + 2]), asfloat(pc.scene[m + 4 * c + 3]));
+        clip += column * (c < 3 ? p[c] : 1.0);
+    }
+    return clip;
+}
 
 float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
 {
@@ -256,13 +274,7 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
     {
         if (sun)
             m = at + MESH_SUN_PROJ + k * 16;
-        float4 clip = float4(0.0, 0.0, 0.0, 0.0);
-        for (uint c = 0; c < 4; c++)
-        {
-            float4 column = float4(asfloat(pc.scene[m + 4 * c]), asfloat(pc.scene[m + 4 * c + 1]),
-                                   asfloat(pc.scene[m + 4 * c + 2]), asfloat(pc.scene[m + 4 * c + 3]));
-            clip += column * (c < 3 ? p[c] : 1.0);
-        }
+        float4 clip = map_clip(m, p);
         if (clip.w <= 1e-4)
             return 1.0;
         ndc = clip.xy / clip.w;
@@ -279,6 +291,25 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
     uint w, h;
     map.GetDimensions(w, h);
     float side = float(h);
+    // Сцена «3D» (солнце и лампы, смотрящие вниз): точка над поверхностью на
+    // MAP_NORMAL_OFFSET точек карты (у лампы точка карты к краю шире: 1 + tan² угла).
+    bool scene3d = sun || (pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0;
+    if (scene3d)
+    {
+        float world;
+        if (sun)
+        {
+            float3 r0 = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 4]), asfloat(pc.scene[m + 8]));
+            world = 2.0 / (length(r0) * side);
+        }
+        else
+            world = length(p - read_lamp(square).at) * 5.5 / side * (1.0 + 7.56 * dot(ndc, ndc));
+        p += n * (MAP_NORMAL_OFFSET * world);
+        float4 moved = map_clip(m, p);
+        if (moved.w <= 1e-4)
+            return 1.0;
+        ndc = clamp(moved.xy / moved.w, -1.0, 1.0);
+    }
     float2 inv = 1.0 / float2(float(w), float(h));
     float2 lo = float2(float(square) * side, 0.0);
     float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * side;
@@ -303,7 +334,8 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
         float facing = dot(SUN, n);
         if (facing > 0.05)
             slope = float2(dot(row0, n), -dot(row1, n)) / scale * texel / facing;
-        slope = clamp(slope, -2.0 * texel, 2.0 * texel);
+        // До 8.20з предел был 2 точки: на гранях наискосок к солнцу плоскость обрезалась.
+        slope = clamp(slope, -6.0 * texel, 6.0 * texel);
         bias = 0.01 + 1.5 * texel;
     }
     else
