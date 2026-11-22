@@ -23,6 +23,8 @@ const HISTORY: usize = 240;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PanelAction {
     Scene(DemoScene),
+    /// Другой файл сцены «3D» из той же папки (номер в [`PanelInfo::space_files`]).
+    SpaceFile(usize),
     Msaa(Msaa),
     CompactScene(bool),
     PerceptualEdges(bool),
@@ -138,6 +140,10 @@ pub(crate) struct PanelInfo<'a> {
     /// Файл сцены «3D» (7.5, если за ним следим), ошибка последнего сохранения и сколько
     /// в сцене предметов.
     pub space_file: Option<&'a str>,
+    /// Файлы сцен «3D» в папке текущего (`.ron`): название для кнопки и номер файла
+    /// сейчас, если он из этого списка.
+    pub space_files: &'a [String],
+    pub space_file_now: Option<usize>,
     pub space_error: Option<String>,
     pub space_objects: usize,
     /// Была ли сетка отсева в последнем объёмном кадре: в сцене «3D» её выключает
@@ -675,6 +681,21 @@ fn contents(ui: &mut egui::Ui, info: &PanelInfo, history: &VecDeque<f32>) {
     }
 }
 
+/// Кнопки файлов сцен «3D» папки (I — сцена «3D» с текущим файлом).
+fn space_file_buttons(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>) {
+    for (i, name) in info.space_files.iter().enumerate() {
+        let on = info.scene_id == DemoScene::Space && info.space_file_now == Some(i);
+        let text = if info.space_file_now == Some(i) {
+            format!("{name} (I)")
+        } else {
+            name.clone()
+        };
+        if ui.selectable_label(on, text).clicked() {
+            actions.push(PanelAction::SpaceFile(i));
+        }
+    }
+}
+
 /// Панель справа: выбор сцены и настройки мышкой. Нажатое попадает в `actions`.
 fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>) {
     egui::CollapsingHeader::new(
@@ -688,10 +709,17 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             // Сцены этапа в строку с переносом: список вдвое короче.
             ui.horizontal_wrapped(|ui| {
                 for (scene, key) in *scenes {
+                    // Сцена «3D» с файлами — кнопкой на каждый файл ниже.
+                    if *scene == DemoScene::Space && !info.space_files.is_empty() {
+                        continue;
+                    }
                     let text = format!("{} ({key})", scene.title());
                     if ui.selectable_label(info.scene_id == *scene, text).clicked() {
                         actions.push(PanelAction::Scene(*scene));
                     }
+                }
+                if scenes.iter().any(|(scene, _)| *scene == DemoScene::Space) {
+                    space_file_buttons(ui, info, actions);
                 }
             });
         }
@@ -1827,6 +1855,8 @@ mod tests {
             scene_file: None,
             scene_error: None,
             space_file: None,
+            space_files: &[],
+            space_file_now: None,
             space_error: None,
             space_objects: 0,
             space_culling: true,
