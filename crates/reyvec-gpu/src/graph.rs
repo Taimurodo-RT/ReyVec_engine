@@ -100,10 +100,13 @@ impl Access {
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
                 vk::AccessFlags2::SHADER_SAMPLED_READ,
             ),
+            // И чтение (8.22): «края 3D» читают доли теней, которые в ту же картинку
+            // записал проход «края 3D: тени»; барьер между ними должен сделать запись
+            // видимой чтению.
             Access::ComputeWrite => (
                 vk::ImageLayout::GENERAL,
                 vk::PipelineStageFlags2::COMPUTE_SHADER,
-                vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
             ),
             Access::TransferSrc => (
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,

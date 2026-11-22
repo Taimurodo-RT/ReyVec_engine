@@ -7,14 +7,10 @@
 // Конус квадрата 8×8 (7.8) накрывает весь квадрат, поэтому любой луч внутри пикселя
 // может начинать с его длины; полигоны берутся из самого пикселя.
 //
-// Тени на краях считаются точно, для своей точки пикселя: картинка теней вдвое меньше
-// кадра, и на перемычке тоньше двух пикселей или на полоске пола у края формы пиксель
-// получал бы тень соседней поверхности. Четыре доли света (солнце, углы, две лампы)
-// делят потоки группы: каждый считает одну долю одного пикселя, при двух лучах — две
-// (7.19б). Луч, попавший на ту же поверхность, берёт эти точные доли, попавший на
-// другую — растянутые из картинки теней. Точные доли считаются, только если растянутые
-// для точки пикселя ненадёжны (7.6с), и только для тех долей, у которых рядом проходит
-// граница тени (8.2б, shadow_steady); остальные доли берутся из картинки теней.
+// Тени на краях: у ненадёжных пикселей (7.6с) точные доли света своей точки пикселя
+// уже посчитал проход «края 3D: тени» (raymarch_edge_shadows.slang, 8.22) и оставил в
+// картинке краёв; у надёжных они растянуты из картинки теней. Луч, попавший на ту же
+// поверхность, берёт эти доли, попавший на другую — растянутые из картинки теней.
 
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
 
@@ -45,19 +41,6 @@ static const float2 SUBPIXEL_PAIR[2] = {
     float2(-0.25, -0.25),
 };
 
-// Замер по частям (8.1, слово 6 заголовка списка, как EdgeProbe в demo.rs): проход
-// пропускает одну часть работы, и по разнице времени на ПК видно, сколько она стоит.
-// Картинка краёв при этом неверная.
-static const uint EDGE_PROBE_NO_EXACT_SHADOWS = 1;
-static const uint EDGE_PROBE_NO_SUB_RAYS = 2;
-static const uint EDGE_PROBE_NO_SHADING = 3;
-static const uint EDGE_PROBE_EMPTY = 4;
-// Бит 8 того же слова (8.2): складки без доп. лучей. Слово 6 — замер (младшие 8 бит)
-// и этот бит, как Demo::edge_list_word в demo.rs.
-static const uint EDGE_CREASES = 0x100;
-// Бит 9 (8.2б): точные доли тени ненадёжных пикселей только там, где рядом проходит
-// граница тени (shadow_steady); остальные берутся из картинки теней.
-static const uint EDGE_SHADOW_REUSE = 0x200;
 
 // Складка (8.2): пиксель, где сходятся две плоские (или почти плоские) поверхности —
 // ребро коробки, стык передней грани и бока выдавленной фигуры, угол пола и стены. Тут
@@ -176,65 +159,6 @@ Crease find_crease(int2 px, float4 g0, uint w, uint h)
 }
 
 groupshared float3 colors[64];
-// Точные доли света пикселей группы: [пиксель][солнце, углы, лампа 1, лампа 2].
-groupshared float parts[32][4];
-
-// Очереди точных долей (8.2б): сколько пикселей ждут каждую долю и какие. Доли идут в
-// порядке PART_ORDER: потоки подряд берут одну долю, и лучи соседних потоков одинаковы
-// (7.19б: при четырёх лучах потоки 0–15 — первая лампа, 16–31 — вторая, 32–47 — углы,
-// 48–63 — солнце).
-groupshared uint need_count[4];
-groupshared uint need_pixel[4][32];
-static const uint PART_ORDER[4] = { 2, 3, 1, 0 };
-
-// Насколько могут расходиться точки картинки теней, чтобы долю взять из неё (8.2б).
-static const float STEADY_SPREAD = 0.03;
-
-// Какие доли света точки пикселя `px` (глубина `t`, нормаль `n`) можно взять из картинки
-// теней (8.2б), битами по номеру доли; `value` — их значения. Пиксель ненадёжный: среди
-// четырёх ближайших точек теней мало похожих на него, и обычное растяжение могло бы дать
-// ему тень соседней поверхности. Но если во всём квадрате 4×4 вокруг доля одна и та же
-// (у любой поверхности, и у неба: там 1), граница тени тут не проходит, и своя точка
-// почти наверняка получит то же. Ещё нужна хоть одна точка своей поверхности в квадрате:
-// перемычку тоньше двух пикселей картинка теней может пропустить целиком, и тогда её
-// освещённость не видна ни в одной точке.
-uint shadow_steady(int2 px, float t, float3 n, out float4 value)
-{
-    uint sw, sh;
-    textures[pc.shadows].GetDimensions(sw, sh);
-    int2 gsize = gbuffer_size();
-    int2 base = px >> 1;
-    float4 lo = float4(1e9, 1e9, 1e9, 1e9);
-    float4 hi = -lo;
-    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
-    bool own = false;
-    for (uint k = 0; k < 16; k++)
-    {
-        int2 hp = clamp(base + int2(int(k & 3) - 1, int(k >> 2) - 1), int2(0, 0), int2(sw, sh) - 1);
-        float4 v = textures[pc.shadows].Load(int3(hp, 0));
-        lo = min(lo, v);
-        hi = max(hi, v);
-        sum += v;
-        float4 g = gbuffer_load(min(hp * 2, gsize - 1));
-        if (g.x >= 0.0)
-        {
-            float depth = saturate(1.0 - abs(g.x - t) / (0.02 * t + 0.05));
-            float facing = saturate(dot(oct_decode(g.zw), n));
-            facing *= facing;
-            own = own || depth * facing * facing > 0.25;
-        }
-    }
-    value = sum / 16.0;
-    if (!own)
-        return 0;
-    uint mask = 0;
-    for (uint p = 0; p < 4; p++)
-    {
-        if (hi[p] - lo[p] < STEADY_SPREAD)
-            mask |= 1u << p;
-    }
-    return mask;
-}
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -290,86 +214,18 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     }
     float3 n0 = oct_decode(g0.zw);
 
-    // Точные доли света точки самого пикселя (солнце, углы, две лампы). Только там, где
-    // тени из половинного размера для неё ненадёжны (7.6с): у силуэта большой формы её
-    // сторона края и так покрыта похожими точками, и четыре луча тени на пиксель не
-    // нужны. Надёжна ли точка, уже решил «поиск» (тот же вес, что набирает
-    // upsampled_shadows_checked). Доли раздаются по долям, а не по пикселям (7.19б):
-    // поток считает одну долю пикселя `lane % per` (при двух лучах — две по очереди), так
-    // что 16 соседних потоков (при двух лучах — 32) идут одним и тем же лучом. В волне из
-    // 32 потоков при четырёх лучах первая считает только лампы, вторая — углы и солнце
-    // (в 2.5D-виде солнца нет, и там только углы); прежде в каждой волне были все четыре.
-    float4 upsampled = float4(1.0, 1.0, 1.0, 1.0);
+    // Точные доли света точки самого пикселя (солнце, углы, две лампы) у ненадёжных
+    // пикселей уже посчитал проход «края 3D: тени» (raymarch_edge_shadows.slang, 8.22) и
+    // оставил в картинке краёв на месте пикселя; цвет ниже их заменит. Надёжным хватает
+    // теней из половинного размера.
+    float4 exact = float4(1.0, 1.0, 1.0, 1.0);
     if (unreliable)
     {
-        // Сначала (8.2б) поток пикселя решает, какие доли можно взять из картинки теней
-        // (shadow_steady), а остальные ставит в очередь своей доли. Потом все 64 потока
-        // разбирают очереди подряд: лампы, лампы, углы, солнце. Без 8.2б в очередях
-        // все доли всех пикселей, и раздача та же, что в 7.19б.
-        bool reuse = (pc.edges[6] & EDGE_SHADOW_REUSE) != 0;
-        if (lane < 4)
-            need_count[lane] = 0;
-        GroupMemoryBarrierWithGroupSync();
-        if (lane < per)
-        {
-            bool has = first_j + lane < count;
-            float4 g = float4(-1.0, 0.0, 0.0, 0.0);
-            int2 at = int2(0, 0);
-            if (has)
-            {
-                uint packed = pc.edges[edge_list_at(list, first_j + lane, w * h)];
-                at = int2(packed & 0xffff, packed >> 16);
-                g = gbuffer_load(at);
-            }
-            bool skip = g.x < 0.0 || probe == EDGE_PROBE_NO_EXACT_SHADOWS;
-            uint steady = 0;
-            float4 value = float4(1.0, 1.0, 1.0, 1.0);
-            if (!skip && reuse)
-                steady = shadow_steady(at, g.x, oct_decode(g.zw), value);
-            for (uint s = 0; s < 4; s++)
-            {
-                uint part = PART_ORDER[s];
-                if (skip)
-                    parts[lane][part] = 1.0;
-                else if ((steady & (1u << part)) != 0)
-                    parts[lane][part] = value[part];
-                else
-                {
-                    uint slot;
-                    InterlockedAdd(need_count[s], 1u, slot);
-                    need_pixel[s][slot] = lane;
-                }
-            }
-        }
-        GroupMemoryBarrierWithGroupSync();
-        uint total = need_count[0] + need_count[1] + need_count[2] + need_count[3];
-        for (uint i = lane; i < total; i += 64)
-        {
-            uint s = 0;
-            uint index = i;
-            while (s < 3 && index >= need_count[s])
-            {
-                index -= need_count[s];
-                s++;
-            }
-            uint mine = need_pixel[s][index];
-            uint part = PART_ORDER[s];
-            uint packed = pc.edges[edge_list_at(list, first_j + mine, w * h)];
-            int2 at = int2(packed & 0xffff, packed >> 16);
-            float4 g = gbuffer_load(at);
-            float3 n = oct_decode(g.zw);
-            float2 c = float2(at) + 0.5;
-            Ray r0 = screen_ray(float2(c.x / float(w) * 2.0 - 1.0, 1.0 - c.y / float(h) * 2.0));
-            parts[mine][part] = shadow_part(r0.origin + r0.dir * g.x, n, g.x, part);
-        }
+        if (valid && probe != EDGE_PROBE_NO_EXACT_SHADOWS)
+            exact = images[pc.target][px];
     }
     else if (g0.x >= 0.0)
-        upsampled = upsampled_shadows(px, g0.x, n0);
-    counters_flush(PASS_EDGE_SHADOWS, id.x >> 6);
-    GroupMemoryBarrierWithGroupSync();
-    float4 exact = upsampled;
-    if (unreliable)
-        exact = float4(parts[pixel][0], parts[pixel][1], parts[pixel][2], parts[pixel][3]);
+        exact = upsampled_shadows(px, g0.x, n0);
 
     float3 color = float3(0.0, 0.0, 0.0);
     if (valid)

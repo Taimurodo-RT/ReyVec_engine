@@ -208,6 +208,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
             InterlockedAdd(pc.edges[3], all, total);
             uint room = total < MAX_EDGES ? MAX_EDGES - total : 0;
             uint groups = 0;
+            uint shadow_groups = 0;
             // Порядок: ненадёжные (4 и 2 луча), потом надёжные.
             for (uint o = 0; o < EDGE_LISTS; o++)
             {
@@ -220,11 +221,17 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
                     uint base;
                     InterlockedAdd(pc.edges[EDGE_COUNT_WORD[k]], keep, base);
                     group_base[k] = base;
-                    groups += groups_crossed(base, keep, edge_list_per(k));
+                    uint crossed = groups_crossed(base, keep, edge_list_per(k));
+                    groups += crossed;
+                    if (k == EDGE_U4 || k == EDGE_U2)
+                        shadow_groups += crossed;
                 }
             }
             if (groups > 0)
                 InterlockedAdd(pc.edges[0], groups);
+            // Группы ненадёжных идут первыми и у «края 3D: тени» те же (8.22).
+            if (shadow_groups > 0)
+                InterlockedAdd(pc.edges[EDGE_SHADOW_GROUPS_WORD], shadow_groups);
         }
     }
     GroupMemoryBarrierWithGroupSync();
