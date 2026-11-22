@@ -64,6 +64,7 @@ pub(crate) fn label(kind: &str) -> &str {
         "Revolve" => "Выточка",
         "Animate" => "Движение",
         "Scene" => "Сцена",
+        "Clay" => "Глина",
         other => other,
     }
 }

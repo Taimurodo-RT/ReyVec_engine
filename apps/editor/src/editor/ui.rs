@@ -31,6 +31,7 @@ use super::shapes::ShapeAngle;
 use super::theme::*;
 use super::viewport::{self, TOOLBAR_HEIGHT, Tool, View, Viewport};
 
+mod clay;
 mod space;
 
 /// Сколько строк журнала держать в консоли редактора.
@@ -177,6 +178,12 @@ pub(crate) enum Action {
         text: String,
         commit: bool,
     },
+    /// Превратить деталь модели по пути в глину (М.9б).
+    ToClay(Vec<usize>),
+    /// Мазок кисти по глине (М.9б).
+    ClayDab(super::clay_edit::Dab),
+    /// Кисть отпустили: проход по глине — один шаг истории.
+    ClayEnd,
 }
 
 /// Модель на подставке «Форм» (М.2).
@@ -352,6 +359,8 @@ pub(crate) struct EditorUi {
     shape_menu: Option<Vec<usize>>,
     /// Лампы, материалы и новые предметы сцены 3D (М.8б).
     space: space::SceneUi,
+    /// Лепка глины (М.9б).
+    clay: clay::ClayUi,
 }
 
 /// Фильтр консоли.
@@ -420,6 +429,7 @@ impl EditorUi {
             object_name: None,
             shape_menu: None,
             space: space::SceneUi::default(),
+            clay: clay::ClayUi::default(),
         }
     }
 
@@ -1258,6 +1268,10 @@ impl EditorUi {
             );
             ui.disable();
         }
+        // Глина (М.9б): карточка кисти сразу наверху.
+        if !scene && part.kind == "Clay" {
+            self.clay_card(ui, text, part, &path);
+        }
         let actions = &mut self.actions;
         let mut end = false;
         let mut send = |r: Result<String, ron_edit::EditError>, commit: bool| match r {
@@ -1499,6 +1513,9 @@ impl EditorUi {
             self.shape_command(text, PartCmd::Remove);
         }
         if !scene {
+            if part.kind != "Clay" {
+                self.clay_card(ui, text, part, &path);
+            }
             self.params_card(ui, shape);
             self.cost_card(ui, shape);
         }
@@ -2028,7 +2045,9 @@ impl EditorUi {
         // сдвинуть.
         // Ручки модели не как в файле (М.6, «Посмотреть»): на подставке не то, что в
         // тексте, поэтому стрелки деталей спрятаны.
-        let gizmo = if shape.preview.is_empty() {
+        // Пока лепят глину (М.9б), левая кнопка у кисти: ручек нет.
+        let sculpting = self.clay_file(shape).is_some();
+        let gizmo = if shape.preview.is_empty() && !sculpting {
             self.shape_gizmo(ui, shape)
         } else {
             None
@@ -2042,7 +2061,8 @@ impl EditorUi {
         let lamp_busy = shape.scene
             && self.gizmo_drag.is_none()
             && self.lamp_pointer(ui, &response, shape, &dots);
-        if !lamp_busy {
+        let clay_busy = !lamp_busy && self.clay_pointer(ui, &response, shape);
+        if !lamp_busy && !clay_busy {
             self.shape_pointer(ui, &response, shape, gizmo.as_ref());
         }
         if shape.scene {
@@ -2067,7 +2087,9 @@ impl EditorUi {
         }
         if response.hovered() || response.dragged() {
             let steps = ui.input(wheel_steps);
-            if steps != 0.0 {
+            // Колесо с Alt у кисти глины — её размер.
+            let brush_size = sculpting && ui.input(|i| i.modifiers.alt);
+            if steps != 0.0 && !brush_size {
                 self.actions.push(cam(ShapeCam::Zoom(steps)));
             }
             // W A S D, Q E ведут камеру в полёте и, как в других редакторах, пока зажата
@@ -2103,6 +2125,11 @@ impl EditorUi {
                 "Левая — выбрать предмет и тянуть его ручки: W — двигать, E — повернуть, \
                  R — размер. Кружки — лампы: тянуть по полу, с Shift — вверх. Модели \
                  перетаскивайте из «Ассетов».\n{camera}"
+            )
+        } else if sculpting {
+            format!(
+                "Лепка: левая на глине — кисть, с Ctrl — наоборот, с Shift — сгладить, \
+                 Alt+колесо — размер кисти. Левая мимо глины — выбрать другую деталь.\n{camera}"
             )
         } else {
             format!(
@@ -6038,6 +6065,110 @@ mod tests {
         );
         frame(&ctx, &mut ui, &shape_info, Vec::new());
         assert!(ui.take_actions().contains(&Action::EndEdit));
+    }
+
+    #[test]
+    fn brush_on_clay_dabs_and_click_beside_selects() {
+        let ball = reyvec_sdf::shape3d::Shape3::Sphere { radius: 0.3 };
+        let brick = reyvec_sdf::brick3d::Brick::from_shape(&ball, 32).unwrap();
+        super::super::clay_edit::put("тест/шар.clay", brick);
+        let text = "(format: \"reyvec-shape\", version: 1, shape: Union(shapes: [Clay(file: \"тест/шар.clay\"), Move(at: (30.0, 0.0, 0.0), shape: Box(size: (0.2, 0.2, 0.2)))]))";
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Edit);
+        let mut camera =
+            reyvec_sdf::Camera3D::looking_at(glam::Vec3::new(0.0, 0.0, 3.0), glam::Vec3::ZERO);
+        camera.far = 100.0;
+        shape_info.shape = Some(ShapeInfo {
+            name: "шар",
+            spin: false,
+            free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            post_aa: false,
+            in_view: true,
+            passes: &[],
+            camera,
+            shift: [0.0; 3],
+            error: None,
+            text,
+            preview: &NO_PREVIEW,
+            cost: None,
+            scene: false,
+            root: std::path::Path::new("."),
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        let mid = ui.viewport().unwrap().center();
+        // Щелчок по глине выбирает её, пока она не выбрана.
+        frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(true)));
+        frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(false)));
+        assert_eq!(ui.shape_selected, vec![0]);
+        ui.take_actions();
+        // Глина выбрана: левая кнопка лепит, по мазку на каждый заметный сдвиг мыши.
+        frame(&ctx, &mut ui, &shape_info, pointer(mid, Some(true)));
+        for k in 1..=4 {
+            frame(
+                &ctx,
+                &mut ui,
+                &shape_info,
+                pointer(mid + vec2(8.0 * k as f32, 0.0), None),
+            );
+        }
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            pointer(mid + vec2(40.0, 0.0), Some(false)),
+        );
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        let actions = ui.take_actions();
+        let dabs: Vec<_> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::ClayDab(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(dabs.len() >= 2, "{actions:?}");
+        assert!(dabs.iter().all(|d| d.file == "тест/шар.clay"));
+        // Мазок — на поверхности шара, ближней к камере.
+        assert!((dabs[0].at.length() - 0.3).abs() < 0.03, "{:?}", dabs[0].at);
+        assert!(dabs[0].at.z > 0.2);
+        assert_eq!(actions.last(), Some(&Action::ClayEnd));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::ShapeText { .. }))
+        );
+        assert_eq!(ui.shape_selected, vec![0]);
+        // Ctrl — наоборот: вдавить.
+        let ctrl = egui::Modifiers::COMMAND;
+        let press = |pressed| egui::Event::PointerButton {
+            pos: mid,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: ctrl,
+        };
+        let ev = vec![
+            egui::Event::ModifiersChanged(ctrl),
+            egui::Event::PointerMoved(mid),
+            press(true),
+        ];
+        frame(&ctx, &mut ui, &shape_info, ev);
+        frame(&ctx, &mut ui, &shape_info, vec![press(false)]);
+        let none = egui::Event::ModifiersChanged(egui::Modifiers::NONE);
+        frame(&ctx, &mut ui, &shape_info, vec![none]);
+        let pushed = ui
+            .take_actions()
+            .into_iter()
+            .any(|a| matches!(a, Action::ClayDab(d) if d.kind == reyvec_sdf::clay::Brush::Push));
+        assert!(pushed);
+        // Мимо глины левая выбирает как обычно (здесь — всю модель).
+        let empty = ui.viewport().unwrap().left_bottom() + vec2(20.0, -20.0);
+        frame(&ctx, &mut ui, &shape_info, pointer(empty, Some(true)));
+        frame(&ctx, &mut ui, &shape_info, pointer(empty, Some(false)));
+        assert!(ui.shape_selected.is_empty());
     }
 
     #[test]
