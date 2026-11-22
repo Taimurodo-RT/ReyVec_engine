@@ -338,7 +338,7 @@ pub(crate) fn kind_of(name: &str, folder: bool, prefab: bool) -> (&'static str, 
         "glb" | "gltf" | "obj" => ("3D-сетка", KIND_PLAYER),
         "wav" | "ogg" | "mp3" | "flac" => ("звук", FILE_SOUND),
         "ttf" | "otf" => ("шрифт", FILE_FONT),
-        "slang" | "rs" | "lua" | "rhai" => ("код", BAD),
+        "slang" | "rs" | "lua" | "luau" | "rhai" => ("код", BAD),
         _ => ("файл", MUTED),
     }
 }

@@ -488,16 +488,21 @@ pub(crate) fn trash(project: &Path, items: &[PathBuf]) -> Result<Done, String> {
     Ok(Done::Trashed(gone))
 }
 
-/// Отменить сделанное. Возвращает, что вернули (пути, которые выбрать).
-pub(crate) fn undo(project: &Path, done: Done) -> Result<Vec<PathBuf>, String> {
+/// Как повторить отменённое (Ctrl+Y).
+#[derive(Debug)]
+pub(crate) enum Redo {
+    /// Перенести снова (ссылки пересчитываются заново).
+    Move(Vec<(PathBuf, PathBuf)>),
+    /// Достать из корзины созданное, которое отмена туда унесла.
+    Restore(Vec<(PathBuf, PathBuf)>),
+    /// Удалить снова.
+    Trash(Vec<PathBuf>),
+}
+
+/// Отменить сделанное. Возвращает, что вернули (пути, которые выбрать), и как повторить.
+pub(crate) fn undo(project: &Path, done: Done) -> Result<(Vec<PathBuf>, Redo), String> {
     match done {
         Done::Moved { moves, refs } => {
-            for e in &refs {
-                // Файл после переноса правили руками — его не трогаем.
-                if std::fs::read_to_string(&e.file).is_ok_and(|t| t == e.after) {
-                    let _ = std::fs::write(&e.file, &e.before);
-                }
-            }
             for (from, to) in moves.iter().rev() {
                 if from.exists() && key(from) != key(to) {
                     return Err(format!(
@@ -505,31 +510,57 @@ pub(crate) fn undo(project: &Path, done: Done) -> Result<Vec<PathBuf>, String> {
                         file_name(from)
                     ));
                 }
+            }
+            for e in &refs {
+                // Файл после переноса правили руками — его не трогаем.
+                if std::fs::read_to_string(&e.file).is_ok_and(|t| t == e.after) {
+                    let _ = std::fs::write(&e.file, &e.before);
+                }
+            }
+            for (from, to) in moves.iter().rev() {
                 rename(to, from).map_err(|e| format!("Не вернуть «{}»: {e}", file_name(to)))?;
             }
-            Ok(moves.into_iter().map(|(f, _)| f).collect())
+            let back = moves.iter().map(|(f, _)| f.clone()).collect();
+            Ok((back, Redo::Move(moves)))
         }
         Done::Created(paths) => {
             // Созданное не стирается насовсем: вдруг в него уже что-то записали.
-            trash(project, &paths)?;
-            Ok(Vec::new())
+            let Done::Trashed(gone) = trash(project, &paths)? else {
+                unreachable!("trash возвращает Trashed");
+            };
+            Ok((Vec::new(), Redo::Restore(gone)))
         }
         Done::Trashed(gone) => {
-            let mut back = Vec::new();
-            for (from, at) in gone.into_iter().rev() {
-                if from.exists() {
-                    return Err(format!("Не вернуть «{}»: имя уже занято", file_name(&from)));
-                }
-                std::fs::rename(&at, &from)
-                    .map_err(|e| format!("Не вернуть «{}»: {e}", file_name(&from)))?;
-                if let Some(slot) = at.parent() {
-                    let _ = std::fs::remove_dir(slot);
-                }
-                back.push(from);
-            }
-            Ok(back)
+            let back = restore(&gone)?;
+            Ok((back.clone(), Redo::Trash(back)))
         }
     }
+}
+
+/// Повторить отменённое; возвращает, что сделано (для новой отмены).
+pub(crate) fn redo(project: &Path, redo: Redo) -> Result<Done, String> {
+    match redo {
+        Redo::Move(moves) => move_all(project, moves),
+        Redo::Restore(gone) => restore(&gone).map(Done::Created),
+        Redo::Trash(paths) => trash(project, &paths),
+    }
+}
+
+/// Вернуть из корзины на старые места.
+fn restore(gone: &[(PathBuf, PathBuf)]) -> Result<Vec<PathBuf>, String> {
+    let mut back = Vec::new();
+    for (from, at) in gone.iter().rev() {
+        if from.exists() {
+            return Err(format!("Не вернуть «{}»: имя уже занято", file_name(from)));
+        }
+        std::fs::rename(at, from).map_err(|e| format!("Не вернуть «{}»: {e}", file_name(from)))?;
+        if let Some(slot) = at.parent() {
+            let _ = std::fs::remove_dir(slot);
+        }
+        back.push(from.clone());
+    }
+    back.reverse();
+    Ok(back)
 }
 
 pub(crate) fn file_name(p: &Path) -> String {
@@ -559,11 +590,11 @@ impl NewKind {
 
     pub(crate) fn label(self) -> &'static str {
         match self {
-            NewKind::Folder => "Папку",
-            NewKind::Scene2D => "Сцену 2D",
-            NewKind::Scene3D => "Сцену 3D",
-            NewKind::Shape => "Модель формы",
-            NewKind::Script => "Скрипт Luau",
+            NewKind::Folder => "Папка",
+            NewKind::Scene2D => "Сцена 2D",
+            NewKind::Scene3D => "Сцена 3D",
+            NewKind::Shape => "Модель",
+            NewKind::Script => "Скрипт",
         }
     }
 
@@ -575,6 +606,16 @@ impl NewKind {
             NewKind::Shape => "новая модель.shape.ron",
             NewKind::Script => "новый скрипт.luau",
         }
+    }
+
+    /// Окончание имени файла этого вида.
+    pub(crate) fn ext(self) -> &'static str {
+        split_name(self.file_name()).1
+    }
+
+    /// Имя по умолчанию без окончания.
+    pub(crate) fn stem(self) -> &'static str {
+        split_name(self.file_name()).0
     }
 
     pub(crate) fn text(self) -> Option<&'static str> {
@@ -704,13 +745,20 @@ mod tests {
             "// рисунок \"../assets/svg/a.svg\" в комментарии\n(svg: \"../assets/svg/b.svg\", name: \"a\")\n"
         );
         assert_eq!(used_in(&t.0, &t.p("assets/svg/b.svg")).len(), 1);
-        let back = undo(&t.0, done).unwrap();
+        let (back, again) = undo(&t.0, done).unwrap();
         assert_eq!(back, vec![t.p("assets/svg/a.svg")]);
         assert!(
             t.read("scenes/room.ron")
                 .contains("(svg: \"../assets/svg/a.svg\"")
         );
         assert!(t.p("assets/svg/a.svg").is_file());
+        // Повтор переносит снова и снова чинит путь.
+        redo(&t.0, again).unwrap();
+        assert!(t.p("assets/svg/b.svg").is_file());
+        assert!(
+            t.read("scenes/room.ron")
+                .contains("\"../assets/svg/b.svg\"")
+        );
     }
 
     #[test]
@@ -771,9 +819,15 @@ mod tests {
         let made = copy_into(&t.p("assets"), &[t.p("assets/a.svg")]).unwrap();
         assert!(t.p("assets/a - копия.svg").is_file());
         assert!(copy_into(&t.p("assets/d"), &[t.p("assets")]).is_err());
-        undo(&t.0, made).unwrap();
+        let (_, again) = undo(&t.0, made).unwrap();
         assert!(!t.p("assets/a - копия.svg").exists());
+        redo(&t.0, again).unwrap();
+        assert!(t.p("assets/a - копия.svg").is_file());
         let gone = trash(&t.0, &[t.p("assets/d")]).unwrap();
+        assert!(!t.p("assets/d").exists());
+        let (_, again) = undo(&t.0, gone).unwrap();
+        assert_eq!(t.read("assets/d/b.svg"), "2");
+        let gone = redo(&t.0, again).unwrap();
         assert!(!t.p("assets/d").exists());
         undo(&t.0, gone).unwrap();
         assert_eq!(t.read("assets/d/b.svg"), "2");
