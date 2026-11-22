@@ -23,6 +23,7 @@ mod endless;
 mod files;
 mod geom;
 mod layout;
+mod model_params;
 mod outline;
 mod overlay;
 mod parts;
@@ -696,6 +697,12 @@ impl Editor {
                     r.set_space_file_in(&text, Some(shape.root.clone()));
                 }
             }
+            Action::ShapePreview(values) => {
+                if let Some(shape) = self.shape.as_mut() {
+                    let text = shape.set_preview(values);
+                    r.set_space_file_in(&text, Some(shape.root.clone()));
+                }
+            }
             Action::SpaceScale(scale) => {
                 r.set_space_scale(scale);
                 tracing::info!("Разрешение 3D: {}", scale.title());
@@ -1264,6 +1271,7 @@ impl Editor {
                 shift: s.shift.into(),
                 error: s.error.as_deref().or(shape_error.as_deref()),
                 text: &s.text,
+                preview: &s.preview,
             }),
         };
         let input = state.take_egui_input(window);

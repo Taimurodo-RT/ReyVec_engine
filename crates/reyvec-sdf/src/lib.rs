@@ -24,6 +24,7 @@ pub mod profile2d;
 pub mod shape3d;
 pub mod shape_mesh;
 pub mod shape_model;
+pub mod shape_param;
 pub mod space_file;
 pub mod view3d;
 pub use camera3d::{Camera3D, FlyInput, Projection};

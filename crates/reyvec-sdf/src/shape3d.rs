@@ -162,8 +162,14 @@ pub enum Shape3 {
     },
     /// Модель из своего файла (М.0, [`crate::shape_model`]): `models/<model>.shape.ron`
     /// рядом с файлом сцены. Раскрывается в дерево модели при чтении сцены; до этого у
-    /// неё нет формы, и программа из неё не собирается.
-    Use { model: String },
+    /// неё нет формы, и программа из неё не собирается. `params` — значения ручек
+    /// модели (М.6, [`crate::shape_param`]) по именам: `params: {"длина": 2.4}`;
+    /// нет ручки в списке — она берёт значение из файла модели.
+    Use {
+        model: String,
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        params: std::collections::BTreeMap<String, f32>,
+    },
 }
 
 fn one() -> f32 {
@@ -1162,7 +1168,7 @@ fn emit(
                 out,
             )
         }
-        Shape3::Use { model } => Err(CompileError::Unresolved(model.clone())),
+        Shape3::Use { model, .. } => Err(CompileError::Unresolved(model.clone())),
     }
 }
 
