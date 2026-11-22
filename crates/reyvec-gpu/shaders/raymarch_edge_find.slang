@@ -224,12 +224,12 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
                     uint crossed = groups_crossed(base, keep, edge_list_per(k));
                     groups += crossed;
                     if (k == EDGE_U4 || k == EDGE_U2)
-                        shadow_groups += crossed;
+                        shadow_groups += groups_crossed(base, keep, EDGE_SHADOW_PIXELS);
                 }
             }
             if (groups > 0)
                 InterlockedAdd(pc.edges[0], groups);
-            // Группы ненадёжных идут первыми и у «края 3D: тени» те же (8.22).
+            // «Края 3D: тени» (8.24): по EDGE_SHADOW_PIXELS ненадёжных на группу.
             if (shadow_groups > 0)
                 InterlockedAdd(pc.edges[EDGE_SHADOW_GROUPS_WORD], shadow_groups);
         }

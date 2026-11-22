@@ -10,9 +10,12 @@
 // и углов стоили 156 % его времени. Отдельный проход короткий и идёт быстрее, картинка
 // та же.
 //
-// Группы те же, что у «краёв 3D» (include/edges.slang, EDGE_ORDER): ненадёжные с
-// четырьмя лучами (16 пикселей), потом с двумя (32); число групп — в слове
-// EDGE_SHADOW_GROUPS_WORD заголовка. Доли раздаются по долям, а не по пикселям (7.19б):
+// Группа берёт 64 ненадёжных пикселя подряд (EDGE_SHADOW_PIXELS, 8.24): сначала с
+// четырьмя лучами, потом с двумя; число групп — в слове EDGE_SHADOW_GROUPS_WORD
+// заголовка. Прежде (8.22) группа брала 16 пикселей, как у «краёв 3D»: большинство их
+// долей берётся готовыми из картинки теней, и лучи считали около 40 % потоков, а
+// остальные ждали (на 5080 в заводе тени краёв 1,40 мс против 1,08 у теней всего кадра).
+// У 64 пикселей очереди длиннее, и потоки заняты почти все. Доли раздаются по долям, а не по пикселям (7.19б):
 // поток пикселя решает, какие доли можно взять из картинки теней (8.2б, shadow_steady),
 // остальные ставит в очередь своей доли; потом все 64 потока разбирают очереди подряд:
 // лампы, лампы, углы, солнце, и лучи соседних потоков одинаковы.
@@ -82,14 +85,14 @@ uint shadow_steady(int2 px, float t, float3 n, out float4 value)
 }
 
 // Точные доли света пикселей группы: [пиксель][солнце, углы, лампа 1, лампа 2].
-groupshared float parts[32][4];
+groupshared float parts[EDGE_SHADOW_PIXELS][4];
 
 // Очереди точных долей (8.2б): сколько пикселей ждут каждую долю и какие. Доли идут в
 // порядке PART_ORDER: потоки подряд берут одну долю, и лучи соседних потоков одинаковы
 // (7.19б: при четырёх лучах потоки 0–15 — первая лампа, 16–31 — вторая, 32–47 — углы,
 // 48–63 — солнце).
 groupshared uint need_count[4];
-groupshared uint need_pixel[4][32];
+groupshared uint need_pixel[4][EDGE_SHADOW_PIXELS];
 static const uint PART_ORDER[4] = { 2, 3, 1, 0 };
 
 [shader("compute")]
@@ -107,26 +110,25 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     uint count = 0;
     {
         uint before = 0;
-        for (uint o = 0; o < EDGE_LISTS; o++)
+        for (uint o = 0; o < 2; o++)
         {
-            uint k = EDGE_ORDER[o];
+            uint k = o == 0 ? EDGE_U4 : EDGE_U2;
             uint n = pc.edges[EDGE_COUNT_WORD[k]];
-            uint per_k = edge_list_per(k);
-            uint groups_k = (n + per_k - 1) / per_k;
+            uint groups_k = (n + EDGE_SHADOW_PIXELS - 1) / EDGE_SHADOW_PIXELS;
             if (group < before + groups_k)
             {
                 list = k;
-                first_j = (group - before) * per_k;
+                first_j = (group - before) * EDGE_SHADOW_PIXELS;
                 count = n;
                 break;
             }
             before += groups_k;
         }
     }
-    // Надёжные (или лишние группы) сюда не попадают: их тени — из картинки теней.
+    // Лишние группы (их не бывает, но на всякий случай) ничего не делают.
     if (list != EDGE_U4 && list != EDGE_U2)
         return;
-    uint per = edge_list_per(list);
+    uint per = EDGE_SHADOW_PIXELS;
     bool reuse = (pc.edges[6] & EDGE_SHADOW_REUSE) != 0;
     if (lane < 4)
         need_count[lane] = 0;
