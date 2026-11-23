@@ -582,6 +582,11 @@ impl GpuResources {
         self.textures.get(id.0).map(|t| t.image)
     }
 
+    /// Вид картинки текстуры с номером `id` (для подключения к графу кадра).
+    pub fn texture_view(&self, id: TextureId) -> Option<vk::ImageView> {
+        self.textures.get(id.0).map(|t| t.view)
+    }
+
     /// Буфер Vulkan с номером `id` (для команд копирования).
     pub fn buffer_raw(&self, id: BufferId) -> Option<vk::Buffer> {
         self.buffers.get(id.0).map(|b| b.raw)

@@ -43,6 +43,12 @@ fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
 const MESH_HEADER_WORDS: usize = MESH_RAY + 2;
 /// Где в разделе моделей начало раздела коробок для RT-ядер.
 const MESH_RAY: usize = 57 + 16 * SUN_CASCADES;
+/// Где в разделе моделей начало раздела изменившихся квадратов «теней 3D» (опыт Р3,
+/// пишет [`set_dirty_tiles`]; 0 — его нет, считаются все точки).
+const MESH_DIRTY: usize = MESH_RAY + 1;
+/// Сторона квадрата «теней 3D» (точек половинного размера), который пересчитывается или
+/// берётся из прошлого кадра целиком (опыт Р3). Как DIRTY_TILE в `raymarch_shadow.slang`.
+pub(crate) const DIRTY_TILE: u32 = 8;
 /// Где в разделе моделей запись сеток из форм.
 const MESH_SHAPES: usize = 52;
 /// Где в разделе моделей карты теней солнца: их число, потом матрицы.
@@ -186,6 +192,45 @@ pub(crate) struct Packed {
     /// объекта — теней не даёт или считается формулой (плоскость). `None` целиком — в
     /// сцене есть бесконечная форма с тенью (поле уровня), RT-ядрам её не отдать.
     pub ray_boxes: Option<Vec<Option<(glam::Vec3, glam::Vec3)>>>,
+    /// Коробки движущихся объектов (опыт Р3); `None` — у движущегося нет границы.
+    pub movers: Option<Vec<(glam::Vec3, glam::Vec3)>>,
+    /// Ниже этой высоты поверхностей нет (опыт Р3): низ коробок объектов и полы.
+    pub floor: f32,
+}
+
+/// Самая низкая поверхность сцены: низ коробок объектов (или шаров-границ) и
+/// горизонтальные плоскости-полы. Бесконечные формы не учитываются.
+pub(crate) fn lowest_point(programs: &[Program]) -> f32 {
+    let mut low = f32::MAX;
+    for p in programs {
+        if let Some((n, c)) = p.plane() {
+            if n.y > 0.99 {
+                low = low.min(-c / n.y);
+            }
+            continue;
+        }
+        if let Some((a, _)) = p.bounds_box {
+            low = low.min(a.y);
+        } else if let Some((c, r)) = p.bounds {
+            low = low.min(c.y - r);
+        }
+    }
+    if low == f32::MAX { 0.0 } else { low }
+}
+
+/// Коробки движущихся объектов (не [`Program::still`]): плотная коробка или коробка
+/// шара-границы. `None` — у одного из них нет границы (бесконечная форма).
+pub(crate) fn mover_boxes(programs: &[Program]) -> Option<Vec<(glam::Vec3, glam::Vec3)>> {
+    programs
+        .iter()
+        .filter(|p| !p.still)
+        .map(|p| {
+            let sphere = p
+                .bounds
+                .map(|(c, r)| (c - glam::Vec3::splat(r), c + glam::Vec3::splat(r)));
+            p.bounds_box.or(sphere)
+        })
+        .collect()
 }
 
 /// Коробки объектов для теней через RT-ядра: у каждого объекта с тенью — его плотная
@@ -348,6 +393,8 @@ pub(crate) fn pack_cached(
             dropped,
             overflow: Some(needed),
             ray_boxes: None,
+            movers: None,
+            floor: 0.0,
         };
     }
     if !culling {
@@ -394,6 +441,8 @@ pub(crate) fn pack_cached(
         dropped,
         overflow: None,
         ray_boxes: ray_boxes(&programs),
+        movers: mover_boxes(&programs),
+        floor: lowest_point(&programs),
     }
 }
 
@@ -723,6 +772,123 @@ pub(crate) fn set_lamp_maps_down(words: &mut [u32]) {
     words[11] |= SCENE_LAMP_MAPS_DOWN;
 }
 
+/// Изменившиеся квадраты «теней 3D» (опыт Р3) в конец слов сцены: квадратов по ширине,
+/// потом биты квадратов по строкам (1 — пересчитать). Шейдер пропускает точки квадратов
+/// с 0: их значения уже в картинке из прошлого кадра. `false` — не влезло.
+pub(crate) fn set_dirty_tiles(words: &mut Vec<u32>, across: u32, bits: &[u32]) -> bool {
+    let Some(at) = mesh_section(words) else {
+        return false;
+    };
+    if words.len() + 1 + bits.len() > MAX_WORDS {
+        return false;
+    }
+    words[at + MESH_DIRTY] = words.len() as u32;
+    words.push(across);
+    words.extend_from_slice(bits);
+    true
+}
+
+/// Какие квадраты «теней 3D» (по [`DIRTY_TILE`] точек половинного размера) могут
+/// измениться, если камера стоит, а двигаются только объекты в коробках `movers`
+/// (опыт Р3). Квадрат меняется, если в нём видна сама коробка с запасом на затенение в
+/// углах, её тень от солнца (коробка, вытянутая от солнца до самого низа сцены `floor`, с
+/// запасом на полутень) или тень от двух ламп с тенями (вытянутая от лампы до её
+/// дальности). Лампы с тенями из `moved_lamps` (место и дальность) сдвинулись: меняется
+/// всё в шаре их дальности. `full` — размер кадра лучей 3D в пикселях; результат — биты
+/// квадратов по строкам и квадратов по ширине. `None` — меняется всё (коробка за спиной
+/// камеры).
+pub(crate) fn dirty_tiles(
+    movers: &[(Vec3, Vec3)],
+    lamps: &[reyvec_sdf::Lamp3],
+    moved_lamps: &[(Vec3, f32)],
+    view_proj: glam::Mat4,
+    full: (u32, u32),
+    floor: f32,
+) -> Option<(u32, Vec<u32>)> {
+    let half = (full.0.div_ceil(2), full.1.div_ceil(2));
+    let across = half.0.div_ceil(DIRTY_TILE);
+    let down = half.1.div_ceil(DIRTY_TILE);
+    let mut bits = vec![0u32; (across * down).div_ceil(32) as usize];
+    let sun = reyvec_sdf::view3d::SUN;
+    // Затенение в углах дотягивается на 0,4 м (пробы ambient_occlusion), запас — до метра.
+    const NEAR: f32 = 1.0;
+    let corners = |a: Vec3, b: Vec3| {
+        (0..8).map(move |k| {
+            Vec3::new(
+                if k & 1 == 0 { a.x } else { b.x },
+                if k & 2 == 0 { a.y } else { b.y },
+                if k & 4 == 0 { a.z } else { b.z },
+            )
+        })
+    };
+    // Области: коробка движущегося (с тенями) или шар дальности сдвинувшейся лампы.
+    let spheres = moved_lamps.iter().map(|&(at, range)| {
+        let r = Vec3::splat(range + NEAR);
+        (corners(at - r, at + r).collect::<Vec<Vec3>>(), true)
+    });
+    let boxes = movers.iter().map(|&(a, b)| (vec![a, b], false));
+    for (shape, sphere) in boxes.chain(spheres) {
+        let mut points: Vec<Vec3> = Vec::new();
+        if sphere {
+            points = shape;
+        } else {
+            let (a, b) = (shape[0] - Vec3::splat(NEAR), shape[1] + Vec3::splat(NEAR));
+            points.extend(corners(a, b));
+            // Солнце: тень падает от солнца до низа сцены; полутень шире с расстоянием (k = 12).
+            let reach = ((b.y - floor).max(0.0) / sun.y.max(0.05)).min(30.0);
+            let soft = Vec3::splat(reach / 12.0 + 0.1);
+            let (sa, sb) = (a - sun * reach - soft, b - sun * reach + soft);
+            points.extend(corners(sa.min(sb), sa.max(sb)));
+            for lamp in lamps.iter().take(reyvec_sdf::shape3d::SHADOW_LAMPS) {
+                let at = Vec3::from(lamp.at);
+                let range = lamp.range.max(0.0);
+                // Дальше дальности лампа не светит: и тени от неё нет.
+                if at.clamp(a, b).distance(at) > range {
+                    continue;
+                }
+                for c in corners(a, b) {
+                    let away = c - at;
+                    let far = range.max(away.length());
+                    let end = at + away.normalize_or_zero() * far;
+                    // Полутень лампы (k = 10) — до десятой доли пути.
+                    let pad = Vec3::splat(far / 10.0 + 0.1);
+                    points.extend(corners(end - pad, end + pad));
+                }
+            }
+        }
+        let (mut lo, mut hi) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
+        for p in points {
+            let clip = view_proj * p.extend(1.0);
+            if clip.w <= 0.01 {
+                return None;
+            }
+            let ndc = glam::Vec2::new(clip.x, clip.y) / clip.w;
+            let px = glam::Vec2::new(
+                (ndc.x * 0.5 + 0.5) * full.0 as f32,
+                (0.5 - ndc.y * 0.5) * full.1 as f32,
+            ) * 0.5;
+            lo = lo.min(px);
+            hi = hi.max(px);
+        }
+        // Пиксель на запас: точка тени берёт пиксель кадра (2x, 2y).
+        let tile = DIRTY_TILE as f32;
+        let x0 = ((lo.x - 2.0) / tile).floor().max(0.0) as u32;
+        let y0 = ((lo.y - 2.0) / tile).floor().max(0.0) as u32;
+        let x1 = ((hi.x + 2.0) / tile).floor().min(across as f32 - 1.0);
+        let y1 = ((hi.y + 2.0) / tile).floor().min(down as f32 - 1.0);
+        if x1 < 0.0 || y1 < 0.0 {
+            continue;
+        }
+        for y in y0..=y1 as u32 {
+            for x in x0..=x1 as u32 {
+                let i = y * across + x;
+                bits[(i / 32) as usize] |= 1 << (i % 32);
+            }
+        }
+    }
+    Some((across, bits))
+}
+
 /// Карта солнца — кэш неподвижных предметов (опыт Р2): внутри неё тень солнца — меньшее из
 /// карты и живого луча по движущимся предметам. Матрицу карты пишет [`set_sun_maps`].
 pub(crate) fn set_sun_static(words: &mut [u32]) {
@@ -1005,6 +1171,31 @@ mod tests {
         let near = m * (Vec3::new(0.0, 0.5, 0.0) + sun * 0.4).extend(1.0);
         let far = m * (Vec3::new(0.0, 0.5, 0.0) - sun * 0.4).extend(1.0);
         assert!(near.z > far.z);
+    }
+
+    /// Тени из прошлого кадра (опыт Р3): ящик в кадре метит квадраты вокруг себя и своей
+    /// тени, но не весь кадр; ящик за спиной камеры — весь кадр; лампа, сдвинувшаяся
+    /// далеко за кадром, кадр не трогает.
+    #[test]
+    fn dirty_tiles_cover_mover_and_its_shadow() {
+        let camera = reyvec_sdf::Camera3D::looking_at(Vec3::new(0.0, 10.0, 15.0), Vec3::ZERO);
+        let view_proj = camera.view_proj(16.0 / 9.0);
+        let full = (960, 540);
+        let mover = (Vec3::new(-0.2, 0.0, -0.2), Vec3::new(0.2, 0.4, 0.2));
+        let (across, bits) =
+            dirty_tiles(&[mover], &[], &[], view_proj, full, 0.0).expect("в кадре");
+        let ones: u32 = bits.iter().map(|w| w.count_ones()).sum();
+        let total = across * 270u32.div_ceil(DIRTY_TILE);
+        assert!(ones > 0 && ones * 4 < total, "{ones} из {total}");
+        // Середина кадра (там ящик) помечена.
+        let (x, y) = (240 / DIRTY_TILE, 135 / DIRTY_TILE);
+        let i = y * across + x;
+        assert_eq!((bits[(i / 32) as usize] >> (i % 32)) & 1, 1);
+        let behind = (Vec3::new(-0.2, 9.8, 16.0), Vec3::new(0.2, 10.2, 16.5));
+        assert!(dirty_tiles(&[behind], &[], &[], view_proj, full, 0.0).is_none());
+        let far_lamp = [(Vec3::new(500.0, 4.0, 0.0), 5.0)];
+        let (_, none) = dirty_tiles(&[], &[], &far_lamp, view_proj, full, 0.0).expect("в кадре");
+        assert!(none.iter().all(|&w| w == 0));
     }
 
     /// Объектов больше предела шейдера: список обрезается до 1024 на процессоре, и панель

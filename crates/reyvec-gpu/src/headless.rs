@@ -534,6 +534,7 @@ fn render(
             demo.set_plane_shadows(tests::PLANE_SHADOWS.get());
             demo.set_space_rt(tests::SPACE_RT.get());
             demo.set_sun_cache(tests::SUN_CACHE.get());
+            demo.set_shadow_reuse(tests::SHADOW_REUSE.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -554,6 +555,50 @@ fn render(
             .create_fence(&vk::FenceCreateInfo::default(), None)
             .ctx("забор")?;
 
+        // Тени из прошлого кадра (опыт Р3): сначала кадр на 1/20 секунды раньше с той же
+        // камерой, снимается второй.
+        #[cfg(test)]
+        if tests::SHADOW_REUSE.get() {
+            d.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .ctx("запись команд")?;
+            let gpu = r.gpu.as_mut().expect("ресурсы созданы выше");
+            let demo = r.demo.as_mut().expect("сцена создана выше");
+            let data = demo.prepare(
+                ctx,
+                gpu,
+                0,
+                extent,
+                scene.time - 0.05,
+                scene.shader_error,
+                scene.scene,
+            );
+            let mut graph = RenderGraph::new();
+            let target = graph.import(
+                "картинка теста",
+                r.image,
+                r.view,
+                extent,
+                FORMAT,
+                ImageState::UNDEFINED,
+                Some(Access::TransferSrc),
+            );
+            demo.add_passes(&mut graph, &gpu.bindless, data, target);
+            graph.execute(ctx, cmd, &mut r.transients, &gpu.bindless, 0, None)?;
+            d.end_command_buffer(cmd).ctx("конец записи команд")?;
+            let cmds = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+            let submit = vk::SubmitInfo2::default().command_buffer_infos(&cmds);
+            d.queue_submit2(ctx.queue, &[submit], r.fence)
+                .ctx("отправка команд")?;
+            d.wait_for_fences(&[r.fence], true, u64::MAX)
+                .ctx("ожидание видеокарты")?;
+            d.reset_fences(&[r.fence]).ctx("забор")?;
+            d.reset_command_pool(r.pool, vk::CommandPoolResetFlags::empty())
+                .ctx("командный пул")?;
+        }
         d.begin_command_buffer(
             cmd,
             &vk::CommandBufferBeginInfo::default()
@@ -840,6 +885,9 @@ pub(crate) mod tests {
         /// Кэш солнца (опыт Р2); по умолчанию выключен. В тестах карта меньше и печётся
         /// целиком в первом же кадре.
         pub(super) static SUN_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Тени из прошлого кадра (опыт Р3): снимаемому кадру предшествует кадр с той же
+        /// камерой на 1/20 секунды раньше.
+        pub(super) static SHADOW_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Мусором залиты только картинки с этим именем (8.0).
         pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
             const { std::cell::Cell::new(None) };
@@ -1424,6 +1472,75 @@ pub(crate) mod tests {
             b.forms,
             a.forms
         );
+    }
+
+    /// Тени из прошлого кадра (опыт Р3) на заводе: камера стоит, снимаемому кадру
+    /// предшествует кадр на 1/20 секунды раньше. Пересчитывается только часть квадратов,
+    /// а картинка та же, что у кадра, посчитанного целиком; без ошибок Vulkan.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn factory_shadow_reuse_matches_full_frame() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 960,
+            height: 540,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(
+                    include_str!("../../../scenes/3d/factory.ron")
+                        .replacen(
+                            ",\n            circle: (radius: (6.0, 2.0), period: 20.0))",
+                            ")",
+                            1,
+                        )
+                        .into(),
+                ),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let render = |reuse: bool| {
+            SHADOW_REUSE.set(reuse);
+            SPACE_COUNTERS.set(true);
+            let frame = render_headless(&options, &scene);
+            SHADOW_REUSE.set(false);
+            SPACE_COUNTERS.set(false);
+            frame.expect("кадр")
+        };
+        let full = render(false);
+        let reused = render(true);
+        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+        let (changed, worst, mean) = image_diff(&full.image, &reused.image);
+        let total = full.image.rgba.len() / 4;
+        let tiles = reused.space_stats.and_then(|s| s.shadow_tiles);
+        eprintln!(
+            "завод, тени из прошлого кадра: квадратов пересчитано {tiles:?}; отличается \
+             {changed} точек из {total}, сильнее всего на {worst}, в среднем {mean:.3}"
+        );
+        let shadows = |f: &HeadlessImage| {
+            f.space_stats
+                .and_then(|s| s.rays)
+                .map(|r| r[crate::counters::PASS_SHADOWS].rays)
+        };
+        eprintln!(
+            "лучей тени: целиком {:?}, из прошлого кадра {:?}",
+            shadows(&full),
+            shadows(&reused)
+        );
+        let (dirty, all) = tiles.expect("тени не взяты из прошлого кадра");
+        assert!(dirty < all, "пересчитаны все квадраты");
+        assert_eq!(changed, 0, "картинка отличается от посчитанной целиком");
     }
 
     /// Тени моделей от кирпичей поля (8.15) — почти те же, что от прежних заменителей из

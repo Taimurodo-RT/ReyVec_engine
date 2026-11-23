@@ -823,6 +823,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Тени из прошлого кадра, пока камера стоит (опыт Р3): включены ли.
+    pub fn shadow_reuse(&self) -> bool {
+        self.demo.as_ref().is_some_and(|d| d.shadow_reuse())
+    }
+
+    /// Включает или выключает тени из прошлого кадра со следующего кадра.
+    pub fn set_shadow_reuse(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_shadow_reuse(on);
+        }
+    }
+
     /// Кэш солнца (опыт Р2): `None` — не умеет, иначе включён ли.
     pub fn sun_cache(&self) -> Option<bool> {
         self.demo.as_ref().and_then(|d| d.sun_cache())

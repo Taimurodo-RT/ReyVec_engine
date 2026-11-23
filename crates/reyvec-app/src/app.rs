@@ -462,6 +462,13 @@ impl App {
                 r.set_space_rt(on);
                 tracing::info!("Тени через RT-ядра: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::ShadowReuse(on) => {
+                r.set_shadow_reuse(on);
+                tracing::info!(
+                    "Тени из прошлого кадра: {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::SunCache(on) => {
                 r.set_sun_cache(on);
                 tracing::info!("Кэш солнца: {}", if on { "вкл" } else { "выкл" });
@@ -757,6 +764,7 @@ impl App {
                 space_boxes: renderer.space_boxes(),
                 space_rt: renderer.space_rt(),
                 sun_cache: renderer.sun_cache(),
+                shadow_reuse: renderer.shadow_reuse(),
                 edge_probe: renderer.edge_probe(),
                 edge_creases: renderer.edge_creases(),
                 edge_shadow_reuse: renderer.edge_shadow_reuse(),

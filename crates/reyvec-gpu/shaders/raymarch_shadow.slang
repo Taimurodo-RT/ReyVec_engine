@@ -13,9 +13,27 @@
 #include "include/space.slang"
 #include "include/shadow3d.slang"
 
+// Камера стоит (опыт Р3, «Р3» в docs/3d-beyond-triangles.md; Keen): квадраты, которые не
+// могли измениться, не считаются — их значения уже в картинке из прошлого кадра (проход
+// начинается не с очистки, а с копии). Как DIRTY_TILE в space.rs.
+static const uint DIRTY_TILE = 8;
+
+bool tile_unchanged(float2 at)
+{
+    uint mesh_at = pc.scene[7];
+    uint d = mesh_at == 0 ? 0 : pc.scene[mesh_at + MESH_DIRTY];
+    if (d == 0)
+        return false;
+    uint2 tile = uint2(at) / DIRTY_TILE;
+    uint i = tile.y * pc.scene[d] + tile.x;
+    return ((pc.scene[d + 1 + i / 32] >> (i % 32)) & 1) == 0;
+}
+
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
+    if (tile_unchanged(input.position.xy))
+        discard;
     int2 size = gbuffer_size();
     uint w = uint(size.x), h = uint(size.y);
     int2 px = min(int2(input.position.xy) * 2, size - 1);

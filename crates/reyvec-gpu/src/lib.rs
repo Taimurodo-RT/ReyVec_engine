@@ -48,6 +48,7 @@ mod pipeline;
 mod resources;
 mod rt;
 mod shaders;
+mod shadow_reuse;
 mod slangc;
 mod space;
 mod sun_cache;

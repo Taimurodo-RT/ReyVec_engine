@@ -123,6 +123,9 @@ static const uint SUN_CASCADES = 2;
 // После карт солнца (опыт Р1, как MESH_RAY в space.rs): где раздел коробок для
 // RT-ядер (0 — его нет), и запасное слово.
 static const uint MESH_RAY = 57 + 16 * SUN_CASCADES;
+// Следом (опыт Р3, как MESH_DIRTY в space.rs): где раздел изменившихся квадратов «теней
+// 3D»; 0 — его нет.
+static const uint MESH_DIRTY = MESH_RAY + 1;
 static const uint MESH_HEADER_WORDS = MESH_RAY + 2;
 static const uint MESH_SHAPES = 52;
 static const uint MESH_SUN = 56;
