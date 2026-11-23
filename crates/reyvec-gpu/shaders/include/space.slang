@@ -119,7 +119,10 @@ static const uint MATERIAL_TEXTURED = 2;
 // сколько мест), карты теней солнца (8.20в: сколько их, 0 — нет, и их матрицы — по
 // SUN_CASCADES, ближняя первой), потом вершины.
 static const uint SUN_CASCADES = 2;
-static const uint MESH_HEADER_WORDS = 57 + 16 * SUN_CASCADES;
+// После карт солнца (опыт Р1, как MESH_RAY в space.rs): где раздел коробок для
+// RT-ядер (0 — его нет), и запасное слово.
+static const uint MESH_RAY = 57 + 16 * SUN_CASCADES;
+static const uint MESH_HEADER_WORDS = MESH_RAY + 2;
 static const uint MESH_SHAPES = 52;
 static const uint MESH_SUN = 56;
 static const uint MESH_SUN_PROJ = 57;

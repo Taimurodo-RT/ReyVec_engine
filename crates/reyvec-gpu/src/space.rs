@@ -37,8 +37,12 @@ fn warn_once(flag: &AtomicBool, over: bool, message: impl FnOnce() -> String) {
 /// ламп для карт теней (пишет [`set_shadow_maps`]), потом сетки из форм (8.20б, пишет
 /// [`set_shape_meshes`]): адрес их буфера (2 слова), где в сцене их места и сколько
 /// мест, потом карты теней солнца (8.20в, пишет [`set_sun_maps`]): сколько их (0 — нет) и
-/// их матрицы ([`SUN_CASCADES`] по 16 чисел). Как в `include/space.slang`.
-const MESH_HEADER_WORDS: usize = 57 + 16 * SUN_CASCADES;
+/// их матрицы ([`SUN_CASCADES`] по 16 чисел), потом где раздел коробок для RT-ядер
+/// (опыт Р1, пишет [`set_ray_boxes`]; 0 — его нет) и запасное слово. Как в
+/// `include/space.slang`.
+const MESH_HEADER_WORDS: usize = MESH_RAY + 2;
+/// Где в разделе моделей начало раздела коробок для RT-ядер.
+const MESH_RAY: usize = 57 + 16 * SUN_CASCADES;
 /// Где в разделе моделей запись сеток из форм.
 const MESH_SHAPES: usize = 52;
 /// Где в разделе моделей карты теней солнца: их число, потом матрицы.
@@ -175,6 +179,30 @@ pub(crate) struct Packed {
     pub dropped: usize,
     /// Сцена не поместилась в буфер: сколько слов ей было нужно (рисуется пустая).
     pub overflow: Option<usize>,
+    /// Коробки объектов для теней через RT-ядра (опыт Р1), по номеру объекта; `None` у
+    /// объекта — теней не даёт или считается формулой (плоскость). `None` целиком — в
+    /// сцене есть бесконечная форма с тенью (поле уровня), RT-ядрам её не отдать.
+    pub ray_boxes: Option<Vec<Option<(glam::Vec3, glam::Vec3)>>>,
+}
+
+/// Коробки объектов для теней через RT-ядра: у каждого объекта с тенью — его плотная
+/// коробка (или коробка шара-границы); плоскости, которые шейдер считает формулой, и
+/// светящиеся без теней — `None`. `None` целиком — есть бесконечная форма с тенью.
+pub(crate) fn ray_boxes(programs: &[Program]) -> Option<Vec<Option<(glam::Vec3, glam::Vec3)>>> {
+    let planes = reyvec_sdf::shape3d::plane_objects(programs);
+    programs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if p.no_shadow || planes.contains(&(i as u32)) {
+                return Some(None);
+            }
+            let sphere = p
+                .bounds
+                .map(|(c, r)| (c - glam::Vec3::splat(r), c + glam::Vec3::splat(r)));
+            p.bounds_box.or(sphere).map(Some)
+        })
+        .collect()
 }
 
 /// Сетка отсева кадра для панели: размер клетки, число клеток по осям и длины списков
@@ -316,6 +344,7 @@ pub(crate) fn pack_cached(
             objects: 0,
             dropped,
             overflow: Some(needed),
+            ray_boxes: None,
         };
     }
     if !culling {
@@ -361,6 +390,7 @@ pub(crate) fn pack_cached(
         grid,
         dropped,
         overflow: None,
+        ray_boxes: ray_boxes(&programs),
     }
 }
 
@@ -545,6 +575,30 @@ pub(crate) fn set_shape_meshes(words: &mut Vec<u32>, address: u64, instances: &[
 fn mesh_section(words: &[u32]) -> Option<usize> {
     let at = *words.get(7)? as usize;
     (at != 0).then_some(at)
+}
+
+/// Раздел коробок для теней через RT-ядра (опыт Р1) в конец слов сцены: адрес верхнего
+/// дерева (2 слова), число коробок на уровень, запасное, потом коробки всех уровней
+/// ([`crate::rt::box_words`]); его начало — в слово [`MESH_RAY`] раздела моделей.
+/// Возвращает, где в словах начинаются коробки (для постройки деревьев), или `None`, если
+/// раздела моделей нет или слова не помещаются в буфер (тогда тени идут по сетке).
+pub(crate) fn set_ray_boxes(
+    words: &mut Vec<u32>,
+    tlas: u64,
+    boxes: &[Option<(glam::Vec3, glam::Vec3)>],
+) -> Option<usize> {
+    let at = mesh_section(words)?;
+    let body = crate::rt::box_words(boxes);
+    // Коробки дерево читает по 8 байт: начало раздела — на чётном слове.
+    let start = words.len().next_multiple_of(2);
+    if start + 4 + body.len() > MAX_WORDS {
+        return None;
+    }
+    words.resize(start, 0);
+    words.extend([tlas as u32, (tlas >> 32) as u32, boxes.len() as u32, 0]);
+    words.extend(body);
+    words[at + MESH_RAY] = start as u32;
+    Some(start + 4)
 }
 
 /// Матрица камеры «мир → экран» в раздел моделей (вершинный шейдер «полигонов 3D»).

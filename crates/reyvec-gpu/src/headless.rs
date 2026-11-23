@@ -532,6 +532,7 @@ fn render(
                 demo.wait_space_meshes();
             }
             demo.set_plane_shadows(tests::PLANE_SHADOWS.get());
+            demo.set_space_rt(tests::SPACE_RT.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -833,6 +834,8 @@ pub(crate) mod tests {
         pub(super) static TRIANGLES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Тени моделей от плоскостей граней, как до 8.15 (обычно — от кирпичей поля).
         pub(super) static PLANE_SHADOWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Тени через RT-ядра (опыт Р1); по умолчанию, как в песочнице, выключены.
+        pub(super) static SPACE_RT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Мусором залиты только картинки с этим именем (8.0).
         pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
             const { std::cell::Cell::new(None) };
@@ -1247,6 +1250,95 @@ pub(crate) mod tests {
         );
         assert!(p_on * 2 < p_off, "{p_on} из {p_off}");
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
+    /// Тени через RT-ядра (опыт Р1) на заводе: картинка почти та же, что с сеткой
+    /// отсева, без ошибок Vulkan; со счётчиками видно, сколько вычислений сцены у лучей
+    /// тени было и стало. Без ray query у видеокарты флажок неактивен, и тест только
+    /// проверяет это.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn factory_rt_shadows_match_grid() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 960,
+            height: 540,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/factory.ron").into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let render = |rt: bool, counted: bool| {
+            SPACE_RT.set(rt);
+            SPACE_COUNTERS.set(counted);
+            let frame = render_headless(&options, &scene);
+            SPACE_RT.set(false);
+            SPACE_COUNTERS.set(false);
+            frame.expect("кадр")
+        };
+        let grid = render(false, true);
+        let rt = render(true, true);
+        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+        let shadows = |f: &HeadlessImage| {
+            f.space_stats
+                .and_then(|s| s.rays)
+                .map(|r| r[crate::counters::PASS_SHADOWS])
+        };
+        let (Some(a), Some(b)) = (shadows(&grid), shadows(&rt)) else {
+            eprintln!("счётчиков лучей нет: видеокарта не умеет, сравнение только картинки");
+            return;
+        };
+        for (name, c) in [("сетка", a), ("RT-ядра", b)] {
+            let per = |x: u64| x as f64 / c.rays.max(1) as f64;
+            eprintln!(
+                "завод, тени 3D, {name}: лучей {}, шаг/луч {:.2}, сцена/луч {:.2}, \
+                 объект/луч {:.2}, форма/луч {:.2}",
+                c.rays,
+                per(c.steps),
+                per(c.scene),
+                per(c.objects),
+                per(c.forms)
+            );
+        }
+        let (changed, worst, mean) = image_diff(&grid.image, &rt.image);
+        let total = grid.image.rgba.len() / 4;
+        eprintln!(
+            "завод, RT-ядра против сетки: отличается {changed} точек из {total} \
+             ({:.2} %), сильнее всего на {worst}, в среднем {mean:.3}",
+            changed as f64 * 100.0 / total as f64
+        );
+        if b.forms == a.forms && b.steps == a.steps {
+            eprintln!("видеокарта не умеет ray query: тени шли по сетке оба раза");
+            assert_eq!(changed, 0);
+            return;
+        }
+        // Полутень по каждому предмету отдельно ложится точками шагов не туда же, где у
+        // сетки, поэтому совпадение не до бита: отличия — на ступень-другую в полутенях и
+        // отдельные точки у краёв (на lavapipe 2026-11-23: 127 точек из 518 400, одна
+        // точка у края — на 107). Лучи тени считают заметно меньше форм.
+        assert!(
+            changed * 1000 < total,
+            "RT-ядра меняют больше 0,1 % кадра: {changed} из {total}"
+        );
+        assert!(
+            b.forms * 10 < a.forms * 8,
+            "форм на луч не меньше: {} против {}",
+            b.forms,
+            a.forms
+        );
     }
 
     /// Тени моделей от кирпичей поля (8.15) — почти те же, что от прежних заменителей из

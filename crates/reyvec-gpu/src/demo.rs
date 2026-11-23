@@ -114,6 +114,8 @@ struct CountedPipelines {
     march: vk::Pipeline,
     march_compute: vk::Pipeline,
     shadow: vk::Pipeline,
+    /// Тени через RT-ядра (опыт Р1); null — видеокарта не умеет ray query.
+    shadow_rt: vk::Pipeline,
     edges: vk::Pipeline,
     edge_find: vk::Pipeline,
     edge_shadow_rays: vk::Pipeline,
@@ -130,6 +132,7 @@ impl CountedPipelines {
             march: vk::Pipeline::null(),
             march_compute: vk::Pipeline::null(),
             shadow: vk::Pipeline::null(),
+            shadow_rt: vk::Pipeline::null(),
             edges: vk::Pipeline::null(),
             edge_find: vk::Pipeline::null(),
             edge_shadow_rays: vk::Pipeline::null(),
@@ -162,6 +165,17 @@ impl CountedPipelines {
                 Msaa::Off,
                 None,
             )?;
+            if ctx.ray_query {
+                made.shadow_rt = build(
+                    ctx,
+                    res,
+                    shaders,
+                    "raymarch_shadow_rt_counted",
+                    SHADOW3D_FORMAT,
+                    Msaa::Off,
+                    None,
+                )?;
+            }
             if res.bindless.storage_images {
                 let layout = res.bindless.pipeline_layout;
                 made.march_compute = crate::pipeline::compute_pipeline(
@@ -205,6 +219,7 @@ impl CountedPipelines {
                 self.march,
                 self.march_compute,
                 self.shadow,
+                self.shadow_rt,
                 self.edges,
                 self.edge_find,
                 self.edge_shadow_rays,
@@ -679,6 +694,9 @@ pub(crate) struct FrameData {
     /// Счётчики лучей (7.18д2): конвейеры со счётчиками, буфер, куда они складывают, и
     /// буфер для процессора. `None` — кадр не считает.
     space_counters: Option<(CountedPipelines, vk::Buffer, vk::Buffer)>,
+    /// Тени через RT-ядра (опыт Р1): ячейка кадра в полёте, адрес коробок в буфере
+    /// сцены и их число на уровень. `None` — тени по сетке отсева.
+    space_ray: Option<(usize, vk::DeviceAddress, u32)>,
     /// Запечённое поле расстояний (7.10б): что пересчитать в проходе «поле». `None` —
     /// поле выключено.
     space_field: Option<crate::field::FieldFrame>,
@@ -739,6 +757,13 @@ pub(crate) struct Demo {
     space_cone: vk::Pipeline,
     /// …тени и затенение в углах по нему (7.4, `raymarch_shadow.slang`)…
     space_shadow: vk::Pipeline,
+    /// То же через RT-ядра (опыт Р1, `raymarch_shadow_rt.slang`); null — видеокарта не
+    /// умеет ray query.
+    space_shadow_rt: vk::Pipeline,
+    /// Деревья коробок предметов для RT-ядер (опыт Р1); `None` — видеокарта не умеет.
+    ray_boxes: Option<crate::rt::RayBoxes>,
+    /// Флажок «Тени через RT-ядра (опыт)» на панели (по умолчанию выключен).
+    space_rt: bool,
     /// Опыт 7.6м: те же лучи вычислительным шейдером (`cs_main` в `raymarch.slang`),
     /// если в файле сцены нет `compute: false` и видеокарта умеет писать в картинки через
     /// общий список (иначе конвейера нет, null).
@@ -1085,10 +1110,16 @@ impl Demo {
         }
         let mut space_buffers = Vec::new();
         for i in 0..frames_in_flight {
+            // С RT-ядрами (опыт Р1) деревья коробок строятся прямо из слов сцены.
+            let rt_input = if ctx.ray_query {
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            } else {
+                vk::BufferUsageFlags::empty()
+            };
             space_buffers.push(res.create_buffer(
                 ctx,
                 (crate::space::MAX_WORDS * 4) as u64,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::BufferUsageFlags::STORAGE_BUFFER | rt_input,
                 BufferMemory::CpuToGpu,
                 &format!("сцена 3D кадра {i}"),
             )?);
@@ -1160,6 +1191,9 @@ impl Demo {
             space_mesh_shadow: vk::Pipeline::null(),
             space_cone: vk::Pipeline::null(),
             space_shadow: vk::Pipeline::null(),
+            space_shadow_rt: vk::Pipeline::null(),
+            ray_boxes: None,
+            space_rt: false,
             space_march_compute: vk::Pipeline::null(),
             space_compute_running: false,
             space_edge_find: vk::Pipeline::null(),
@@ -1440,6 +1474,22 @@ impl Demo {
                 Msaa::Off,
                 None,
             )?;
+            if ctx.ray_query {
+                demo.space_shadow_rt = build(
+                    ctx,
+                    res,
+                    shaders,
+                    "raymarch_shadow_rt",
+                    SHADOW3D_FORMAT,
+                    Msaa::Off,
+                    None,
+                )?;
+                demo.ray_boxes = crate::rt::RayBoxes::new(
+                    ctx,
+                    frames_in_flight,
+                    reyvec_sdf::shape3d::MAX_OBJECTS as u32,
+                )?;
+            }
             demo.resolve = build(ctx, res, shaders, "resolve", scene_format, Msaa::Off, None)?;
             for name in FIELD_SHADERS {
                 *demo.field.slot(name) =
@@ -2189,6 +2239,20 @@ impl Demo {
     /// Сетка по коробкам или по шарам, как до 8.8а (для сравнения времени).
     pub fn set_space_boxes(&mut self, on: bool) {
         self.space_boxes = on;
+    }
+
+    /// Тени через RT-ядра (опыт Р1): `None` — видеокарта не умеет, иначе включены ли.
+    pub fn space_rt(&self) -> Option<bool> {
+        self.rt_ready().then_some(self.space_rt)
+    }
+
+    /// Включает или выключает тени через RT-ядра со следующего кадра (без RT-ядер — ничего).
+    pub fn set_space_rt(&mut self, on: bool) {
+        self.space_rt = on && self.rt_ready();
+    }
+
+    fn rt_ready(&self) -> bool {
+        self.ray_boxes.is_some() && self.space_shadow_rt != vk::Pipeline::null()
     }
 
     /// Замер «краёв 3D» по частям (8.1).
@@ -3460,6 +3524,9 @@ impl Demo {
                     Some(MESH_DEPTH_FORMAT),
                 ),
                 "raymarch_shadow" => (&mut self.space_shadow, SHADOW3D_FORMAT, Msaa::Off, None),
+                "raymarch_shadow_rt" if ctx.ray_query => {
+                    (&mut self.space_shadow_rt, SHADOW3D_FORMAT, Msaa::Off, None)
+                }
                 "particles" => {
                     match build(ctx, res, shaders, name, self.format, Msaa::Off, None) {
                         Ok(new) => {
@@ -3821,6 +3888,7 @@ impl Demo {
         let mut space_textured = false;
         let mut space_shadow_maps = 0;
         let mut space_counters = None;
+        let mut space_ray = None;
         let space_compute =
             (level || self.space.compute) && self.space_march_compute != vk::Pipeline::null();
         if scene == DemoScene::Space {
@@ -4086,6 +4154,19 @@ impl Demo {
             }
             .filter(|&(_, address, _, _)| crate::space::set_counters(&mut packed.words, address))
             .map(|(pipelines, _, gpu, host)| (pipelines, gpu, host));
+            // Тени через RT-ядра (опыт Р1): коробки предметов в конец слов сцены, деревья
+            // строятся из них в начале кадра. Без коробок (поле уровня, слова не влезли) —
+            // тени по сетке отсева.
+            if self.space_rt
+                && let Some(rt) = self.ray_boxes.as_ref()
+                && let Some(boxes) = packed.ray_boxes.as_ref()
+                && boxes.len() <= rt.max_boxes() as usize
+                && let Some(at) =
+                    crate::space::set_ray_boxes(&mut packed.words, rt.tlas_address(slot), boxes)
+            {
+                let address = res.buffer_address(space_buffer) + (at * 4) as u64;
+                space_ray = Some((slot, address, boxes.len() as u32));
+            }
             res.write_words(space_buffer, 0, &packed.words);
             // Запекание поля уровня прямо в кадре (снимки, тесты) — не сборка кадра.
             let build_ms = (built - started).saturating_sub(baked_inline).as_secs_f64() * 1000.0;
@@ -4138,6 +4219,7 @@ impl Demo {
             space_compute,
             space_edges,
             space_counters,
+            space_ray,
             space_field,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
@@ -4989,6 +5071,15 @@ impl Demo {
         let map_flags = move |p: &PassContext| {
             shadow_maps.map_or(0, |m| SPACE_FLAG_SHADOW_MAP | (p.texture(m) << 16))
         };
+        // Деревья коробок для теней через RT-ядра (опыт Р1) — до «теней 3D».
+        if let (Some((slot, boxes, count)), Some(rt)) = (frame.space_ray, self.ray_boxes.as_ref()) {
+            graph.add_pass("коробки RT", &[], move |p| {
+                // SAFETY: проход вне рисования; буфер сцены кадра жив, пока кадр рисуется, и
+                // создан с ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR; ячейка `slot`
+                // принадлежит этому кадру, прошлый её кадр закончен.
+                unsafe { rt.record_build(p.device, p.cmd, slot, boxes, count) };
+            });
+        }
         let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
         let mut uses = vec![
             (gbuffer, Access::Sampled),
@@ -5015,9 +5106,12 @@ impl Demo {
             unsafe {
                 begin_color_pass(d, cmd, p.view(shadows), half);
                 bindless.bind(d, cmd);
-                let pipeline = frame
-                    .space_counters
-                    .map_or(self.space_shadow, |c| c.0.shadow);
+                let pipeline = match (frame.space_counters, frame.space_ray) {
+                    (Some(c), Some(_)) => c.0.shadow_rt,
+                    (Some(c), None) => c.0.shadow,
+                    (None, Some(_)) => self.space_shadow_rt,
+                    (None, None) => self.space_shadow,
+                };
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                 d.cmd_draw(cmd, 3, 1, 0, 0);
@@ -5797,6 +5891,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_mesh_shadow, None);
             ctx.device.destroy_pipeline(self.space_cone, None);
             ctx.device.destroy_pipeline(self.space_shadow, None);
+            ctx.device.destroy_pipeline(self.space_shadow_rt, None);
             ctx.device.destroy_pipeline(self.space_march_compute, None);
             ctx.device.destroy_pipeline(self.space_edge_find, None);
             ctx.device.destroy_pipeline(self.space_edges, None);
@@ -5836,6 +5931,7 @@ impl Demo {
         self.space_mesh_shadow = vk::Pipeline::null();
         self.space_cone = vk::Pipeline::null();
         self.space_shadow = vk::Pipeline::null();
+        self.space_shadow_rt = vk::Pipeline::null();
         self.space_march_compute = vk::Pipeline::null();
         self.space_edge_find = vk::Pipeline::null();
         self.space_edges = vk::Pipeline::null();
@@ -5868,6 +5964,9 @@ impl Demo {
     /// Уничтожает конвейеры. Текстуры и буферы уходят вместе с [`GpuResources`].
     pub fn destroy(mut self, ctx: &GpuContext) {
         self.destroy_pipelines(ctx);
+        if let Some(mut boxes) = self.ray_boxes.take() {
+            boxes.destroy(ctx);
+        }
     }
 }
 

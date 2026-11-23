@@ -46,6 +46,7 @@ pub(crate) enum PanelAction {
     SpaceFree(bool),
     /// Сетка отсева по плотным коробкам предметов (8.8а; выкл — по шарам, как раньше).
     SpaceBoxes(bool),
+    SpaceRt(bool),
     /// Замер «краёв 3D» по частям (8.1).
     EdgeProbe(EdgeProbe),
     EdgeCreases(bool),
@@ -169,6 +170,8 @@ pub(crate) struct PanelInfo<'a> {
     /// Длинный шаг в пустоте (7.18д4): включён ли.
     pub space_free: bool,
     pub space_boxes: bool,
+    /// Тени через RT-ядра (опыт Р1): `None` — видеокарта не умеет.
+    pub space_rt: Option<bool>,
     /// Замер «краёв 3D» по частям (8.1).
     pub edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2).
@@ -1026,6 +1029,23 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             {
                 actions.push(PanelAction::SpaceBoxes(boxes));
             }
+            let mut rt = info.space_rt.unwrap_or(false);
+            let rt_box = ui.add_enabled(
+                info.space_rt.is_some(),
+                egui::Checkbox::new(&mut rt, "Тени через RT-ядра (опыт)"),
+            );
+            if rt_box
+                .on_hover_text(
+                    "Опыт Р1: лучи тени не спрашивают сетку отсева, а ищут предметы RT-ядрами \
+                 видеокарты в дереве коробок и шагают только по формам этих предметов. \
+                 Картинка почти та же. Включите и сравните время «теней 3D» (вместе с \
+                 «коробками RT»). Неактивно, если видеокарта не умеет ray query",
+                )
+                .on_disabled_hover_text("Видеокарта не умеет ray query (RT-ядра из шейдера)")
+                .changed()
+            {
+                actions.push(PanelAction::SpaceRt(rt));
+            }
             if info.space_smooth.0 {
                 let mut creases = info.edge_creases;
                 if ui
@@ -1348,9 +1368,10 @@ fn zoom_text(zoom: f64) -> String {
 
 /// Проходы, которые шагают лучами по сцене «3D»: вместе у них свой бюджет
 /// (`docs/decisions/0003-performance-targets.md`).
-const RAYMARCH_PASSES: [&str; 6] = [
+const RAYMARCH_PASSES: [&str; 7] = [
     "лучи 3D грубо",
     "реймарчинг",
+    "коробки RT",
     "тени 3D",
     "края 3D: поиск",
     "края 3D: тени",
@@ -1913,6 +1934,7 @@ mod tests {
             space_counters: (true, true),
             space_free: true,
             space_boxes: true,
+            space_rt: None,
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,

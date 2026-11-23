@@ -811,6 +811,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Тени через RT-ядра (опыт Р1): `None` — видеокарта не умеет, иначе включены ли.
+    pub fn space_rt(&self) -> Option<bool> {
+        self.demo.as_ref().and_then(|d| d.space_rt())
+    }
+
+    /// Включает или выключает тени через RT-ядра со следующего кадра.
+    pub fn set_space_rt(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_rt(on);
+        }
+    }
+
     /// Сетка отсева по плотным коробкам предметов (8.8а): включена ли.
     pub fn space_boxes(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.space_boxes())

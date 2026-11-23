@@ -359,6 +359,12 @@ pub(crate) struct GpuContext {
     /// пиксельном и вычислительном шейдере, запись в память из пиксельного, проверка
     /// вспомогательных потоков. Без этого флажок «Счётчики лучей 3D» неактивен.
     pub ray_counters: bool,
+    /// RT-ядра доступны шейдерам (опыт «тени через RT-ядра», `rt.rs`): включены
+    /// VK_KHR_acceleration_structure и VK_KHR_ray_query. Без них проход «тени 3D» идёт
+    /// только по сетке отсева, флажок на панели неактивен.
+    pub ray_query: bool,
+    /// Свойства деревьев коробок (выравнивание памяти для постройки), если `ray_query`.
+    pub accel_scratch_align: u64,
     // Последним: уничтожается после устройства.
     pub core: Core,
 }
@@ -383,6 +389,8 @@ impl GpuContext {
                 present_fences,
                 storage_images,
                 ray_counters,
+                ray_query,
+                accel_scratch_align,
             )) => {
                 let allocator = gpu_allocator::vulkan::Allocator::new(
                     &gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -412,6 +420,8 @@ impl GpuContext {
                     present_fences,
                     storage_images,
                     ray_counters,
+                    ray_query,
+                    accel_scratch_align,
                     core,
                 })
             }
@@ -434,6 +444,8 @@ impl GpuContext {
             bool,
             bool,
             bool,
+            bool,
+            u64,
         ),
         GpuError,
     > {
@@ -453,6 +465,7 @@ impl GpuContext {
             .queue_priorities(&priorities)];
         let storage_images = Self::storage_images(&core.instance, physical);
         let ray_counters = Self::ray_counters(&core.instance, physical);
+        let (ray_query, accel_scratch_align) = Self::ray_query(&core.instance, physical)?;
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .descriptor_binding_storage_image_update_after_bind(storage_images)
             .descriptor_indexing(true)
@@ -497,6 +510,15 @@ impl GpuContext {
                 extensions.push(ext::swapchain_maintenance1::NAME.as_ptr());
             }
         }
+        if ray_query {
+            extensions.push(khr::deferred_host_operations::NAME.as_ptr());
+            extensions.push(khr::acceleration_structure::NAME.as_ptr());
+            extensions.push(khr::ray_query::NAME.as_ptr());
+        }
+        let mut accel_features = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+            .acceleration_structure(true);
+        let mut ray_query_features =
+            vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
         let mut sm1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
             .swapchain_maintenance1(true);
         // Векторный слой рисует много фигур одной командой (vkCmdDrawIndirect).
@@ -514,6 +536,11 @@ impl GpuContext {
         if present_fences {
             create_info = create_info.push_next(&mut sm1);
         }
+        if ray_query {
+            create_info = create_info
+                .push_next(&mut accel_features)
+                .push_next(&mut ray_query_features);
+        }
 
         // SAFETY: видеокарта проверена в find_problem, все возможности поддерживаются.
         let device = unsafe { core.instance.create_device(physical, &create_info, None) }
@@ -529,6 +556,60 @@ impl GpuContext {
             present_fences,
             storage_images,
             ray_counters,
+            ray_query,
+            accel_scratch_align,
+        ))
+    }
+
+    /// Умеет ли видеокарта искать коробки лучом из шейдера (RT-ядра): расширения
+    /// VK_KHR_acceleration_structure, VK_KHR_ray_query и их возможности. Второе число —
+    /// выравнивание памяти для постройки дерева. Переменная `REYVEC_NO_RAY_QUERY`
+    /// выключает (проверка запасного пути).
+    fn ray_query(
+        instance: &ash::Instance,
+        physical: vk::PhysicalDevice,
+    ) -> Result<(bool, u64), GpuError> {
+        if std::env::var_os("REYVEC_NO_RAY_QUERY").is_some() {
+            return Ok((false, 0));
+        }
+        // SAFETY: physical получен из этого экземпляра.
+        let available = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .ctx("расширения видеокарты")?;
+        let has = |name: &CStr| {
+            available
+                .iter()
+                .any(|e| e.extension_name_as_c_str() == Ok(name))
+        };
+        if !(has(khr::acceleration_structure::NAME)
+            && has(khr::ray_query::NAME)
+            && has(khr::deferred_host_operations::NAME))
+        {
+            tracing::info!("RT-ядра для теней недоступны: нет расширений ray query");
+            return Ok((false, 0));
+        }
+        let mut accel = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
+        let mut query = vk::PhysicalDeviceRayQueryFeaturesKHR::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut accel)
+            .push_next(&mut query);
+        let mut accel_props = vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut accel_props);
+        // SAFETY: структуры живут до конца вызовов, расширения есть у видеокарты.
+        unsafe {
+            instance.get_physical_device_features2(physical, &mut f2);
+            instance.get_physical_device_properties2(physical, &mut p2);
+        }
+        let ok = accel.acceleration_structure == vk::TRUE && query.ray_query == vk::TRUE;
+        if !ok {
+            tracing::info!("RT-ядра для теней недоступны: видеокарта не включает ray query");
+        }
+        Ok((
+            ok,
+            u64::from(
+                accel_props
+                    .min_acceleration_structure_scratch_offset_alignment
+                    .max(1),
+            ),
         ))
     }
 

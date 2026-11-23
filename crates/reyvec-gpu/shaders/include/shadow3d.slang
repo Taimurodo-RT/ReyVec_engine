@@ -2,11 +2,140 @@
 // (raymarch_shadow.slang, половинный размер) и краёв форм (7.6о, raymarch_edges.slang,
 // точно для пикселя края). Перед подключением — space.slang.
 
+#ifdef SPACE_RAY_QUERY
+// Тени через RT-ядра (опыт Р1, crates/reyvec-gpu/src/rt.rs; «Р1» в
+// docs/3d-beyond-triangles.md). Шейдер с этим вариантом (raymarch_shadow_rt.slang)
+// собирается, только если видеокарта умеет ray query.
+//
+// Видеокарта сама ищет, через какие коробки предметов проходит луч тени, и луч шагает
+// только по формам этих предметов. Мягкая тень — минимум k·h/t по точкам луча, где h —
+// расстояние до ближайшей формы, то есть минимум по всем формам сразу. Поэтому её можно
+// считать по каждому предмету отдельно и взять наименьшее: картинка почти та же (точки
+// шагов у разных предметов свои, поэтому полутень совпадает не до бита). Полутень даёт
+// только форма ближе t/k к точке луча, поэтому коробки раздуты: на отрезке луча `i`
+// (до k · RAY_INFLATE[i]) — на RAY_INFLATE[i] метров, у каждого отрезка своё дерево.
+
+// Как rt::RAY_INFLATE.
+static const float RAY_INFLATE[3] = { 0.1, 0.5, 3.0 };
+// Больше шагов на весь луч (по всем предметам) не делаем: у сетки — 64.
+static const uint RAY_MAX_STEPS = 128;
+
+// Где раздел коробок RT в словах сцены; 0 — его нет, тени идут по сетке отсева.
+uint ray_section()
+{
+    uint at = pc.scene[7];
+    return at == 0 ? 0 : pc.scene[at + MESH_RAY];
+}
+
+RaytracingAccelerationStructure ray_tlas(uint rt)
+{
+    // Адрес — двумя 32-битными словами: так не нужна возможность shaderInt64.
+    uint2 a = uint2(pc.scene[rt], pc.scene[rt + 1]);
+    return spirv_asm { result:$$RaytracingAccelerationStructure = OpConvertUToAccelerationStructureKHR $a };
+}
+
+// Отрезок луча внутри коробки с углами по словам `b` (6 чисел): x — вход, y — выход.
+float2 box_span(uint b, float3 from, float3 inv)
+{
+    float3 lo = float3(asfloat(pc.scene[b]), asfloat(pc.scene[b + 1]), asfloat(pc.scene[b + 2]));
+    float3 hi = float3(asfloat(pc.scene[b + 3]), asfloat(pc.scene[b + 4]), asfloat(pc.scene[b + 5]));
+    float3 a = (lo - from) * inv;
+    float3 c = (hi - from) * inv;
+    float3 near_ = min(a, c);
+    float3 far_ = max(a, c);
+    return float2(max(max(near_.x, near_.y), near_.z), min(min(far_.x, far_.y), far_.z));
+}
+
+// Полутень от одного предмета `o` на отрезке луча [t, end]: те же правила шага и
+// уточнения, что у soft_shadow, только расстояние — до одной этой формы. `h_of_planes` —
+// вместо предмета плоскости сцены, посчитанные формулой.
+void shadow_object(uint o, bool h_of_planes, float3 from, float3 dir, float t, float end, float k,
+                   inout float light, inout uint steps)
+{
+    float last = 1e9;
+    while (t < end && steps < RAY_MAX_STEPS)
+    {
+        steps++;
+        count_step();
+        float3 q = from + dir * t;
+        float2 s;
+        if (h_of_planes)
+            s = float2(planes_distance_shadow(q), 0.0);
+        else
+        {
+            uint winner;
+            float second;
+            s = scene_walk<1>(q, max(0.15, 2.0 * t / k), true, false, o, 1e9, winner, second);
+        }
+        float h = s.x;
+        if (h >= 1e8)
+            return;
+        float y = h * h / (2.0 * last);
+        float d = sign(h) * sqrt(max(h * h - y * y, 0.0));
+        if (s.y >= 0.0)
+            light = min(light, max(k * d / max(t - y, 1e-4), k * h / t - 1.0));
+        last = s.y < 0.0 ? 1e9 : h;
+        if (light < 0.002)
+            return;
+        t += (k * h > 2.0 * t) ? h : clamp(h, 0.02, 0.6);
+    }
+}
+
+float soft_shadow_rt(float3 from, float3 dir, float far, float k, uint rt)
+{
+    count_ray();
+    float light = 1.0;
+    uint steps = 0;
+    uint count = min(pc.scene[rt + 2], MAX_OBJECTS);
+    uint boxes = rt + 4;
+    float3 inv = 1.0 / select(abs(dir) > 1e-8, dir, float3(1e-8, 1e-8, 1e-8));
+    // Плоскости (пол, стены) — формулой, как у soft_shadow; в деревьях их нет.
+    if (!away_from_planes(from, dir))
+        shadow_object(0, true, from, dir, 0.02, far, k, light, steps);
+    RaytracingAccelerationStructure tlas = ray_tlas(rt);
+    float lo = 0.02;
+    for (uint i = 0; i < 3; i++)
+    {
+        if (lo >= far || light < 0.002)
+            break;
+        float hi = i == 2 ? far : min(far, k * RAY_INFLATE[i]);
+        RayQuery<RAY_FLAG_SKIP_TRIANGLES> q;
+        RayDesc r;
+        r.Origin = from;
+        r.Direction = dir;
+        r.TMin = lo;
+        r.TMax = hi;
+        q.TraceRayInline(tlas, RAY_FLAG_NONE, 1u << i, r);
+        while (q.Proceed())
+        {
+            uint o = q.CandidatePrimitiveIndex();
+            if (o >= count)
+                continue;
+            float2 span = box_span(boxes + (i * count + o) * 6, from, inv);
+            float t0 = max(span.x, lo);
+            float t1 = min(span.y, hi);
+            if (t0 < t1)
+                shadow_object(o, false, from, dir, t0, t1, k, light, steps);
+            if (light < 0.002)
+                q.Abort();
+        }
+        lo = hi;
+    }
+    light = saturate(light);
+    return light * light * (3.0 - 2.0 * light);
+}
+#endif
+
 // Доля света от источника по направлению `dir` с расстояния `far`: 1 — свет виден
 // целиком, 0 — закрыт. `k` — жёсткость края (больше — резче).
 float soft_shadow(float3 from, float3 dir, float far, float k)
 {
     float light = 1.0;
+#ifdef SPACE_RAY_QUERY
+    uint rt = ray_section();
+    if (rt != 0)
+        return soft_shadow_rt(from, dir, far, k, rt);
+#endif
     float t = 0.02;
     float last = 1e9;
     // Луч, уходящий от всех плоскостей (от пола к солнцу или к лампе над полом), они не
