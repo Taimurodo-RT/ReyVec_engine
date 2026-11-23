@@ -51,6 +51,8 @@ pub(crate) enum PanelAction {
     SunCache(bool),
     /// Тени из прошлого кадра, пока камера стоит (опыт Р3).
     ShadowReuse(bool),
+    /// Замер фильтра на тензорных ядрах (опыт Р4): включён ли и размер картинки.
+    TensorBench(bool, usize),
     /// Замер «краёв 3D» по частям (8.1).
     EdgeProbe(EdgeProbe),
     EdgeCreases(bool),
@@ -180,6 +182,9 @@ pub(crate) struct PanelInfo<'a> {
     pub sun_cache: Option<bool>,
     /// Тени из прошлого кадра, пока камера стоит (опыт Р3).
     pub shadow_reuse: bool,
+    /// Замер фильтра на тензорных ядрах (опыт Р4): включён ли, размер картинки (номер в
+    /// `reyvec_gpu::BENCH_SIZES`) и есть ли тензорные ядра.
+    pub tensor_bench: (bool, usize, bool),
     /// Замер «краёв 3D» по частям (8.1).
     pub edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2).
@@ -1087,6 +1092,33 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             {
                 actions.push(PanelAction::ShadowReuse(reuse));
             }
+            let (mut bench, mut size, tensor) = info.tensor_bench;
+            let before = (bench, size);
+            ui.checkbox(&mut bench, "Замер фильтра на тензорных ядрах (опыт)")
+                .on_hover_text(
+                    "Опыт Р4: одно и то же размытие картинки шума (радиус 16 точек, по \
+                     строкам и столбцам) считают обычные ядра и тензорные, умножением матриц. \
+                     Картинку кадра это не меняет. Сравните время проходов «фильтр: обычные \
+                     ядра» и «фильтр: тензорные ядра»",
+                );
+            if bench {
+                ui.horizontal(|ui| {
+                    ui.label("Картинка замера");
+                    egui::ComboBox::from_id_salt("tensor_bench_size")
+                        .selected_text(bench_size(size))
+                        .show_ui(ui, |ui| {
+                            for k in 0..reyvec_gpu::BENCH_SIZES.len() {
+                                ui.selectable_value(&mut size, k, bench_size(k));
+                            }
+                        });
+                });
+            }
+            if bench && !tensor {
+                ui.label("Тензорных ядер нет: замер только обычных");
+            }
+            if (bench, size) != before {
+                actions.push(PanelAction::TensorBench(bench, size));
+            }
             if info.space_smooth.0 {
                 let mut creases = info.edge_creases;
                 if ui
@@ -1405,6 +1437,12 @@ fn zoom_text(zoom: f64) -> String {
     } else {
         format!("{zoom:.2}")
     }
+}
+
+/// Подпись размера картинки замера фильтра (опыт Р4).
+fn bench_size(k: usize) -> String {
+    let (w, h) = reyvec_gpu::BENCH_SIZES[k.min(reyvec_gpu::BENCH_SIZES.len() - 1)];
+    format!("{w}×{h}")
 }
 
 /// Проходы, которые шагают лучами по сцене «3D»: вместе у них свой бюджет
@@ -1986,6 +2024,7 @@ mod tests {
             space_rt: None,
             sun_cache: None,
             shadow_reuse: false,
+            tensor_bench: (false, 0, false),
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,

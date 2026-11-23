@@ -462,6 +462,13 @@ impl App {
                 r.set_space_rt(on);
                 tracing::info!("Тени через RT-ядра: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::TensorBench(on, size) => {
+                r.set_tensor_bench(on, size);
+                tracing::info!(
+                    "Замер фильтра: {}, размер {size}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::ShadowReuse(on) => {
                 r.set_shadow_reuse(on);
                 tracing::info!(
@@ -765,6 +772,7 @@ impl App {
                 space_rt: renderer.space_rt(),
                 sun_cache: renderer.sun_cache(),
                 shadow_reuse: renderer.shadow_reuse(),
+                tensor_bench: renderer.tensor_bench(),
                 edge_probe: renderer.edge_probe(),
                 edge_creases: renderer.edge_creases(),
                 edge_shadow_reuse: renderer.edge_shadow_reuse(),

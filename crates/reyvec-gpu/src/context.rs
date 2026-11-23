@@ -365,6 +365,10 @@ pub(crate) struct GpuContext {
     pub ray_query: bool,
     /// Свойства деревьев коробок (выравнивание памяти для постройки), если `ray_query`.
     pub accel_scratch_align: u64,
+    /// Тензорные ядра доступны шейдерам (опыт Р4, `tensor_bench.rs`): сторона квадратных
+    /// матриц half → float, которые видеокарта умножает на волну (16 у NVIDIA, 8 у
+    /// lavapipe); 0 — тензорных ядер нет (VK_KHR_cooperative_matrix не включено).
+    pub tensor: u32,
     // Последним: уничтожается после устройства.
     pub core: Core,
 }
@@ -391,6 +395,7 @@ impl GpuContext {
                 ray_counters,
                 ray_query,
                 accel_scratch_align,
+                tensor,
             )) => {
                 let allocator = gpu_allocator::vulkan::Allocator::new(
                     &gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -422,6 +427,7 @@ impl GpuContext {
                     ray_counters,
                     ray_query,
                     accel_scratch_align,
+                    tensor,
                     core,
                 })
             }
@@ -446,6 +452,7 @@ impl GpuContext {
             bool,
             bool,
             u64,
+            u32,
         ),
         GpuError,
     > {
@@ -466,6 +473,8 @@ impl GpuContext {
         let storage_images = Self::storage_images(&core.instance, physical);
         let ray_counters = Self::ray_counters(&core.instance, physical);
         let (ray_query, accel_scratch_align) = Self::ray_query(&core.instance, physical)?;
+        let tensor = Self::tensor(core, physical)?;
+        let coop = tensor != 0;
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
             .descriptor_binding_storage_image_update_after_bind(storage_images)
             .descriptor_indexing(true)
@@ -474,7 +483,10 @@ impl GpuContext {
             .descriptor_binding_sampled_image_update_after_bind(true)
             .descriptor_binding_update_unused_while_pending(true)
             .shader_sampled_image_array_non_uniform_indexing(true)
-            .buffer_device_address(true);
+            .buffer_device_address(true)
+            .shader_float16(coop)
+            .vulkan_memory_model(coop)
+            .vulkan_memory_model_device_scope(coop);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default()
             .dynamic_rendering(true)
             .synchronization2(true)
@@ -519,6 +531,11 @@ impl GpuContext {
             .acceleration_structure(true);
         let mut ray_query_features =
             vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
+        if coop {
+            extensions.push(khr::cooperative_matrix::NAME.as_ptr());
+        }
+        let mut tensor_features =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut sm1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default()
             .swapchain_maintenance1(true);
         // Векторный слой рисует много фигур одной командой (vkCmdDrawIndirect).
@@ -541,6 +558,9 @@ impl GpuContext {
                 .push_next(&mut accel_features)
                 .push_next(&mut ray_query_features);
         }
+        if coop {
+            create_info = create_info.push_next(&mut tensor_features);
+        }
 
         // SAFETY: видеокарта проверена в find_problem, все возможности поддерживаются.
         let device = unsafe { core.instance.create_device(physical, &create_info, None) }
@@ -558,7 +578,64 @@ impl GpuContext {
             ray_counters,
             ray_query,
             accel_scratch_align,
+            tensor,
         ))
+    }
+
+    /// Умеет ли видеокарта умножать матрицы на тензорных ядрах из шейдера (опыт Р4):
+    /// VK_KHR_cooperative_matrix с матрицами 16×16×16 half → float на волну, числа half и
+    /// модель памяти Vulkan. Переменная `REYVEC_NO_TENSOR` выключает.
+    fn tensor(core: &Core, physical: vk::PhysicalDevice) -> Result<u32, GpuError> {
+        if std::env::var_os("REYVEC_NO_TENSOR").is_some() {
+            return Ok(0);
+        }
+        let instance = &core.instance;
+        // SAFETY: physical получен из этого экземпляра.
+        let available = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .ctx("расширения видеокарты")?;
+        if !available
+            .iter()
+            .any(|e| e.extension_name_as_c_str() == Ok(khr::cooperative_matrix::NAME))
+        {
+            tracing::info!("тензорные ядра недоступны: нет VK_KHR_cooperative_matrix");
+            return Ok(0);
+        }
+        let mut coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut f2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut coop)
+            .push_next(&mut f12);
+        let loader = khr::cooperative_matrix::Instance::new(&core.entry, instance);
+        // SAFETY: структуры живут до конца вызовов, расширение есть у видеокарты.
+        let shapes = unsafe {
+            instance.get_physical_device_features2(physical, &mut f2);
+            loader.get_physical_device_cooperative_matrix_properties(physical)
+        }
+        .unwrap_or_default();
+        let half_to_float = |side: u32| {
+            shapes.iter().any(|p| {
+                p.m_size == side
+                    && p.n_size == side
+                    && p.k_size == side
+                    && p.a_type == vk::ComponentTypeKHR::FLOAT16
+                    && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                    && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                    && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                    && p.scope == vk::ScopeKHR::SUBGROUP
+            })
+        };
+        let side = [16, 8].into_iter().find(|&s| half_to_float(s)).unwrap_or(0);
+        let ok = coop.cooperative_matrix == vk::TRUE
+            && f12.shader_float16 == vk::TRUE
+            && f12.vulkan_memory_model == vk::TRUE
+            && f12.vulkan_memory_model_device_scope == vk::TRUE
+            && side != 0;
+        if !ok {
+            tracing::info!(
+                "тензорные ядра недоступны: нет умножения матриц 16×16 или 8×8 half → float на волну"
+            );
+        }
+        Ok(if ok { side } else { 0 })
     }
 
     /// Умеет ли видеокарта искать коробки лучом из шейдера (RT-ядра): расширения
