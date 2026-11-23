@@ -1594,6 +1594,10 @@ pub const OBJECT_PLANE: u32 = 2;
 pub const OBJECT_CHAIN: u32 = 4;
 /// Флаг объекта: теней и затенения в углах не даёт ([`Program::no_shadow`]).
 pub const OBJECT_NO_SHADOW: u32 = 8;
+/// Флаг объекта: неподвижный предмет ([`Program::still`]), не плоскость. Его тень от солнца
+/// может браться из запечённой карты (опыт Р2, кэш солнца в `reyvec-gpu`), и тогда живой
+/// луч тени его пропускает.
+pub const OBJECT_STILL: u32 = 16;
 /// Больше плоскостей, считаемых формулой, не бывает (шейдер дальше не читает).
 pub const MAX_PLANES: usize = 8;
 /// Больше объектов шейдер не читает (`MAX_OBJECTS` в `include/space.slang`: число
@@ -1709,6 +1713,9 @@ pub fn pack_scene_cached(
         }
         if p.no_shadow {
             flags |= OBJECT_NO_SHADOW;
+        }
+        if p.still && plane.is_none() {
+            flags |= OBJECT_STILL;
         }
         let (n, c) = plane.unwrap_or((Vec3::ZERO, 0.0));
         out.extend([start as u32, p.words.len() as u32, flags, c.to_bits()]);

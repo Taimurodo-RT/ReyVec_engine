@@ -50,6 +50,7 @@ mod rt;
 mod shaders;
 mod slangc;
 mod space;
+mod sun_cache;
 mod timing;
 mod ui;
 mod vector;

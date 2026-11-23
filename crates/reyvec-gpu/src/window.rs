@@ -823,6 +823,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Кэш солнца (опыт Р2): `None` — не умеет, иначе включён ли.
+    pub fn sun_cache(&self) -> Option<bool> {
+        self.demo.as_ref().and_then(|d| d.sun_cache())
+    }
+
+    /// Включает или выключает кэш солнца со следующего кадра.
+    pub fn set_sun_cache(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_sun_cache(on);
+        }
+    }
+
     /// Сетка отсева по плотным коробкам предметов (8.8а): включена ли.
     pub fn space_boxes(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.space_boxes())
