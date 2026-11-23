@@ -579,6 +579,17 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
         bool inside;
         uint square = sun ? min(pc.scene[mesh_at + 1], SHADOW_LAMPS) : part - 2;
         by_map = map_shadow(p, n, square, sun, inside);
+        // Кэш солнца (опыт Р2): карта знает тени только неподвижных предметов, движущиеся
+        // считает живой луч. Мягкая тень — минимум по предметам, поэтому и здесь меньшее.
+        if (inside && sun && (pc.scene[11] & SCENE_SUN_STATIC) != 0)
+        {
+            if (by_map <= 0.0)
+                return 0.0;
+            g_skip_still = true;
+            float moving = soft_shadow(p, dir, far, k_hard);
+            g_skip_still = false;
+            return min(by_map, moving);
+        }
         if (inside && (sun || (pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0))
             return by_map;
         if (by_map <= 0.0)

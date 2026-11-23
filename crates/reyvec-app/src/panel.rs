@@ -47,6 +47,8 @@ pub(crate) enum PanelAction {
     /// Сетка отсева по плотным коробкам предметов (8.8а; выкл — по шарам, как раньше).
     SpaceBoxes(bool),
     SpaceRt(bool),
+    /// Кэш солнца неподвижного (опыт Р2).
+    SunCache(bool),
     /// Замер «краёв 3D» по частям (8.1).
     EdgeProbe(EdgeProbe),
     EdgeCreases(bool),
@@ -172,6 +174,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_boxes: bool,
     /// Тени через RT-ядра (опыт Р1): `None` — видеокарта не умеет.
     pub space_rt: Option<bool>,
+    /// Кэш солнца (опыт Р2): `None` — не умеет.
+    pub sun_cache: Option<bool>,
     /// Замер «краёв 3D» по частям (8.1).
     pub edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2).
@@ -1046,6 +1050,22 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             {
                 actions.push(PanelAction::SpaceRt(rt));
             }
+            let mut sun = info.sun_cache.unwrap_or(false);
+            if ui
+                .add_enabled(
+                    info.sun_cache.is_some(),
+                    egui::Checkbox::new(&mut sun, "Кэш солнца неподвижного (опыт)"),
+                )
+                .on_hover_text(
+                    "Опыт Р2, как свет у Quake: тень солнца от неподвижных предметов \
+                 печётся один раз в большую карту, а лучи тени каждый кадр шагают только \
+                 по движущимся. Включите, подождите полсекунды (карта печётся) и сравните \
+                 время «теней 3D» и картинку. В режиме «треугольники» не действует",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::SunCache(sun));
+            }
             if info.space_smooth.0 {
                 let mut creases = info.edge_creases;
                 if ui
@@ -1368,10 +1388,11 @@ fn zoom_text(zoom: f64) -> String {
 
 /// Проходы, которые шагают лучами по сцене «3D»: вместе у них свой бюджет
 /// (`docs/decisions/0003-performance-targets.md`).
-const RAYMARCH_PASSES: [&str; 7] = [
+const RAYMARCH_PASSES: [&str; 8] = [
     "лучи 3D грубо",
     "реймарчинг",
     "коробки RT",
+    "кэш солнца",
     "тени 3D",
     "края 3D: поиск",
     "края 3D: тени",
@@ -1935,6 +1956,7 @@ mod tests {
             space_free: true,
             space_boxes: true,
             space_rt: None,
+            sun_cache: None,
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,

@@ -685,6 +685,8 @@ pub(crate) struct FrameData {
     space_shadow_maps: u32,
     /// Карт теней солнца по сеткам из форм (8.20в): квадраты сразу после карт ламп.
     space_sun_maps: u32,
+    /// Кэш солнца (опыт Р2): печь этого кадра и готова ли карта; `None` — кэша нет.
+    space_sun: Option<crate::sun_cache::SunFrame>,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
@@ -764,6 +766,9 @@ pub(crate) struct Demo {
     ray_boxes: Option<crate::rt::RayBoxes>,
     /// Флажок «Тени через RT-ядра (опыт)» на панели (по умолчанию выключен).
     space_rt: bool,
+    /// Кэш солнца (опыт Р2, `sun_bake.slang`): карта тени солнца от неподвижного.
+    sun_cache: crate::sun_cache::SunCache,
+    space_sun_bake: vk::Pipeline,
     /// Опыт 7.6м: те же лучи вычислительным шейдером (`cs_main` в `raymarch.slang`),
     /// если в файле сцены нет `compute: false` и видеокарта умеет писать в картинки через
     /// общий список (иначе конвейера нет, null).
@@ -1194,6 +1199,8 @@ impl Demo {
             space_shadow_rt: vk::Pipeline::null(),
             ray_boxes: None,
             space_rt: false,
+            sun_cache: crate::sun_cache::SunCache::new(),
+            space_sun_bake: vk::Pipeline::null(),
             space_march_compute: vk::Pipeline::null(),
             space_compute_running: false,
             space_edge_find: vk::Pipeline::null(),
@@ -1524,6 +1531,11 @@ impl Demo {
                 &ctx.device,
                 res.bindless.pipeline_layout,
                 shaders.compute("field_bake"),
+            )?;
+            demo.space_sun_bake = crate::pipeline::compute_pipeline(
+                &ctx.device,
+                res.bindless.pipeline_layout,
+                shaders.compute("sun_bake"),
             )?;
             if res.bindless.storage_images {
                 let layout = res.bindless.pipeline_layout;
@@ -2253,6 +2265,23 @@ impl Demo {
 
     fn rt_ready(&self) -> bool {
         self.ray_boxes.is_some() && self.space_shadow_rt != vk::Pipeline::null()
+    }
+
+    /// Кэш солнца (опыт Р2): `None` — конвейера печи нет, иначе включён ли.
+    pub fn sun_cache(&self) -> Option<bool> {
+        (self.space_sun_bake != vk::Pipeline::null()).then_some(self.sun_cache.enabled)
+    }
+
+    /// Включает или выключает кэш солнца со следующего кадра (включённый печётся заново,
+    /// у выключенного картинка и буферы освобождаются).
+    pub fn set_sun_cache(&mut self, on: bool) {
+        self.sun_cache.enabled = on && self.space_sun_bake != vk::Pipeline::null();
+        // Тесты рисуют один кадр: карта меньше и печётся в нём целиком.
+        #[cfg(test)]
+        {
+            self.sun_cache.side = 2048;
+            self.sun_cache.per_frame = 16;
+        }
     }
 
     /// Замер «краёв 3D» по частям (8.1).
@@ -3889,6 +3918,7 @@ impl Demo {
         let mut space_shadow_maps = 0;
         let mut space_counters = None;
         let mut space_ray = None;
+        let mut space_sun = None;
         let space_compute =
             (level || self.space.compute) && self.space_march_compute != vk::Pipeline::null();
         if scene == DemoScene::Space {
@@ -3961,6 +3991,13 @@ impl Demo {
                     }
                 }
                 frame.hide_from_eye(&hide);
+            }
+            // Кэш солнца (опыт Р2) — по всему неподвижному, до отсева по взгляду. В режиме
+            // «треугольники» у солнца свои карты.
+            if !level && shape_places.is_empty() && self.space_sun_bake != vk::Pipeline::null() {
+                space_sun = self
+                    .sun_cache
+                    .prepare(ctx, res, &frame, &self.space.materials);
             }
             let built = std::time::Instant::now();
             let frame_counts = FrameCounts {
@@ -4167,6 +4204,10 @@ impl Demo {
                 let address = res.buffer_address(space_buffer) + (at * 4) as u64;
                 space_ray = Some((slot, address, boxes.len() as u32));
             }
+            if let Some(sun) = space_sun.filter(|s| s.ready) {
+                crate::space::set_sun_maps(&mut packed.words, &[sun.matrix]);
+                crate::space::set_sun_static(&mut packed.words);
+            }
             res.write_words(space_buffer, 0, &packed.words);
             // Запекание поля уровня прямо в кадре (снимки, тесты) — не сборка кадра.
             let build_ms = (built - started).saturating_sub(baked_inline).as_secs_f64() * 1000.0;
@@ -4220,6 +4261,7 @@ impl Demo {
             space_edges,
             space_counters,
             space_ray,
+            space_sun,
             space_field,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
@@ -4744,6 +4786,19 @@ impl Demo {
                 }
             });
         }
+        // Кэш солнца (опыт Р2): квадраты карты неподвижного — до теней и краёв.
+        if let Some(sun) = frame.space_sun {
+            let bake = self.space_sun_bake;
+            graph.add_pass("кэш солнца", &[], move |p| {
+                // SAFETY: проход вне рисования; конвейер жив, пока жива сцена; картинка и
+                // буферы кэша удаляются отложенно, после конца кадра.
+                unsafe {
+                    crate::sun_cache::SunCache::record(
+                        p.device, p.cmd, bindless, layout, bake, &sun,
+                    );
+                }
+            });
+        }
         // Предварительное шагание конусами (7.8): точка на квадрат 8×8 пикселей.
         let tiles = vk::Extent2D {
             width: ext.width.div_ceil(CONE_TILE),
@@ -5068,8 +5123,12 @@ impl Demo {
             maps
         });
         // Флаг и номер картинки карт теней для «теней 3D» и «краёв 3D».
-        let map_flags = move |p: &PassContext| {
-            shadow_maps.map_or(0, |m| SPACE_FLAG_SHADOW_MAP | (p.texture(m) << 16))
+        // Кэш солнца (опыт Р2) — та же карта солнца, только своя картинка вне графа.
+        let sun_static = frame.space_sun.filter(|s| s.ready).map(|s| s.slot);
+        let map_flags = move |p: &PassContext| match (shadow_maps, sun_static) {
+            (Some(m), _) => SPACE_FLAG_SHADOW_MAP | (p.texture(m) << 16),
+            (None, Some(slot)) => SPACE_FLAG_SHADOW_MAP | (slot << 16),
+            (None, None) => 0,
         };
         // Деревья коробок для теней через RT-ядра (опыт Р1) — до «теней 3D».
         if let (Some((slot, boxes, count)), Some(rt)) = (frame.space_ray, self.ray_boxes.as_ref()) {
@@ -5899,6 +5958,7 @@ impl Demo {
             ctx.device
                 .destroy_pipeline(self.space_edge_shadow_rays, None);
             ctx.device.destroy_pipeline(self.space_field_bake, None);
+            ctx.device.destroy_pipeline(self.space_sun_bake, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.space_shade_small, None);
             ctx.device.destroy_pipeline(self.space_post_aa, None);
@@ -5938,6 +5998,7 @@ impl Demo {
         self.space_edge_shadows = vk::Pipeline::null();
         self.space_edge_shadow_rays = vk::Pipeline::null();
         self.space_field_bake = vk::Pipeline::null();
+        self.space_sun_bake = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.space_shade_small = vk::Pipeline::null();
         self.space_post_aa = vk::Pipeline::null();

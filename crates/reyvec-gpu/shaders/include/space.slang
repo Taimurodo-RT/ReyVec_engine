@@ -88,6 +88,7 @@ static const uint OBJECT_SHADOW_ONLY = 1; // как shape3d::OBJECT_SHADOW_ONLY
 static const uint OBJECT_NO_SHADOW = 8; // как shape3d::OBJECT_NO_SHADOW
 static const uint OBJECT_PLANE = 2; // как shape3d::OBJECT_PLANE
 static const uint OBJECT_CHAIN = 4; // как shape3d::OBJECT_CHAIN
+static const uint OBJECT_STILL = 16; // как shape3d::OBJECT_STILL
 static const uint MAX_PLANES = 8; // как shape3d::MAX_PLANES
 // Флаги констант (pc.flags) сцены «3D», как SPACE_FLAG_* в demo.rs.
 static const uint SPACE_FLAG_MESHES = 1; // у «реймарчинга» есть буфер геометрии полигонов
@@ -147,6 +148,14 @@ static const float LAMP_SHADOW_GAP = 0.35;
 // запечённому полю, и ближняя проба тоже (режим «треугольники»: формы не считаются ни для
 // одной пробы внутри поля).
 static const uint SCENE_AO_FIELD_ONLY = 16;
+// Бит 5 слова 11 (опыт Р2, как SCENE_SUN_STATIC в space.rs): карта солнца — запечённая
+// карта неподвижных предметов (кэш солнца, crates/reyvec-gpu/src/sun_cache.rs). Внутри
+// неё тень солнца — меньшее из карты и живого луча только по движущимся предметам.
+static const uint SCENE_SUN_STATIC = 32;
+
+// Перебор пропускает неподвижные предметы (OBJECT_STILL): их тень от солнца уже в
+// запечённой карте (опыт Р2). Ставит и снимает shadow_part вокруг одного луча тени.
+static bool g_skip_still = false;
 
 // Расстояние до ближайшего объекта (x) и его материал (y).
 //
@@ -265,6 +274,8 @@ float2 scene_walk<let PICK : int>(float3 p, float near, bool proxies, bool plane
         if (proxies && (flags & OBJECT_NO_SHADOW) != 0)
             continue;
         if (!planes && (flags & OBJECT_PLANE) != 0)
+            continue;
+        if (g_skip_still && (flags & OBJECT_STILL) != 0)
             continue;
         count_object();
         float radius = asfloat(pc.scene[w + 7]);

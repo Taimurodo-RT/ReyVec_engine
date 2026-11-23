@@ -63,6 +63,9 @@ const SCENE_LAMP_MAPS_DOWN: u32 = 8;
 /// Слово 11, бит 4: затенение в углах только по полю, с ближней пробой (8.20г, режим
 /// «треугольники»). Как SCENE_AO_FIELD_ONLY в `space.slang`.
 const SCENE_AO_FIELD_ONLY: u32 = 16;
+/// Слово 11, бит 5: карта солнца — кэш неподвижных предметов (опыт Р2, [`set_sun_static`]).
+/// Как SCENE_SUN_STATIC в `space.slang`.
+const SCENE_SUN_STATIC: u32 = 32;
 /// Бит 2 слова 11: нормаль по всей сцене (как SCENE_FULL_NORMAL в `include/march.slang`).
 #[cfg(test)]
 const SCENE_FULL_NORMAL: u32 = 4;
@@ -720,6 +723,91 @@ pub(crate) fn set_lamp_maps_down(words: &mut [u32]) {
     words[11] |= SCENE_LAMP_MAPS_DOWN;
 }
 
+/// Карта солнца — кэш неподвижных предметов (опыт Р2): внутри неё тень солнца — меньшее из
+/// карты и живого луча по движущимся предметам. Матрицу карты пишет [`set_sun_maps`].
+pub(crate) fn set_sun_static(words: &mut [u32]) {
+    words[11] |= SCENE_SUN_STATIC;
+}
+
+/// Неподвижное кадра (опыт Р2): неподвижные предметы и заменители моделей, без ламп,
+/// сеток и светящихся. Из него печётся кэш солнца.
+pub(crate) fn still_frame(frame: &SpaceFrame) -> SpaceFrame {
+    let shapes: Vec<_> = still_shapes(frame, 0, &frame.shapes).cloned().collect();
+    let proxies: Vec<_> = still_shapes(frame, frame.shapes.len(), &frame.proxies)
+        .cloned()
+        .collect();
+    let count = shapes.len() + proxies.len();
+    SpaceFrame {
+        shapes,
+        proxies,
+        lamps: Vec::new(),
+        meshes: Vec::new(),
+        glows: Vec::new(),
+        still: vec![true; count],
+    }
+}
+
+/// Неподвижные из `shapes` (флаги кадра с номера `first`).
+fn still_shapes<'a>(
+    frame: &'a SpaceFrame,
+    first: usize,
+    shapes: &'a [Shape3],
+) -> impl Iterator<Item = &'a Shape3> + 'a {
+    shapes
+        .iter()
+        .enumerate()
+        .filter(move |(i, _)| frame.still.get(first + i).copied().unwrap_or(false))
+        .map(|(_, s)| s)
+}
+
+/// Неподвижное кадра то же, что `still` ([`still_frame`]), без копирования форм.
+pub(crate) fn same_still(frame: &SpaceFrame, still: &SpaceFrame) -> bool {
+    still_shapes(frame, 0, &frame.shapes).eq(still.shapes.iter())
+        && still_shapes(frame, frame.shapes.len(), &frame.proxies).eq(still.proxies.iter())
+}
+
+/// Матрица кэша солнца (опыт Р2): прямоугольная проекция вдоль солнца на все предметы с
+/// тенью из `programs` (плоскости — нет: их живой луч считает формулой), глубина обратная
+/// (ближе к солнцу — 1), как у [`sun_view_proj`]. Квадрат карты накрывает их коробки с
+/// запасом в метр. `None` — таких предметов нет или у одного нет границы.
+pub(crate) fn sun_cache_view_proj(programs: &[Program]) -> Option<glam::Mat4> {
+    use glam::Mat4;
+    let sun = reyvec_sdf::view3d::SUN;
+    let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+    let view = Mat4::look_at_rh(Vec3::ZERO, -sun, up);
+    let boxes = ray_boxes(programs)?;
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for (a, b) in boxes.into_iter().flatten() {
+        for k in 0..8 {
+            let corner = Vec3::new(
+                if k & 1 == 0 { a.x } else { b.x },
+                if k & 2 == 0 { a.y } else { b.y },
+                if k & 4 == 0 { a.z } else { b.z },
+            );
+            let v = view.transform_point3(corner);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    if lo.x > hi.x || !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let center = (lo + hi) * 0.5;
+    let half = ((hi.x - lo.x).max(hi.y - lo.y) * 0.5 + 1.0).ceil();
+    // Вид смотрит вдоль −Z: дальше от солнца — меньше z.
+    let (near, far) = (-hi.z - 1.0, -lo.z + 1.0);
+    Some(
+        Mat4::orthographic_rh(
+            center.x - half,
+            center.x + half,
+            center.y - half,
+            center.y + half,
+            far,
+            near,
+        ) * view,
+    )
+}
+
 /// Все пробы затенения в углах — по полю, где оно есть (8.20г).
 pub(crate) fn set_ao_field_only(words: &mut [u32]) {
     words[11] |= SCENE_AO_FIELD_ONLY;
@@ -874,6 +962,51 @@ mod tests {
         assert_eq!(packed.overflow, None);
     }
 
+    /// Кэш солнца (опыт Р2): в неподвижное идут только неподвижные предметы, сравнение
+    /// видит сдвиг одного из них, а карта накрывает их все, ближе к солнцу — больше глубина.
+    #[test]
+    fn sun_cache_takes_still_shapes_and_covers_them() {
+        let sphere = |x: f32| Shape3::Sphere { radius: 0.5 }.placed([x, 0.5, 0.0], [0.0; 3]);
+        let frame = SpaceFrame {
+            shapes: vec![sphere(-5.0), sphere(0.0), sphere(7.0)],
+            lamps: Vec::new(),
+            meshes: Vec::new(),
+            proxies: Vec::new(),
+            glows: Vec::new(),
+            still: vec![true, false, true],
+        };
+        let still = still_frame(&frame);
+        assert_eq!(still.shapes, vec![sphere(-5.0), sphere(7.0)]);
+        assert!(same_still(&frame, &still));
+        let mut moved = frame.clone();
+        moved.shapes[1] = sphere(1.0);
+        assert!(
+            same_still(&moved, &still),
+            "двигается движущееся — карта та же"
+        );
+        moved.shapes[2] = sphere(7.5);
+        assert!(!same_still(&moved, &still));
+        let words = pack_scene(&programs(&frame), &[], &[]);
+        let flags = |i: usize| words[words[1] as usize + i * 8 + 2];
+        let still_flag = reyvec_sdf::shape3d::OBJECT_STILL;
+        assert_eq!(
+            [flags(0), flags(1), flags(2)].map(|f| f & still_flag),
+            [still_flag, 0, still_flag]
+        );
+        let m = sun_cache_view_proj(&programs(&still)).expect("карта");
+        for x in [-5.0, 7.0] {
+            let c = m * glam::Vec4::new(x, 0.5, 0.0, 1.0);
+            assert!(
+                c.x.abs() < 1.0 && c.y.abs() < 1.0 && (0.0..=1.0).contains(&c.z),
+                "{c}"
+            );
+        }
+        let sun = reyvec_sdf::view3d::SUN;
+        let near = m * (Vec3::new(0.0, 0.5, 0.0) + sun * 0.4).extend(1.0);
+        let far = m * (Vec3::new(0.0, 0.5, 0.0) - sun * 0.4).extend(1.0);
+        assert!(near.z > far.z);
+    }
+
     /// Объектов больше предела шейдера: список обрезается до 1024 на процессоре, и панель
     /// узнаёт, сколько не рисуется (7.18б). Раньше шейдер резал список молча.
     #[test]
@@ -957,7 +1090,8 @@ mod tests {
         );
         // Заменители — последние объекты и помечены флагом.
         let (count, objects) = (w[0] as usize, w[1] as usize);
-        let flag = |i: usize| w[objects + i * 8 + 2];
+        // Неподвижность (опыт Р2) здесь не проверяется.
+        let flag = |i: usize| w[objects + i * 8 + 2] & !reyvec_sdf::shape3d::OBJECT_STILL;
         // Пол — плоскость, луч глаза находит её формулой (7.6и).
         assert_eq!(flag(0), reyvec_sdf::shape3d::OBJECT_PLANE);
         // Капля — объединение списком: шейдер считает её без стека (7.6т).
