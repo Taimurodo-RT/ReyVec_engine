@@ -94,6 +94,9 @@ pub struct SpaceStats {
     /// Сетки из форм сцены из файла (8.20а): разных сеток и треугольников в них; `None` —
     /// ещё строятся или сцена не из файла.
     pub shape_meshes: Option<(usize, usize)>,
+    /// Тени из прошлого кадра (опыт Р3): квадратов пересчитано и всего; `None` — в этом
+    /// кадре тени считались целиком (камера двигалась, опыт выключен).
+    pub shadow_tiles: Option<(u32, u32)>,
 }
 
 /// Из чего состоит кадр сцены «3D» до отсева по взгляду (8.7).
@@ -687,6 +690,8 @@ pub(crate) struct FrameData {
     space_sun_maps: u32,
     /// Кэш солнца (опыт Р2): печь этого кадра и готова ли карта; `None` — кэша нет.
     space_sun: Option<crate::sun_cache::SunFrame>,
+    /// Тени из прошлого кадра (опыт Р3); `None` — опыт выключен.
+    space_reuse: Option<crate::shadow_reuse::ReuseFrame>,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
@@ -769,6 +774,8 @@ pub(crate) struct Demo {
     /// Кэш солнца (опыт Р2, `sun_bake.slang`): карта тени солнца от неподвижного.
     sun_cache: crate::sun_cache::SunCache,
     space_sun_bake: vk::Pipeline,
+    /// Тени из прошлого кадра, пока камера стоит (опыт Р3).
+    shadow_reuse: crate::shadow_reuse::ShadowReuse,
     /// Опыт 7.6м: те же лучи вычислительным шейдером (`cs_main` в `raymarch.slang`),
     /// если в файле сцены нет `compute: false` и видеокарта умеет писать в картинки через
     /// общий список (иначе конвейера нет, null).
@@ -1200,6 +1207,7 @@ impl Demo {
             ray_boxes: None,
             space_rt: false,
             sun_cache: crate::sun_cache::SunCache::new(),
+            shadow_reuse: crate::shadow_reuse::ShadowReuse::new(),
             space_sun_bake: vk::Pipeline::null(),
             space_march_compute: vk::Pipeline::null(),
             space_compute_running: false,
@@ -2265,6 +2273,16 @@ impl Demo {
 
     fn rt_ready(&self) -> bool {
         self.ray_boxes.is_some() && self.space_shadow_rt != vk::Pipeline::null()
+    }
+
+    /// Тени из прошлого кадра, пока камера стоит (опыт Р3): включены ли.
+    pub fn shadow_reuse(&self) -> bool {
+        self.shadow_reuse.enabled
+    }
+
+    /// Включает или выключает тени из прошлого кадра со следующего кадра.
+    pub fn set_shadow_reuse(&mut self, on: bool) {
+        self.shadow_reuse.enabled = on;
     }
 
     /// Кэш солнца (опыт Р2): `None` — конвейера печи нет, иначе включён ли.
@@ -3919,6 +3937,7 @@ impl Demo {
         let mut space_counters = None;
         let mut space_ray = None;
         let mut space_sun = None;
+        let mut space_reuse = None;
         let space_compute =
             (level || self.space.compute) && self.space_march_compute != vk::Pipeline::null();
         if scene == DemoScene::Space {
@@ -3998,6 +4017,12 @@ impl Demo {
                 space_sun = self
                     .sun_cache
                     .prepare(ctx, res, &frame, &self.space.materials);
+            }
+            // Тени из прошлого кадра (опыт Р3): неподвижное сверяется до отсева.
+            let reuse_on = self.shadow_reuse.enabled && !level && shape_places.is_empty();
+            let reuse_still = reuse_on && self.shadow_reuse.same_still(&frame);
+            if !reuse_on {
+                self.shadow_reuse.forget(res);
             }
             let built = std::time::Instant::now();
             let frame_counts = FrameCounts {
@@ -4208,6 +4233,56 @@ impl Demo {
                 crate::space::set_sun_maps(&mut packed.words, &[sun.matrix]);
                 crate::space::set_sun_static(&mut packed.words);
             }
+            if reuse_on {
+                let full = (ray_extent.width, ray_extent.height);
+                // Всё, кроме камеры, ламп и неподвижного, от чего зависят тени.
+                let bits = [
+                    self.space_free,
+                    self.space_boxes,
+                    self.space_plane_shadows,
+                    space_ray.is_some(),
+                    space_sun.is_some_and(|s| s.ready),
+                    space_counters.is_some(),
+                    space_field.is_some(),
+                    culling,
+                    self.space_view_culled,
+                ];
+                let settings = bits
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |a, (i, &b)| a | (u64::from(b) << i));
+                let key = crate::shadow_reuse::Key {
+                    view_proj,
+                    full,
+                    lamps: frame.lamps.len(),
+                    settings,
+                };
+                let lamps_moved = self.shadow_reuse.moved_lamps(&frame.lamps);
+                let dirty = packed.movers.as_deref().and_then(|m| {
+                    crate::space::dirty_tiles(
+                        m,
+                        &frame.lamps,
+                        &lamps_moved,
+                        view_proj,
+                        full,
+                        packed.floor,
+                    )
+                });
+                let half = vk::Extent2D {
+                    width: full.0.div_ceil(2),
+                    height: full.1.div_ceil(2),
+                };
+                space_reuse = self.shadow_reuse.prepare(
+                    ctx,
+                    res,
+                    key,
+                    reuse_still,
+                    dirty,
+                    half,
+                    SHADOW3D_FORMAT,
+                    &mut packed.words,
+                );
+            }
             res.write_words(space_buffer, 0, &packed.words);
             // Запекание поля уровня прямо в кадре (снимки, тесты) — не сборка кадра.
             let build_ms = (built - started).saturating_sub(baked_inline).as_secs_f64() * 1000.0;
@@ -4232,6 +4307,9 @@ impl Demo {
                 frame: frame_counts,
                 moving: if level { 0 } else { self.space.moving_count() },
                 shape_meshes: self.space_meshes().map(|m| (m.unique, m.triangles)),
+                shadow_tiles: space_reuse
+                    .filter(|r| r.reuse)
+                    .and(self.shadow_reuse.last_counts),
             });
         } else {
             self.space_field.skip();
@@ -4262,6 +4340,7 @@ impl Demo {
             space_counters,
             space_ray,
             space_sun,
+            space_reuse,
             space_field,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
@@ -5140,6 +5219,36 @@ impl Demo {
             });
         }
         let shadows = graph.create("тени 3D", half, SHADOW3D_FORMAT);
+        // Тени из прошлого кадра (опыт Р3): прошлая картинка — вне графа; кадр начинается
+        // с её копии, если камера стоит, и в конце копирует в неё свои тени.
+        let reuse = frame.space_reuse.filter(|r| r.extent == half);
+        let history = reuse.map(|r| {
+            let initial = if r.written {
+                Access::TransferDst.state()
+            } else {
+                crate::graph::ImageState::UNDEFINED
+            };
+            graph.import(
+                "тени 3D: прошлый кадр",
+                r.image,
+                r.view,
+                r.extent,
+                SHADOW3D_FORMAT,
+                initial,
+                None,
+            )
+        });
+        let load = reuse.is_some_and(|r| r.reuse);
+        if let Some(h) = history.filter(|_| load) {
+            graph.add_pass(
+                "тени 3D: прошлый кадр",
+                &[(h, Access::TransferSrc), (shadows, Access::TransferDst)],
+                move |p| {
+                    // SAFETY: граф перевёл картинки в раскладки копирования; размеры равны.
+                    unsafe { copy_whole(p.device, p.cmd, p.image(h), p.image(shadows), half) };
+                },
+            );
+        }
         let mut uses = vec![
             (gbuffer, Access::Sampled),
             (shadows, Access::ColorAttachment),
@@ -5163,7 +5272,11 @@ impl Demo {
             // SAFETY: граф перевёл буфер геометрии в чтение, а тени в цель
             // рисования; буфер сцены этого кадра жив, пока кадр рисуется.
             unsafe {
-                begin_color_pass(d, cmd, p.view(shadows), half);
+                if load {
+                    crate::pipeline::begin_color_pass_load(d, cmd, p.view(shadows), half);
+                } else {
+                    begin_color_pass(d, cmd, p.view(shadows), half);
+                }
                 bindless.bind(d, cmd);
                 let pipeline = match (frame.space_counters, frame.space_ray) {
                     (Some(c), Some(_)) => c.0.shadow_rt,
@@ -5177,6 +5290,16 @@ impl Demo {
                 d.cmd_end_rendering(cmd);
             }
         });
+        if let Some(h) = history {
+            graph.add_pass(
+                "тени 3D: запомнить",
+                &[(shadows, Access::TransferSrc), (h, Access::TransferDst)],
+                move |p| {
+                    // SAFETY: граф перевёл картинки в раскладки копирования; размеры равны.
+                    unsafe { copy_whole(p.device, p.cmd, p.image(shadows), p.image(h), half) };
+                },
+            );
+        }
         // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
         // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
         let edges = frame.space_edges.map(|(list, list_buffer, count_buffer)| {
@@ -6141,6 +6264,42 @@ struct SpaceSlots {
     cone: u32,
     meshes: u32,
     edges: vk::DeviceAddress,
+}
+
+/// Копирует картинку `from` (раскладка TRANSFER_SRC_OPTIMAL) в `to` (TRANSFER_DST_OPTIMAL)
+/// целиком; размер обеих — `extent`.
+///
+/// # Safety
+/// `cmd` записывается; картинки живы до конца кадра и в этих раскладках.
+unsafe fn copy_whole(
+    d: &ash::Device,
+    cmd: vk::CommandBuffer,
+    from: vk::Image,
+    to: vk::Image,
+    extent: vk::Extent2D,
+) {
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    let region = vk::ImageCopy::default()
+        .src_subresource(layers)
+        .dst_subresource(layers)
+        .extent(vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        });
+    // SAFETY: условия функции.
+    unsafe {
+        d.cmd_copy_image(
+            cmd,
+            from,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            to,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+    }
 }
 
 fn space_push(

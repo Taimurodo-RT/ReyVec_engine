@@ -49,6 +49,8 @@ pub(crate) enum PanelAction {
     SpaceRt(bool),
     /// Кэш солнца неподвижного (опыт Р2).
     SunCache(bool),
+    /// Тени из прошлого кадра, пока камера стоит (опыт Р3).
+    ShadowReuse(bool),
     /// Замер «краёв 3D» по частям (8.1).
     EdgeProbe(EdgeProbe),
     EdgeCreases(bool),
@@ -176,6 +178,8 @@ pub(crate) struct PanelInfo<'a> {
     pub space_rt: Option<bool>,
     /// Кэш солнца (опыт Р2): `None` — не умеет.
     pub sun_cache: Option<bool>,
+    /// Тени из прошлого кадра, пока камера стоит (опыт Р3).
+    pub shadow_reuse: bool,
     /// Замер «краёв 3D» по частям (8.1).
     pub edge_probe: EdgeProbe,
     /// Складки без доп. лучей в «краях 3D» (8.2).
@@ -1066,6 +1070,23 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             {
                 actions.push(PanelAction::SunCache(sun));
             }
+            let mut reuse = info.shadow_reuse;
+            if ui
+                .checkbox(
+                    &mut reuse,
+                    "Тени из прошлого кадра, пока камера стоит (опыт)",
+                )
+                .on_hover_text(
+                    "Опыт Р3, как у Commander Keen: если камера, лампы и неподвижное те же, \
+                 «тени 3D» пересчитываются только в квадратах экрана, где видны движущиеся \
+                 предметы и их тени; остальное берётся из прошлого кадра. Картинка та же. \
+                 Включите, не трогайте камеру и сравните время «теней 3D»; строка \
+                 «Тени из прошлого кадра» ниже показывает, сколько квадратов пересчитано",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::ShadowReuse(reuse));
+            }
             if info.space_smooth.0 {
                 let mut creases = info.edge_creases;
                 if ui
@@ -1559,6 +1580,12 @@ fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
          заменителей для теней {}",
         f.shapes, s.moving, f.mesh_parts, f.triangles, f.proxies
     )));
+    if let Some((dirty, total)) = s.shadow_tiles {
+        ui.label(mono(format!(
+            "Тени из прошлого кадра: пересчитано квадратов {dirty} из {total} ({:.0} %)",
+            f64::from(dirty) * 100.0 / f64::from(total.max(1))
+        )));
+    }
     if let Some((unique, triangles)) = s.shape_meshes {
         ui.label(mono(format!(
             "Сетки из форм (для режима «треугольники»): разных {unique}, треугольников {triangles}"
@@ -1924,6 +1951,7 @@ mod tests {
                 },
                 moving: 12,
                 shape_meshes: Some((16, 393_968)),
+                shadow_tiles: Some((120, 2040)),
                 rays: Some(
                     [reyvec_gpu::RayCounts {
                         rays: 2_073_600,
@@ -1957,6 +1985,7 @@ mod tests {
             space_boxes: true,
             space_rt: None,
             sun_cache: None,
+            shadow_reuse: false,
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
             edge_shadow_reuse: true,

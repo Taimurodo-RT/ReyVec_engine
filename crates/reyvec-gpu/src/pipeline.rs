@@ -328,6 +328,26 @@ pub(crate) unsafe fn begin_color_pass_with(
     unsafe { begin_rendering(device, cmd, &attachments, extent) };
 }
 
+/// То же, что [`begin_color_pass`], но без очистки: в картинке остаётся, что в ней было
+/// (опыт Р3: тени из прошлого кадра, шейдер пишет только изменившиеся квадраты).
+///
+/// # Safety
+/// `cmd` в состоянии записи, `view` жив до конца выполнения команд.
+pub(crate) unsafe fn begin_color_pass_load(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    view: vk::ImageView,
+    extent: vk::Extent2D,
+) {
+    let attachments = [vk::RenderingAttachmentInfo::default()
+        .image_view(view)
+        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+        .load_op(vk::AttachmentLoadOp::LOAD)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    // SAFETY: условия описаны в контракте функции.
+    unsafe { begin_rendering(device, cmd, &attachments, extent) };
+}
+
 /// Проход рисования с глубиной (полигоны сцены «3D», 7.6ж): цвет в `view` очищается
 /// цветом `clear`, глубина в `depth_view` — нулём (обратная глубина: ноль — дальше всего).
 /// Обе картинки в раскладках целей рисования.
