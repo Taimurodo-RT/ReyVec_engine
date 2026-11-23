@@ -16,6 +16,12 @@ path = "src/main.rs"
 egui.workspace = true
 egui-winit.workspace = true
 glam.workspace = true
+# Конвертеры ассетов (Э.6): звук WAV, OGG Vorbis, MP3, FLAC; картинки PNG, JPEG и др.
+claxon = "0.4"
+hound = "3.5"
+image = { workspace = true, features = ["png", "jpeg", "bmp", "tga", "gif", "webp"] }
+nanomp3 = "0.2"
+vorbis_rs = { version = "0.5", default-features = false }
 kurbo.workspace = true
 # Проверка скриптов в редакторе кода: тот же Luau, что у движка (reyvec-script).
 mlua = { version = "0.12", features = ["luau", "send"] }
