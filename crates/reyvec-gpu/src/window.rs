@@ -823,6 +823,21 @@ impl WindowRenderer {
         }
     }
 
+    /// Замер фильтра на тензорных ядрах (опыт Р4): включён ли, размер картинки (номер в
+    /// [`crate::BENCH_SIZES`]) и есть ли тензорные ядра.
+    pub fn tensor_bench(&self) -> (bool, usize, bool) {
+        self.demo
+            .as_ref()
+            .map_or((false, 0, false), |d| d.tensor_bench())
+    }
+
+    /// Включает или выключает замер фильтра и выбирает размер картинки.
+    pub fn set_tensor_bench(&mut self, on: bool, size: usize) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_tensor_bench(on, size);
+        }
+    }
+
     /// Тени из прошлого кадра, пока камера стоит (опыт Р3): включены ли.
     pub fn shadow_reuse(&self) -> bool {
         self.demo.as_ref().is_some_and(|d| d.shadow_reuse())

@@ -315,6 +315,44 @@ fn read_field(
     }))
 }
 
+/// Ответы замера фильтра (опыт Р4) после законченного кадра: обычные ядра, тензорные
+/// ядра и размер картинки.
+#[cfg(test)]
+type BenchAnswers = (Vec<f32>, Option<Vec<f32>>, (u32, u32));
+
+#[cfg(test)]
+fn read_bench(
+    ctx: &GpuContext,
+    gpu: &mut GpuResources,
+    demo: &Demo,
+) -> Result<Option<BenchAnswers>, GpuError> {
+    let Some((plain, tensor, (w, h))) = demo.tensor_bench_answers() else {
+        return Ok(None);
+    };
+    let bytes = u64::from(w) * u64::from(h) * 4;
+    let mut out = Vec::new();
+    for id in [plain, tensor] {
+        let read = gpu.create_buffer(
+            ctx,
+            bytes,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            crate::BufferMemory::GpuToCpu,
+            "чтение замера фильтра",
+        )?;
+        gpu.copy_buffer(ctx, id, read, bytes)?;
+        let data = gpu.read_buffer(read, bytes as usize).unwrap_or_default();
+        gpu.destroy_buffer(read);
+        out.push(
+            data.chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<f32>>(),
+        );
+    }
+    let tensor = out.pop().filter(|_| demo.tensor_bench().2);
+    let plain = out.pop().unwrap_or_default();
+    Ok(Some((plain, tensor, (w, h))))
+}
+
 fn render(
     ctx: &GpuContext,
     scene: &HeadlessScene,
@@ -535,6 +573,7 @@ fn render(
             demo.set_space_rt(tests::SPACE_RT.get());
             demo.set_sun_cache(tests::SUN_CACHE.get());
             demo.set_shadow_reuse(tests::SHADOW_REUSE.get());
+            demo.set_tensor_bench(tests::TENSOR_BENCH.get(), 0);
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -718,6 +757,13 @@ fn render(
             }
             _ => None,
         };
+        // Ответы замера фильтра (опыт Р4).
+        #[cfg(test)]
+        if let (Some(gpu), Some(demo)) = (r.gpu.as_mut(), r.demo.as_ref())
+            && let Some(answers) = read_bench(ctx, gpu, demo)?
+        {
+            tests::BENCH_OUT.set(Some(answers));
+        }
         // Счётчики кадра (7.18б): число краёв читается теперь, когда кадр закончен (в
         // окне его читает подготовка следующего кадра той же ячейки).
         let space_stats = match (r.gpu.as_ref(), r.demo.as_ref()) {
@@ -888,6 +934,11 @@ pub(crate) mod tests {
         /// Тени из прошлого кадра (опыт Р3): снимаемому кадру предшествует кадр с той же
         /// камерой на 1/20 секунды раньше.
         pub(super) static SHADOW_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Замер фильтра на тензорных ядрах (опыт Р4), картинка 1920×1088.
+        pub(super) static TENSOR_BENCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Ответы замера фильтра последнего кадра.
+        pub(super) static BENCH_OUT: std::cell::RefCell<Option<super::BenchAnswers>> =
+            const { std::cell::RefCell::new(None) };
         /// Мусором залиты только картинки с этим именем (8.0).
         pub(super) static POISON_ONLY: std::cell::Cell<Option<&'static str>> =
             const { std::cell::Cell::new(None) };
@@ -1541,6 +1592,59 @@ pub(crate) mod tests {
         let (dirty, all) = tiles.expect("тени не взяты из прошлого кадра");
         assert!(dirty < all, "пересчитаны все квадраты");
         assert_eq!(changed, 0, "картинка отличается от посчитанной целиком");
+    }
+
+    /// Замер фильтра (опыт Р4): обычные и тензорные ядра размывают шум так же, как
+    /// процессор (тензорные — с точностью половинных чисел); без ошибок Vulkan.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn tensor_bench_matches_cpu_blur() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 320,
+            height: 180,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::Off,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles::default(),
+            cascades: false,
+        };
+        TENSOR_BENCH.set(true);
+        BENCH_OUT.set(None);
+        let frame = render_headless(&options, &scene);
+        TENSOR_BENCH.set(false);
+        let frame = frame.expect("кадр");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+        let (plain, tensor, (w, h)) = BENCH_OUT.take().expect("замер не включился");
+        let want = crate::tensor_bench::blur_cpu(&crate::tensor_bench::noise(w, h), w, h);
+        let worst = |got: &[f32]| {
+            assert_eq!(got.len(), want.len());
+            got.iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let plain_err = worst(&plain);
+        if let Some(t) = &frame.gpu_timings {
+            eprintln!("замер фильтра {w}×{h}: {}", t.describe());
+        }
+        eprintln!("обычные ядра: расхождение с процессором до {plain_err}");
+        assert!(plain_err < 1e-4, "обычные ядра считают не то");
+        let Some(tensor) = tensor else {
+            eprintln!("тензорных ядер нет: их ответ не проверен");
+            return;
+        };
+        let tensor_err = worst(&tensor);
+        eprintln!("тензорные ядра: расхождение с процессором до {tensor_err}");
+        assert!(tensor_err < 1e-3, "тензорные ядра считают не то");
     }
 
     /// Тени моделей от кирпичей поля (8.15) — почти те же, что от прежних заменителей из

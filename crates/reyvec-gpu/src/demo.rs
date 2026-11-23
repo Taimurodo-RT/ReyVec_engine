@@ -692,6 +692,8 @@ pub(crate) struct FrameData {
     space_sun: Option<crate::sun_cache::SunFrame>,
     /// Тени из прошлого кадра (опыт Р3); `None` — опыт выключен.
     space_reuse: Option<crate::shadow_reuse::ReuseFrame>,
+    /// Замер фильтра на тензорных ядрах (опыт Р4); `None` — выключен.
+    space_bench: Option<crate::tensor_bench::BenchFrame>,
     /// Опыт 7.6м: лучи вычислительным шейдером, он пишет буфер геометрии прямо в
     /// картинку. `false` — пиксельным шейдером.
     space_compute: bool,
@@ -776,6 +778,11 @@ pub(crate) struct Demo {
     space_sun_bake: vk::Pipeline,
     /// Тени из прошлого кадра, пока камера стоит (опыт Р3).
     shadow_reuse: crate::shadow_reuse::ShadowReuse,
+    /// Замер фильтра на тензорных ядрах (опыт Р4) и его конвейеры (`filter_plain.slang`,
+    /// `filter_tensor.slang`; второй — null, если тензорных ядер нет).
+    tensor_bench: crate::tensor_bench::TensorBench,
+    bench_plain: vk::Pipeline,
+    bench_tensor: vk::Pipeline,
     /// Опыт 7.6м: те же лучи вычислительным шейдером (`cs_main` в `raymarch.slang`),
     /// если в файле сцены нет `compute: false` и видеокарта умеет писать в картинки через
     /// общий список (иначе конвейера нет, null).
@@ -1208,6 +1215,9 @@ impl Demo {
             space_rt: false,
             sun_cache: crate::sun_cache::SunCache::new(),
             shadow_reuse: crate::shadow_reuse::ShadowReuse::new(),
+            tensor_bench: crate::tensor_bench::TensorBench::new(),
+            bench_plain: vk::Pipeline::null(),
+            bench_tensor: vk::Pipeline::null(),
             space_sun_bake: vk::Pipeline::null(),
             space_march_compute: vk::Pipeline::null(),
             space_compute_running: false,
@@ -1545,6 +1555,24 @@ impl Demo {
                 res.bindless.pipeline_layout,
                 shaders.compute("sun_bake"),
             )?;
+            demo.bench_plain = crate::pipeline::compute_pipeline(
+                &ctx.device,
+                res.bindless.pipeline_layout,
+                shaders.compute("filter_plain"),
+            )?;
+            // Тензорные ядра (опыт Р4): матрицы 16×16 у NVIDIA, 8×8 у lavapipe.
+            let tensor_shader = match ctx.tensor {
+                16 => Some("filter_tensor"),
+                8 => Some("filter_tensor8"),
+                _ => None,
+            };
+            if let Some(name) = tensor_shader {
+                demo.bench_tensor = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    res.bindless.pipeline_layout,
+                    shaders.compute(name),
+                )?;
+            }
             if res.bindless.storage_images {
                 let layout = res.bindless.pipeline_layout;
                 demo.space_march_compute = crate::pipeline::compute_pipeline(
@@ -2273,6 +2301,34 @@ impl Demo {
 
     fn rt_ready(&self) -> bool {
         self.ray_boxes.is_some() && self.space_shadow_rt != vk::Pipeline::null()
+    }
+
+    /// Замер фильтра на тензорных ядрах (опыт Р4): включён ли, какой размер картинки
+    /// (номер в [`crate::tensor_bench::BENCH_SIZES`]) и есть ли тензорные ядра.
+    pub fn tensor_bench(&self) -> (bool, usize, bool) {
+        (
+            self.tensor_bench.enabled,
+            self.tensor_bench.size,
+            self.bench_tensor != vk::Pipeline::null(),
+        )
+    }
+
+    /// Включает или выключает замер фильтра и выбирает размер картинки.
+    pub fn set_tensor_bench(&mut self, on: bool, size: usize) {
+        self.tensor_bench.enabled = on && self.bench_plain != vk::Pipeline::null();
+        self.tensor_bench.size = size.min(crate::tensor_bench::BENCH_SIZES.len() - 1);
+    }
+
+    /// Буферы ответов замера фильтра (обычные и тензорные ядра) и размер (для теста).
+    #[cfg(test)]
+    pub(crate) fn tensor_bench_answers(
+        &self,
+    ) -> Option<(
+        crate::resources::BufferId,
+        crate::resources::BufferId,
+        (u32, u32),
+    )> {
+        self.tensor_bench.answers()
     }
 
     /// Тени из прошлого кадра, пока камера стоит (опыт Р3): включены ли.
@@ -3938,6 +3994,11 @@ impl Demo {
         let mut space_ray = None;
         let mut space_sun = None;
         let mut space_reuse = None;
+        let space_bench = if scene == DemoScene::Space {
+            self.tensor_bench.prepare(ctx, res)
+        } else {
+            None
+        };
         let space_compute =
             (level || self.space.compute) && self.space_march_compute != vk::Pipeline::null();
         if scene == DemoScene::Space {
@@ -4341,6 +4402,7 @@ impl Demo {
             space_ray,
             space_sun,
             space_reuse,
+            space_bench,
             space_field,
             lights_address: res.buffer_address(light_buffer),
             light_count: light_count as u32,
@@ -4864,6 +4926,30 @@ impl Demo {
                     );
                 }
             });
+        }
+        // Замер фильтра (опыт Р4): одна и та же работа обычными и тензорными ядрами.
+        if let Some(bench) = frame.space_bench {
+            let plain = self.bench_plain;
+            graph.add_pass("фильтр: обычные ядра", &[], move |p| {
+                // SAFETY: проход вне рисования; конвейер и буферы замера живы (удаляются
+                // отложенно).
+                unsafe {
+                    crate::tensor_bench::TensorBench::record(
+                        p.device, p.cmd, layout, plain, &bench, false,
+                    );
+                }
+            });
+            let tensor = self.bench_tensor;
+            if tensor != vk::Pipeline::null() {
+                graph.add_pass("фильтр: тензорные ядра", &[], move |p| {
+                    // SAFETY: как у прохода выше.
+                    unsafe {
+                        crate::tensor_bench::TensorBench::record(
+                            p.device, p.cmd, layout, tensor, &bench, true,
+                        );
+                    }
+                });
+            }
         }
         // Кэш солнца (опыт Р2): квадраты карты неподвижного — до теней и краёв.
         if let Some(sun) = frame.space_sun {
@@ -6082,6 +6168,8 @@ impl Demo {
                 .destroy_pipeline(self.space_edge_shadow_rays, None);
             ctx.device.destroy_pipeline(self.space_field_bake, None);
             ctx.device.destroy_pipeline(self.space_sun_bake, None);
+            ctx.device.destroy_pipeline(self.bench_plain, None);
+            ctx.device.destroy_pipeline(self.bench_tensor, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.space_shade_small, None);
             ctx.device.destroy_pipeline(self.space_post_aa, None);
@@ -6122,6 +6210,8 @@ impl Demo {
         self.space_edge_shadow_rays = vk::Pipeline::null();
         self.space_field_bake = vk::Pipeline::null();
         self.space_sun_bake = vk::Pipeline::null();
+        self.bench_plain = vk::Pipeline::null();
+        self.bench_tensor = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.space_shade_small = vk::Pipeline::null();
         self.space_post_aa = vk::Pipeline::null();
