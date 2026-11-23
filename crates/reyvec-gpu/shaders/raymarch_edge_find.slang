@@ -31,10 +31,7 @@ float2 pixel_screen(int2 px, float2 size)
     return float2(c.x / size.x * 2.0 - 1.0, 1.0 - c.y / size.y * 2.0);
 }
 
-// Больше групп одной командой видеокарта может не запустить (гарантировано 65535). Четыре
-// части списка (include/edges.slang) дают до ⌈U4/16⌉ + ⌈U2/32⌉ + ⌈R4/16⌉ + ⌈R2/32⌉ групп:
-// на три больше, чем один список, поэтому 65532.
-static const uint MAX_EDGES = 65532 * 16;
+// MAX_EDGES — в include/edges.slang.
 
 // Почему пиксель — край (8.11а, счётчики краёв по причине): 0 — не край.
 static const uint EDGE_NONE = 0;

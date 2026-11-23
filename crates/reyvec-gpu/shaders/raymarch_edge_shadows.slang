@@ -1,24 +1,19 @@
-// Сцена «3D», проход «края 3D: тени» (8.22): точные доли света (солнце, углы, две лампы)
-// точки ненадёжных пикселей края. Картинка теней вдвое меньше кадра, и на перемычке
-// тоньше двух пикселей или на полоске пола у края формы такой пиксель получал бы из неё
-// тень соседней поверхности (7.6с, 7.19а). Доли пикселя проход пишет в картинку краёв на
-// его место; «края 3D» (raymarch_edges.slang) читает их оттуда и заменяет своим цветом.
+// Сцена «3D», проход «края 3D: тени», часть первая (8.22, 8.25): какие точные доли света
+// (солнце, углы, две лампы) нужны ненадёжным пикселям края. Картинка теней вдвое меньше
+// кадра, и на перемычке тоньше двух пикселей или на полоске пола у края формы такой
+// пиксель получал бы из неё тень соседней поверхности (7.6с, 7.19а).
 //
-// Прежде (7.19б–8.2б) эти лучи пускал сам проход «края 3D», перед доп. лучами. Там
-// много вычислений (доп. луч, складка, освещение), видеокарта держит меньше групп сразу,
-// и лучи тени шли медленно: на RTX 5080 в заводе 44 % работы основного прохода теней
-// и углов стоили 156 % его времени. Отдельный проход короткий и идёт быстрее, картинка
-// та же.
+// Группа берёт 64 ненадёжных пикселя подряд (EDGE_SHADOW_PIXELS): сначала с четырьмя
+// лучами, потом с двумя; число групп — в слове EDGE_SHADOW_GROUPS_WORD заголовка. Поток
+// пикселя решает, какие доли можно взять из картинки теней (8.2б, shadow_steady), и сразу
+// пишет их в доли света пикселя (include/edges.slang, edge_parts_at). Остальные доли
+// группа кладёт в общий список работ — подряд по долям (лампы, лампы, углы, солнце), и
+// лучи соседних работ одинаковы. Лучи по списку пускает часть вторая
+// (raymarch_edge_shadow_rays.slang): каждый поток — одна работа, без пустых мест.
 //
-// Группа берёт 64 ненадёжных пикселя подряд (EDGE_SHADOW_PIXELS, 8.24): сначала с
-// четырьмя лучами, потом с двумя; число групп — в слове EDGE_SHADOW_GROUPS_WORD
-// заголовка. Прежде (8.22) группа брала 16 пикселей, как у «краёв 3D»: большинство их
-// долей берётся готовыми из картинки теней, и лучи считали около 40 % потоков, а
-// остальные ждали (на 5080 в заводе тени краёв 1,40 мс против 1,08 у теней всего кадра).
-// У 64 пикселей очереди длиннее, и потоки заняты почти все. Доли раздаются по долям, а не по пикселям (7.19б):
-// поток пикселя решает, какие доли можно взять из картинки теней (8.2б, shadow_steady),
-// остальные ставит в очередь своей доли; потом все 64 потока разбирают очереди подряд:
-// лампы, лампы, углы, солнце, и лучи соседних потоков одинаковы.
+// Прежде (8.22–8.24) лучи пускала сама группа: большинство долей берётся готовыми, и
+// у группы из 64 потоков работ было то 20, то 130 — часть потоков ждала (на 5080 в
+// заводе тени краёв 1,03 мс при 1,11 у теней всего кадра, где лучей втрое больше).
 
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
 
@@ -84,14 +79,13 @@ uint shadow_steady(int2 px, float t, float3 n, out float4 value)
     return mask;
 }
 
-// Точные доли света пикселей группы: [пиксель][солнце, углы, лампа 1, лампа 2].
-groupshared float parts[EDGE_SHADOW_PIXELS][4];
 
 // Очереди точных долей (8.2б): сколько пикселей ждут каждую долю и какие. Доли идут в
 // порядке PART_ORDER: потоки подряд берут одну долю, и лучи соседних потоков одинаковы
 // (7.19б: при четырёх лучах потоки 0–15 — первая лампа, 16–31 — вторая, 32–47 — углы,
 // 48–63 — солнце).
 groupshared uint need_count[4];
+groupshared uint task_base;
 groupshared uint need_pixel[4][EDGE_SHADOW_PIXELS];
 static const uint PART_ORDER[4] = { 2, 3, 1, 0 };
 
@@ -134,11 +128,13 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         need_count[lane] = 0;
     GroupMemoryBarrierWithGroupSync();
     bool has = lane < per && first_j + lane < count;
-    int2 at = int2(0, 0);
+    uint wh = w * h;
+    uint parts_at = edge_parts_at(wh);
+    uint slot = edge_shadow_slot(list, first_j + lane);
     if (has)
     {
-        uint packed = pc.edges[edge_list_at(list, first_j + lane, w * h)];
-        at = int2(packed & 0xffff, packed >> 16);
+        uint packed = pc.edges[edge_list_at(list, first_j + lane, wh)];
+        int2 at = int2(packed & 0xffff, packed >> 16);
         float4 g = gbuffer_load(at);
         uint steady = 0;
         float4 value = float4(1.0, 1.0, 1.0, 1.0);
@@ -148,19 +144,31 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         {
             uint part = PART_ORDER[s];
             if (g.x < 0.0)
-                parts[lane][part] = 1.0;
+                pc.edges[parts_at + slot * 4 + part] = asuint(1.0);
             else if ((steady & (1u << part)) != 0)
-                parts[lane][part] = value[part];
+                pc.edges[parts_at + slot * 4 + part] = asuint(value[part]);
             else
             {
-                uint slot;
-                InterlockedAdd(need_count[s], 1u, slot);
-                need_pixel[s][slot] = lane;
+                uint index;
+                InterlockedAdd(need_count[s], 1u, index);
+                need_pixel[s][index] = lane;
             }
         }
     }
     GroupMemoryBarrierWithGroupSync();
     uint total = need_count[0] + need_count[1] + need_count[2] + need_count[3];
+    if (lane == 0 && total > 0)
+    {
+        uint base;
+        InterlockedAdd(pc.edges[EDGE_TASK_COUNT_WORD], total, base);
+        task_base = base;
+        // Новые границы групп по 64 работы — в размер запуска второй части.
+        uint crossed = (base + total + 63) / 64 - (base + 63) / 64;
+        if (crossed > 0)
+            InterlockedAdd(pc.edges[EDGE_TASK_GROUPS_WORD], crossed);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint tasks_at = edge_tasks_at(wh);
     for (uint i = lane; i < total; i += 64)
     {
         uint s = 0;
@@ -171,16 +179,7 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
             s++;
         }
         uint mine = need_pixel[s][index];
-        uint part = PART_ORDER[s];
-        uint packed = pc.edges[edge_list_at(list, first_j + mine, w * h)];
-        int2 p = int2(packed & 0xffff, packed >> 16);
-        float4 g = gbuffer_load(p);
-        float2 c = float2(p) + 0.5;
-        Ray r0 = screen_ray(float2(c.x / float(w) * 2.0 - 1.0, 1.0 - c.y / float(h) * 2.0));
-        parts[mine][part] = shadow_part(r0.origin + r0.dir * g.x, oct_decode(g.zw), g.x, part);
+        uint slot_m = edge_shadow_slot(list, first_j + mine);
+        pc.edges[tasks_at + task_base + i] = (slot_m << 2) | PART_ORDER[s];
     }
-    counters_flush(PASS_EDGE_SHADOWS, group);
-    GroupMemoryBarrierWithGroupSync();
-    if (has)
-        images[pc.target][at] = float4(parts[lane][0], parts[lane][1], parts[lane][2], parts[lane][3]);
 }
