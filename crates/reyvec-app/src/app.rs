@@ -458,6 +458,10 @@ impl App {
                 r.set_space_free(on);
                 tracing::info!("Длинный шаг в пустоте: {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::SpaceRt(on) => {
+                r.set_space_rt(on);
+                tracing::info!("Тени через RT-ядра: {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::SpaceBoxes(on) => {
                 r.set_space_boxes(on);
                 tracing::info!(
@@ -747,6 +751,7 @@ impl App {
                 space_counters: renderer.space_counters(),
                 space_free: renderer.space_free(),
                 space_boxes: renderer.space_boxes(),
+                space_rt: renderer.space_rt(),
                 edge_probe: renderer.edge_probe(),
                 edge_creases: renderer.edge_creases(),
                 edge_shadow_reuse: renderer.edge_shadow_reuse(),

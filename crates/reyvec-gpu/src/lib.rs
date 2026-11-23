@@ -46,6 +46,7 @@ mod lights;
 mod particles;
 mod pipeline;
 mod resources;
+mod rt;
 mod shaders;
 mod slangc;
 mod space;
