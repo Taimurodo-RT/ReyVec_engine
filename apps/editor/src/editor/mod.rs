@@ -20,6 +20,7 @@ mod assets;
 mod clay_edit;
 mod code;
 mod contour;
+mod convert;
 mod cost;
 mod doc;
 mod endless;

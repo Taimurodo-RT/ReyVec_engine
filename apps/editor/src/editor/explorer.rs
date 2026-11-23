@@ -24,6 +24,7 @@ use super::theme::*;
 use super::thumbs::{self, Thumbs};
 
 mod bin;
+mod convert_ui;
 mod marks;
 
 /// Во сколько раз крупнее своего размера можно показать миниатюру в панели сведений.
@@ -211,6 +212,11 @@ pub(crate) struct Explorer {
     label_view: Option<u8>,
     /// Окно «Названия меток»: правки названий.
     naming: Option<Vec<String>>,
+    /// Окно «Конвертировать…» (Э.6) и идущая конвертация.
+    converting: Option<convert_ui::Converting>,
+    converting_job: Option<convert_ui::ConvertJob>,
+    /// Сведения о звуке или картинке выбранного: для какого файла и что прочитано.
+    about: Option<(PathBuf, Option<String>)>,
     out: Vec<Out>,
 }
 
@@ -262,6 +268,9 @@ impl Explorer {
             labels: super::labels::Labels::default(),
             label_view: None,
             naming: None,
+            converting: None,
+            converting_job: None,
+            about: None,
             out: Vec::new(),
         }
     }
@@ -274,6 +283,7 @@ impl Explorer {
     pub(crate) fn refresh(&mut self) {
         self.listed_at = None;
         self.reload_labels();
+        self.about = None;
         self.used = None;
         self.bin_counted = None;
     }
@@ -960,6 +970,7 @@ impl Explorer {
             self.keys(ui, busy)
         };
         self.thumbs.poll(ui.ctx());
+        self.poll_convert(ui.ctx());
         let frame = Frame::NONE.fill(PANEL);
         egui::Panel::top("explorer-nav")
             .exact_size(44.0)
@@ -1044,6 +1055,7 @@ impl Explorer {
         self.create_dialog(&ctx);
         self.erase_dialog(&ctx);
         self.labels_dialog(&ctx);
+        self.convert_dialog(&ctx);
         std::mem::take(&mut self.out)
     }
 
@@ -1054,7 +1066,11 @@ impl Explorer {
             .unwrap_or(1)
             .max(1);
         let ctx = ui.ctx().clone();
-        if ctx.egui_wants_keyboard_input() || self.creating.is_some() || self.naming.is_some() {
+        if ctx.egui_wants_keyboard_input()
+            || self.creating.is_some()
+            || self.naming.is_some()
+            || self.converting.is_some()
+        {
             // Пока печатают имя или поиск, клавиши принадлежат полю.
             return per_row;
         }
@@ -1931,6 +1947,15 @@ impl Explorer {
             ui.close();
         }
         ui.separator();
+        if self.convertible().is_some()
+            && ui
+                .button("Конвертировать…")
+                .on_hover_text("Звук — в OGG или WAV, картинку — в PNG или JPEG")
+                .clicked()
+        {
+            self.ask_convert();
+            ui.close();
+        }
         ui.menu_button("Метки", |ui| self.label_menu(ui));
         if ui.button("Показать в проводнике Windows").clicked() {
             self.out.push(Out::Reveal(item.path.clone()));
@@ -2074,10 +2099,12 @@ impl Explorer {
         if let Some(m) = item.modified {
             fact(ui, "Изменён", &when_text(m));
         }
+        self.media_fact(ui, item);
         if let Some(rel) = self.rel(&item.path) {
             fact(ui, "Где", &rel);
         }
         ui.add_space(GAP_L);
+        let convertible = self.convertible().is_some();
         ui.horizontal(|ui| {
             let label = match (item.folder, self.open_kind(&item.path)) {
                 (true, _) => "Открыть",
@@ -2097,6 +2124,14 @@ impl Explorer {
                 self.out.push(Out::Reveal(item.path.clone()));
             }
         });
+        if convertible
+            && ui
+                .button("Конвертировать…")
+                .on_hover_text("Звук — в OGG или WAV, картинку — в PNG или JPEG")
+                .clicked()
+        {
+            self.ask_convert();
+        }
         self.label_picker(ui);
         // Где используется (считается раз на выбор: просмотр всех .ron проекта).
         if self.used.as_ref().is_none_or(|(p, _)| p != &item.path)
@@ -2843,6 +2878,65 @@ mod tests {
         ctx.set_fonts(reyvec_app::for_editor::fonts());
         super::super::theme::apply(&ctx);
         ctx
+    }
+
+    /// Конвертация (Э.6): окно, Enter запускает, готовый файл рядом и выбран, Ctrl+Z
+    /// уносит его в корзину; у звука в свойствах — длительность и частота.
+    #[test]
+    fn convert_sound_and_undo() {
+        let t = project(&[("assets/note.txt", "")]);
+        let wav = t.0.join("assets/тон.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for i in 0..16_000 {
+            w.write_sample(((i as f32 * 0.3).sin() * 8000.0) as i16)
+                .unwrap();
+        }
+        w.finalize().unwrap();
+        let ctx = ctx();
+        let mut ex = Explorer::new(Some(&t.0));
+        let mut time = 0.0;
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        ex.selected = vec![wav.clone()];
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        assert_eq!(
+            ex.about.as_ref().and_then(|(_, a)| a.clone()).as_deref(),
+            Some("0:02 · 8 000 Гц · моно")
+        );
+        ex.ask_convert();
+        frame(&ctx, &mut ex, &mut time, vec![]);
+        assert!(ex.converting.is_some());
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Enter, Modifiers::NONE)],
+        );
+        assert!(ex.converting.is_none());
+        let ogg = t.0.join("assets/тон.ogg");
+        for _ in 0..200 {
+            frame(&ctx, &mut ex, &mut time, vec![]);
+            if ex.converting_job.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(ex.converting_job.is_none(), "конвертация закончилась");
+        assert!(std::fs::metadata(&ogg).unwrap().len() > 100);
+        assert_eq!(ex.selected, vec![ogg.clone()]);
+        frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Z, Modifiers::COMMAND)],
+        );
+        assert!(!ogg.exists(), "Ctrl+Z убрал результат");
+        assert!(wav.exists(), "исходный на месте");
     }
 
     /// Метки (Э.5): Ctrl+1 ставит и снимает, метка видна в списке «Метки» и едет с файлом
