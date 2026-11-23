@@ -8,9 +8,10 @@
 // может начинать с его длины; полигоны берутся из самого пикселя.
 //
 // Тени на краях: у ненадёжных пикселей (7.6с) точные доли света своей точки пикселя
-// уже посчитал проход «края 3D: тени» (raymarch_edge_shadows.slang, 8.22) и оставил в
-// картинке краёв; у надёжных они растянуты из картинки теней. Луч, попавший на ту же
-// поверхность, берёт эти доли, попавший на другую — растянутые из картинки теней.
+// уже посчитал проход «края 3D: тени» (raymarch_edge_shadows.slang и
+// raymarch_edge_shadow_rays.slang, 8.22, 8.25) и оставил в списке краёв; у надёжных
+// они растянуты из картинки теней. Луч, попавший на ту же поверхность, берёт эти доли,
+// попавший на другую — растянутые из картинки теней.
 
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
 
@@ -237,14 +238,18 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
     float3 n0 = oct_decode(g0.zw);
 
     // Точные доли света точки самого пикселя (солнце, углы, две лампы) у ненадёжных
-    // пикселей уже посчитал проход «края 3D: тени» (raymarch_edge_shadows.slang, 8.22) и
-    // оставил в картинке краёв на месте пикселя; цвет ниже их заменит. Надёжным хватает
-    // теней из половинного размера.
+    // пикселей уже посчитал проход «края 3D: тени» (8.22, 8.25) и оставил в долях света
+    // списка (include/edges.slang, edge_parts_at). Надёжным хватает теней из половинного
+    // размера.
     float4 exact = float4(1.0, 1.0, 1.0, 1.0);
     if (unreliable)
     {
         if (valid && probe != EDGE_PROBE_NO_EXACT_SHADOWS)
-            exact = images[pc.target][px];
+        {
+            uint at = edge_parts_at(w * h) + edge_shadow_slot(list, j) * 4;
+            exact = float4(asfloat(pc.edges[at]), asfloat(pc.edges[at + 1]),
+                asfloat(pc.edges[at + 2]), asfloat(pc.edges[at + 3]));
+        }
     }
     else if (g0.x >= 0.0)
         exact = upsampled_shadows(px, g0.x, n0);

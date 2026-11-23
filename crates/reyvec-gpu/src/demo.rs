@@ -116,7 +116,7 @@ struct CountedPipelines {
     shadow: vk::Pipeline,
     edges: vk::Pipeline,
     edge_find: vk::Pipeline,
-    edge_shadows: vk::Pipeline,
+    edge_shadow_rays: vk::Pipeline,
 }
 
 impl CountedPipelines {
@@ -132,7 +132,7 @@ impl CountedPipelines {
             shadow: vk::Pipeline::null(),
             edges: vk::Pipeline::null(),
             edge_find: vk::Pipeline::null(),
-            edge_shadows: vk::Pipeline::null(),
+            edge_shadow_rays: vk::Pipeline::null(),
         };
         let result = (|| {
             made.cone = build(
@@ -179,10 +179,10 @@ impl CountedPipelines {
                     layout,
                     shaders.compute("raymarch_edge_find_counted"),
                 )?;
-                made.edge_shadows = crate::pipeline::compute_pipeline(
+                made.edge_shadow_rays = crate::pipeline::compute_pipeline(
                     &ctx.device,
                     layout,
-                    shaders.compute("raymarch_edge_shadows_counted"),
+                    shaders.compute("raymarch_edge_shadow_rays_counted"),
                 )?;
             }
             Ok(())
@@ -207,7 +207,7 @@ impl CountedPipelines {
                 self.shadow,
                 self.edges,
                 self.edge_find,
-                self.edge_shadows,
+                self.edge_shadow_rays,
             ] {
                 ctx.device.destroy_pipeline(p, None);
             }
@@ -223,10 +223,13 @@ pub const MAX_SCENE_WORDS: usize = crate::space::MAX_WORDS;
 /// остальные рисуются одним лучом.
 pub const MAX_EDGE_PIXELS: u32 = 65532 * 16;
 /// Слов в заголовке списка краёв (`EDGE_HEADER` в `include/edges.slang`).
-const EDGE_HEADER: usize = 16;
+const EDGE_HEADER: usize = 20;
 /// Слово заголовка с размерами запуска «края 3D: тени» (`EDGE_SHADOW_GROUPS_WORD` в
 /// `include/edges.slang`, 8.22).
 const EDGE_SHADOW_GROUPS_WORD: u64 = 10;
+/// Слово заголовка с размерами запуска «лучей теней краёв» (`EDGE_TASK_GROUPS_WORD`,
+/// 8.25).
+const EDGE_TASK_GROUPS_WORD: u64 = 16;
 /// «Края: два луча вдали» (8.11б): с какого размера пикселя на поверхности (метров, при
 /// высоте кадра 1080; при другой высоте порог меняется так же, как размер пикселя) край
 /// получает два луча вместо четырёх. На заводе при виде сверху пиксель накрывает от 1 до
@@ -747,8 +750,11 @@ pub(crate) struct Demo {
     /// писать в картинки через общий список.
     space_edge_find: vk::Pipeline,
     space_edges: vk::Pipeline,
-    /// Точные тени ненадёжных пикселей края (8.22, `raymarch_edge_shadows.slang`).
+    /// Точные тени ненадёжных пикселей края (8.22, 8.25): какие доли нужны
+    /// (`raymarch_edge_shadows.slang`) и лучи по списку работ
+    /// (`raymarch_edge_shadow_rays.slang`).
     space_edge_shadows: vk::Pipeline,
+    space_edge_shadow_rays: vk::Pipeline,
     /// Список пикселей краёв, свой у каждого кадра в полёте (буфер и его размер).
     space_edge_lists: Vec<Option<(BufferId, u64)>>,
     /// Начало списка краёв (16 байт, в том числе число пикселей), скопированное для
@@ -1159,6 +1165,7 @@ impl Demo {
             space_edge_find: vk::Pipeline::null(),
             space_edges: vk::Pipeline::null(),
             space_edge_shadows: vk::Pipeline::null(),
+            space_edge_shadow_rays: vk::Pipeline::null(),
             space_edge_lists: vec![None; frames_in_flight],
             space_edge_counts: vec![None; frames_in_flight],
             space_smooth: true,
@@ -1489,6 +1496,11 @@ impl Demo {
                     &ctx.device,
                     layout,
                     shaders.compute("raymarch_edge_shadows"),
+                )?;
+                demo.space_edge_shadow_rays = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_edge_shadow_rays"),
                 )?;
             }
             demo.bloom_down = build(
@@ -1859,7 +1871,7 @@ impl Demo {
 
     /// Список пикселей краёв (7.6о) кадра `slot` для кадра размера `extent`: создаётся
     /// при первой надобности и пересоздаётся, когда кадр стал больше. Вместе с ним —
-    /// буфер на 32 байта, куда проход «края 3D: поиск» копирует начало списка со счётчиками
+    /// буфер на заголовок списка, куда проход «края 3D: поиск» копирует начало списка со счётчиками
     /// пикселей для панели (7.18б, 7.19а). `None` — не вышло (тогда края не сглаживаются).
     fn edge_list(
         &mut self,
@@ -1868,9 +1880,12 @@ impl Demo {
         slot: usize,
         extent: vk::Extent2D,
     ) -> Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)> {
-        // Заголовок и две половины по пикселю кадра (include/edges.slang, 8.11б).
-        let size =
-            EDGE_HEADER as u64 * 4 + 2 * u64::from(extent.width) * u64::from(extent.height) * 4;
+        // Заголовок, две половины по пикселю кадра (include/edges.slang, 8.11б), доли
+        // света ненадёжных пикселей и список работ их лучей (по 4 слова на пиксель края,
+        // 8.25).
+        let size = EDGE_HEADER as u64 * 4
+            + 2 * u64::from(extent.width) * u64::from(extent.height) * 4
+            + 8 * u64::from(MAX_EDGE_PIXELS) * 4;
         let entry = self.space_edge_lists.get_mut(slot)?;
         if entry.is_some_and(|(_, have)| have < size)
             && let Some((id, _)) = entry.take()
@@ -5062,6 +5077,9 @@ impl Demo {
                 // Размеры запуска «края 3D: тени» (8.22): групп ненадёжных, 1, 1.
                 header[11] = 1;
                 header[12] = 1;
+                // Размеры запуска «лучей теней краёв» (8.25): групп по 64 работы, 1, 1.
+                header[EDGE_TASK_GROUPS_WORD as usize + 1] = 1;
+                header[EDGE_TASK_GROUPS_WORD as usize + 2] = 1;
                 // Порог «края: два луча вдали» (8.11б), 0 — выключено. Порог задан для
                 // высоты 1080: при меньшей пиксель накрывает больше, порог растёт так же.
                 header[9] = (far * 1080.0 / ext.height.max(1) as f32).to_bits();
@@ -5147,9 +5165,11 @@ impl Demo {
                     );
                 }
             });
-            // Точные тени ненадёжных пикселей края (8.22): отдельный короткий проход перед
-            // «краями 3D». Доли света пишет в картинку краёв на место пикселя, «края 3D»
-            // читают их оттуда и заменяют цветом.
+            // Точные тени ненадёжных пикселей края (8.22, 8.25): отдельный проход перед
+            // «краями 3D» из двух запусков. Первый решает, какие доли света можно взять из
+            // картинки теней, и собирает остальные в общий список работ; второй пускает
+            // лучи по списку, поток на работу. Доли света — в списке краёв, «края 3D»
+            // читают их оттуда.
             let mut shadow_uses = vec![
                 (gbuffer, Access::ComputeSampled),
                 (shadows, Access::ComputeSampled),
@@ -5183,17 +5203,46 @@ impl Demo {
                     },
                     mesh_bits | tint_bits | pairs | map_flags(p),
                 );
+                // Список работ записан первым запуском — второй читает его и размеры
+                // запуска; доли света — дальше, «краям 3D».
+                let written = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::COMPUTE_SHADER
+                            | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                    )
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE
+                            | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                    )];
                 let (d, cmd) = (p.device, p.cmd);
                 // SAFETY: граф перевёл картинки в чтение, а картинку краёв в запись;
-                // список краёв записан (барьер в проходе поиска) и жив весь кадр.
+                // список краёв записан (барьер в проходе поиска) и жив весь кадр; барьеры
+                // выше упорядочивают запуски между собой и с «краями 3D».
                 unsafe {
                     bindless.bind_compute(d, cmd);
-                    let pipeline = frame
-                        .space_counters
-                        .map_or(self.space_edge_shadows, |c| c.0.edge_shadows);
-                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    d.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.space_edge_shadows,
+                    );
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
                     d.cmd_dispatch_indirect(cmd, list_buffer, EDGE_SHADOW_GROUPS_WORD * 4);
+                    d.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&written),
+                    );
+                    let rays = frame
+                        .space_counters
+                        .map_or(self.space_edge_shadow_rays, |c| c.0.edge_shadow_rays);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, rays);
+                    d.cmd_dispatch_indirect(cmd, list_buffer, EDGE_TASK_GROUPS_WORD * 4);
+                    d.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().memory_barriers(&written),
+                    );
                 }
             });
             let mut uses = vec![
@@ -5752,6 +5801,8 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_edge_find, None);
             ctx.device.destroy_pipeline(self.space_edges, None);
             ctx.device.destroy_pipeline(self.space_edge_shadows, None);
+            ctx.device
+                .destroy_pipeline(self.space_edge_shadow_rays, None);
             ctx.device.destroy_pipeline(self.space_field_bake, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
             ctx.device.destroy_pipeline(self.space_shade_small, None);
@@ -5789,6 +5840,7 @@ impl Demo {
         self.space_edge_find = vk::Pipeline::null();
         self.space_edges = vk::Pipeline::null();
         self.space_edge_shadows = vk::Pipeline::null();
+        self.space_edge_shadow_rays = vk::Pipeline::null();
         self.space_field_bake = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
         self.space_shade_small = vk::Pipeline::null();
