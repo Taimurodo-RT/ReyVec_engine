@@ -147,14 +147,21 @@ float reflect_share(float shine, float3 n, float3 dir)
     return shine + (1.0 - shine) * c2 * c2 * c * saturate(shine * 4.0);
 }
 
-// Цвет точки `p` поверхности: луч шёл по `dir` и прошёл `t` метров (по ним дымка),
-// материал `mat` (как в буфере геометрии), нормаль `n`, доли света `shadows` (солнце,
-// углы, две лампы). `ax` и `ay` — сдвиг точки луча на соседний пиксель по x и y (ширина
-// линий сетки пола). `primary` — луч глаза: только у него цвет текстуры полигона
-// (`px` и `sub` — пиксель и луч края в нём, −1 — луч середины) и отражение из картинки
-// отражений. Лучи отражений (raymarch_reflect.slang) красят свою точку без них.
-float3 shade_surface(float3 p, float3 dir, float t, float mat, float3 n, float4 shadows,
-                     float3 ax, float3 ay, int2 px, int sub, bool primary)
+// Материал точки `p` поверхности (луч шёл по `dir`, материал `mat` — как в буфере
+// геометрии, нормаль `n`): цвет с сеткой пола и текстурой, есть ли сетка, свечение и
+// адрес записи материала. `ax` и `ay` — сдвиг точки луча на соседний пиксель по x и y
+// (ширина линий сетки пола). Текстура полигона — только у луча глаза (`primary`; `px` и
+// `sub` — пиксель и луч края в нём, −1 — луч середины).
+struct SurfaceMaterial
+{
+    float3 albedo;
+    bool grid_on;
+    float glow;
+    uint at;
+};
+
+SurfaceMaterial surface_material(float3 p, float3 dir, float mat, float3 n, float3 ax, float3 ay,
+                                 int2 px, int sub, bool primary)
 {
     uint material = min(uint(mat + 0.5), max(pc.scene[3], 1) - 1);
     uint m = pc.scene[2] + material * 8;
@@ -162,7 +169,6 @@ float3 shade_surface(float3 p, float3 dir, float t, float mat, float3 n, float4 
     bool grid_on = (pc.scene[m + 3] & MATERIAL_GRID) != 0;
     if (primary && (pc.scene[m + 3] & MATERIAL_TEXTURED) != 0)
         albedo *= mesh_tint(px, sub, mat);
-    float glow = asfloat(pc.scene[m + 4]);
     if (grid_on)
     {
         // Сколько метров пола в пикселе: соседний луч пересекается с той же плоскостью.
@@ -179,6 +185,27 @@ float3 shade_surface(float3 p, float3 dir, float t, float mat, float3 n, float4 
         albedo = lerp(albedo, float3(0.85, 0.15, 0.12), axis.x); // ось X (вдоль z = 0)
         albedo = lerp(albedo, float3(0.15, 0.35, 0.95), axis.y); // ось Z (вдоль x = 0)
     }
+    SurfaceMaterial out_;
+    out_.albedo = albedo;
+    out_.grid_on = grid_on;
+    out_.glow = asfloat(pc.scene[m + 4]);
+    out_.at = m;
+    return out_;
+}
+
+// Цвет точки `p` поверхности: луч шёл по `dir` и прошёл `t` метров (по ним дымка),
+// материал `mat` (как в буфере геометрии), нормаль `n`, доли света `shadows` (солнце,
+// углы, две лампы). `ax`, `ay`, `px`, `sub` — как у surface_material. `primary` — луч
+// глаза: только у него цвет текстуры полигона и отражение из картинки отражений. Лучи
+// отражений (raymarch_reflect.slang) красят свою точку без них.
+float3 shade_surface(float3 p, float3 dir, float t, float mat, float3 n, float4 shadows,
+                     float3 ax, float3 ay, int2 px, int sub, bool primary)
+{
+    SurfaceMaterial sm = surface_material(p, dir, mat, n, ax, ay, px, sub, primary);
+    float3 albedo = sm.albedo;
+    bool grid_on = sm.grid_on;
+    float glow = sm.glow;
+    uint m = sm.at;
 
     // Солнце с мягкой тенью; свет неба сверху и отражённый от пола снизу, их затеняют углы.
     float sun_light = saturate(dot(n, SUN)) * shadows.x;

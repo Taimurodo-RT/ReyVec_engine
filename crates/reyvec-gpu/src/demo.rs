@@ -701,6 +701,8 @@ pub(crate) struct FrameData {
     space_reflect: bool,
     /// Размытие отражений (Л2): в кадре есть блестящие шероховатые материалы.
     space_rough: bool,
+    /// Эталон 3D (путь ReSTIR, шаг 1): кадр — трассировка путей с накоплением.
+    space_path: Option<crate::path_ref::PathFrame>,
     /// Сглаживание краёв форм (7.6о): список пикселей краёв (адрес и сам буфер) и буфер
     /// для чтения его счётчика процессором (7.18б). `None` — выключено.
     space_edges: Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)>,
@@ -825,6 +827,10 @@ pub(crate) struct Demo {
     glossy: bool,
     /// Их размытие (raymarch_reflect_blur.slang).
     space_reflect_blur: vk::Pipeline,
+    /// Эталон 3D: трассировка путей с накоплением (флажок «Эталон 3D»).
+    path_ref: crate::path_ref::PathRef,
+    /// Его проход (raymarch_path.slang).
+    space_path: vk::Pipeline,
     /// Счётчики лучей 3D включены (флажок на панели, 7.18д2).
     space_counters_on: bool,
     /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
@@ -1251,6 +1257,8 @@ impl Demo {
             space_reflect: vk::Pipeline::null(),
             glossy: true,
             space_reflect_blur: vk::Pipeline::null(),
+            path_ref: crate::path_ref::PathRef::new(),
+            space_path: vk::Pipeline::null(),
             space_counters_on: false,
             level_field_apart: true,
             space_free: true,
@@ -1636,6 +1644,11 @@ impl Demo {
                     &ctx.device,
                     layout,
                     shaders.compute("raymarch_reflect_blur"),
+                )?;
+                demo.space_path = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_path"),
                 )?;
             }
             demo.bloom_down = build(
@@ -2312,6 +2325,21 @@ impl Demo {
     /// Включает и выключает размытые отражения (Л2): выключенные — везде резкие.
     pub fn set_glossy(&mut self, on: bool) {
         self.glossy = on;
+    }
+
+    /// Эталон 3D (трассировка путей с накоплением) включён.
+    pub fn path_ref(&self) -> bool {
+        self.path_ref.enabled
+    }
+
+    /// Включает и выключает эталон 3D.
+    pub fn set_path_ref(&mut self, on: bool) {
+        self.path_ref.enabled = on && self.space_path != vk::Pipeline::null();
+    }
+
+    /// Сколько кадров эталон 3D уже накопил; `None` — он выключен.
+    pub fn path_samples(&self) -> Option<u32> {
+        self.path_ref.samples()
     }
 
     /// Идёт ли в кадре сглаживание по картинке: включено и шейдер собран.
@@ -4058,6 +4086,7 @@ impl Demo {
         let mut space_textured = false;
         let mut space_reflect = false;
         let mut space_rough = false;
+        let mut space_path = None;
         let mut space_shadow_maps = 0;
         let mut space_counters = None;
         let mut space_ray = None;
@@ -4117,6 +4146,8 @@ impl Demo {
                 self.poll_space_meshes();
                 self.sync_shape_buffer(ctx, res);
                 self.space.plane_shadows = self.space_plane_shadows;
+                // Пока копит эталон 3D, сцена стоит: иначе сумма сбрасывалась бы каждый кадр.
+                let time = self.path_ref.time(time);
                 (self.space.frame(time), None)
             };
             if level {
@@ -4149,7 +4180,9 @@ impl Demo {
                     .prepare(ctx, res, &frame, &self.space.materials);
             }
             // Тени из прошлого кадра (опыт Р3): неподвижное сверяется до отсева.
-            let reuse_on = self.shadow_reuse.enabled && !level && shape_places.is_empty();
+            let path_on = self.path_ref.enabled && !level;
+            let reuse_on =
+                self.shadow_reuse.enabled && !level && shape_places.is_empty() && !path_on;
             let reuse_still = reuse_on && self.shadow_reuse.same_still(&frame);
             if !reuse_on {
                 self.shadow_reuse.forget(res);
@@ -4207,6 +4240,14 @@ impl Demo {
                 &mut self.space_pack_cache,
             );
             self.space_grid = packed.grid;
+            // Эталон 3D сверяет сцену по словам до адресов кадра (они у ячеек кадров разные).
+            if path_on {
+                space_path = self
+                    .path_ref
+                    .prepare(ctx, res, view_proj, ray_extent, &packed.words);
+            } else {
+                self.path_ref.forget(res);
+            }
             crate::space::set_view_proj(&mut packed.words, view_proj);
             crate::space::set_field(
                 &mut packed.words,
@@ -4452,6 +4493,7 @@ impl Demo {
         } else {
             self.space_field.skip();
             self.space_stats = None;
+            self.path_ref.forget(res);
         }
         if let Some(counted) = self.space_counted_slots.get_mut(slot) {
             *counted = space_counters.is_some();
@@ -4476,6 +4518,7 @@ impl Demo {
             space_compute,
             space_reflect,
             space_rough,
+            space_path,
             space_edges,
             space_counters,
             space_ray,
@@ -5047,6 +5090,54 @@ impl Demo {
                     );
                 }
             });
+        }
+        // Эталон 3D: вместо всех проходов — трассировка путей, сумма копится в буфере.
+        if let Some(path) = frame.space_path {
+            let out = graph.create("эталон 3D", ext, SPACE_COLOR_FORMAT);
+            let pipeline = self.space_path;
+            graph.add_pass(
+                "эталон 3D",
+                &[(out, Access::ComputeWrite)],
+                move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            target: p.storage(out),
+                            meshes: path.count,
+                            edges: path.sums,
+                            ..SpaceSlots::default()
+                        },
+                        crate::path_ref::PATH_BOUNCES,
+                    );
+                    // Сумму читал и писал этот же проход прошлого кадра.
+                    let order = [vk::MemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(
+                            vk::AccessFlags2::SHADER_STORAGE_READ
+                                | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                        )];
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинку в запись; буфер суммы удаляется только
+                    // отложенно, буфер сцены этого кадра жив, пока кадр рисуется; барьер
+                    // упорядочивает сумму с прошлым кадром.
+                    unsafe {
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&order),
+                        );
+                        bindless.bind_compute(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                    }
+                },
+            );
+            return (out, out, None, Some(out), None, None);
         }
         // Предварительное шагание конусами (7.8): точка на квадрат 8×8 пикселей.
         let tiles = vk::Extent2D {
@@ -6356,6 +6447,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_post_aa, None);
             ctx.device.destroy_pipeline(self.space_reflect, None);
             ctx.device.destroy_pipeline(self.space_reflect_blur, None);
+            ctx.device.destroy_pipeline(self.space_path, None);
             ctx.device.destroy_pipeline(self.space_upscale, None);
             ctx.device.destroy_pipeline(self.space_present, None);
             ctx.device.destroy_pipeline(self.space_shade_present, None);
@@ -6401,6 +6493,7 @@ impl Demo {
         self.space_post_aa = vk::Pipeline::null();
         self.space_reflect = vk::Pipeline::null();
         self.space_reflect_blur = vk::Pipeline::null();
+        self.space_path = vk::Pipeline::null();
         self.space_upscale = vk::Pipeline::null();
         self.space_present = vk::Pipeline::null();
         self.space_shade_present = vk::Pipeline::null();

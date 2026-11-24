@@ -579,6 +579,7 @@ fn render(
             demo.set_tensor_bench(tests::TENSOR_BENCH.get(), 0);
             demo.set_reflections(tests::REFLECTIONS.get());
             demo.set_glossy(tests::GLOSSY.get());
+            demo.set_path_ref(tests::PATH_FRAMES.get() > 0);
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -600,9 +601,15 @@ fn render(
             .ctx("забор")?;
 
         // Тени из прошлого кадра (опыт Р3): сначала кадр на 1/20 секунды раньше с той же
-        // камерой, снимается второй.
+        // камерой, снимается второй. Эталон 3D: снимается последний из PATH_FRAMES кадров.
         #[cfg(test)]
-        if tests::SHADOW_REUSE.get() {
+        let pre_frames = if tests::SHADOW_REUSE.get() {
+            1
+        } else {
+            tests::PATH_FRAMES.get().saturating_sub(1)
+        };
+        #[cfg(test)]
+        for _ in 0..pre_frames {
             d.begin_command_buffer(
                 cmd,
                 &vk::CommandBufferBeginInfo::default()
@@ -616,7 +623,7 @@ fn render(
                 gpu,
                 0,
                 extent,
-                scene.time - 0.05,
+                scene.time - if tests::SHADOW_REUSE.get() { 0.05 } else { 0.0 },
                 scene.shader_error,
                 scene.scene,
             );
@@ -942,6 +949,8 @@ pub(crate) mod tests {
         pub(super) static SHADOW_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Отражения у блестящих материалов (Л1).
         pub(super) static REFLECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        /// Эталон 3D: сколько кадров копить (снимается последний); 0 — эталон выключен.
+        pub(super) static PATH_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         /// Размытые отражения шероховатых материалов (Л2).
         pub(super) static GLOSSY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Замер фильтра на тензорных ядрах (опыт Р4), картинка 1920×1088.
@@ -1381,6 +1390,69 @@ pub(crate) mod tests {
         REFLECTIONS.set(true);
         let (changed, _, _) = image_diff(&a.image, &b.expect("кадр примера без отражений").image);
         assert_eq!(changed, 0, "без блестящих материалов кадр не меняется");
+    }
+
+    /// Эталон 3D (путь ReSTIR, шаг 1): кадры копятся, картинка сцены «зеркала» по
+    /// яркости близка к быстрому режиму (единицы света те же), а шума с накоплением
+    /// становится меньше.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn path_reference_converges() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 160,
+            height: 120,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/mirrors.ron").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let fast = render_headless(&options, &scene).expect("кадр быстрого режима");
+        let mut shots = Vec::new();
+        for frames in [4, 16, 64] {
+            PATH_FRAMES.set(frames);
+            let shot = render_headless(&options, &scene);
+            PATH_FRAMES.set(0);
+            shots.push(shot.expect("кадр эталона"));
+        }
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            for (name, image) in [("fast", &fast), ("p4", &shots[0]), ("p64", &shots[2])] {
+                let _ = std::fs::write(format!("{dir}/{name}.rgba"), &image.image.rgba);
+            }
+        }
+        let brightness = |image: &FrameImage| {
+            let sum: u64 = image
+                .rgba
+                .chunks(4)
+                .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
+                .sum();
+            sum as f64 / (image.rgba.len() / 4 * 3) as f64
+        };
+        let (b_fast, b_ref) = (brightness(&fast.image), brightness(&shots[2].image));
+        eprintln!("яркость: быстрый режим {b_fast:.1}, эталон {b_ref:.1}");
+        assert!(b_ref > 10.0, "эталон чёрный: {b_ref}");
+        assert!(
+            (b_ref / b_fast - 1.0).abs() < 0.35,
+            "эталон и быстрый режим слишком разные по яркости: {b_ref} и {b_fast}"
+        );
+        // Шум: от 4 кадров к 16 картинка меняется сильнее, чем от 16 к 64.
+        let (_, _, early) = image_diff(&shots[0].image, &shots[2].image);
+        let (_, _, late) = image_diff(&shots[1].image, &shots[2].image);
+        eprintln!("шум: 4 кадра против 64 — {early:.2}, 16 против 64 — {late:.2}");
+        assert!(late < early, "накопление не убирает шум: {early} и {late}");
     }
 
     /// Склад из стеллажей по 59 деталей рисуется тремя способами: детали — отдельные

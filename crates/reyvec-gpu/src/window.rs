@@ -886,6 +886,23 @@ impl WindowRenderer {
         }
     }
 
+    /// Эталон 3D (трассировка путей с накоплением): включён ли.
+    pub fn path_ref(&self) -> bool {
+        self.demo.as_ref().is_some_and(|d| d.path_ref())
+    }
+
+    /// Включает и выключает эталон 3D.
+    pub fn set_path_ref(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_path_ref(on);
+        }
+    }
+
+    /// Сколько кадров накопил эталон 3D; `None` — выключен.
+    pub fn path_samples(&self) -> Option<u32> {
+        self.demo.as_ref().and_then(|d| d.path_samples())
+    }
+
     /// Размытые отражения шероховатых материалов (Л2): включены ли.
     pub fn glossy(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.glossy())
