@@ -1,7 +1,7 @@
 // Освещение точки сцены «3D» (этапы 7.3–7.4): общее для прохода «сцена»
 // (raymarch_shade.slang) и краёв форм (7.6о, raymarch_edges.slang). Перед подключением
 // должен быть подключён space.slang (с ним приходит и список картинок `textures[]`).
-// Буфер геометрии — `gbuffer_load` (pc.gbuffer, space.slang), тени — `textures[pc.shadows]`,
+// Буфер геометрии — `gbuffer_load` (pc.gbuffer, space.slang), тени — `textures[shadow_slot()]`,
 // цвет текстур полигонов — mesh_tint (mesh.slang, 8.14б2).
 
 #include "mesh.slang"
@@ -75,12 +75,12 @@ float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
 {
     uint sw, sh;
     int2 gsize = gbuffer_size();
-    textures[pc.shadows].GetDimensions(sw, sh);
+    textures[shadow_slot()].GetDimensions(sw, sh);
     int2 base = px >> 1;
     float2 f = float2(px & 1) * 0.5;
     float4 sum = float4(0.0, 0.0, 0.0, 0.0);
     float total = 0.0;
-    float4 nearest = textures[pc.shadows].Load(int3(min(base, int2(sw, sh) - 1), 0));
+    float4 nearest = textures[shadow_slot()].Load(int3(min(base, int2(sw, sh) - 1), 0));
     for (uint k = 0; k < 4; k++)
     {
         int2 o = int2(k & 1, k >> 1);
@@ -92,7 +92,7 @@ float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
         float weight = shadow_weight(hp, bilinear, t, n, gsize);
         if (weight <= 0.0)
             continue;
-        sum += textures[pc.shadows].Load(int3(hp, 0)) * weight;
+        sum += textures[shadow_slot()].Load(int3(hp, 0)) * weight;
         total += weight;
     }
     similar = total;
@@ -112,7 +112,7 @@ float4 upsampled_shadows_checked(int2 px, float t, float3 n, out float similar)
         float facing = saturate(dot(oct_decode(g.zw), n));
         facing *= facing;
         float weight = depth * facing * facing;
-        sum += textures[pc.shadows].Load(int3(hp, 0)) * weight;
+        sum += textures[shadow_slot()].Load(int3(hp, 0)) * weight;
         total += weight;
     }
     return total > 1e-4 ? sum / total : nearest;
@@ -125,39 +125,44 @@ float4 upsampled_shadows(int2 px, float t, float3 n)
     return upsampled_shadows_checked(px, t, n, similar);
 }
 
-// То же с готовыми долями света `shadows` (солнце, углы, две лампы). `px` и `sub` —
-// пиксель и луч края в нём (−1 — луч середины): по ним берётся цвет текстуры полигона.
-float3 shade_lit(float2 screen, float4 g, float4 shadows, int2 px, int sub)
+// Блеск материала номер `material` (Л1): слово 6 записи материала, 0 — не отражает.
+float material_shine(uint material)
 {
-    Ray ray = screen_ray(screen);
-    float t = g.x;
-    if (t < 0.0)
-        return sky(ray.dir);
-    // Как меняется луч к соседнему пикселю: лучи через соседние точки экрана. Не ddx:
-    // так же считается и в вычислительном шейдере краёв, где производных нет.
-    float2 size = float2(round(pc.aspect * pc.height), pc.height);
-    Ray rx = screen_ray(screen + float2(2.0 / size.x, 0.0));
-    Ray ry = screen_ray(screen - float2(0.0, 2.0 / size.y));
-    float3 dox = rx.origin - ray.origin, doy = ry.origin - ray.origin;
-    float3 ddx_dir = rx.dir - ray.dir, ddy_dir = ry.dir - ray.dir;
-    float3 p = ray.origin + ray.dir * t;
+    return asfloat(pc.scene[pc.scene[2] + material * 8 + 6]);
+}
 
-    uint material = min(uint(g.y + 0.5), max(pc.scene[3], 1) - 1);
+// Доля отражения (Л1): блеск, если смотреть прямо, и больше вскользь (приближение
+// Шлика к Френелю). Вскользь растёт только у заметно блестящих: у матовых (блеск
+// меньше 0,25) прибавка меньше, иначе всё вскользь становилось бы зеркалом.
+float reflect_share(float shine, float3 n, float3 dir)
+{
+    float c = 1.0 - saturate(-dot(n, dir));
+    float c2 = c * c;
+    return shine + (1.0 - shine) * c2 * c2 * c * saturate(shine * 4.0);
+}
+
+// Цвет точки `p` поверхности: луч шёл по `dir` и прошёл `t` метров (по ним дымка),
+// материал `mat` (как в буфере геометрии), нормаль `n`, доли света `shadows` (солнце,
+// углы, две лампы). `ax` и `ay` — сдвиг точки луча на соседний пиксель по x и y (ширина
+// линий сетки пола). `primary` — луч глаза: только у него цвет текстуры полигона
+// (`px` и `sub` — пиксель и луч края в нём, −1 — луч середины) и отражение из картинки
+// отражений. Лучи отражений (raymarch_reflect.slang) красят свою точку без них.
+float3 shade_surface(float3 p, float3 dir, float t, float mat, float3 n, float4 shadows,
+                     float3 ax, float3 ay, int2 px, int sub, bool primary)
+{
+    uint material = min(uint(mat + 0.5), max(pc.scene[3], 1) - 1);
     uint m = pc.scene[2] + material * 8;
     float3 albedo = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 1]), asfloat(pc.scene[m + 2]));
     bool grid_on = (pc.scene[m + 3] & MATERIAL_GRID) != 0;
-    if ((pc.scene[m + 3] & MATERIAL_TEXTURED) != 0)
-        albedo *= mesh_tint(px, sub, g.y);
+    if (primary && (pc.scene[m + 3] & MATERIAL_TEXTURED) != 0)
+        albedo *= mesh_tint(px, sub, mat);
     float glow = asfloat(pc.scene[m + 4]);
-    float3 n = oct_decode(g.zw);
     if (grid_on)
     {
         // Сколько метров пола в пикселе: соседний луч пересекается с той же плоскостью.
-        float facing = min(dot(n, ray.dir), -1e-4);
-        float3 ax = dox + ddx_dir * t;
-        float3 ay = doy + ddy_dir * t;
-        ax -= ray.dir * (dot(n, ax) / facing);
-        ay -= ray.dir * (dot(n, ay) / facing);
+        float facing = min(dot(n, dir), -1e-4);
+        ax -= dir * (dot(n, ax) / facing);
+        ay -= dir * (dot(n, ay) / facing);
         float2 fw = abs(ax.xz) + abs(ay.xz);
         // Сетка: тонкие линии каждый метр, яркие каждые 10 м; оси X и Z цветом.
         float minor = grid(p.xz, 1.0, 0.02, fw);
@@ -175,7 +180,7 @@ float3 shade_lit(float2 screen, float4 g, float4 shadows, int2 px, int sub)
     float3 ambient = float3(0.25, 0.30, 0.40) * (0.5 + 0.5 * n.y) + GROUND * (0.5 - 0.5 * n.y);
     light += ambient * shadows.y;
     // Лампы: у двух первых тени из прохода «тени 3D», остальные светят без теней.
-    float3 h = normalize(SUN - ray.dir);
+    float3 h = normalize(SUN - dir);
     float specular = pow(saturate(dot(n, h)), 48.0) * shadows.x;
     uint lamps = lamp_count();
     for (uint i = 0; i < lamps; i++)
@@ -183,21 +188,54 @@ float3 shade_lit(float2 screen, float4 g, float4 shadows, int2 px, int sub)
         Lamp l = read_lamp(i);
         float3 to = l.at - p;
         float distance = length(to);
-        float3 dir = to / max(distance, 1e-4);
+        float3 ldir = to / max(distance, 1e-4);
         float shadow = i == 0 ? shadows.z : (i == 1 ? shadows.w : 1.0);
-        float amount = lamp_falloff(l, distance) * saturate(dot(n, dir)) * shadow;
+        float amount = lamp_falloff(l, distance) * saturate(dot(n, ldir)) * shadow;
         light += l.color * amount;
-        specular += amount * pow(saturate(dot(n, normalize(dir - ray.dir))), 48.0);
+        specular += amount * pow(saturate(dot(n, normalize(ldir - dir))), 48.0);
     }
     float3 color = albedo * light;
     // Блик у форм (не у пола с сеткой).
     if (!grid_on)
         color += 0.25 * specular;
+    // Отражение (Л1): цвет того, что видно в зеркальном направлении, уже посчитан
+    // проходом «отражения 3D» для луча середины пикселя. Луч края, попавший на блестящее,
+    // берёт его, если и середина пикселя попала на блестящее (иначе там пусто).
+    uint slot = reflect_slot();
+    if (primary && slot != 0)
+    {
+        float shine = asfloat(pc.scene[m + 6]);
+        if (shine > 0.0)
+        {
+            float4 mirror = textures[slot - 1].Load(int3(px, 0));
+            if (mirror.a > 0.0)
+                color = lerp(color, mirror.rgb, reflect_share(shine, n, dir));
+        }
+    }
     // Свечение: своя яркость, тень и свет на неё не влияют. Ярче 1 — ореол при выводе.
     color += albedo * glow;
     // Даль уходит в дымку неба (сетка не рябит у горизонта).
     float fog = 1.0 - exp(-0.0025 * t * t * 0.1);
-    return lerp(color, sky(ray.dir), saturate(fog));
+    return lerp(color, sky(dir), saturate(fog));
+}
+
+// То же для точки буфера геометрии `g` луча глаза через точку экрана `screen` с готовыми
+// долями света `shadows`. `px` и `sub` — пиксель и луч края в нём (−1 — луч середины).
+float3 shade_lit(float2 screen, float4 g, float4 shadows, int2 px, int sub)
+{
+    Ray ray = screen_ray(screen);
+    float t = g.x;
+    if (t < 0.0)
+        return sky(ray.dir);
+    // Как меняется луч к соседнему пикселю: лучи через соседние точки экрана. Не ddx:
+    // так же считается и в вычислительном шейдере краёв, где производных нет.
+    float2 size = float2(round(pc.aspect * pc.height), pc.height);
+    Ray rx = screen_ray(screen + float2(2.0 / size.x, 0.0));
+    Ray ry = screen_ray(screen - float2(0.0, 2.0 / size.y));
+    float3 ax = rx.origin - ray.origin + (rx.dir - ray.dir) * t;
+    float3 ay = ry.origin - ray.origin + (ry.dir - ray.dir) * t;
+    float3 p = ray.origin + ray.dir * t;
+    return shade_surface(p, ray.dir, t, g.y, oct_decode(g.zw), shadows, ax, ay, px, sub, true);
 }
 
 // Цвет точки буфера геометрии `g`, полученной лучом через точку экрана `screen`

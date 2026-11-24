@@ -309,6 +309,18 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
+        // Л1: резкие отражения (`scenes/3d/mirrors.ron`): зеркальная стена, хромовый
+        // шар, чуть блестящий пол.
+        Case {
+            name: "space-mirrors-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/mirrors.ron").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
         // 7.7: векторные контуры, выдавленные и повёрнутые в объёмные формы
         // (`scenes/3d/vector.ron`).
         Case {

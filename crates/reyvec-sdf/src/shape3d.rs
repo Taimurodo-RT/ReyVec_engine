@@ -1688,6 +1688,11 @@ pub struct Material3 {
     /// сцены видеокарта заменяет его номером картинки в общем списке текстур.
     #[serde(skip)]
     pub texture: u32,
+    /// Блеск (Л1, docs/rays-further.md): доля отражения, если смотреть прямо на
+    /// поверхность (0 — не отражает, 1 — зеркало). Вскользь отражение сильнее (Френель).
+    /// В буфере сцены — слово 6 записи материала.
+    #[serde(default)]
+    pub shine: f32,
 }
 
 /// Флаг материала: сетка на поверхности.
@@ -1916,7 +1921,12 @@ pub fn pack_scene_cached(
         out.push(
             (u32::from(m.grid) * MATERIAL_GRID) | (u32::from(m.texture != 0) * MATERIAL_TEXTURED),
         );
-        out.extend([m.glow.to_bits(), m.texture, 0, 0]);
+        out.extend([
+            m.glow.to_bits(),
+            m.texture,
+            m.shine.clamp(0.0, 1.0).to_bits(),
+            0,
+        ]);
     }
     for l in lamps {
         out.extend(l.at.map(f32::to_bits));
@@ -2485,6 +2495,7 @@ mod tests {
             glow: 0.0,
             grid: true,
             texture: 0,
+            shine: 0.0,
         }];
         let lamps = [Lamp3 {
             at: [1.0, 2.0, 3.0],

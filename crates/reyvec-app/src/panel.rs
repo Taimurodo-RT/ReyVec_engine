@@ -67,6 +67,8 @@ pub(crate) enum PanelAction {
     SplitParts(bool),
     /// Шаг луча отсеивает предметы и по коробке (М.1в).
     ObjectBoxes(bool),
+    /// Отражения у блестящих материалов (Л1).
+    Reflections(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -205,6 +207,8 @@ pub(crate) struct PanelInfo<'a> {
     pub split_parts: bool,
     /// Шаг луча отсеивает предметы и по коробке.
     pub object_boxes: bool,
+    /// Отражения у блестящих материалов (Л1).
+    pub reflections: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -1049,6 +1053,20 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::SpaceBoxes(boxes));
+            }
+            let mut reflections = info.reflections;
+            if ui
+                .checkbox(&mut reflections, "Отражения 3D")
+                .on_hover_text(
+                    "Л1: блестящие материалы (у материала в файле сцены «shine» больше 0) \
+                 отражают сцену: из каждой блестящей точки идёт луч в зеркальную сторону, \
+                 и то, что он встретил, освещается как обычно, с тенями солнца и двух \
+                 первых ламп. Вскользь отражение сильнее. Выключите, чтобы сравнить вид и \
+                 время прохода «отражения 3D». Пример — сцена «зеркала»",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::Reflections(reflections));
             }
             let mut rt = info.space_rt.unwrap_or(false);
             let rt_box = ui.add_enabled(
@@ -2067,6 +2085,7 @@ mod tests {
             part_bounds: true,
             split_parts: true,
             object_boxes: true,
+            reflections: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

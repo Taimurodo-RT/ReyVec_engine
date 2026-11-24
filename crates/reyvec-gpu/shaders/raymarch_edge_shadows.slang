@@ -44,7 +44,7 @@ static const float STEADY_SPREAD = 0.03;
 uint shadow_steady(int2 px, float t, float3 n, out float4 value)
 {
     uint sw, sh;
-    textures[pc.shadows].GetDimensions(sw, sh);
+    textures[shadow_slot()].GetDimensions(sw, sh);
     int2 gsize = gbuffer_size();
     int2 base = px >> 1;
     float4 lo = float4(1e9, 1e9, 1e9, 1e9);
@@ -54,7 +54,7 @@ uint shadow_steady(int2 px, float t, float3 n, out float4 value)
     for (uint k = 0; k < 16; k++)
     {
         int2 hp = clamp(base + int2(int(k & 3) - 1, int(k >> 2) - 1), int2(0, 0), int2(sw, sh) - 1);
-        float4 v = textures[pc.shadows].Load(int3(hp, 0));
+        float4 v = textures[shadow_slot()].Load(int3(hp, 0));
         lo = min(lo, v);
         hi = max(hi, v);
         sum += v;
