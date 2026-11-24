@@ -46,6 +46,9 @@ pub struct GridOptions {
     /// Объекты раскладываются по плотным коробкам (8.8а); иначе по шарам-границам, как
     /// до 8.8а.
     pub boxes: bool,
+    /// Шаг луча отсеивает предмет ещё и по коробке вокруг середины его шара (слово 3
+    /// записи, [`crate::shape3d::box_word`]); иначе только по шару, как до М.1в.
+    pub object_boxes: bool,
 }
 
 impl Default for GridOptions {
@@ -53,6 +56,7 @@ impl Default for GridOptions {
         Self {
             free: true,
             boxes: true,
+            object_boxes: true,
         }
     }
 }
@@ -249,6 +253,8 @@ pub struct Grid {
     /// Поле уровня (7.18д3, [`crate::shape3d::level_field_object`]): считается в каждой
     /// точке первым, до `unbounded`; в `unbounded` его нет.
     pub field: Option<u32>,
+    /// Отсеивать предметы и по коробке ([`GridOptions::object_boxes`]).
+    pub object_boxes: bool,
 }
 
 impl Grid {
@@ -281,6 +287,7 @@ impl Grid {
             SPHERE_MAX_CELLS
         };
         let mut grid = Self::geometry(objects, field, &bounds, max_cells);
+        grid.object_boxes = options.object_boxes;
         if grid.dims == [0; 3] {
             cache.clear();
             return grid;
@@ -695,7 +702,15 @@ impl Grid {
         for &i in unbounded.iter().chain(list) {
             let o = &objects[i as usize];
             if let Some((c, r)) = o.bounds {
-                let outside = (p - c).length() - r;
+                let mut outside = (p - c).length() - r;
+                if self.object_boxes {
+                    outside = outside.max(crate::shape3d::box_outside(
+                        crate::shape3d::box_word(o),
+                        c,
+                        r,
+                        p,
+                    ));
+                }
                 if outside >= pick.distance {
                     pick.second = pick.second.min(outside);
                     continue;
@@ -812,10 +827,12 @@ mod tests {
         GridOptions {
             free: true,
             boxes: true,
+            object_boxes: true,
         },
         GridOptions {
             free: true,
             boxes: false,
+            object_boxes: false,
         },
     ];
 

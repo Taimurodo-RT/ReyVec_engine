@@ -523,6 +523,9 @@ fn render(
             // Сетка отсева по шарам, как до 8.8а (для сравнения).
             #[cfg(test)]
             demo.set_space_boxes(!tests::SPHERE_GRID.get());
+            // Предметы только по шару, как до М.1в (для сравнения).
+            #[cfg(test)]
+            demo.set_space_object_boxes(!tests::SPHERES_ONLY.get());
             // Поле уровня в общем переборе, как до 7.18д3 (для сравнения).
             #[cfg(test)]
             demo.set_level_field_apart(!tests::LEVEL_FIELD_IN_LOOP.get());
@@ -903,6 +906,7 @@ pub(crate) mod tests {
         pub(super) static FREE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Сетка отсева по шарам-границам, как до 8.8а.
         pub(super) static SPHERE_GRID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static SPHERES_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Нормаль по всей сцене, как до 7.18д5.
         pub(super) static FULL_NORMAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Поле уровня в общем переборе объектов, как до 7.18д3.
@@ -1334,6 +1338,9 @@ pub(crate) mod tests {
         };
         SPACE_COUNTERS.set(true);
         let split = render_headless(&options, &scene);
+        SPHERES_ONLY.set(true);
+        let spheres = render_headless(&options, &scene);
+        SPHERES_ONLY.set(false);
         SPLIT_PARTS.store(false, Ordering::Relaxed);
         let bounds = render_headless(&options, &scene);
         PART_BOUNDS.store(false, Ordering::Relaxed);
@@ -1342,6 +1349,7 @@ pub(crate) mod tests {
         SPLIT_PARTS.store(true, Ordering::Relaxed);
         SPACE_COUNTERS.set(false);
         let split = split.expect("кадр с деталями-предметами");
+        let spheres = spheres.expect("кадр с деталями только по шарам");
         let bounds = bounds.expect("кадр с границами");
         let whole = whole.expect("кадр без границ");
         // Без границ шаги луча те же, отличий почти нет.
@@ -1376,17 +1384,44 @@ pub(crate) mod tests {
             per(p_bounds),
             per(p_whole)
         );
-        for (n, i) in [("детали", &split), ("границы", &bounds), ("без", &whole)] {
+        // Коробки предметов (М.1в): вдали от предмета шаг берёт расстояние до коробки, а
+        // не до шара, — шаги длиннее, и, как у деталей-предметов, на стыках деталей луч
+        // останавливается в другой точке в пределах точности попадания.
+        let (changed, worst, mean) = image_diff(&split.image, &spheres.image);
+        eprintln!(
+            "коробки предметов: отличается {changed} пикселей, наибольшая {worst}, в среднем {mean:.2}"
+        );
+        let pixels = (split.image.width * split.image.height) as usize;
+        assert!(
+            changed * 200 <= pixels && mean < 0.5,
+            "коробки: {changed} пикселей, {mean}"
+        );
+        for (n, i) in [
+            ("детали", &split),
+            ("детали по шарам", &spheres),
+            ("границы", &bounds),
+            ("без", &whole),
+        ] {
             let rays = i.space_stats.expect("счётчики").rays.expect("лучи");
             let row: Vec<_> = rays
                 .iter()
                 .zip(crate::counters::RAY_PASS_NAMES)
-                .map(|(c, name)| format!("{name} {}/{}/{}", c.steps, c.prims, c.objects))
+                .map(|(c, name)| {
+                    format!(
+                        "{name} {}/{}/{}/{}/{}",
+                        c.steps, c.scene, c.objects, c.forms, c.prims
+                    )
+                })
                 .collect();
-            eprintln!("{n}: шаги/примитивы/предметы {}", row.join(", "));
+            eprintln!(
+                "{n}: шаги/сцены/предметы/формы/примитивы {}",
+                row.join(", ")
+            );
         }
         assert!(p_bounds.0 * 2 < p_whole.0, "{p_bounds:?} из {p_whole:?}");
         assert!(per(p_split) < per(p_bounds), "{p_split:?} и {p_bounds:?}");
+        let p_spheres = prims(&spheres);
+        assert!(p_split.0 < p_spheres.0, "{p_split:?} и {p_spheres:?}");
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
@@ -1466,13 +1501,14 @@ pub(crate) mod tests {
         // Полутень по каждому предмету отдельно ложится точками шагов не туда же, где у
         // сетки, поэтому совпадение не до бита: отличия — на ступень-другую в полутенях и
         // отдельные точки у краёв (на lavapipe 2026-11-23: 127 точек из 518 400, одна
-        // точка у края — на 107). Лучи тени считают заметно меньше форм.
+        // точка у края — на 107). Лучи тени считают меньше форм; с коробками предметов в
+        // шаге луча (М.1в) сетка отсекает почти так же: форм на луч 4,39 против 3,69.
         assert!(
             changed * 1000 < total,
             "RT-ядра меняют больше 0,1 % кадра: {changed} из {total}"
         );
         assert!(
-            b.forms * 10 < a.forms * 8,
+            b.forms < a.forms,
             "форм на луч не меньше: {} против {}",
             b.forms,
             a.forms

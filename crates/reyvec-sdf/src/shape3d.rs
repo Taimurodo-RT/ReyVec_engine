@@ -1722,6 +1722,45 @@ pub const MAX_MATERIALS: usize = 4096;
 const LAMP_WORDS: usize = 8;
 /// Слов в записи объекта.
 pub const OBJECT_WORDS: usize = 8;
+
+/// Есть ли коробка в слове 3 записи объекта ([`box_word`]).
+pub const OBJECT_BOX: u32 = 1 << 30;
+
+/// Слово 3 записи объекта (М.1в): коробка вокруг середины шара-границы, полуширины по
+/// осям — доли радиуса по 10 бит (округление вверх, коробка не меньше настоящей), бит 30 —
+/// коробка есть. Шар длинной доски или балки огромен, и шаг луча считал её даже там, где
+/// до неё далеко; коробка вокруг той же середины почти так же плотна, как сама доска.
+/// 0 — коробки нет (у плоскостей слово 3 занято сдвигом плоскости).
+pub fn box_word(p: &Program) -> u32 {
+    let (Some((c, r)), Some((lo, hi))) = (p.bounds, p.bounds_box) else {
+        return 0;
+    };
+    if r.is_nan() || r <= 0.0 {
+        return 0;
+    }
+    let h = (lo - c).abs().max((hi - c).abs());
+    // Полшага запаса: r·k/1023 на видеокарте не должно выйти меньше h из-за округления.
+    let k = (h / r * 1023.0 + 0.5)
+        .ceil()
+        .clamp(Vec3::ZERO, Vec3::splat(1023.0));
+    OBJECT_BOX | k.x as u32 | (k.y as u32) << 10 | (k.z as u32) << 20
+}
+
+/// Расстояние со знаком от точки `p` до коробки из [`box_word`] (внутри — минус до её
+/// стенки): не больше расстояния до формы и внутри неё, как и у шара. Как в `scene_walk`
+/// (`include/space.slang`). Без коробки — минус бесконечность.
+pub fn box_outside(word: u32, c: Vec3, r: f32, p: Vec3) -> f32 {
+    if word & OBJECT_BOX == 0 {
+        return f32::NEG_INFINITY;
+    }
+    let k = Vec3::new(
+        (word & 1023) as f32,
+        ((word >> 10) & 1023) as f32,
+        ((word >> 20) & 1023) as f32,
+    );
+    let q = (p - c).abs() - k * (r / 1023.0);
+    q.max(Vec3::ZERO).length() + q.max_element().min(0.0)
+}
 /// Флаг объекта: заменитель полигональной модели, только для теней (как в
 /// `include/space.slang`).
 pub const OBJECT_SHADOW_ONLY: u32 = 1;
@@ -1858,7 +1897,12 @@ pub fn pack_scene_cached(
             flags |= OBJECT_STILL;
         }
         let (n, c) = plane.unwrap_or((Vec3::ZERO, 0.0));
-        out.extend([start as u32, p.words.len() as u32, flags, c.to_bits()]);
+        let spare = match plane {
+            Some(_) => c.to_bits(),
+            None if grid.object_boxes => box_word(p),
+            None => 0,
+        };
+        out.extend([start as u32, p.words.len() as u32, flags, spare]);
         let (center, r) = p.bounds.unwrap_or((n, -1.0));
         out.extend([center.x, center.y, center.z, r].map(f32::to_bits));
         if field == Some(i) {

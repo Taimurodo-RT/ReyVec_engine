@@ -874,6 +874,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Шаг луча отсеивает предметы и по коробке (М.1в): включено ли.
+    pub fn space_object_boxes(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.space_object_boxes())
+    }
+
+    /// Коробки предметов в шаге луча (`true`) или только шары, как до М.1в.
+    pub fn set_space_object_boxes(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_space_object_boxes(on);
+        }
+    }
+
     /// Включает или выключает счётчики лучей 3D со следующего кадра (при первом включении
     /// собираются шейдеры со счётчиками). Ошибка пишется в журнал, счётчики остаются
     /// выключенными.

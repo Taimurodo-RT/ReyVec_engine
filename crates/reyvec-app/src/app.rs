@@ -498,6 +498,13 @@ impl App {
                     if on { "вкл" } else { "выкл" }
                 );
             }
+            PanelAction::ObjectBoxes(on) => {
+                r.set_space_object_boxes(on);
+                tracing::info!(
+                    "Коробки предметов в шаге луча {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::SplitParts(on) => {
                 reyvec_sdf::shape3d::SPLIT_PARTS.store(on, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
@@ -787,6 +794,7 @@ impl App {
                 brick_shadows: renderer.brick_shadows(),
                 part_bounds: reyvec_sdf::shape3d::part_bounds(),
                 split_parts: reyvec_sdf::shape3d::split_parts(),
+                object_boxes: renderer.space_object_boxes(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
                 level_render: renderer.level_render(),
