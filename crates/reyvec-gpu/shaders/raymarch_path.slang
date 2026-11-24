@@ -12,8 +12,9 @@
 //   шероховатых — в случайную сторону конуса (как пятно размытия Л2), иначе — отскок по
 //   косинусу.
 // Ушёл в небо — свет неба: сверху тот же цвет, что у «света неба» быстрого режима, снизу —
-// GROUND; луч глаза и зеркальные отскоки видят само небо (sky), как в быстром режиме. Единицы те же, что у быстрого режима (shade_surface): цвет = альбедо × освещённость,
-// поэтому картинки можно сравнивать.
+// GROUND; луч глаза и зеркальные отскоки видят само небо (sky), как в быстром режиме.
+// Единицы те же, что у быстрого режима (shade_surface): цвет = альбедо × освещённость,
+// поэтому картинки можно сравнивать. Точки света и случайные числа — include/light3d.slang.
 //
 // Сумма путей — в буфере по адресу pc.edges (4 числа на пиксель), число уже накопленных
 // кадров — pc.meshes (0 — начать заново), отскоков — pc.flags. Среднее пишется в картинку
@@ -22,6 +23,8 @@
 // Режим «качество» (путь ReSTIR, шаг 2, бит PATH_LIVE в pc.flags): путь начинается с
 // точки буфера геометрии (лучи глаза и края — как у быстрого режима), по одному пути на
 // пиксель без накопления; pc.meshes — номер кадра (для случайных чисел). Сумма не пишется.
+// С битом PATH_RESTIR (шаг 3) прямой свет первой точки — ReSTIR DI: pc.edges — буфер
+// запасов (include/restir.slang).
 //
 // Не видно: модели из треугольников (их нет в поле сцены).
 
@@ -31,6 +34,8 @@
 #include "include/shade3d.slang"
 #include "include/shadow3d.slang"
 #include "include/trace3d.slang"
+#include "include/light3d.slang"
+#include "include/restir.slang"
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
@@ -38,118 +43,92 @@ float4 fs_main(VertexOut input) : SV_Target
     return float4(0.0, 0.0, 0.0, 0.0);
 }
 
-static const float PI = 3.14159265;
-// Угловой радиус диска солнца, рад: полутень того же размера, что у мягких теней быстрого
-// режима (k = 12 в shadow_part).
-static const float SUN_RADIUS = 0.04;
-// Радиус светящегося шарика лампы для полутени, м.
-static const float LAMP_RADIUS = 0.1;
-static const float3 SKY_TOP = float3(0.25, 0.30, 0.40);
-static const float3 SUN_COLOR = float3(1.0, 0.95, 0.85);
-
 static const uint PATH_LIVE = 16;
-
-static uint g_rng;
-
-uint hash(uint x)
-{
-    x ^= x >> 16;
-    x *= 0x7feb352d;
-    x ^= x >> 15;
-    x *= 0x846ca68b;
-    x ^= x >> 16;
-    return x;
-}
-
-float rnd()
-{
-    g_rng = g_rng * 747796405u + 2891336453u;
-    uint w = ((g_rng >> ((g_rng >> 28u) + 4u)) ^ g_rng) * 277803737u;
-    w = (w >> 22u) ^ w;
-    return float(w) * (1.0 / 4294967296.0);
-}
-
-// Две оси, перпендикулярные `n`.
-void basis(float3 n, out float3 t, out float3 b)
-{
-    float3 up = abs(n.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
-    t = normalize(cross(up, n));
-    b = cross(n, t);
-}
-
-// Направление вокруг `n` с плотностью по косинусу.
-float3 cosine_dir(float3 n)
-{
-    float3 t, b;
-    basis(n, t, b);
-    float u = rnd(), v = rnd();
-    float r = sqrt(u);
-    float phi = 2.0 * PI * v;
-    return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(1.0 - u, 0.0)));
-}
-
-// Равномерно в конусе вокруг `axis` с половинным углом `angle`.
-float3 cone_dir(float3 axis, float angle)
-{
-    float3 t, b;
-    basis(axis, t, b);
-    float c = 1.0 - rnd() * (1.0 - cos(angle));
-    float s = sqrt(max(1.0 - c * c, 0.0));
-    float phi = 2.0 * PI * rnd();
-    return normalize(t * (s * cos(phi)) + b * (s * sin(phi)) + axis * c);
-}
-
-// Свет неба для луча, ушедшего мимо всего.
-float3 sky_light(float3 dir)
-{
-    return dir.y >= 0.0 ? SKY_TOP : GROUND;
-}
+// Бит pc.flags (шаг 3): прямой свет первой точки — ReSTIR DI (include/restir.slang); запасы
+// этого кадра до соседей готовит проход «ReSTIR: кандидаты».
+static const uint PATH_RESTIR = 32;
+// Сколько соседей берёт пиксель и как далеко (пикселей).
+static const uint RESTIR_NEIGHBORS = 4;
+static const float RESTIR_RADIUS = 16.0;
+static const float RESTIR_REACH = 0.5;
 
 // Прямой свет солнца и ламп в точке `q` (уже поднятой над поверхностью) с нормалью `n`;
-// луч пришёл по `dir`. Как в shade_surface: альбедо × освещённость плюс блик.
+// луч пришёл по `dir`. По случайной точке каждого источника с лучом тени.
 float3 direct_light(float3 q, float3 n, float3 dir, SurfaceMaterial sm)
 {
     float3 color = float3(0.0, 0.0, 0.0);
-    float shine = 0.0;
-    if ((pc.scene[11] & SCENE_NO_SUN) == 0)
-    {
-        float3 l = cone_dir(SUN, SUN_RADIUS);
-        float c = dot(n, l);
-        if (c > 0.0 && !occluded(q, l, 30.0))
-        {
-            color += sm.albedo * SUN_COLOR * c;
-            shine += pow(saturate(dot(n, normalize(SUN - dir))), 48.0);
-        }
-    }
+    color += sun_light(q, n, dir, sm);
     uint lamps = lamp_count();
     for (uint i = 0; i < lamps; i++)
-    {
-        Lamp lamp = read_lamp(i);
-        float3 to = lamp.at - q;
-        float distance = length(to);
-        float3 ldir = to / max(distance, 1e-4);
-        float amount = lamp_falloff(lamp, distance) * saturate(dot(n, ldir));
-        if (amount <= 0.0)
-            continue;
-        // Луч тени к случайной точке шарика лампы; останавливается, не дойдя до неё
-        // LAMP_SHADOW_GAP, как в shadow_part (лампочка не закрывает свою лампу).
-        float3 aim = lamp.at + (cone_dir(-ldir, PI * 0.5) * LAMP_RADIUS) - q;
-        float far = length(aim) - LAMP_SHADOW_GAP;
-        if (far > 0.0 && occluded(q, aim / max(length(aim), 1e-4), far))
-            continue;
-        color += sm.albedo * lamp.color * amount;
-        shine += amount * pow(saturate(dot(n, normalize(ldir - dir))), 48.0);
-    }
-    if (!sm.grid_on)
-        color += 0.25 * shine;
+        color += light_seen(light_sample(i + 1u, float2(rnd(), rnd()), q, n, dir, sm), q);
     return color;
+}
+
+// Прямой свет дальних точек пути в режиме ReSTIR: несколько случайных точек света, одна
+// по весам — и один луч тени к ней (как запас ReSTIR, но без соседей и прошлого кадра):
+// ламп может быть много, а луч тени один.
+static const uint RIS_CANDIDATES = 16;
+
+float3 sampled_light(float3 q, float3 n, float3 dir, SurfaceMaterial sm)
+{
+    float3 sun = sun_light(q, n, dir, sm);
+    uint total = lamp_count();
+    if (total == 0u)
+        return sun;
+    ReservoirBuilder b = builder_new(q, n);
+    for (uint k = 0; k < RIS_CANDIDATES; k++)
+    {
+        uint light = pick_lamp(rnd());
+        float2 uv = float2(rnd(), rnd());
+        float target = luminance(light_sample(light, uv, q, n, dir, sm).light);
+        builder_add(b, light, uv, target, target * float(total), 1.0);
+    }
+    Reservoir r = builder_finish(b);
+    if (r.light == RESTIR_EMPTY)
+        return sun;
+    return sun + light_seen(light_sample(r.light, r.uv, q, n, dir, sm), q) * r.W;
+}
+
+// Прямой свет первой точки через ReSTIR DI: свой запас и запасы соседей (слой 1), один
+// луч тени к выбранной точке лампы и один — к солнцу. Итог (с тенью: закрытая точка теряет вес) — в слой 0, его
+// возьмёт следующий кадр.
+float3 restir_direct(int2 px, uint w, uint h, float3 p, float3 n, float3 q, float3 dir,
+                     SurfaceMaterial sm, float t, float spread)
+{
+    ReservoirBuilder b = builder_new(p, n);
+    builder_merge(b, reservoir_load(1u, px, w, h), 1e30, q, dir, sm, t);
+    // Соседи — не дальше RESTIR_REACH метров по поверхности: вдали 16 пикселей — это
+    // метры, и свет там уже другой.
+    float radius = clamp(RESTIR_REACH / max(spread * t, 1e-5), 2.0, RESTIR_RADIUS);
+    for (uint k = 0; k < RESTIR_NEIGHBORS; k++)
+    {
+        float r = radius * sqrt(rnd());
+        float phi = 2.0 * PI * rnd();
+        int2 o = px + int2(round(float2(cos(phi), sin(phi)) * r));
+        if (all(o == px) || any(o < 0) || o.x >= int(w) || o.y >= int(h))
+            continue;
+        builder_merge(b, reservoir_load(1u, o, w, h), 1e30, q, dir, sm, t);
+    }
+    Reservoir chosen = builder_finish(b);
+    float3 direct = sun_light(q, n, dir, sm);
+    if (chosen.light != RESTIR_EMPTY)
+    {
+        float3 seen = light_seen(light_sample(chosen.light, chosen.uv, q, n, dir, sm), q);
+        if (all(seen <= 0.0))
+            chosen.W = 0.0;
+        direct += seen * chosen.W;
+    }
+    chosen.M = min(chosen.M, RESTIR_HISTORY * float(RESTIR_CANDIDATES));
+    reservoir_store(0u, px, w, h, chosen);
+    return direct;
 }
 
 // Свет, пришедший в глаз по лучу из `origin` по `dir` (длина до дальней плоскости
 // `limit`). `spread` — ширина пикселя на метр пути, `px` — пиксель.
 // `first` — готовое первое попадание (x — длина, −1 — небо; y — материал; zw — нормаль
 // в октаэдре), если `known`.
-float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint bounces, bool known, float4 first)
+float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint bounces, bool known, float4 first,
+           bool restir, uint w, uint h)
 {
     float3 light = float3(0.0, 0.0, 0.0);
     float3 weight = float3(1.0, 1.0, 1.0);
@@ -187,8 +166,8 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         }
         float3 side, up;
         basis(dir, side, up);
-        float w = spread * travelled;
-        SurfaceMaterial sm = surface_material(p, dir, hit.y, n, side * w, up * w, px, -1, false);
+        float width = spread * travelled;
+        SurfaceMaterial sm = surface_material(p, dir, hit.y, n, side * width, up * width, px, -1, false);
         // Шарик лампы, встреченный после рассеяния, не светит: свет лампы уже взят явным
         // лучом к ней (иначе он учёлся бы дважды, и были бы яркие точки).
         if (seen || (pc.scene[sm.at + 3] & MATERIAL_BULB) == 0)
@@ -198,8 +177,12 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         float share = shine > 0.0 ? reflect_share(shine, n, dir) : 0.0;
         // Прямой свет — всегда, с долей рассеянного: случайным выбирается только, куда
         // идёт путь дальше (иначе у зеркал редкие яркие точки рассеянного света).
-        if (share < 1.0)
-            light += weight * (1.0 - share) * direct_light(q, n, dir, sm);
+        float3 direct = float3(0.0, 0.0, 0.0);
+        if (k == 0 && restir)
+            direct = restir_direct(px, w, h, p, n, q, dir, sm, hit.x, spread);
+        else if (share < 1.0)
+            direct = restir ? sampled_light(q, n, dir, sm) : direct_light(q, n, dir, sm);
+        light += weight * (1.0 - share) * direct;
         if (rnd() < share)
         {
             // Зеркальный отскок: с вероятностью доли Френеля, поэтому вес тот же.
@@ -247,15 +230,16 @@ void cs_main(uint3 id : SV_DispatchThreadID)
         return;
     int2 px = int2(id.xy);
     uint frame = pc.meshes;
-    g_rng = hash(id.x * 1973u + id.y * 9277u + hash(frame) * 26699u) | 1u;
+    seed_rng(id.xy, frame, 0u);
     bool live = (pc.flags & PATH_LIVE) != 0;
+    bool restir = live && (pc.flags & PATH_RESTIR) != 0;
     float2 jitter = live ? float2(0.5, 0.5) : float2(rnd(), rnd());
     float2 screen = float2((float(px.x) + jitter.x) / float(w) * 2.0 - 1.0, 1.0 - (float(px.y) + jitter.y) / float(h) * 2.0);
     Ray ray = screen_ray(screen);
     Ray next = screen_ray(screen + float2(2.0 / float(w), 0.0));
     float spread = length(next.dir - ray.dir);
     float4 first = live ? gbuffer_load(px) : float4(0.0, 0.0, 0.0, 0.0);
-    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, pc.flags & 15, live, first);
+    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, pc.flags & 15, live, first, restir, w, h);
     // Светлячки (редкий путь в яркое) не дают NaN и бесконечностей.
     if (any(isnan(c)) || any(isinf(c)))
         c = float3(0.0, 0.0, 0.0);

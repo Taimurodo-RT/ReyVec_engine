@@ -910,6 +910,18 @@ impl WindowRenderer {
         }
     }
 
+    /// ReSTIR DI в режиме «качество»: включён ли.
+    pub fn path_restir(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.path_restir())
+    }
+
+    /// Включает и выключает ReSTIR DI.
+    pub fn set_path_restir(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_path_restir(on);
+        }
+    }
+
     /// Сколько кадров накопил эталон 3D; `None` — выключен.
     pub fn path_samples(&self) -> Option<u32> {
         self.demo.as_ref().and_then(|d| d.path_samples())

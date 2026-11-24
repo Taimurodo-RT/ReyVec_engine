@@ -580,7 +580,9 @@ fn render(
             demo.set_reflections(tests::REFLECTIONS.get());
             demo.set_glossy(tests::GLOSSY.get());
             demo.set_path_ref(tests::PATH_FRAMES.get() > 0);
-            demo.set_path_live(tests::PATH_LIVE.get());
+            demo.set_path_live(tests::LIVE_FRAMES.get() > 0);
+            demo.set_path_restir(tests::PATH_RESTIR.get());
+            demo.set_path_bounces(tests::PATH_BOUNCES.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -607,7 +609,10 @@ fn render(
         let pre_frames = if tests::SHADOW_REUSE.get() {
             1
         } else {
-            tests::PATH_FRAMES.get().saturating_sub(1)
+            tests::PATH_FRAMES
+                .get()
+                .max(tests::LIVE_FRAMES.get())
+                .saturating_sub(1)
         };
         #[cfg(test)]
         for _ in 0..pre_frames {
@@ -952,8 +957,13 @@ pub(crate) mod tests {
         pub(super) static REFLECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Эталон 3D: сколько кадров копить (снимается последний); 0 — эталон выключен.
         pub(super) static PATH_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-        /// Режим «качество»: путь на пиксель каждый кадр, от буфера геометрии.
-        pub(super) static PATH_LIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Режим «качество»: сколько кадров снимать (снимается последний); 0 — выключен.
+        pub(super) static LIVE_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Отскоки путей эталона и режима «качество».
+        pub(super) static PATH_BOUNCES: std::cell::Cell<u32> =
+            const { std::cell::Cell::new(crate::path_ref::PATH_BOUNCES) };
+        /// ReSTIR DI в режиме «качество».
+        pub(super) static PATH_RESTIR: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Размытые отражения шероховатых материалов (Л2).
         pub(super) static GLOSSY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Замер фильтра на тензорных ядрах (опыт Р4), картинка 1920×1088.
@@ -1430,10 +1440,17 @@ pub(crate) mod tests {
             PATH_FRAMES.set(0);
             shots.push(shot.expect("кадр эталона"));
         }
-        PATH_LIVE.set(true);
+        // Режим «качество»: без ReSTIR (один кадр) и с ним (восьмой кадр — запасы
+        // прошлых кадров уже есть).
+        LIVE_FRAMES.set(1);
+        PATH_RESTIR.set(false);
         let live = render_headless(&options, &scene);
-        PATH_LIVE.set(false);
+        PATH_RESTIR.set(true);
+        LIVE_FRAMES.set(8);
+        let restir = render_headless(&options, &scene);
+        LIVE_FRAMES.set(0);
         let live = live.expect("кадр режима «качество»");
+        let restir = restir.expect("кадр режима «качество» с ReSTIR");
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
         if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
             let named = [
@@ -1441,6 +1458,7 @@ pub(crate) mod tests {
                 ("p4", &shots[0]),
                 ("p64", &shots[2]),
                 ("live", &live),
+                ("restir", &restir),
             ];
             for (name, image) in named {
                 let _ = std::fs::write(format!("{dir}/{name}.rgba"), &image.image.rgba);
@@ -1468,11 +1486,115 @@ pub(crate) mod tests {
             (b_live / b_ref - 1.0).abs() < 0.15,
             "режим «качество» и эталон разные по яркости: {b_live} и {b_ref}"
         );
+        // ReSTIR DI (шаг 3): яркость та же (смещение небольшое). Шум — в зале с лампами
+        // (restir_lamps_hall): здесь ламп две, и луч к каждой дешевле выбора.
+        let b_restir = brightness(&restir.image);
+        eprintln!("ReSTIR: яркость {b_restir:.1}");
+        assert!(
+            (b_restir / b_ref - 1.0).abs() < 0.15,
+            "ReSTIR и эталон разные по яркости: {b_restir} и {b_ref}"
+        );
         // Шум: от 4 кадров к 16 картинка меняется сильнее, чем от 16 к 64.
         let (_, _, early) = image_diff(&shots[0].image, &shots[2].image);
         let (_, _, late) = image_diff(&shots[1].image, &shots[2].image);
         eprintln!("шум: 4 кадра против 64 — {early:.2}, 16 против 64 — {late:.2}");
         assert!(late < early, "накопление не убирает шум: {early} и {late}");
+    }
+
+    /// ReSTIR DI (путь ReSTIR, шаг 3) в зале с 48 лампами, только прямой свет (без
+    /// отскоков: их шум заслонил бы разницу): запасы прошлых кадров убирают шум (восьмой
+    /// кадр ближе к эталону, чем первый), потемнения нет, ошибок валидации нет.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn restir_lamps_hall() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 160,
+            height: 120,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/lamps.ron").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        PATH_BOUNCES.set(0);
+        PATH_FRAMES.set(32);
+        let reference = render_headless(&options, &scene);
+        PATH_FRAMES.set(0);
+        let mut shots = Vec::new();
+        for (frames, restir) in [(1, false), (1, true), (8, true)] {
+            LIVE_FRAMES.set(frames);
+            PATH_RESTIR.set(restir);
+            shots.push(render_headless(&options, &scene));
+        }
+        LIVE_FRAMES.set(0);
+        PATH_RESTIR.set(true);
+        PATH_BOUNCES.set(crate::path_ref::PATH_BOUNCES);
+        let reference = reference.expect("кадр эталона");
+        let shots: Vec<_> = shots
+            .into_iter()
+            .map(|s| s.expect("кадр режима «качество»"))
+            .collect();
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let named = [
+                ("hall-ref", &reference),
+                ("hall-plain", &shots[0]),
+                ("hall-restir1", &shots[1]),
+                ("hall-restir8", &shots[2]),
+            ];
+            for (name, image) in named {
+                let _ = std::fs::write(format!("{dir}/{name}.rgba"), &image.image.rgba);
+            }
+        }
+        let brightness = |image: &FrameImage| {
+            let sum: u64 = image
+                .rgba
+                .chunks(4)
+                .map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2]))
+                .sum();
+            sum as f64 / (image.rgba.len() / 4 * 3) as f64
+        };
+        let b_ref = brightness(&reference.image);
+        let noise: Vec<f64> = shots
+            .iter()
+            .map(|s| image_diff(&s.image, &reference.image).2)
+            .collect();
+        let bright: Vec<f64> = shots.iter().map(|s| brightness(&s.image)).collect();
+        eprintln!(
+            "зал: яркость эталона {b_ref:.1}; без ReSTIR {:.1} (отличие {:.2}), ReSTIR кадр 1 {:.1} ({:.2}), кадр 8 {:.1} ({:.2})",
+            bright[0], noise[0], bright[1], noise[1], bright[2], noise[2]
+        );
+        assert!(b_ref > 10.0, "зал чёрный: {b_ref}");
+        assert!(
+            (bright[0] / b_ref - 1.0).abs() < 0.1,
+            "кадр без ReSTIR и эталон разные по яркости: {} и {b_ref}",
+            bright[0]
+        );
+        // Шумный кадр ReSTIR чуть темнее: яркие точки обрезаются при выводе (выбор света
+        // без смещения — проверено накоплением). Заметно темнее — смещение запасов.
+        assert!(
+            bright[2] > b_ref * 0.85,
+            "ReSTIR темнеет: {} при эталоне {b_ref}",
+            bright[2]
+        );
+        assert!(
+            noise[2] < noise[1],
+            "запасы прошлых кадров не убирают шум: {} и {}",
+            noise[1],
+            noise[2]
+        );
     }
 
     /// Склад из стеллажей по 59 деталей рисуется тремя способами: детали — отдельные
