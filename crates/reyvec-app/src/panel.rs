@@ -75,6 +75,8 @@ pub(crate) enum PanelAction {
     PathRef(bool),
     /// Режим «качество»: трассировка путей каждый кадр (путь ReSTIR, шаг 2).
     PathLive(bool),
+    /// ReSTIR DI в режиме «качество» (путь ReSTIR, шаг 3).
+    PathRestir(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -221,6 +223,8 @@ pub(crate) struct PanelInfo<'a> {
     pub path_ref: bool,
     /// Режим «качество» включён.
     pub path_live: bool,
+    /// ReSTIR DI в режиме «качество» включён.
+    pub path_restir: bool,
     /// Сколько кадров он накопил.
     pub path_samples: Option<u32>,
     /// Разрешение сцены «3D» (7.14).
@@ -1128,6 +1132,23 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::PathLive(path_live));
+            }
+            let mut path_restir = info.path_restir;
+            if ui
+                .add_enabled(
+                    info.path_live,
+                    egui::Checkbox::new(&mut path_restir, "ReSTIR DI (свет ламп и солнца)"),
+                )
+                .on_hover_text(
+                    "Путь ReSTIR, шаг 3: прямой свет первой точки выбирается умно. Каждый \
+                 пиксель пробует 8 случайных точек ламп и солнца, берёт лучшее из своего \
+                 места в прошлом кадре и у 4 соседей — и проверяет лучом тени только одну. \
+                 Ламп может быть много, а лучей тени — один на пиксель. Выключите, чтобы \
+                 сравнить шум: тогда к каждой лампе свой луч",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::PathRestir(path_restir));
             }
             if let Some(n) = info.path_samples {
                 ui.label(format!("Эталон: накоплено кадров {n}"));
@@ -2153,6 +2174,7 @@ mod tests {
             glossy: true,
             path_ref: false,
             path_live: false,
+            path_restir: true,
             path_samples: None,
             space_scale: SpaceScale::Full,
             level_view: false,

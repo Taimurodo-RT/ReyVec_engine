@@ -22,7 +22,15 @@ pub(crate) struct PathFrame {
     pub count: u32,
     /// Режим «качество» (шаг 2): путь от буфера геометрии, без накопления.
     pub live: bool,
+    /// ReSTIR DI (шаг 3): `sums` — адрес буфера запасов.
+    pub restir: bool,
+    /// Сколько отскоков у пути.
+    pub bounces: u32,
 }
+
+/// Слов на запас пикселя (как RESTIR_WORDS в include/restir.slang) и слоёв запасов.
+const RESTIR_WORDS: u64 = 8;
+const RESTIR_LAYERS: u64 = 2;
 
 /// Сколько отскоков у пути.
 pub(crate) const PATH_BOUNCES: u32 = 4;
@@ -35,6 +43,13 @@ pub(crate) struct PathRef {
     /// накопления; эталон, если включён, важнее.
     pub live: bool,
     live_frame: u32,
+    /// ReSTIR DI в режиме «качество» (флажок на панели).
+    pub restir: bool,
+    /// Сколько отскоков у пути (тесты ставят 0 — только прямой свет).
+    pub bounces: u32,
+    restir_buffer: Option<(BufferId, u64)>,
+    /// Камера и размер прошлого кадра с запасами.
+    prev: Option<(glam::Mat4, (u32, u32))>,
     buffer: Option<(BufferId, u64)>,
     count: u32,
     key: Option<(glam::Mat4, (u32, u32), u64)>,
@@ -48,6 +63,10 @@ impl PathRef {
             enabled: false,
             live: false,
             live_frame: 0,
+            restir: true,
+            bounces: PATH_BOUNCES,
+            restir_buffer: None,
+            prev: None,
             buffer: None,
             count: 0,
             key: None,
@@ -79,14 +98,68 @@ impl PathRef {
         }
     }
 
-    /// Кадр режима «качество»: свой номер для случайных чисел.
-    pub fn live_frame(&mut self) -> PathFrame {
+    /// Кадр без режима «качество»: буфер запасов отдаётся.
+    pub fn forget_live(&mut self, res: &mut GpuResources) {
+        self.prev = None;
+        if let Some((id, _)) = self.restir_buffer.take() {
+            res.destroy_buffer(id);
+        }
+    }
+
+    /// Кадр режима «качество»: свой номер для случайных чисел и (с ReSTIR) буфер запасов.
+    /// Второе — камера прошлого кадра, если его запасы годятся (в слова сцены).
+    pub fn live_frame(
+        &mut self,
+        ctx: &GpuContext,
+        res: &mut GpuResources,
+        view_proj: glam::Mat4,
+        extent: vk::Extent2D,
+    ) -> (PathFrame, Option<glam::Mat4>) {
         self.live_frame = self.live_frame.wrapping_add(1);
-        PathFrame {
+        let mut frame = PathFrame {
             sums: 0,
             count: self.live_frame,
             live: true,
+            restir: false,
+            bounces: self.bounces,
+        };
+        if !self.restir {
+            self.forget_live(res);
+            return (frame, None);
         }
+        let size =
+            u64::from(extent.width) * u64::from(extent.height) * RESTIR_WORDS * 4 * RESTIR_LAYERS;
+        if self.restir_buffer.is_some_and(|(_, have)| have < size) {
+            self.forget_live(res);
+        }
+        if self.restir_buffer.is_none() {
+            match res.create_buffer(
+                ctx,
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                BufferMemory::GpuOnly,
+                "ReSTIR: запасы",
+            ) {
+                Ok(id) => self.restir_buffer = Some((id, size)),
+                Err(e) => {
+                    tracing::warn!("буфер запасов ReSTIR: {e}");
+                    self.restir = false;
+                    return (frame, None);
+                }
+            }
+        }
+        let Some((id, _)) = self.restir_buffer else {
+            return (frame, None);
+        };
+        frame.sums = res.buffer_address(id);
+        frame.restir = true;
+        let size = (extent.width, extent.height);
+        let prev = self
+            .prev
+            .filter(|&(_, s)| s == size)
+            .map(|(matrix, _)| matrix);
+        self.prev = Some((view_proj, size));
+        (frame, prev)
     }
 
     /// Готовит кадр: `view_proj` — камера, `extent` — размер картинки, `words` — сцена
@@ -136,6 +209,8 @@ impl PathRef {
             sums: res.buffer_address(id),
             count: self.count,
             live: false,
+            restir: false,
+            bounces: self.bounces,
         };
         self.count = self.count.saturating_add(1);
         Some(frame)

@@ -129,7 +129,10 @@ static const uint MESH_RAY = 57 + 16 * SUN_CASCADES;
 // Следом (опыт Р3, как MESH_DIRTY в space.rs): где раздел изменившихся квадратов «теней
 // 3D»; 0 — его нет.
 static const uint MESH_DIRTY = MESH_RAY + 1;
-static const uint MESH_HEADER_WORDS = MESH_RAY + 2;
+// Следом (ReSTIR DI, как MESH_PREV_VIEW_PROJ в space.rs): матрица камеры прошлого кадра и
+// слово «прошлый кадр годится».
+static const uint MESH_PREV_VIEW_PROJ = MESH_DIRTY + 1;
+static const uint MESH_HEADER_WORDS = MESH_PREV_VIEW_PROJ + 17;
 static const uint MESH_SHAPES = 52;
 static const uint MESH_SUN = 56;
 static const uint MESH_SUN_PROJ = 57;

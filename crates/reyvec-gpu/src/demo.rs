@@ -831,6 +831,8 @@ pub(crate) struct Demo {
     path_ref: crate::path_ref::PathRef,
     /// Его проход (raymarch_path.slang).
     space_path: vk::Pipeline,
+    /// Кандидаты ReSTIR DI режима «качество» (raymarch_restir.slang).
+    space_restir: vk::Pipeline,
     /// Счётчики лучей 3D включены (флажок на панели, 7.18д2).
     space_counters_on: bool,
     /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
@@ -1259,6 +1261,7 @@ impl Demo {
             space_reflect_blur: vk::Pipeline::null(),
             path_ref: crate::path_ref::PathRef::new(),
             space_path: vk::Pipeline::null(),
+            space_restir: vk::Pipeline::null(),
             space_counters_on: false,
             level_field_apart: true,
             space_free: true,
@@ -1649,6 +1652,11 @@ impl Demo {
                     &ctx.device,
                     layout,
                     shaders.compute("raymarch_path"),
+                )?;
+                demo.space_restir = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_restir"),
                 )?;
             }
             demo.bloom_down = build(
@@ -2345,6 +2353,22 @@ impl Demo {
     /// Включает и выключает режим «качество».
     pub fn set_path_live(&mut self, on: bool) {
         self.path_ref.live = on && self.space_path != vk::Pipeline::null();
+    }
+
+    /// Сколько отскоков у путей эталона и режима «качество» (тесты: 0 — только прямой свет).
+    #[cfg(test)]
+    pub fn set_path_bounces(&mut self, bounces: u32) {
+        self.path_ref.bounces = bounces;
+    }
+
+    /// ReSTIR DI в режиме «качество» включён.
+    pub fn path_restir(&self) -> bool {
+        self.path_ref.restir
+    }
+
+    /// Включает и выключает ReSTIR DI.
+    pub fn set_path_restir(&mut self, on: bool) {
+        self.path_ref.restir = on;
     }
 
     /// Сколько кадров эталон 3D уже накопил; `None` — он выключен.
@@ -4251,16 +4275,23 @@ impl Demo {
             );
             self.space_grid = packed.grid;
             // Эталон 3D сверяет сцену по словам до адресов кадра (они у ячеек кадров разные).
+            let mut restir_prev = None;
             if path_on {
+                self.path_ref.forget_live(res);
                 space_path = self
                     .path_ref
                     .prepare(ctx, res, view_proj, ray_extent, &packed.words);
             } else {
                 self.path_ref.forget(res);
-                if self.path_ref.live && !level {
-                    space_path = Some(self.path_ref.live_frame());
+                if self.path_ref.live && !level && self.space_restir != vk::Pipeline::null() {
+                    let (frame, prev) = self.path_ref.live_frame(ctx, res, view_proj, ray_extent);
+                    space_path = Some(frame);
+                    restir_prev = prev;
+                } else {
+                    self.path_ref.forget_live(res);
                 }
             }
+            crate::space::set_prev_view_proj(&mut packed.words, restir_prev);
             crate::space::set_view_proj(&mut packed.words, view_proj);
             crate::space::set_field(
                 &mut packed.words,
@@ -4507,6 +4538,7 @@ impl Demo {
             self.space_field.skip();
             self.space_stats = None;
             self.path_ref.forget(res);
+            self.path_ref.forget_live(res);
         }
         if let Some(counted) = self.space_counted_slots.get_mut(slot) {
             *counted = space_counters.is_some();
@@ -5123,7 +5155,7 @@ impl Demo {
                             edges: path.sums,
                             ..SpaceSlots::default()
                         },
-                        crate::path_ref::PATH_BOUNCES,
+                        path.bounces,
                     );
                     // Сумму читал и писал этот же проход прошлого кадра.
                     let order = [vk::MemoryBarrier2::default()
@@ -5393,6 +5425,52 @@ impl Demo {
                 (gbuffer, Access::ComputeSampled),
                 (out, Access::ComputeWrite),
             ];
+            // Запасы читают и пишут оба прохода, этот кадр и прошлый: барьер перед каждым.
+            let order = || {
+                [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )]
+            };
+            if path.restir {
+                let restir = self.space_restir;
+                graph.add_pass("ReSTIR: кандидаты", &uses, move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            gbuffer: p.texture(gbuffer),
+                            target: p.storage(out),
+                            meshes: path.count,
+                            edges: path.sums,
+                            ..SpaceSlots::default()
+                        },
+                        0,
+                    );
+                    let barrier = order();
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл буфер геометрии в чтение; буфер запасов удаляется
+                    // только отложенно, буфер сцены этого кадра жив, пока кадр рисуется;
+                    // барьер упорядочивает запасы с прошлым кадром.
+                    unsafe {
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&barrier),
+                        );
+                        bindless.bind_compute(d, cmd);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, restir);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                    }
+                });
+            }
+            let flags = path.bounces | PATH_LIVE | if path.restir { PATH_RESTIR } else { 0 };
             graph.add_pass("путь 3D", &uses, move |p| {
                 let push = space_push(
                     &camera,
@@ -5403,14 +5481,23 @@ impl Demo {
                         gbuffer: p.texture(gbuffer),
                         target: p.storage(out),
                         meshes: path.count,
+                        edges: path.sums,
                         ..SpaceSlots::default()
                     },
-                    crate::path_ref::PATH_BOUNCES | PATH_LIVE,
+                    flags,
                 );
+                let barrier = order();
                 let (d, cmd) = (p.device, p.cmd);
                 // SAFETY: граф перевёл буфер геометрии в чтение, а картинку в запись; буфер
-                // сцены этого кадра жив, пока кадр рисуется.
+                // сцены этого кадра жив, пока кадр рисуется; буфер запасов (если есть)
+                // удаляется только отложенно, барьер упорядочивает его с «кандидатами».
                 unsafe {
+                    if path.restir {
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&barrier),
+                        );
+                    }
                     bindless.bind_compute(d, cmd);
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
@@ -6496,6 +6583,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_reflect, None);
             ctx.device.destroy_pipeline(self.space_reflect_blur, None);
             ctx.device.destroy_pipeline(self.space_path, None);
+            ctx.device.destroy_pipeline(self.space_restir, None);
             ctx.device.destroy_pipeline(self.space_upscale, None);
             ctx.device.destroy_pipeline(self.space_present, None);
             ctx.device.destroy_pipeline(self.space_shade_present, None);
@@ -6542,6 +6630,7 @@ impl Demo {
         self.space_reflect = vk::Pipeline::null();
         self.space_reflect_blur = vk::Pipeline::null();
         self.space_path = vk::Pipeline::null();
+        self.space_restir = vk::Pipeline::null();
         self.space_upscale = vk::Pipeline::null();
         self.space_present = vk::Pipeline::null();
         self.space_shade_present = vk::Pipeline::null();
@@ -6912,6 +7001,8 @@ const CONE_TILE: u32 = 8;
 /// Флаг прохода «путь 3D»: режим «качество», путь от буфера геометрии (PATH_LIVE в
 /// raymarch_path.slang).
 const PATH_LIVE: u32 = 16;
+/// Флаг прохода «путь 3D»: прямой свет первой точки — ReSTIR DI (PATH_RESTIR).
+const PATH_RESTIR: u32 = 32;
 const SPACE_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
 const SHADOW3D_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;

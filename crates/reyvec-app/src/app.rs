@@ -510,6 +510,10 @@ impl App {
                 r.set_path_live(on);
                 tracing::info!("Качество 3D {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::PathRestir(on) => {
+                r.set_path_restir(on);
+                tracing::info!("ReSTIR DI {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::PathRef(on) => {
                 r.set_path_ref(on);
                 tracing::info!("Эталон 3D {}", if on { "вкл" } else { "выкл" });
@@ -815,6 +819,7 @@ impl App {
                 glossy: renderer.glossy(),
                 path_ref: renderer.path_ref(),
                 path_live: renderer.path_live(),
+                path_restir: renderer.path_restir(),
                 path_samples: renderer.path_samples(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
