@@ -9,8 +9,9 @@
 // (mesh_shadow.slang), пусто — 1e9. Карту читает map_shadow (include/shadow3d.slang).
 //
 // Карта печётся квадратами TILE×TILE (pc.cone) по несколько за кадр: квадрат с углом
-// (pc.gbuffer, pc.shadows) карты стороной pc.flags точек пишет в буфер `pc.edges` на место
-// pc.target (TILE² слов на квадрат), оттуда копирование кладёт его в картинку карты.
+// (pc.gbuffer, pc.shadows) карты стороной pc.flags точек пишет в буфер всей карты
+// `pc.edges` (по строкам), оттуда копирование кладёт его в картинку карты, а проходы
+// sun_envelope.slang считают по буферу запас.
 // Обратная матрица карты — в pc.inv0..inv3: точка карты с глубиной 1 — ближе к солнцу.
 
 #include "include/space.slang"
@@ -57,5 +58,7 @@ void cs_main(uint3 id : SV_DispatchThreadID)
         }
         t += max(h, 0.001);
     }
-    pc.edges[pc.target * tile * tile + id.y * tile + id.x] = asuint(depth);
+    if (pc.gbuffer + id.x >= pc.flags || pc.shadows + id.y >= pc.flags)
+        return;
+    pc.edges[(pc.shadows + id.y) * pc.flags + pc.gbuffer + id.x] = asuint(depth);
 }
