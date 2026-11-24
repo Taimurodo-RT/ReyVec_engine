@@ -34,6 +34,7 @@ mod model_params;
 mod outline;
 mod overlay;
 mod parts;
+pub(crate) mod project;
 mod project_files;
 mod ron_edit;
 mod shape_edit;
@@ -96,14 +97,23 @@ pub struct EditorConfig {
     pub max_seconds: Option<f64>,
     /// Закрыть окно после стольких кадров (для автопроверок).
     pub max_frames: Option<u64>,
+    /// Показать окно «Проекты» сразу после запуска (П.1).
+    pub start_screen: bool,
     /// Сохранить снимок окна в этот файл и закрыть окно (для проверки в CI).
     pub snapshot: Option<PathBuf>,
     /// Через сколько секунд после открытия делать снимок.
     pub snapshot_after: f64,
 }
 
+/// Чем закончилась работа редактора.
+pub struct EditorExit {
+    pub summary: RunSummary,
+    /// Открыть этот проект: редактор перезапускается на его папке (П.1).
+    pub reopen: Option<PathBuf>,
+}
+
 /// Открывает редактор и работает, пока его не закроют.
-pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
+pub fn run_editor(config: EditorConfig) -> Result<EditorExit, AppError> {
     let event_loop = EventLoop::new().map_err(|e| AppError::Window(e.to_string()))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let scene_text = config
@@ -133,8 +143,13 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
         .and_then(std::path::Path::parent)
         .map(files::list_scenes)
         .unwrap_or_default();
+    let mut ui = EditorUi::new(config.project.as_deref());
+    if config.start_screen {
+        ui.open_projects(true);
+    }
     let mut editor = Editor {
-        ui: EditorUi::new(config.project.as_deref()),
+        reopen: None,
+        ui,
         config,
         window: None,
         renderer: None,
@@ -193,20 +208,25 @@ pub fn run_editor(config: EditorConfig) -> Result<RunSummary, AppError> {
     }
     let end = editor.closed_at.unwrap_or_else(Instant::now);
     let seconds = end.duration_since(editor.start).as_secs_f64();
-    Ok(RunSummary {
-        frames: editor.frames,
-        adapter: editor.adapter.clone(),
-        average_fps: if seconds > 0.0 {
-            editor.frames as f64 / seconds
-        } else {
-            0.0
+    Ok(EditorExit {
+        summary: RunSummary {
+            frames: editor.frames,
+            adapter: editor.adapter.clone(),
+            average_fps: if seconds > 0.0 {
+                editor.frames as f64 / seconds
+            } else {
+                0.0
+            },
+            gpu: None,
         },
-        gpu: None,
+        reopen: editor.reopen.take(),
     })
 }
 
 struct Editor {
     config: EditorConfig,
+    /// Проект, который открыть после закрытия (перезапуском).
+    reopen: Option<PathBuf>,
     ui: EditorUi,
     renderer: Option<WindowRenderer>,
     window: Option<Arc<Window>>,
@@ -706,6 +726,13 @@ impl Editor {
             Action::Minimize => w.set_minimized(true),
             Action::ToggleMaximize => w.set_maximized(!w.is_maximized()),
             Action::Close => self.close_or_ask(event_loop),
+            Action::ShowProjects => self.ui.open_projects(false),
+            Action::OpenProject(dir) => {
+                // Окно «Проекты» само не даёт открыть другой проект с несохранённым.
+                tracing::info!("Открываю проект «{}»: перезапуск редактора", dir.display());
+                self.reopen = Some(dir);
+                self.close(event_loop);
+            }
             Action::ForceClose => self.close(event_loop),
             Action::SaveAndClose => {
                 if let Err(e) = self.ui.save_code() {

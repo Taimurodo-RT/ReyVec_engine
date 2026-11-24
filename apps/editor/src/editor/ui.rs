@@ -34,6 +34,7 @@ use super::theme::*;
 use super::viewport::{self, TOOLBAR_HEIGHT, Tool, View, Viewport};
 
 mod clay;
+mod projects;
 mod space;
 
 /// Сколько строк журнала держать в консоли редактора.
@@ -64,6 +65,10 @@ pub(crate) enum Action {
     Minimize,
     ToggleMaximize,
     Close,
+    /// Открыть окно «Проекты».
+    ShowProjects,
+    /// Открыть другой проект (редактор перезапускается на его папке).
+    OpenProject(std::path::PathBuf),
     /// Тащить окно за верхнюю полосу.
     DragWindow,
     /// Тянуть окно за край.
@@ -311,6 +316,8 @@ pub(crate) struct Info<'a> {
 
 /// Состояние интерфейса между кадрами.
 pub(crate) struct EditorUi {
+    /// Окно «Проекты» (П.1).
+    pub(crate) projects: Option<projects::ProjectsScreen>,
     workspace: usize,
     /// Открытая вкладка каждой области каждого пространства.
     tabs: Vec<[usize; 3]>,
@@ -416,6 +423,7 @@ impl EditorUi {
     /// `project`: папка проекта (в ней `assets` и `scenes`), если нашлась.
     pub(crate) fn new(project: Option<&Path>) -> Self {
         Self {
+            projects: None,
             workspace: START_WORKSPACE,
             tabs: vec![[0; 3]; WORKSPACES.len()],
             selected: None,
@@ -607,6 +615,7 @@ impl EditorUi {
             if self.asking_close {
                 self.close_dialog(&ctx, info);
             }
+            self.projects_dialog(&ctx, info);
             return;
         }
         let panel_frame = Frame::NONE.fill(PANEL);
@@ -637,6 +646,7 @@ impl EditorUi {
         if self.asking_close {
             self.close_dialog(&ctx, info);
         }
+        self.projects_dialog(&ctx, info);
     }
 
     /// В открытом скрипте несохранённые правки.
@@ -2498,6 +2508,15 @@ impl EditorUi {
         ui.menu_button(brand, |ui| {
             ui.set_min_width(180.0);
             ui.menu_button("Файл", |ui| {
+                if ui
+                    .button("Проекты…")
+                    .on_hover_text("Создать проект, открыть другой, недавние")
+                    .clicked()
+                {
+                    actions.push(Action::ShowProjects);
+                    ui.close();
+                }
+                ui.separator();
                 // Другую сцену — только когда правки этой сохранены и идёт правка.
                 let free = !info.dirty && info.play == PlayState::Edit && info.can_save;
                 let why = "Сначала сохраните правки (Ctrl+S) и остановите игру";
