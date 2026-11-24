@@ -2,7 +2,9 @@
 //! панели инструментов вокруг (Р.1 — каркас).
 //!
 //! Флаги:
-//! - `--scene-file <файл.ron>`: какую сцену открыть (по умолчанию `scenes/first-room.ron`);
+//! - `--project <папка>`: какой проект открыть (по умолчанию последний открытый, а без
+//!   него — пример движка рядом со сборкой); без флагов при запуске видно окно «Проекты»;
+//! - `--scene-file <файл.ron>`: какую сцену открыть (по умолчанию первую сцену проекта);
 //! - `--shape <файл.shape.ron>`: сразу открыть модель во «Формах» (для проверок);
 //! - `--assets`: сразу открыть «Ассеты» с проводником файлов (для проверок);
 //! - `--window-frame`: обычная рамка окна Windows вместо своей верхней полосы;
@@ -26,7 +28,8 @@ const HELP: &str = "\
 
 Запуск: reyvec-editor [флаги]
 
-  --scene-file <файл.ron>  какую сцену открыть (по умолчанию scenes\\first-room.ron)
+  --project <папка>      какой проект открыть (по умолчанию последний)
+  --scene-file <файл.ron>  какую сцену открыть (по умолчанию первую сцену проекта)
   --shape <файл>         сразу открыть модель во «Формах»
   --assets               сразу открыть «Ассеты» (проводник файлов проекта)
   --window-frame         обычная рамка окна Windows вместо своей верхней полосы
@@ -52,6 +55,7 @@ struct Args {
     validation: bool,
     gpu: Option<String>,
     scene_file: Option<String>,
+    project: Option<String>,
     shape: Option<String>,
     assets: bool,
     seconds: Option<f64>,
@@ -78,6 +82,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--no-vsync" => out.no_vsync = true,
             "--validation" => out.validation = true,
             "--assets" => out.assets = true,
+            "--project" => {
+                out.project = Some(it.next().ok_or("после --project нужна папка проекта")?);
+            }
             "--gpu" => out.gpu = Some(it.next().ok_or("после --gpu нужен номер или название")?),
             "--scene-file" => {
                 out.scene_file = Some(
@@ -122,6 +129,47 @@ fn project_dir() -> Option<PathBuf> {
         .map(|p| std::path::absolute(&p).unwrap_or(p))
 }
 
+/// Флаги, с которыми перезапустить редактор на другом проекте.
+struct Relaunch {
+    window_frame: bool,
+    no_vsync: bool,
+    validation: bool,
+    gpu: Option<String>,
+}
+
+impl Relaunch {
+    fn args(&self, project: &Path) -> Vec<std::ffi::OsString> {
+        let mut out: Vec<std::ffi::OsString> = vec!["--project".into(), project.into()];
+        for (on, flag) in [
+            (self.window_frame, "--window-frame"),
+            (self.no_vsync, "--no-vsync"),
+            (self.validation, "--validation"),
+        ] {
+            if on {
+                out.push(flag.into());
+            }
+        }
+        if let Some(g) = &self.gpu {
+            out.push("--gpu".into());
+            out.push(g.into());
+        }
+        out
+    }
+
+    /// Запустить редактор заново на проекте `project` (этот процесс сейчас закончится).
+    fn spawn(&self, project: &Path) {
+        let started = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .args(self.args(project))
+                .spawn()
+        });
+        match started {
+            Ok(_) => tracing::info!("Редактор перезапущен на «{}»", project.display()),
+            Err(e) => tracing::error!("Не перезапустить редактор: {e}"),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(a) => a,
@@ -149,10 +197,43 @@ fn main() -> ExitCode {
     if let Some(path) = &log.path {
         tracing::info!("Лог пишется в {}", path.display());
     }
-    let project = project_dir();
+    // Проект: из --project, иначе последний открытый, иначе пример движка рядом со сборкой.
+    let recent_path = editor::project::recent_path();
+    let mut recent = editor::project::Recent::load(&recent_path);
+    let project = match &args.project {
+        Some(p) => {
+            let p = std::path::absolute(p).unwrap_or_else(|_| PathBuf::from(p));
+            if !editor::project::is_project(&p) {
+                tracing::error!(
+                    "В «{}» нет проекта ReyVec: нужна папка scenes или файл project.ron",
+                    p.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            Some(p)
+        }
+        None if args.scene_file.is_none() => {
+            recent.last().map(Path::to_path_buf).or_else(project_dir)
+        }
+        None => project_dir(),
+    };
+    // Окно «Проекты» — при обычном запуске, не в проверках и не с явным проектом.
+    let start_screen = args.project.is_none()
+        && args.scene_file.is_none()
+        && args.shape.is_none()
+        && !args.assets
+        && args.snapshot.is_none()
+        && args.seconds.is_none()
+        && args.frames.is_none()
+        && !recent.skip_start;
+    if let Some(dir) = &project {
+        recent.touch(dir);
+        recent.save(&recent_path);
+    }
+    let project_name = project.as_deref().map(|d| editor::project::read(d).name);
     let scene_file = match (&args.scene_file, &project) {
         (Some(p), _) => Some(PathBuf::from(p)),
-        (None, Some(dir)) => Some(dir.join("scenes").join("first-room.ron")),
+        (None, Some(dir)) => editor::project::first_scene(dir),
         (None, None) => {
             tracing::warn!("Папка проекта не найдена, открываю встроенный пример сцены");
             None
@@ -167,10 +248,13 @@ fn main() -> ExitCode {
     // В отладочной сборке валидация включена всегда: так ошибки ловятся сразу.
     let validation = args.validation || cfg!(debug_assertions);
     let config = editor::EditorConfig {
-        title: format!("{} — редактор", reyvec_app::engine_title()),
+        title: match &project_name {
+            Some(name) => format!("{name} — {} — редактор", reyvec_app::engine_title()),
+            None => format!("{} — редактор", reyvec_app::engine_title()),
+        },
         gpu: reyvec_app::GpuOptions {
             validation,
-            gpu: args.gpu,
+            gpu: args.gpu.clone(),
         },
         vsync: !args.no_vsync,
         frameless: !args.window_frame,
@@ -181,6 +265,7 @@ fn main() -> ExitCode {
         }),
         assets: args.assets,
         project,
+        start_screen,
         max_seconds: args.seconds,
         max_frames: args.frames,
         snapshot: args.snapshot.map(|p| {
@@ -189,10 +274,20 @@ fn main() -> ExitCode {
         }),
         snapshot_after: args.snapshot_after.unwrap_or(3.0),
     };
+    let relaunch = Relaunch {
+        window_frame: args.window_frame,
+        no_vsync: args.no_vsync,
+        validation: args.validation,
+        gpu: args.gpu.clone(),
+    };
     let result = editor::run_editor(config);
     let errors = reyvec_app::validation_error_count();
     match result {
-        Ok(summary) => {
+        Ok(exit) => {
+            let summary = exit.summary;
+            if let Some(dir) = exit.reopen {
+                relaunch.spawn(&dir);
+            }
             tracing::info!(
                 "Редактор закрыт: {} кадров на «{}», в среднем {:.0} к/с",
                 summary.frames,
@@ -237,6 +332,33 @@ mod tests {
         assert!(parse("--seconds -1").is_err());
         assert!(parse("--frames x").is_err());
         assert!(parse("--что-то").is_err());
+    }
+
+    #[test]
+    fn relaunch_keeps_flags() {
+        let r = Relaunch {
+            window_frame: true,
+            no_vsync: false,
+            validation: false,
+            gpu: Some("radeon".into()),
+        };
+        let a: Vec<String> = r
+            .args(Path::new("D:/игры/Моя игра"))
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            a,
+            [
+                "--project",
+                "D:/игры/Моя игра",
+                "--window-frame",
+                "--gpu",
+                "radeon"
+            ]
+        );
+        assert_eq!(parse("--project x").unwrap().project.as_deref(), Some("x"));
+        assert!(parse("--project").is_err());
     }
 
     #[test]
