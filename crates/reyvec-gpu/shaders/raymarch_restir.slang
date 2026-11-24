@@ -63,7 +63,7 @@ void cs_main(uint3 id : SV_DispatchThreadID)
             builder_add(b, light, uv, target, target * float(total), 1.0);
         }
         int2 prev;
-        if (previous_pixel(p, w, h, prev))
+        if (previous_pixel(p, w, h, PREV_RESTIR, prev))
         {
             Reservoir old = reservoir_load(0u, prev, w, h);
             builder_merge(b, old, RESTIR_HISTORY * float(RESTIR_CANDIDATES), q, ray.dir, sm, g.x);

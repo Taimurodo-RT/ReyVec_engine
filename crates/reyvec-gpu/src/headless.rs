@@ -582,6 +582,7 @@ fn render(
             demo.set_path_ref(tests::PATH_FRAMES.get() > 0);
             demo.set_path_live(tests::LIVE_FRAMES.get() > 0);
             demo.set_path_restir(tests::PATH_RESTIR.get());
+            demo.set_path_denoise(tests::PATH_DENOISE.get());
             demo.set_path_bounces(tests::PATH_BOUNCES.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -962,6 +963,8 @@ pub(crate) mod tests {
         /// Отскоки путей эталона и режима «качество».
         pub(super) static PATH_BOUNCES: std::cell::Cell<u32> =
             const { std::cell::Cell::new(crate::path_ref::PATH_BOUNCES) };
+        /// Шумодав режима «качество».
+        pub(super) static PATH_DENOISE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// ReSTIR DI в режиме «качество».
         pub(super) static PATH_RESTIR: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Размытые отражения шероховатых материалов (Л2).
@@ -1442,15 +1445,20 @@ pub(crate) mod tests {
         }
         // Режим «качество»: без ReSTIR (один кадр) и с ним (восьмой кадр — запасы
         // прошлых кадров уже есть).
+        PATH_DENOISE.set(false);
         LIVE_FRAMES.set(1);
         PATH_RESTIR.set(false);
         let live = render_headless(&options, &scene);
         PATH_RESTIR.set(true);
         LIVE_FRAMES.set(8);
         let restir = render_headless(&options, &scene);
+        // Шумодав (шаг 5): восьмой кадр с памятью и размытием.
+        PATH_DENOISE.set(true);
+        let clean = render_headless(&options, &scene);
         LIVE_FRAMES.set(0);
         let live = live.expect("кадр режима «качество»");
         let restir = restir.expect("кадр режима «качество» с ReSTIR");
+        let clean = clean.expect("кадр режима «качество» с шумодавом");
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
         if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
             let named = [
@@ -1459,6 +1467,7 @@ pub(crate) mod tests {
                 ("p64", &shots[2]),
                 ("live", &live),
                 ("restir", &restir),
+                ("clean", &clean),
             ];
             for (name, image) in named {
                 let _ = std::fs::write(format!("{dir}/{name}.rgba"), &image.image.rgba);
@@ -1493,6 +1502,21 @@ pub(crate) mod tests {
         assert!(
             (b_restir / b_ref - 1.0).abs() < 0.15,
             "ReSTIR и эталон разные по яркости: {b_restir} и {b_ref}"
+        );
+        // Шумодав: яркость та же, а до эталона — вдвое ближе, чем шумный кадр.
+        let b_clean = brightness(&clean.image);
+        let (_, _, noisy) = image_diff(&restir.image, &shots[2].image);
+        let (_, _, denoised) = image_diff(&clean.image, &shots[2].image);
+        eprintln!(
+            "шумодав: яркость {b_clean:.1}; отличие от эталона без него {noisy:.2}, с ним {denoised:.2}"
+        );
+        assert!(
+            (b_clean / b_ref - 1.0).abs() < 0.1,
+            "шумодав меняет яркость: {b_clean} и {b_ref}"
+        );
+        assert!(
+            denoised * 2.0 < noisy,
+            "шумодав почти не убирает шум: {noisy} и {denoised}"
         );
         // Шум: от 4 кадров к 16 картинка меняется сильнее, чем от 16 к 64.
         let (_, _, early) = image_diff(&shots[0].image, &shots[2].image);
@@ -1529,6 +1553,7 @@ pub(crate) mod tests {
             cascades: false,
         };
         PATH_BOUNCES.set(0);
+        PATH_DENOISE.set(false);
         PATH_FRAMES.set(32);
         let reference = render_headless(&options, &scene);
         PATH_FRAMES.set(0);
@@ -1540,6 +1565,7 @@ pub(crate) mod tests {
         }
         LIVE_FRAMES.set(0);
         PATH_RESTIR.set(true);
+        PATH_DENOISE.set(true);
         PATH_BOUNCES.set(crate::path_ref::PATH_BOUNCES);
         let reference = reference.expect("кадр эталона");
         let shots: Vec<_> = shots
@@ -1594,6 +1620,30 @@ pub(crate) mod tests {
             "запасы прошлых кадров не убирают шум: {} и {}",
             noise[1],
             noise[2]
+        );
+        // Весь свет (с отскоками) с ReSTIR и шумодавом: яркость как у эталона.
+        PATH_FRAMES.set(32);
+        let full = render_headless(&options, &scene);
+        PATH_FRAMES.set(0);
+        LIVE_FRAMES.set(16);
+        let clean = render_headless(&options, &scene);
+        LIVE_FRAMES.set(0);
+        let (full, clean) = (
+            full.expect("кадр эталона"),
+            clean.expect("кадр с шумодавом"),
+        );
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            for (name, image) in [("hall-full", &full), ("hall-clean", &clean)] {
+                let _ = std::fs::write(format!("{dir}/{name}.rgba"), &image.image.rgba);
+            }
+        }
+        let (b_full, b_clean) = (brightness(&full.image), brightness(&clean.image));
+        let (_, _, off) = image_diff(&clean.image, &full.image);
+        eprintln!("зал целиком: эталон {b_full:.1}, шумодав {b_clean:.1}, отличие {off:.2}");
+        assert!(
+            (b_clean / b_full - 1.0).abs() < 0.15,
+            "шумодав в зале меняет яркость: {b_clean} и {b_full}"
         );
     }
 

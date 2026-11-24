@@ -26,7 +26,15 @@ pub(crate) struct PathFrame {
     pub restir: bool,
     /// Сколько отскоков у пути.
     pub bounces: u32,
+    /// Шумодав (шаг 5): адрес буфера его памяти, 0 — шумодава нет.
+    pub history: vk::DeviceAddress,
 }
+
+/// Что из прошлого кадра годится (как PREV_* в include/restir.slang).
+pub(crate) const PREV_RESTIR: u32 = 1;
+pub(crate) const PREV_HISTORY: u32 = 2;
+/// Слов памяти шумодава на пиксель (как HISTORY_WORDS в raymarch_denoise.slang).
+const HISTORY_WORDS: u64 = 10;
 
 /// Слов на запас пикселя (как RESTIR_WORDS в include/restir.slang) и слоёв запасов.
 const RESTIR_WORDS: u64 = 8;
@@ -48,6 +56,9 @@ pub(crate) struct PathRef {
     /// Сколько отскоков у пути (тесты ставят 0 — только прямой свет).
     pub bounces: u32,
     restir_buffer: Option<(BufferId, u64)>,
+    /// Шумодав режима «качество» (флажок на панели).
+    pub denoise: bool,
+    history_buffer: Option<(BufferId, u64)>,
     /// Камера и размер прошлого кадра с запасами.
     prev: Option<(glam::Mat4, (u32, u32))>,
     buffer: Option<(BufferId, u64)>,
@@ -66,6 +77,8 @@ impl PathRef {
             restir: true,
             bounces: PATH_BOUNCES,
             restir_buffer: None,
+            denoise: true,
+            history_buffer: None,
             prev: None,
             buffer: None,
             count: 0,
@@ -98,23 +111,26 @@ impl PathRef {
         }
     }
 
-    /// Кадр без режима «качество»: буфер запасов отдаётся.
+    /// Кадр без режима «качество»: буферы запасов и памяти шумодава отдаются.
     pub fn forget_live(&mut self, res: &mut GpuResources) {
         self.prev = None;
-        if let Some((id, _)) = self.restir_buffer.take() {
-            res.destroy_buffer(id);
+        for slot in [&mut self.restir_buffer, &mut self.history_buffer] {
+            if let Some((id, _)) = slot.take() {
+                res.destroy_buffer(id);
+            }
         }
     }
 
-    /// Кадр режима «качество»: свой номер для случайных чисел и (с ReSTIR) буфер запасов.
-    /// Второе — камера прошлого кадра, если его запасы годятся (в слова сцены).
+    /// Кадр режима «качество»: свой номер для случайных чисел, буфер запасов (с ReSTIR)
+    /// и буфер памяти шумодава. Второе — камера прошлого кадра и что из него годится
+    /// (биты PREV_*, в слова сцены), если он был того же размера.
     pub fn live_frame(
         &mut self,
         ctx: &GpuContext,
         res: &mut GpuResources,
         view_proj: glam::Mat4,
         extent: vk::Extent2D,
-    ) -> (PathFrame, Option<glam::Mat4>) {
+    ) -> (PathFrame, Option<(glam::Mat4, u32)>) {
         self.live_frame = self.live_frame.wrapping_add(1);
         let mut frame = PathFrame {
             sums: 0,
@@ -122,44 +138,40 @@ impl PathRef {
             live: true,
             restir: false,
             bounces: self.bounces,
+            history: 0,
         };
-        if !self.restir {
-            self.forget_live(res);
-            return (frame, None);
-        }
-        let size =
-            u64::from(extent.width) * u64::from(extent.height) * RESTIR_WORDS * 4 * RESTIR_LAYERS;
-        if self.restir_buffer.is_some_and(|(_, have)| have < size) {
-            self.forget_live(res);
-        }
-        if self.restir_buffer.is_none() {
-            match res.create_buffer(
-                ctx,
-                size,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                BufferMemory::GpuOnly,
-                "ReSTIR: запасы",
-            ) {
-                Ok(id) => self.restir_buffer = Some((id, size)),
-                Err(e) => {
-                    tracing::warn!("буфер запасов ReSTIR: {e}");
-                    self.restir = false;
-                    return (frame, None);
-                }
-            }
-        }
-        let Some((id, _)) = self.restir_buffer else {
-            return (frame, None);
-        };
-        frame.sums = res.buffer_address(id);
-        frame.restir = true;
         let size = (extent.width, extent.height);
-        let prev = self
+        let same = self
             .prev
             .filter(|&(_, s)| s == size)
             .map(|(matrix, _)| matrix);
         self.prev = Some((view_proj, size));
-        (frame, prev)
+        let pixels = u64::from(extent.width) * u64::from(extent.height);
+        let mut valid = 0;
+        if let Some((address, fresh)) = keep_buffer(
+            ctx,
+            res,
+            &mut self.restir_buffer,
+            self.restir,
+            pixels * RESTIR_WORDS * 4 * RESTIR_LAYERS,
+            "ReSTIR: запасы",
+        ) {
+            frame.sums = address;
+            frame.restir = true;
+            valid |= u32::from(!fresh) * PREV_RESTIR;
+        }
+        if let Some((address, fresh)) = keep_buffer(
+            ctx,
+            res,
+            &mut self.history_buffer,
+            self.denoise,
+            pixels * HISTORY_WORDS * 4 * 2,
+            "шумодав: память",
+        ) {
+            frame.history = address;
+            valid |= u32::from(!fresh) * PREV_HISTORY;
+        }
+        (frame, same.map(|m| (m, valid)))
     }
 
     /// Готовит кадр: `view_proj` — камера, `extent` — размер картинки, `words` — сцена
@@ -211,6 +223,7 @@ impl PathRef {
             live: false,
             restir: false,
             bounces: self.bounces,
+            history: 0,
         };
         self.count = self.count.saturating_add(1);
         Some(frame)
@@ -221,4 +234,44 @@ impl Default for PathRef {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Буфер не меньше `size`, пока `on`; иначе отдаётся. Адрес и «новый ли» (в новом нет
+/// прошлого кадра).
+fn keep_buffer(
+    ctx: &GpuContext,
+    res: &mut GpuResources,
+    slot: &mut Option<(BufferId, u64)>,
+    on: bool,
+    size: u64,
+    name: &str,
+) -> Option<(vk::DeviceAddress, bool)> {
+    if (!on || slot.is_some_and(|(_, have)| have < size))
+        && let Some((id, _)) = slot.take()
+    {
+        res.destroy_buffer(id);
+    }
+    if !on {
+        return None;
+    }
+    let mut fresh = false;
+    if slot.is_none() {
+        match res.create_buffer(
+            ctx,
+            size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            BufferMemory::GpuOnly,
+            name,
+        ) {
+            Ok(id) => {
+                *slot = Some((id, size));
+                fresh = true;
+            }
+            Err(e) => {
+                tracing::warn!("буфер «{name}»: {e}");
+                return None;
+            }
+        }
+    }
+    slot.map(|(id, _)| (res.buffer_address(id), fresh))
 }

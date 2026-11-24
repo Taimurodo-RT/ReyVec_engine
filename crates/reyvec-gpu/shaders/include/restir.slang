@@ -158,13 +158,18 @@ void builder_merge(inout ReservoirBuilder b, Reservoir other, float cap, float3 
     builder_add(b, other.light, other.uv, target, target * other.W * m, m);
 }
 
+// Что из прошлого кадра годится (слово после матрицы камеры прошлого кадра): запасы ReSTIR
+// и память шумодава (как PREV_* в space.rs).
+static const uint PREV_RESTIR = 1;
+static const uint PREV_HISTORY = 2;
+
 // Пиксель прошлого кадра для точки `p` (матрица камеры прошлого кадра — в разделе моделей);
-// false — прошлого кадра нет или точка вне его.
-bool previous_pixel(float3 p, uint w, uint h, out int2 px)
+// false — прошлого кадра нет, его данные `what` не годятся или точка вне него.
+bool previous_pixel(float3 p, uint w, uint h, uint what, out int2 px)
 {
     px = int2(-1, -1);
     uint at = pc.scene[7];
-    if (at == 0u || pc.scene[at + MESH_PREV_VIEW_PROJ + 16] == 0u)
+    if (at == 0u || (pc.scene[at + MESH_PREV_VIEW_PROJ + 16] & what) == 0u)
         return false;
     uint m = at + MESH_PREV_VIEW_PROJ;
     float4 clip = float4(0.0, 0.0, 0.0, 0.0);
