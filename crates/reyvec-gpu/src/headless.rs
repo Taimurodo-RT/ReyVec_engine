@@ -578,6 +578,7 @@ fn render(
             demo.set_shadow_reuse(tests::SHADOW_REUSE.get());
             demo.set_tensor_bench(tests::TENSOR_BENCH.get(), 0);
             demo.set_reflections(tests::REFLECTIONS.get());
+            demo.set_glossy(tests::GLOSSY.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -941,6 +942,8 @@ pub(crate) mod tests {
         pub(super) static SHADOW_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Отражения у блестящих материалов (Л1).
         pub(super) static REFLECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        /// Размытые отражения шероховатых материалов (Л2).
+        pub(super) static GLOSSY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Замер фильтра на тензорных ядрах (опыт Р4), картинка 1920×1088.
         pub(super) static TENSOR_BENCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Ответы замера фильтра последнего кадра.
@@ -1352,6 +1355,20 @@ pub(crate) mod tests {
             "отражения почти ничего не меняют: {changed}"
         );
         assert!(worst >= 64, "отражения слабые: {worst}");
+        // Размытые отражения (Л2): пол, тор и цилиндр шероховаты — без размытия их
+        // отражения резкие, кадр заметно другой.
+        GLOSSY.set(false);
+        let sharp = render_headless(&options, &scene);
+        GLOSSY.set(true);
+        let sharp = sharp.expect("кадр с резкими отражениями");
+        let (changed, worst, mean) = image_diff(&on.image, &sharp.image);
+        eprintln!(
+            "размытие отражений: отличается {changed} пикселей, наибольшая {worst}, в среднем {mean:.2}"
+        );
+        assert!(
+            changed * 50 >= pixels,
+            "размытие почти ничего не меняет: {changed}"
+        );
         // Сцена без блестящих материалов с включёнными отражениями — кадр тот же: проход
         // не запускается.
         let plain = HeadlessScene {

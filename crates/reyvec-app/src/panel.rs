@@ -69,6 +69,8 @@ pub(crate) enum PanelAction {
     ObjectBoxes(bool),
     /// Отражения у блестящих материалов (Л1).
     Reflections(bool),
+    /// Размытые отражения шероховатых материалов (Л2).
+    Glossy(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -209,6 +211,8 @@ pub(crate) struct PanelInfo<'a> {
     pub object_boxes: bool,
     /// Отражения у блестящих материалов (Л1).
     pub reflections: bool,
+    /// Размытые отражения шероховатых материалов (Л2).
+    pub glossy: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -1067,6 +1071,23 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::Reflections(reflections));
+            }
+            let mut glossy = info.glossy;
+            if ui
+                .add_enabled(
+                    info.reflections,
+                    egui::Checkbox::new(&mut glossy, "Размытые отражения 3D"),
+                )
+                .on_hover_text(
+                    "Л2: у шероховатого блеска (у материала «rough» больше 0) отражение \
+                 размыто — как у полированного металла или лака. Луч отражения идёт из \
+                 одного пикселя квадрата 2×2, потом картинка отражений размывается с \
+                 оглядкой на края (проходы «отражения 3D: размытие»): дальнее в отражении \
+                 мягче ближнего. Выключите, чтобы сравнить: тогда отражения везде резкие",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::Glossy(glossy));
             }
             let mut rt = info.space_rt.unwrap_or(false);
             let rt_box = ui.add_enabled(
@@ -2086,6 +2107,7 @@ mod tests {
             split_parts: true,
             object_boxes: true,
             reflections: true,
+            glossy: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

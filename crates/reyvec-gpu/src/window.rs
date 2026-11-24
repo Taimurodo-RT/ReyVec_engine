@@ -886,6 +886,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Размытые отражения шероховатых материалов (Л2): включены ли.
+    pub fn glossy(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.glossy())
+    }
+
+    /// Включает и выключает размытые отражения (Л2).
+    pub fn set_glossy(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_glossy(on);
+        }
+    }
+
     /// Шаг луча отсеивает предметы и по коробке (М.1в): включено ли.
     pub fn space_object_boxes(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.space_object_boxes())

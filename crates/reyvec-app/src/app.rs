@@ -502,6 +502,10 @@ impl App {
                 r.set_reflections(on);
                 tracing::info!("Отражения 3D {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::Glossy(on) => {
+                r.set_glossy(on);
+                tracing::info!("Размытые отражения 3D {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::ObjectBoxes(on) => {
                 r.set_space_object_boxes(on);
                 tracing::info!(
@@ -800,6 +804,7 @@ impl App {
                 split_parts: reyvec_sdf::shape3d::split_parts(),
                 object_boxes: renderer.space_object_boxes(),
                 reflections: renderer.reflections(),
+                glossy: renderer.glossy(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
                 level_render: renderer.level_render(),

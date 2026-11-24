@@ -593,6 +593,7 @@ impl Materials {
                 grid: false,
                 texture: 0,
                 shine: 0.0,
+                rough: 0.0,
             });
             self.list.len() as u32 - 1
         })
