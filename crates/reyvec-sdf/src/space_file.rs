@@ -323,6 +323,7 @@ impl SpaceScene {
                 texture: 0,
                 shine: m.shine,
                 rough: m.rough,
+                bulb: false,
             });
         }
         let mut object_materials = Vec::new();
@@ -403,6 +404,7 @@ impl SpaceScene {
                                     texture: texture.unwrap_or(0),
                                     shine: 0.0,
                                     rough: 0.0,
+                                    bulb: false,
                                 });
                                 materials.len() as u32 - 1
                             }
@@ -513,6 +515,7 @@ impl SpaceScene {
                     texture: 0,
                     shine: 0.0,
                     rough: 0.0,
+                    bulb: true,
                 });
                 materials.len() as u32 - 1
             }));

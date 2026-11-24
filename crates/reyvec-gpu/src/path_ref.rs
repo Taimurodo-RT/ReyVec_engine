@@ -18,8 +18,10 @@ use crate::resources::{BufferId, BufferMemory, GpuResources};
 pub(crate) struct PathFrame {
     /// Адрес буфера суммы.
     pub sums: vk::DeviceAddress,
-    /// Сколько кадров уже в сумме (0 — начать заново).
+    /// Сколько кадров уже в сумме (0 — начать заново); в режиме «качество» — номер кадра.
     pub count: u32,
+    /// Режим «качество» (шаг 2): путь от буфера геометрии, без накопления.
+    pub live: bool,
 }
 
 /// Сколько отскоков у пути.
@@ -29,6 +31,10 @@ pub(crate) const PATH_BOUNCES: u32 = 4;
 pub(crate) struct PathRef {
     /// Флажок на панели.
     pub enabled: bool,
+    /// Режим «качество» (путь ReSTIR, шаг 2): по пути на пиксель каждый кадр, без
+    /// накопления; эталон, если включён, важнее.
+    pub live: bool,
+    live_frame: u32,
     buffer: Option<(BufferId, u64)>,
     count: u32,
     key: Option<(glam::Mat4, (u32, u32), u64)>,
@@ -40,6 +46,8 @@ impl PathRef {
     pub fn new() -> Self {
         PathRef {
             enabled: false,
+            live: false,
+            live_frame: 0,
             buffer: None,
             count: 0,
             key: None,
@@ -68,6 +76,16 @@ impl PathRef {
         self.count = 0;
         if let Some((id, _)) = self.buffer.take() {
             res.destroy_buffer(id);
+        }
+    }
+
+    /// Кадр режима «качество»: свой номер для случайных чисел.
+    pub fn live_frame(&mut self) -> PathFrame {
+        self.live_frame = self.live_frame.wrapping_add(1);
+        PathFrame {
+            sums: 0,
+            count: self.live_frame,
+            live: true,
         }
     }
 
@@ -117,6 +135,7 @@ impl PathRef {
         let frame = PathFrame {
             sums: res.buffer_address(id),
             count: self.count,
+            live: false,
         };
         self.count = self.count.saturating_add(1);
         Some(frame)

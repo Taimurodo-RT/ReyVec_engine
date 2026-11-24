@@ -6,10 +6,11 @@
 // Путь пикселя: луч глаза через случайную точку пикселя (так же сглаживаются края),
 // дальше до PATH_BOUNCES отскоков. В каждой точке:
 // - свечение материала светит само;
-// - с долей Френеля (блеск, reflect_share) путь отражается зеркально, у шероховатых — в
-//   случайную сторону конуса (как пятно размытия Л2);
-// - иначе — рассеянный свет: явный луч к солнцу (случайная точка диска) и к каждой лампе
-//   (случайная точка шарика), лучи тени «да или нет», дальше отскок по косинусу.
+// - прямой свет с долей рассеянного (1 − доля Френеля): явный луч к солнцу (случайная
+//   точка диска) и к каждой лампе (случайная точка шарика), лучи тени «да или нет»;
+// - дальше с долей Френеля (блеск, reflect_share) путь отражается зеркально, у
+//   шероховатых — в случайную сторону конуса (как пятно размытия Л2), иначе — отскок по
+//   косинусу.
 // Ушёл в небо — свет неба: сверху тот же цвет, что у «света неба» быстрого режима, снизу —
 // GROUND; луч глаза и зеркальные отскоки видят само небо (sky), как в быстром режиме. Единицы те же, что у быстрого режима (shade_surface): цвет = альбедо × освещённость,
 // поэтому картинки можно сравнивать.
@@ -17,6 +18,10 @@
 // Сумма путей — в буфере по адресу pc.edges (4 числа на пиксель), число уже накопленных
 // кадров — pc.meshes (0 — начать заново), отскоков — pc.flags. Среднее пишется в картинку
 // pc.target, её растягивает «вывод».
+//
+// Режим «качество» (путь ReSTIR, шаг 2, бит PATH_LIVE в pc.flags): путь начинается с
+// точки буфера геометрии (лучи глаза и края — как у быстрого режима), по одному пути на
+// пиксель без накопления; pc.meshes — номер кадра (для случайных чисел). Сумма не пишется.
 //
 // Не видно: модели из треугольников (их нет в поле сцены).
 
@@ -41,6 +46,8 @@ static const float SUN_RADIUS = 0.04;
 static const float LAMP_RADIUS = 0.1;
 static const float3 SKY_TOP = float3(0.25, 0.30, 0.40);
 static const float3 SUN_COLOR = float3(1.0, 0.95, 0.85);
+
+static const uint PATH_LIVE = 16;
 
 static uint g_rng;
 
@@ -140,7 +147,9 @@ float3 direct_light(float3 q, float3 n, float3 dir, SurfaceMaterial sm)
 
 // Свет, пришедший в глаз по лучу из `origin` по `dir` (длина до дальней плоскости
 // `limit`). `spread` — ширина пикселя на метр пути, `px` — пиксель.
-float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint bounces)
+// `first` — готовое первое попадание (x — длина, −1 — небо; y — материал; zw — нормаль
+// в октаэдре), если `known`.
+float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint bounces, bool known, float4 first)
 {
     float3 light = float3(0.0, 0.0, 0.0);
     float3 weight = float3(1.0, 1.0, 1.0);
@@ -153,7 +162,15 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
     {
         bool plane;
         float3 n;
-        float2 hit = trace_eye(origin, dir, k == 0 ? limit : 80.0, plane, n);
+        float2 hit;
+        if (k == 0 && known)
+        {
+            hit = first.xy;
+            plane = true;
+            n = oct_decode(first.zw);
+        }
+        else
+            hit = trace_eye(origin, dir, k == 0 ? limit : 80.0, plane, n);
         if (hit.x < 0.0)
         {
             light += weight * (seen ? sky(dir) : sky_light(dir));
@@ -172,10 +189,18 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         basis(dir, side, up);
         float w = spread * travelled;
         SurfaceMaterial sm = surface_material(p, dir, hit.y, n, side * w, up * w, px, -1, false);
-        light += weight * sm.albedo * sm.glow;
+        // Шарик лампы, встреченный после рассеяния, не светит: свет лампы уже взят явным
+        // лучом к ней (иначе он учёлся бы дважды, и были бы яркие точки).
+        if (seen || (pc.scene[sm.at + 3] & MATERIAL_BULB) == 0)
+            light += weight * sm.albedo * sm.glow;
         float3 q = p + n * (0.01 + 0.002 * travelled);
         float shine = asfloat(pc.scene[sm.at + 6]);
-        if (shine > 0.0 && rnd() < reflect_share(shine, n, dir))
+        float share = shine > 0.0 ? reflect_share(shine, n, dir) : 0.0;
+        // Прямой свет — всегда, с долей рассеянного: случайным выбирается только, куда
+        // идёт путь дальше (иначе у зеркал редкие яркие точки рассеянного света).
+        if (share < 1.0)
+            light += weight * (1.0 - share) * direct_light(q, n, dir, sm);
+        if (rnd() < share)
         {
             // Зеркальный отскок: с вероятностью доли Френеля, поэтому вес тот же.
             float3 r = reflect(dir, n);
@@ -189,7 +214,7 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
             dir = r;
             continue;
         }
-        light += weight * direct_light(q, n, dir, sm);
+        // Рассеянный отскок: с вероятностью 1 − доля, вклад (1 − доля) × цвет.
         weight *= sm.albedo;
         seen = false;
         // Русская рулетка: тусклые пути обрываются, оставшиеся весят больше.
@@ -223,15 +248,22 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     int2 px = int2(id.xy);
     uint frame = pc.meshes;
     g_rng = hash(id.x * 1973u + id.y * 9277u + hash(frame) * 26699u) | 1u;
-    float2 jitter = float2(rnd(), rnd());
+    bool live = (pc.flags & PATH_LIVE) != 0;
+    float2 jitter = live ? float2(0.5, 0.5) : float2(rnd(), rnd());
     float2 screen = float2((float(px.x) + jitter.x) / float(w) * 2.0 - 1.0, 1.0 - (float(px.y) + jitter.y) / float(h) * 2.0);
     Ray ray = screen_ray(screen);
     Ray next = screen_ray(screen + float2(2.0 / float(w), 0.0));
     float spread = length(next.dir - ray.dir);
-    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, pc.flags & 15);
+    float4 first = live ? gbuffer_load(px) : float4(0.0, 0.0, 0.0, 0.0);
+    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, pc.flags & 15, live, first);
     // Светлячки (редкий путь в яркое) не дают NaN и бесконечностей.
     if (any(isnan(c)) || any(isinf(c)))
         c = float3(0.0, 0.0, 0.0);
+    if (live)
+    {
+        images[pc.target][id.xy] = float4(c, 1.0);
+        return;
+    }
     uint at = (id.y * w + id.x) * 4;
     float3 sum = c;
     if (frame > 0)

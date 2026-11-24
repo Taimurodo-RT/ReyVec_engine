@@ -580,6 +580,7 @@ fn render(
             demo.set_reflections(tests::REFLECTIONS.get());
             demo.set_glossy(tests::GLOSSY.get());
             demo.set_path_ref(tests::PATH_FRAMES.get() > 0);
+            demo.set_path_live(tests::PATH_LIVE.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -951,6 +952,8 @@ pub(crate) mod tests {
         pub(super) static REFLECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Эталон 3D: сколько кадров копить (снимается последний); 0 — эталон выключен.
         pub(super) static PATH_FRAMES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Режим «качество»: путь на пиксель каждый кадр, от буфера геометрии.
+        pub(super) static PATH_LIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Размытые отражения шероховатых материалов (Л2).
         pub(super) static GLOSSY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Замер фильтра на тензорных ядрах (опыт Р4), картинка 1920×1088.
@@ -1427,9 +1430,19 @@ pub(crate) mod tests {
             PATH_FRAMES.set(0);
             shots.push(shot.expect("кадр эталона"));
         }
+        PATH_LIVE.set(true);
+        let live = render_headless(&options, &scene);
+        PATH_LIVE.set(false);
+        let live = live.expect("кадр режима «качество»");
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
         if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
-            for (name, image) in [("fast", &fast), ("p4", &shots[0]), ("p64", &shots[2])] {
+            let named = [
+                ("fast", &fast),
+                ("p4", &shots[0]),
+                ("p64", &shots[2]),
+                ("live", &live),
+            ];
+            for (name, image) in named {
                 let _ = std::fs::write(format!("{dir}/{name}.rgba"), &image.image.rgba);
             }
         }
@@ -1447,6 +1460,13 @@ pub(crate) mod tests {
         assert!(
             (b_ref / b_fast - 1.0).abs() < 0.35,
             "эталон и быстрый режим слишком разные по яркости: {b_ref} и {b_fast}"
+        );
+        // Режим «качество» (шаг 2): один путь на пиксель — шумно, но в среднем тот же свет.
+        let b_live = brightness(&live.image);
+        eprintln!("яркость режима «качество»: {b_live:.1}");
+        assert!(
+            (b_live / b_ref - 1.0).abs() < 0.15,
+            "режим «качество» и эталон разные по яркости: {b_live} и {b_ref}"
         );
         // Шум: от 4 кадров к 16 картинка меняется сильнее, чем от 16 к 64.
         let (_, _, early) = image_diff(&shots[0].image, &shots[2].image);

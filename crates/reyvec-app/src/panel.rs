@@ -73,6 +73,8 @@ pub(crate) enum PanelAction {
     Glossy(bool),
     /// Эталон 3D: трассировка путей с накоплением (путь ReSTIR, шаг 1).
     PathRef(bool),
+    /// Режим «качество»: трассировка путей каждый кадр (путь ReSTIR, шаг 2).
+    PathLive(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -217,6 +219,8 @@ pub(crate) struct PanelInfo<'a> {
     pub glossy: bool,
     /// Эталон 3D включён.
     pub path_ref: bool,
+    /// Режим «качество» включён.
+    pub path_live: bool,
     /// Сколько кадров он накопил.
     pub path_samples: Option<u32>,
     /// Разрешение сцены «3D» (7.14).
@@ -1110,6 +1114,20 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::PathRef(path_ref));
+            }
+            let mut path_live = info.path_live;
+            if ui
+                .checkbox(&mut path_live, "Качество 3D: трассировка путей")
+                .on_hover_text(
+                    "Путь ReSTIR, шаг 2: тот же честный свет, что у эталона, но каждый кадр \
+                 заново — по одному пути света на пиксель, без накопления. Края и первая \
+                 точка — как у быстрого режима, дальше путь: свет солнца и ламп с мягкими \
+                 тенями, отражения, отражённый свет. Пока картинка шумит: шум уберут \
+                 следующие шаги (ReSTIR и шумодав). Смотрите на время прохода «путь 3D»",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::PathLive(path_live));
             }
             if let Some(n) = info.path_samples {
                 ui.label(format!("Эталон: накоплено кадров {n}"));
@@ -2134,6 +2152,7 @@ mod tests {
             reflections: true,
             glossy: true,
             path_ref: false,
+            path_live: false,
             path_samples: None,
             space_scale: SpaceScale::Full,
             level_view: false,
