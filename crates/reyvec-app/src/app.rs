@@ -498,6 +498,13 @@ impl App {
                     if on { "вкл" } else { "выкл" }
                 );
             }
+            PanelAction::SplitParts(on) => {
+                reyvec_sdf::shape3d::SPLIT_PARTS.store(on, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    "Детали моделей — отдельные предметы {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::PartBounds(on) => {
                 reyvec_sdf::shape3d::PART_BOUNDS.store(on, std::sync::atomic::Ordering::Relaxed);
                 tracing::info!(
@@ -779,6 +786,7 @@ impl App {
                 edge_far: renderer.edge_far(),
                 brick_shadows: renderer.brick_shadows(),
                 part_bounds: reyvec_sdf::shape3d::part_bounds(),
+                split_parts: reyvec_sdf::shape3d::split_parts(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
                 level_render: renderer.level_render(),

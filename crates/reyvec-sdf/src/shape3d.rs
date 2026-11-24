@@ -973,6 +973,144 @@ pub fn compile_with(shape: &Shape3, part_bounds: bool) -> Result<Program, Compil
     })
 }
 
+/// Деталей не меньше стольких — форма делится на детали-предметы ([`compile_parts`]).
+pub const SPLIT_MIN_PARTS: usize = 8;
+/// Деталей больше стольких — форма не делится (предел предметов сцены шейдера).
+pub const SPLIT_MAX_PARTS: usize = 256;
+
+/// Делить ли тяжёлые формы на детали ([`compile_parts`]); переключатель на панели, для
+/// сравнения времени.
+pub static SPLIT_PARTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Делятся ли тяжёлые формы на детали ([`SPLIT_PARTS`]).
+pub fn split_parts() -> bool {
+    SPLIT_PARTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Дерево формы → программы её деталей. Тяжёлая модель (стеллаж из 59 деталей) — один
+/// предмет сцены, и сетка отсева по коробкам предметов внутри неё не помогает: у стеллажа
+/// каждый шаг луча считал около 21 детали (склад, Роман 2026-11-24). Жёсткое объединение —
+/// просто наименьшее из частей, поэтому его части можно отдать сцене отдельными
+/// предметами: у каждой своя коробка в сетке, и луч считает только детали рядом. Делятся
+/// жёсткие объединения, зеркала и повторы (со сдвигами, поворотами и материалами вокруг);
+/// плавные швы, вырезания и пересечения остаются целыми деталями. Форма, в которой меньше
+/// [`SPLIT_MIN_PARTS`] или больше [`SPLIT_MAX_PARTS`] деталей, с полями слоя или
+/// кирпичами, остаётся одной программой, как у [`compile`].
+pub fn compile_parts(shape: &Shape3) -> Result<Vec<Program>, CompileError> {
+    if !split_parts() || holds_textures(shape) {
+        return compile(shape).map(|p| vec![p]);
+    }
+    let mut leaves = Vec::new();
+    split_leaves(shape, Placement::IDENTITY, 0, &mut leaves);
+    if leaves.len() < SPLIT_MIN_PARTS || leaves.len() > SPLIT_MAX_PARTS {
+        return compile(shape).map(|p| vec![p]);
+    }
+    let bounds_on = part_bounds();
+    leaves
+        .into_iter()
+        .map(|(leaf, at, material)| {
+            let mut out = Emit {
+                part_bounds: bounds_on,
+                ..Emit::default()
+            };
+            emit(&leaf, at, material, 0, &mut out)?;
+            if out.words.len() > MAX_PROGRAM_WORDS {
+                return Err(CompileError::TooLong);
+            }
+            Ok(Program {
+                words: out.words,
+                bounds: leaf.bounds().and_then(|b| world_sphere(at, b)),
+                bounds_box: tight_box(&leaf).and_then(|b| world_box(at, b)),
+                shadow_only: false,
+                no_shadow: false,
+                still: false,
+                fields: out.fields,
+                bricks: out.bricks,
+            })
+        })
+        .collect()
+}
+
+/// Детали формы для [`compile_parts`]: сама деталь, куда она поставлена и её материал.
+fn split_leaves(
+    shape: &Shape3,
+    at: Placement,
+    material: u32,
+    out: &mut Vec<(Shape3, Placement, u32)>,
+) {
+    if out.len() > SPLIT_MAX_PARTS {
+        return;
+    }
+    match shape {
+        Shape3::Union { shapes, smooth } if *smooth == 0.0 && !shapes.is_empty() => {
+            for s in shapes {
+                split_leaves(s, at, material, out);
+            }
+        }
+        Shape3::Move {
+            at: to,
+            turn,
+            scale,
+            shape,
+        } => split_leaves(shape, at.then(*to, *turn, scale.max(1e-6)), material, out),
+        Shape3::Paint { material, shape } => split_leaves(shape, at, *material, out),
+        Shape3::Animate { .. } => split_leaves(&shape.at_time(0.0), at, material, out),
+        Shape3::Mirror {
+            axis,
+            smooth,
+            shape,
+        } if *smooth == 0.0 => {
+            let s = Mat3::from_diagonal(axis.reflect(Vec3::ONE));
+            let mirrored = Placement {
+                rot: s * at.rot,
+                shift: s * at.shift,
+                scale: at.scale,
+            };
+            split_leaves(shape, at, material, out);
+            split_leaves(shape, mirrored, material, out);
+        }
+        Shape3::Repeat {
+            count,
+            step,
+            smooth,
+            shape,
+        } if *smooth == 0.0 && *count <= MAX_REPEAT => split_leaves(
+            &Shape3::repeat_union(*count, *step, 0.0, shape),
+            at,
+            material,
+            out,
+        ),
+        _ => out.push((shape.clone(), at, material)),
+    }
+}
+
+/// Шар-граница детали в мире: деталь в своей системе — `local = rot · p + shift`.
+fn world_sphere(at: Placement, (c, r): (Vec3, f32)) -> Option<(Vec3, f32)> {
+    let inv = at.rot.inverse();
+    inv.is_finite()
+        .then(|| (inv * (c - at.shift), r * at.scale))
+}
+
+/// Коробка детали в мире: коробка вокруг восьми углов её коробки.
+fn world_box(at: Placement, (lo, hi): (Vec3, Vec3)) -> Option<(Vec3, Vec3)> {
+    let inv = at.rot.inverse();
+    if !inv.is_finite() {
+        return None;
+    }
+    let (mut a, mut b) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for k in 0..8 {
+        let corner = Vec3::new(
+            if k & 1 == 0 { lo.x } else { hi.x },
+            if k & 2 == 0 { lo.y } else { hi.y },
+            if k & 4 == 0 { lo.z } else { hi.z },
+        );
+        let p = inv * (corner - at.shift);
+        a = a.min(p);
+        b = b.max(p);
+    }
+    Some((a, b))
+}
+
 /// Коробка формы для сетки отсева: её коробка, подрезанная коробкой шара-границы (обе
 /// честные, значит и пересечение).
 fn tight_box(shape: &Shape3) -> Option<(Vec3, Vec3)> {

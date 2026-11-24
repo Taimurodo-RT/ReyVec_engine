@@ -63,6 +63,8 @@ pub(crate) enum PanelAction {
     BrickShadows(bool),
     /// Границы частей внутри моделей (М.1).
     PartBounds(bool),
+    /// Детали тяжёлых моделей — отдельные предметы сетки отсева (склад).
+    SplitParts(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -197,6 +199,8 @@ pub(crate) struct PanelInfo<'a> {
     pub brick_shadows: bool,
     /// Границы частей внутри моделей (М.1).
     pub part_bounds: bool,
+    /// Детали тяжёлых моделей — отдельные предметы сетки отсева.
+    pub split_parts: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -1184,6 +1188,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 {
                     actions.push(PanelAction::PartBounds(parts));
                 }
+                let mut split = info.split_parts;
+                if ui
+                    .checkbox(&mut split, "Детали моделей — отдельные предметы")
+                    .on_hover_text(
+                        "Модель из многих деталей (стеллаж склада) делится на детали, и \
+                     сетка отсева знает каждую деталь отдельно: шаг луча считает только \
+                     детали рядом. Вид тот же. Выключите, чтобы сравнить время «лучей 3D» \
+                     с прежним, где модель была одним предметом",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::SplitParts(split));
+                }
                 ui.label("Замер краёв 3D").on_hover_text(
                     "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
                  По разнице времени строки «края 3D» с «как обычно» видно, сколько стоит \
@@ -2031,6 +2048,7 @@ mod tests {
             edge_far: false,
             brick_shadows: true,
             part_bounds: true,
+            split_parts: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

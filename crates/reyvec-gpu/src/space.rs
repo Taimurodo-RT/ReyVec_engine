@@ -331,6 +331,8 @@ pub(crate) struct PackCache {
     programs: Vec<CachedProgram>,
     /// С какими границами частей (М.1) собраны запомненные программы.
     part_bounds: bool,
+    /// Делились ли тяжёлые формы на детали ([`reyvec_sdf::shape3d::split_parts`]).
+    split: bool,
 }
 
 /// То же, что [`pack_with`], с готовым из `cache`; слова те же.
@@ -344,9 +346,11 @@ pub(crate) fn pack_cached(
 ) -> Packed {
     // Переключили границы частей (М.1) — запомненные программы и сетка собраны по-старому.
     let part_bounds = reyvec_sdf::shape3d::part_bounds();
-    if cache.part_bounds != part_bounds {
+    let split = reyvec_sdf::shape3d::split_parts();
+    if cache.part_bounds != part_bounds || cache.split != split {
         *cache = PackCache {
             part_bounds,
+            split,
             ..PackCache::default()
         };
     }
@@ -452,63 +456,92 @@ pub(crate) fn programs(frame: &SpaceFrame) -> Vec<Program> {
     programs_cached(frame, None)
 }
 
-/// Запомненная программа формы (8.8б): форма и что из неё вышло; `None` — не запоминается.
-type CachedProgram = Option<(Shape3, Result<Program, reyvec_sdf::shape3d::CompileError>)>;
+/// Запомненные программы формы (8.8б): форма и что из неё вышло (программы её деталей,
+/// [`reyvec_sdf::shape3d::compile_parts`]); `None` — не запоминается.
+type CachedProgram = Option<(
+    Shape3,
+    Result<Vec<Program>, reyvec_sdf::shape3d::CompileError>,
+)>;
 
-/// То же; форма, такая же, как на том же месте в прошлом кадре, берёт готовую программу
+/// То же; форма, такая же, как на том же месте в прошлом кадре, берёт готовые программы
 /// из `cache` (8.8б: неподвижные предметы не превращаются в программу каждый кадр).
+/// Тяжёлая модель становится несколькими предметами — по одному на деталь (сетка отсева
+/// видит детали). Если с деталями предметов больше [`MAX_OBJECTS`], формы не делятся.
 pub(crate) fn programs_cached(
     frame: &SpaceFrame,
+    cache: Option<&mut Vec<CachedProgram>>,
+) -> Vec<Program> {
+    let split = reyvec_sdf::shape3d::split_parts();
+    let programs = programs_with(frame, cache, split);
+    if split && programs.len() > MAX_OBJECTS {
+        return programs_with(frame, None, false);
+    }
+    programs
+}
+
+fn programs_with(
+    frame: &SpaceFrame,
     mut cache: Option<&mut Vec<CachedProgram>>,
+    split: bool,
 ) -> Vec<Program> {
     let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
     if let Some(cache) = cache.as_mut() {
         cache.truncate(total);
     }
-    let mut at = 0;
-    let mut compile_cached = |s: &Shape3| -> Result<Program, reyvec_sdf::shape3d::CompileError> {
-        let n = at;
-        at += 1;
-        let Some(cache) = cache.as_mut() else {
-            return compile(s);
-        };
-        if let Some(Some((source, program))) = cache.get(n)
-            && source == s
-        {
-            return program.clone();
-        }
-        let program = compile(s);
-        // Формы с полем слоя (и с ошибкой) не запоминаются: копия держала бы поле, и уровень не смог бы
-        // перепечь его на месте (`Arc::get_mut`, «поле занято прошлым кадром»).
-        let holds_field = program.as_ref().map_or(true, |p| !p.fields.is_empty());
-        let entry = (!holds_field).then(|| (s.clone(), program.clone()));
-        if n < cache.len() {
-            cache[n] = entry;
+    let compile_one = |s: &Shape3| {
+        if split {
+            reyvec_sdf::shape3d::compile_parts(s)
         } else {
-            cache.push(entry);
+            compile(s).map(|p| vec![p])
         }
-        program
     };
+    let mut at = 0;
+    let mut compile_cached =
+        |s: &Shape3| -> Result<Vec<Program>, reyvec_sdf::shape3d::CompileError> {
+            let n = at;
+            at += 1;
+            let Some(cache) = cache.as_mut() else {
+                return compile_one(s);
+            };
+            if let Some(Some((source, programs))) = cache.get(n)
+                && source == s
+            {
+                return programs.clone();
+            }
+            let programs = compile_one(s);
+            // Формы с полем слоя (и с ошибкой) не запоминаются: копия держала бы поле, и
+            // уровень не смог бы перепечь его на месте (`Arc::get_mut`, «поле занято
+            // прошлым кадром»).
+            let holds_field = programs
+                .as_ref()
+                .map_or(true, |p| p.iter().any(|p| !p.fields.is_empty()));
+            let entry = (!holds_field).then(|| (s.clone(), programs.clone()));
+            if n < cache.len() {
+                cache[n] = entry;
+            } else {
+                cache.push(entry);
+            }
+            programs
+        };
     // Флаги неподвижности (8.8б): по одному на предмет, потом на заменитель.
     let still = |i: usize| frame.still.get(i).copied().unwrap_or(false);
     let mut build =
         |shapes: &[Shape3], first: Option<usize>, shadow_only: bool, no_shadow: bool| {
-            shapes
-                .iter()
-                .enumerate()
-                .filter_map(|(i, s)| match compile_cached(s) {
-                    Ok(mut p) => {
-                        p.shadow_only = shadow_only;
-                        p.no_shadow = no_shadow;
-                        p.still = first.is_some_and(|f| still(f + i));
-                        Some(p)
+            let mut out = Vec::with_capacity(shapes.len());
+            for (i, s) in shapes.iter().enumerate() {
+                match compile_cached(s) {
+                    Ok(parts) => {
+                        for mut p in parts {
+                            p.shadow_only = shadow_only;
+                            p.no_shadow = no_shadow;
+                            p.still = first.is_some_and(|f| still(f + i));
+                            out.push(p);
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("форма 3D пропущена: {e}");
-                        None
-                    }
-                })
-                .collect::<Vec<Program>>()
+                    Err(e) => tracing::warn!("форма 3D пропущена: {e}"),
+                }
+            }
+            out
         };
     let mut programs = build(&frame.shapes, Some(0), false, false);
     programs.extend(build(&frame.proxies, Some(frame.shapes.len()), true, false));
@@ -1077,6 +1110,37 @@ mod tests {
         set_shadow_maps(&mut set, &[glam::Mat4::IDENTITY]);
         set_sun_maps(&mut set, &[glam::Mat4::IDENTITY]);
         assert_eq!(set, empty, "без раздела моделей заголовок цел");
+    }
+
+    /// Тяжёлые модели делятся на детали-предметы, а все сцены 3D всё равно помещаются в
+    /// предел предметов шейдера (иначе формы не делятся, и каждый кадр собирается дважды).
+    #[test]
+    fn scenes_split_into_parts_fit() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let scenes = [
+            ("factory", include_str!("../../../scenes/3d/factory.ron")),
+            ("forge", include_str!("../../../scenes/3d/forge.ron")),
+            ("mixed", include_str!("../../../scenes/3d/mixed.ron")),
+            ("models", include_str!("../../../scenes/3d/models.ron")),
+            ("space", include_str!("../../../scenes/3d/space.ron")),
+            ("stress", include_str!("../../../scenes/3d/stress.ron")),
+            ("vector", include_str!("../../../scenes/3d/vector.ron")),
+            (
+                "warehouse",
+                include_str!("../../../scenes/3d/warehouse.ron"),
+            ),
+        ];
+        for (name, text) in scenes {
+            let scene = reyvec_sdf::SpaceScene::parse_in(text, Some(dir)).unwrap();
+            let frame = scene.frame(1.0);
+            let split = programs_with(&frame, None, true).len();
+            let whole = programs_with(&frame, None, false).len();
+            eprintln!("{name}: предметов {whole}, с деталями {split}");
+            assert!(split <= MAX_OBJECTS, "{name}: {split} предметов");
+            if name == "warehouse" {
+                assert_eq!((whole, split), (9, 1 + 8 * 59));
+            }
+        }
     }
 
     #[test]

@@ -1017,6 +1017,58 @@ mod tests {
     }
 
     #[test]
+    fn warehouse_rack_splits_into_parts() {
+        // Стеллаж делится на 59 деталей-предметов: наименьшее из деталей — то же
+        // расстояние и тот же материал, что у целой формы; каждая деталь внутри своих шара
+        // и коробки (по ним сетка отсева решает, где деталь не нужна).
+        use crate::shape3d::{compile_parts, compile_with};
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/warehouse.ron");
+        let scene = SpaceScene::parse_in(text, Some(dir)).unwrap();
+        let frame = scene.frame(0.0);
+        // Стеллаж 5 повёрнут на 180°.
+        for rack in [&frame.shapes[1], &frame.shapes[5]] {
+            let whole = compile_with(rack, false).unwrap();
+            let parts = compile_parts(rack).unwrap();
+            assert_eq!(parts.len(), 59);
+            let center = rack.bounds().unwrap().0;
+            for x in -30..=30 {
+                for y in 0..=24 {
+                    for z in -8..=8 {
+                        let p = center
+                            + glam::Vec3::new(x as f32 * 0.1, y as f32 * 0.1 - 1.2, z as f32 * 0.1);
+                        let want = whole.distance(p);
+                        let mut best = (f32::MAX, 0);
+                        for part in &parts {
+                            let d = part.distance(p);
+                            if d.0 < best.0 {
+                                best = d;
+                            }
+                            let (c, r) = part.bounds.unwrap();
+                            assert!(d.0 >= p.distance(c) - r - 1e-4, "{p}: шар детали");
+                            let (lo, hi) = part.bounds_box.unwrap();
+                            let outside = (lo - p).max(p - hi).max(glam::Vec3::ZERO).length();
+                            assert!(
+                                outside == 0.0 || d.0 >= outside - 1e-4,
+                                "{p}: коробка детали"
+                            );
+                        }
+                        assert!(
+                            (want.0 - best.0).abs() <= 1e-5 * want.0.abs().max(1.0),
+                            "{p}: {want:?} {best:?}"
+                        );
+                        if want.0 < 0.05 {
+                            assert_eq!(want.1, best.1, "{p}: материал");
+                        }
+                    }
+                }
+            }
+        }
+        // Пол (одна плоскость) и лёгкие формы не делятся.
+        assert_eq!(compile_parts(&frame.shapes[0]).unwrap().len(), 1);
+    }
+
+    #[test]
     fn model_errors_say_what_is_wrong() {
         let scene = |meshes: &str| {
             format!(

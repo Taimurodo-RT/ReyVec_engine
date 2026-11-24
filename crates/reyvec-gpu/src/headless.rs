@@ -1301,11 +1301,14 @@ pub(crate) mod tests {
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
-    /// Границы частей внутри моделей (М.1): склад из стеллажей по 59 деталей рисуется
-    /// с границами и без — картинка та же, а деталей на расчёт сцены считается меньше.
+    /// Склад из стеллажей по 59 деталей рисуется тремя способами: детали — отдельные
+    /// предметы сетки отсева (как обычно), одним предметом с границами частей (М.1) и
+    /// одним предметом без границ. Картинка та же, а деталей на расчёт сцены считается
+    /// всё меньше. Флажки меняются в одном тесте, чтобы тесты не мешали друг другу.
     #[test]
     #[ignore = "нужен драйвер Vulkan"]
-    fn part_bounds_keep_the_frame() {
+    fn warehouse_parts_keep_the_frame() {
+        use reyvec_sdf::shape3d::{PART_BOUNDS, SPLIT_PARTS};
         use std::sync::atomic::Ordering;
         let options = GpuOptions {
             validation: true,
@@ -1330,28 +1333,60 @@ pub(crate) mod tests {
             cascades: false,
         };
         SPACE_COUNTERS.set(true);
-        let on = render_headless(&options, &scene);
-        reyvec_sdf::shape3d::PART_BOUNDS.store(false, Ordering::Relaxed);
-        let off = render_headless(&options, &scene);
-        reyvec_sdf::shape3d::PART_BOUNDS.store(true, Ordering::Relaxed);
+        let split = render_headless(&options, &scene);
+        SPLIT_PARTS.store(false, Ordering::Relaxed);
+        let bounds = render_headless(&options, &scene);
+        PART_BOUNDS.store(false, Ordering::Relaxed);
+        let whole = render_headless(&options, &scene);
+        PART_BOUNDS.store(true, Ordering::Relaxed);
+        SPLIT_PARTS.store(true, Ordering::Relaxed);
         SPACE_COUNTERS.set(false);
-        let (on, off) = (on.expect("кадр с границами"), off.expect("кадр без границ"));
-        let (changed, worst, _) = image_diff(&on.image, &off.image);
-        eprintln!("границы частей: отличается {changed} пикселей, наибольшая {worst}");
-        assert!(changed <= 20 && worst <= 8, "{changed} пикселей, {worst}");
+        let split = split.expect("кадр с деталями-предметами");
+        let bounds = bounds.expect("кадр с границами");
+        let whole = whole.expect("кадр без границ");
+        // Без границ шаги луча те же, отличий почти нет.
+        let (changed, worst, _) = image_diff(&bounds.image, &whole.image);
+        eprintln!("без границ: отличается {changed} пикселей, наибольшая {worst}");
+        assert!(
+            changed <= 20 && worst <= 8,
+            "без границ: {changed} пикселей, {worst}"
+        );
+        // Детали-предметы меняют длину шагов (сетка знает каждую деталь), и луч
+        // останавливается в другой точке в пределах точности попадания: на стыках
+        // деталей меняются отдельные точки, не больше 0,5 % кадра.
+        let (changed, worst, mean) = image_diff(&bounds.image, &split.image);
+        eprintln!(
+            "детали-предметы: отличается {changed} пикселей, наибольшая {worst}, в среднем {mean:.2}"
+        );
+        let pixels = (split.image.width * split.image.height) as usize;
+        assert!(
+            changed * 200 <= pixels && mean < 0.5,
+            "детали-предметы: {changed} пикселей, {mean}"
+        );
         let prims = |image: &HeadlessImage| {
             let rays = image.space_stats.expect("счётчики").rays.expect("лучи");
             let c = rays[crate::counters::PASS_MARCH];
             (c.prims, c.scene)
         };
-        let ((p_on, s_on), (p_off, s_off)) = (prims(&on), prims(&off));
-        let per = |p: u64, s: u64| p as f64 / s.max(1) as f64;
+        let per = |(p, s): (u64, u64)| p as f64 / s.max(1) as f64;
+        let (p_split, p_bounds, p_whole) = (prims(&split), prims(&bounds), prims(&whole));
         eprintln!(
-            "примитивов на расчёт сцены: с границами {:.1}, без {:.1}",
-            per(p_on, s_on),
-            per(p_off, s_off)
+            "примитивов на расчёт сцены: детали-предметы {:.1}, с границами {:.1}, без {:.1}",
+            per(p_split),
+            per(p_bounds),
+            per(p_whole)
         );
-        assert!(p_on * 2 < p_off, "{p_on} из {p_off}");
+        for (n, i) in [("детали", &split), ("границы", &bounds), ("без", &whole)] {
+            let rays = i.space_stats.expect("счётчики").rays.expect("лучи");
+            let row: Vec<_> = rays
+                .iter()
+                .zip(crate::counters::RAY_PASS_NAMES)
+                .map(|(c, name)| format!("{name} {}/{}/{}", c.steps, c.prims, c.objects))
+                .collect();
+            eprintln!("{n}: шаги/примитивы/предметы {}", row.join(", "));
+        }
+        assert!(p_bounds.0 * 2 < p_whole.0, "{p_bounds:?} из {p_whole:?}");
+        assert!(per(p_split) < per(p_bounds), "{p_split:?} и {p_bounds:?}");
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
