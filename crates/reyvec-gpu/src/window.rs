@@ -910,6 +910,18 @@ impl WindowRenderer {
         }
     }
 
+    /// ReSTIR GI режима «качество»: включён ли.
+    pub fn path_gi(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.path_gi())
+    }
+
+    /// Включает и выключает ReSTIR GI режима «качество».
+    pub fn set_path_gi(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_path_gi(on);
+        }
+    }
+
     /// Шумодав режима «качество»: включён ли.
     pub fn path_denoise(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.path_denoise())

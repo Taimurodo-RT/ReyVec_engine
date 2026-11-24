@@ -514,6 +514,10 @@ impl App {
                 r.set_path_denoise(on);
                 tracing::info!("Шумодав 3D {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::PathGi(on) => {
+                r.set_path_gi(on);
+                tracing::info!("ReSTIR GI {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::PathRestir(on) => {
                 r.set_path_restir(on);
                 tracing::info!("ReSTIR DI {}", if on { "вкл" } else { "выкл" });
@@ -825,6 +829,7 @@ impl App {
                 path_live: renderer.path_live(),
                 path_restir: renderer.path_restir(),
                 path_denoise: renderer.path_denoise(),
+                path_gi: renderer.path_gi(),
                 path_samples: renderer.path_samples(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
