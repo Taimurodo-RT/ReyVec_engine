@@ -71,6 +71,8 @@ pub(crate) enum PanelAction {
     Reflections(bool),
     /// Размытые отражения шероховатых материалов (Л2).
     Glossy(bool),
+    /// Эталон 3D: трассировка путей с накоплением (путь ReSTIR, шаг 1).
+    PathRef(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -213,6 +215,10 @@ pub(crate) struct PanelInfo<'a> {
     pub reflections: bool,
     /// Размытые отражения шероховатых материалов (Л2).
     pub glossy: bool,
+    /// Эталон 3D включён.
+    pub path_ref: bool,
+    /// Сколько кадров он накопил.
+    pub path_samples: Option<u32>,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -1088,6 +1094,25 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::Glossy(glossy));
+            }
+            let mut path_ref = info.path_ref;
+            if ui
+                .checkbox(&mut path_ref, "Эталон 3D: трассировка путей")
+                .on_hover_text(
+                    "Путь ReSTIR, шаг 1: честный свет без упрощений. Каждый кадр — по одному \
+                 пути света на пиксель (до 4 отскоков: прямой свет солнца и ламп с мягкими \
+                 тенями, отражения, свет, отражённый от стен и пола), и кадры складываются. \
+                 Пока камера стоит, картинка из шумной становится чистой — это и есть \
+                 правильный ответ, с ним сравниваются быстрые режимы. Время сцены на это \
+                 время замирает. Пошевелите камерой — накопление начнётся заново. \
+                 Модели из треугольников он пока не видит",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::PathRef(path_ref));
+            }
+            if let Some(n) = info.path_samples {
+                ui.label(format!("Эталон: накоплено кадров {n}"));
             }
             let mut rt = info.space_rt.unwrap_or(false);
             let rt_box = ui.add_enabled(
@@ -2108,6 +2133,8 @@ mod tests {
             object_boxes: true,
             reflections: true,
             glossy: true,
+            path_ref: false,
+            path_samples: None,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

@@ -24,6 +24,7 @@
 #include "include/march.slang"
 #include "include/shade3d.slang"
 #include "include/shadow3d.slang"
+#include "include/trace3d.slang"
 
 // Файл обязан иметь пару для рисования (build.rs собирает её у всех шейдеров); здесь
 // она не используется.
@@ -33,70 +34,13 @@ float4 fs_main(VertexOut input) : SV_Target
     return float4(0.0, 0.0, 0.0, 0.0);
 }
 
-// Как далеко идёт луч отражения, метров, и сколько у него шагов.
+// Как далеко идёт луч отражения, метров.
 static const float REFLECT_FAR = 80.0;
-static const int REFLECT_STEPS = 160;
 // Длина «до неба» в альфе результата.
 static const float REFLECT_SKY = 100.0;
 // Флаг констант этого прохода (Л2): размытые отражения включены. Бит освещения
 // SPACE_FLAG_DITHER, этому проходу он не нужен.
 static const uint REFLECT_FLAG_ROUGH = 64;
-
-// Шагание луча отражения из `origin` по `dir`, как march_pixel (перелёт с откатом,
-// плоскости формулой), но без конусов и полигонов. x — длина до попадания (−1 — небо),
-// y — материал; `normal` — нормаль, если попал в плоскость (`plane` — да).
-float2 march_reflect(float3 origin, float3 dir, out bool plane, out float3 normal)
-{
-    float2 hit_plane = plane_hit(origin, dir, normal);
-    float limit = min(REFLECT_FAR, hit_plane.x);
-    plane = false;
-    float t = 0.0;
-    float omega = 1.6;
-    float step = 0.0;
-    float previous = 0.0;
-    for (int i = 0; i < REFLECT_STEPS; i++)
-    {
-        count_step();
-        float3 at = origin + dir * t;
-        float2 s = scene_near(at, 0.25 + 0.001 * t, false, false);
-        float radius = abs(s.x);
-        if (omega > 1.0 && radius + previous < step)
-        {
-            t -= step - previous;
-            step = previous;
-            omega = 1.0;
-            continue;
-        }
-        // Точность грубее, чем у луча глаза: отражение в кривой поверхности и так
-        // растягивает точку на много пикселей.
-        if (s.x < 0.001 * max(t, 1.0))
-        {
-            float material = s.y;
-            if (material == LAYER_MATERIAL_LOOKUP)
-                material = level_field_material(pc.scene, pc.scene[13], at);
-            return float2(t, material);
-        }
-        step = s.x * omega;
-        previous = radius;
-        t += step;
-        if (t > limit)
-        {
-            if (omega <= 1.0)
-                break;
-            t -= step - previous;
-            step = previous;
-            omega = 1.0;
-            if (t > limit)
-                break;
-        }
-    }
-    if (hit_plane.x <= REFLECT_FAR)
-    {
-        plane = true;
-        return hit_plane;
-    }
-    return float2(-1.0, 0.0);
-}
 
 // Цвет того, что видно из точки `p` (нормаль `n`, луч глаза прошёл до неё `t` метров)
 // в зеркальном направлении `dir`. `spread` — ширина пикселя на метр пути (для сетки пола
@@ -107,7 +51,7 @@ float4 reflected(float3 p, float3 n, float3 dir, float t, float spread, int2 px)
     bool plane;
     float3 normal;
     count_ray();
-    float2 hit = march_reflect(from, dir, plane, normal);
+    float2 hit = trace_eye(from, dir, REFLECT_FAR, plane, normal);
     if (hit.x < 0.0)
         return float4(sky(dir), REFLECT_SKY);
     float3 at = from + dir * hit.x;

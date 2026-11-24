@@ -44,6 +44,7 @@ mod lab;
 mod level3d;
 mod lights;
 mod particles;
+mod path_ref;
 mod pipeline;
 mod resources;
 mod rt;
