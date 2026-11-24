@@ -1444,85 +1444,109 @@ pub(crate) mod tests {
         );
     }
 
-    /// Кэш солнца (опыт Р2) на заводе: тень солнца от неподвижного — из запечённой карты,
-    /// лучи тени шагают только по движущимся. Без ошибок Vulkan; картинка близка к живой
-    /// тени (карта даёт свою полутень), а форм на луч тени заметно меньше.
+    /// Кэш солнца (опыт Р2) на заводе и складе: карта неподвижного решает только то, что
+    /// знает точно, у края тени и в полутени — живой луч по всем предметам. Без ошибок
+    /// Vulkan; картинка почти та же, что без кэша (только шаги живого луча ложатся чуть
+    /// иначе), а форм на луч тени меньше. Склад — сцена, где первая карта (с полутенью
+    /// по карте) заметно размывала тени (Роман, 2026-11-24).
     #[test]
     #[ignore = "нужен драйвер Vulkan"]
-    fn factory_sun_cache_matches_live_shadows() {
+    fn sun_cache_matches_live_shadows() {
         let options = GpuOptions {
             validation: true,
             gpu: None,
         };
         let errors = validation_error_count();
-        let scene = HeadlessScene {
-            width: 960,
-            height: 540,
-            time: 1.0,
-            shader_error: false,
-            scene: DemoScene::Space,
-            msaa: Msaa::X4,
-            perceptual_edges: false,
-            fill: crate::FillMode::default(),
-            zoom: false,
-            files: crate::UserFiles {
-                space: Some(include_str!("../../../scenes/3d/factory.ron").into()),
-                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
-                ..Default::default()
-            },
-            cascades: false,
-        };
-        let render = |cache: bool| {
-            SUN_CACHE.set(cache);
-            SPACE_COUNTERS.set(true);
-            let frame = render_headless(&options, &scene);
-            SUN_CACHE.set(false);
-            SPACE_COUNTERS.set(false);
-            frame.expect("кадр")
-        };
-        let live = render(false);
-        let cached = render(true);
-        assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
-        let (changed, worst, mean) = image_diff(&live.image, &cached.image);
-        let total = live.image.rgba.len() / 4;
-        eprintln!(
-            "завод, кэш солнца против живой тени: отличается {changed} точек из {total} \
-             ({:.2} %), сильнее всего на {worst}, в среднем {mean:.3}",
-            changed as f64 * 100.0 / total as f64
-        );
-        let shadows = |f: &HeadlessImage| {
-            f.space_stats
-                .and_then(|s| s.rays)
-                .map(|r| r[crate::counters::PASS_SHADOWS])
-        };
-        let (Some(a), Some(b)) = (shadows(&live), shadows(&cached)) else {
-            panic!("нет счётчиков лучей");
-        };
-        for (name, c) in [("живая", a), ("кэш", b)] {
-            let per = |x: u64| x as f64 / c.rays.max(1) as f64;
+        let scenes = [
+            (
+                "завод",
+                include_str!("../../../scenes/3d/factory.ron"),
+                (960, 540),
+            ),
+            (
+                "склад",
+                include_str!("../../../scenes/3d/warehouse.ron"),
+                (480, 270),
+            ),
+        ];
+        for (name, text, (width, height)) in scenes {
+            let scene = HeadlessScene {
+                width,
+                height,
+                time: 1.0,
+                shader_error: false,
+                scene: DemoScene::Space,
+                msaa: Msaa::X4,
+                perceptual_edges: false,
+                fill: crate::FillMode::default(),
+                zoom: false,
+                files: crate::UserFiles {
+                    space: Some(text.into()),
+                    space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                    ..Default::default()
+                },
+                cascades: false,
+            };
+            let render = |cache: bool| {
+                SUN_CACHE.set(cache);
+                SPACE_COUNTERS.set(true);
+                let frame = render_headless(&options, &scene);
+                SUN_CACHE.set(false);
+                SPACE_COUNTERS.set(false);
+                frame.expect("кадр")
+            };
+            let live = render(false);
+            let cached = render(true);
+            assert_eq!(validation_error_count(), errors, "ошибки валидации Vulkan");
+            let (changed, worst, mean) = image_diff(&live.image, &cached.image);
+            let total = live.image.rgba.len() / 4;
+            let strong = live
+                .image
+                .rgba
+                .chunks(4)
+                .zip(cached.image.rgba.chunks(4))
+                .filter(|(a, b)| a.iter().zip(b.iter()).any(|(x, y)| x.abs_diff(*y) > 16))
+                .count();
             eprintln!(
-                "завод, тени 3D, {name}: лучей {}, шаг/луч {:.2}, объект/луч {:.2}, форма/луч {:.2}",
-                c.rays,
-                per(c.steps),
-                per(c.objects),
-                per(c.forms)
+                "{name}, кэш солнца против живой тени: отличается {changed} точек из {total}, \
+                 больше 16 — {strong}, сильнее всего на {worst}, в среднем {mean:.4}"
+            );
+            let shadows = |f: &HeadlessImage| {
+                f.space_stats
+                    .and_then(|s| s.rays)
+                    .map(|r| r[crate::counters::PASS_SHADOWS])
+            };
+            let (Some(a), Some(b)) = (shadows(&live), shadows(&cached)) else {
+                panic!("нет счётчиков лучей");
+            };
+            for (kind, c) in [("живая", a), ("кэш", b)] {
+                let per = |x: u64| x as f64 / c.rays.max(1) as f64;
+                eprintln!(
+                    "{name}, тени 3D, {kind}: лучей {}, шаг/луч {:.2}, объект/луч {:.2}, \
+                     форма/луч {:.2}",
+                    c.rays,
+                    per(c.steps),
+                    per(c.objects),
+                    per(c.forms)
+                );
+            }
+            // На lavapipe 2026-11-24: завод — в среднем 0,01 из 255, больше 16 — около
+            // десятка точек; форм на луч тени 8,58 → 6,32.
+            assert!(
+                mean < 0.05,
+                "{name}: кэш солнца меняет кадр: в среднем {mean:.4}"
+            );
+            assert!(
+                strong * 10_000 < total,
+                "{name}: кэш солнца заметно меняет {strong} точек"
+            );
+            assert!(
+                b.forms < a.forms,
+                "{name}: форм на лучи тени не меньше: {} против {}",
+                b.forms,
+                a.forms
             );
         }
-        // Карта даёт свою полутень (с обеих сторон края, как у карт солнца режима
-        // «треугольники»), живой луч — только снаружи края; поэтому кадр отличается
-        // по полутеням на ступень-другую, местами светлее (на lavapipe 2026-11-23, карта
-        // 2048: 14 % точек, в среднем 1,7 из 255, отдельные точки на 100–140).
-        assert!(changed > 0, "кэш солнца не изменил кадр: карта не читается");
-        assert!(
-            mean < 2.5,
-            "кэш солнца слишком меняет кадр: в среднем {mean:.3}"
-        );
-        assert!(
-            b.forms * 10 < a.forms * 6,
-            "форм на лучи тени не меньше: {} против {}",
-            b.forms,
-            a.forms
-        );
     }
 
     /// Тени из прошлого кадра (опыт Р3) на заводе: камера стоит, снимаемому кадру

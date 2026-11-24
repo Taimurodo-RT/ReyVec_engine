@@ -529,6 +529,61 @@ float map_shadow(float3 p, float3 n, uint square, bool sun, out bool inside)
     return lit / float(probes);
 }
 
+// Кэш солнца (опыт Р2): жёсткость конуса, с которой испечён запас карты (как
+// sun_cache::CONE). Живой луч тени солнца (k = 12) не тронут предметом, если тот не ближе
+// к лучу, чем t / 12 на расстоянии t; конус круче (10 < √(12² − 1)) — с запасом.
+static const float SUN_STATIC_CONE = 10.0;
+// Запас по глубине, метры: карта печётся с точностью около миллиметра.
+static const float SUN_STATIC_MARGIN = 0.004;
+
+// Кэш солнца (опыт Р2): что карта неподвижного точно знает о свете солнца в точке `p`
+// (начало луча тени). 1 — неподвижное точно не затеняет (ни тени, ни полутени: живой луч
+// может шагать только по движущимся), 0 — точка точно в полной тени неподвижного, −1 —
+// не знает (край тени, полутень, точка вне карты): нужен живой луч по всем предметам.
+//
+// В картинке карты две половины. Слева — глубина первой формы от солнца в точке карты
+// (−dot(q, SUN), пусто — 1e9). Справа — запас: в точке x не больше, чем
+// min по всем точкам b (глубина b + CONE · расстояние от x до b вбок), кроме самой x
+// (sun_envelope.slang). Луч из точки на глубине here вдоль солнца проходит от
+// заслоняющего b на расстоянии вбок L, и его полутени нет, если here − глубина b ≤
+// CONE · L. Четыре ближних точки карты сверяются точно (их расстояние вбок известно), все
+// остальные — по запасу ближней: от неё до точки луча меньше половины диагонали точки.
+int sun_static_known(float3 p)
+{
+    uint m = pc.scene[7] + MESH_SUN_PROJ;
+    float4 clip = map_clip(m, p);
+    if (clip.w <= 1e-4)
+        return -1;
+    float2 ndc = clip.xy / clip.w;
+    if (any(abs(ndc) > 0.98))
+        return -1;
+    Texture2D map = textures[pc.flags >> 16];
+    uint w, h;
+    map.GetDimensions(w, h);
+    float side = float(h);
+    float2 inv = 1.0 / float2(float(w), float(h));
+    float3 row0 = float3(asfloat(pc.scene[m]), asfloat(pc.scene[m + 4]), asfloat(pc.scene[m + 8]));
+    float texel = 2.0 / (length(row0) * side);
+    float here = -dot(p, SUN);
+    float2 b = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * side - 0.5;
+    float2 corner = clamp(floor(b), 0.0, side - 2.0);
+    float2 f = b - corner;
+    // Порядок Gather: w — (0, 0), z — (1, 0), x — (0, 1), y — (1, 1) от угла.
+    float4 ax = float4(f.x, 1.0 - f.x, 1.0 - f.x, f.x);
+    float4 ay = float4(1.0 - f.y, 1.0 - f.y, f.y, f.y);
+    float4 lateral = sqrt(ax * ax + ay * ay) * texel;
+    float4 depth = map.GatherRed(samplers[1], (corner + 1.0) * inv);
+    float4 envelope = map.GatherRed(samplers[1], (corner + float2(side, 0.0) + 1.0) * inv);
+    // Все четыре точки карты рядом заслонены заметно выше: луч идёт сквозь неподвижное.
+    if (all(depth < here - 0.02))
+        return 0;
+    if (any(here - depth + SUN_STATIC_MARGIN > SUN_STATIC_CONE * lateral))
+        return -1;
+    float4 bound = envelope - SUN_STATIC_CONE * lateral;
+    float best = max(max(bound.x, bound.y), max(bound.z, bound.w));
+    return best >= here + SUN_STATIC_MARGIN ? 1 : -1;
+}
+
 // Одна из четырёх долей света точки `surface` (на поверхности, нормаль `n`, `t` —
 // расстояние вдоль луча глаза): 0 — солнце, 1 — затенение в углах, 2 и 3 — две первые
 // лампы. Порядок — как в картинке теней (x, y, z, w).
@@ -572,6 +627,18 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
     // только вне карт. Вызов один на обе: шейдер не растёт.
     uint mesh_at = pc.scene[7];
     bool sun = part == 0;
+    // Кэш солнца (опыт Р2): карта неподвижного решает только то, что знает точно; у края
+    // тени и в полутени — живой луч по всем предметам, как без кэша.
+    if (sun && (pc.scene[11] & SCENE_SUN_STATIC) != 0 && (pc.flags & SPACE_FLAG_SHADOW_MAP) != 0)
+    {
+        int known = sun_static_known(p);
+        if (known == 0)
+            return 0.0;
+        g_skip_still = known > 0;
+        float light = soft_shadow(p, dir, far, k_hard);
+        g_skip_still = false;
+        return light;
+    }
     float by_map = 1.0;
     if ((pc.flags & SPACE_FLAG_SHADOW_MAP) != 0
         && (!sun || (mesh_at != 0 && pc.scene[mesh_at + MESH_SUN] != 0)))
@@ -579,17 +646,6 @@ float shadow_part(float3 surface, float3 n, float t, uint part)
         bool inside;
         uint square = sun ? min(pc.scene[mesh_at + 1], SHADOW_LAMPS) : part - 2;
         by_map = map_shadow(p, n, square, sun, inside);
-        // Кэш солнца (опыт Р2): карта знает тени только неподвижных предметов, движущиеся
-        // считает живой луч. Мягкая тень — минимум по предметам, поэтому и здесь меньшее.
-        if (inside && sun && (pc.scene[11] & SCENE_SUN_STATIC) != 0)
-        {
-            if (by_map <= 0.0)
-                return 0.0;
-            g_skip_still = true;
-            float moving = soft_shadow(p, dir, far, k_hard);
-            g_skip_still = false;
-            return min(by_map, moving);
-        }
         if (inside && (sun || (pc.scene[11] & SCENE_LAMP_MAPS_DOWN) != 0))
             return by_map;
         if (by_map <= 0.0)

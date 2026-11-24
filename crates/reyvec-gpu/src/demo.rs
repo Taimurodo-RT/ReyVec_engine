@@ -776,6 +776,8 @@ pub(crate) struct Demo {
     /// Кэш солнца (опыт Р2, `sun_bake.slang`): карта тени солнца от неподвижного.
     sun_cache: crate::sun_cache::SunCache,
     space_sun_bake: vk::Pipeline,
+    /// Запас карты кэша солнца (`sun_envelope.slang`).
+    space_sun_envelope: vk::Pipeline,
     /// Тени из прошлого кадра, пока камера стоит (опыт Р3).
     shadow_reuse: crate::shadow_reuse::ShadowReuse,
     /// Замер фильтра на тензорных ядрах (опыт Р4) и его конвейеры (`filter_plain.slang`,
@@ -1219,6 +1221,7 @@ impl Demo {
             bench_plain: vk::Pipeline::null(),
             bench_tensor: vk::Pipeline::null(),
             space_sun_bake: vk::Pipeline::null(),
+            space_sun_envelope: vk::Pipeline::null(),
             space_march_compute: vk::Pipeline::null(),
             space_compute_running: false,
             space_edge_find: vk::Pipeline::null(),
@@ -1554,6 +1557,11 @@ impl Demo {
                 &ctx.device,
                 res.bindless.pipeline_layout,
                 shaders.compute("sun_bake"),
+            )?;
+            demo.space_sun_envelope = crate::pipeline::compute_pipeline(
+                &ctx.device,
+                res.bindless.pipeline_layout,
+                shaders.compute("sun_envelope"),
             )?;
             demo.bench_plain = crate::pipeline::compute_pipeline(
                 &ctx.device,
@@ -4954,12 +4962,13 @@ impl Demo {
         // Кэш солнца (опыт Р2): квадраты карты неподвижного — до теней и краёв.
         if let Some(sun) = frame.space_sun {
             let bake = self.space_sun_bake;
+            let envelope = self.space_sun_envelope;
             graph.add_pass("кэш солнца", &[], move |p| {
                 // SAFETY: проход вне рисования; конвейер жив, пока жива сцена; картинка и
                 // буферы кэша удаляются отложенно, после конца кадра.
                 unsafe {
                     crate::sun_cache::SunCache::record(
-                        p.device, p.cmd, bindless, layout, bake, &sun,
+                        p.device, p.cmd, bindless, layout, bake, envelope, &sun,
                     );
                 }
             });
@@ -6168,6 +6177,7 @@ impl Demo {
                 .destroy_pipeline(self.space_edge_shadow_rays, None);
             ctx.device.destroy_pipeline(self.space_field_bake, None);
             ctx.device.destroy_pipeline(self.space_sun_bake, None);
+            ctx.device.destroy_pipeline(self.space_sun_envelope, None);
             ctx.device.destroy_pipeline(self.bench_plain, None);
             ctx.device.destroy_pipeline(self.bench_tensor, None);
             ctx.device.destroy_pipeline(self.space_shade, None);
@@ -6210,6 +6220,7 @@ impl Demo {
         self.space_edge_shadow_rays = vk::Pipeline::null();
         self.space_field_bake = vk::Pipeline::null();
         self.space_sun_bake = vk::Pipeline::null();
+        self.space_sun_envelope = vk::Pipeline::null();
         self.bench_plain = vk::Pipeline::null();
         self.bench_tensor = vk::Pipeline::null();
         self.space_shade = vk::Pipeline::null();
