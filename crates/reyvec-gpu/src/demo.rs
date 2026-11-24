@@ -822,6 +822,8 @@ pub(crate) struct Demo {
     space_free: bool,
     /// Сетка отсева по плотным коробкам (8.8а, флажок на панели).
     space_boxes: bool,
+    /// Шаг луча отсеивает предметы и по коробке (М.1в).
+    space_object_boxes: bool,
     /// Готовое из прошлых кадров для упаковки сцены «3D» (8.8б).
     space_pack_cache: crate::space::PackCache,
     /// Замер «краёв 3D» по частям (8.1).
@@ -1237,6 +1239,7 @@ impl Demo {
             level_field_apart: true,
             space_free: true,
             space_boxes: true,
+            space_object_boxes: true,
             space_pack_cache: Default::default(),
             edge_probe: EdgeProbe::Off,
             edge_creases: true,
@@ -2295,6 +2298,16 @@ impl Demo {
     /// Сетка по коробкам или по шарам, как до 8.8а (для сравнения времени).
     pub fn set_space_boxes(&mut self, on: bool) {
         self.space_boxes = on;
+    }
+
+    /// Шаг луча отсеивает предметы и по коробке (М.1в).
+    pub fn space_object_boxes(&self) -> bool {
+        self.space_object_boxes
+    }
+
+    /// Коробки предметов в шаге луча или только шары, как до М.1в (для сравнения).
+    pub fn set_space_object_boxes(&mut self, on: bool) {
+        self.space_object_boxes = on;
     }
 
     /// Тени через RT-ядра (опыт Р1): `None` — видеокарта не умеет, иначе включены ли.
@@ -4134,6 +4147,7 @@ impl Demo {
                 reyvec_sdf::grid3d::GridOptions {
                     free: self.space_free,
                     boxes: self.space_boxes,
+                    object_boxes: self.space_object_boxes,
                 },
                 &mut self.space_pack_cache,
             );

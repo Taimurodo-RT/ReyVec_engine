@@ -55,6 +55,7 @@ pub(crate) fn pack_jobs(programs: &[Program], jobs: &[BrickJob], size: i32) -> V
         GridOptions {
             free: false,
             boxes: true,
+            object_boxes: true,
         },
     ));
     out

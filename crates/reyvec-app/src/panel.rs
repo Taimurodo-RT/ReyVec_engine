@@ -65,6 +65,8 @@ pub(crate) enum PanelAction {
     PartBounds(bool),
     /// Детали тяжёлых моделей — отдельные предметы сетки отсева (склад).
     SplitParts(bool),
+    /// Шаг луча отсеивает предметы и по коробке (М.1в).
+    ObjectBoxes(bool),
     /// Разрешение сцены «3D» (7.14).
     SpaceScale(SpaceScale),
     /// 2.5D-вид уровня из файла (7.9).
@@ -201,6 +203,8 @@ pub(crate) struct PanelInfo<'a> {
     pub part_bounds: bool,
     /// Детали тяжёлых моделей — отдельные предметы сетки отсева.
     pub split_parts: bool,
+    /// Шаг луча отсеивает предметы и по коробке.
+    pub object_boxes: bool,
     /// Разрешение сцены «3D» (7.14).
     pub space_scale: SpaceScale,
     /// 2.5D-вид уровня из файла (7.9).
@@ -1201,6 +1205,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 {
                     actions.push(PanelAction::SplitParts(split));
                 }
+                let mut object_boxes = info.object_boxes;
+                if ui
+                    .checkbox(&mut object_boxes, "Коробки предметов в шаге луча")
+                    .on_hover_text(
+                        "Шаг луча пропускает предмет, если до него далеко, — раньше это \
+                     проверялось только по шару вокруг предмета. У длинной доски или балки \
+                     шар огромен, и её считали почти везде. Теперь ещё и по коробке. Вид \
+                     тот же. Выключите, чтобы сравнить время «лучей 3D»",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::ObjectBoxes(object_boxes));
+                }
                 ui.label("Замер краёв 3D").on_hover_text(
                     "Только для замера (8.1): проход «края 3D» пропускает одну часть работы. \
                  По разнице времени строки «края 3D» с «как обычно» видно, сколько стоит \
@@ -2049,6 +2066,7 @@ mod tests {
             brick_shadows: true,
             part_bounds: true,
             split_parts: true,
+            object_boxes: true,
             space_scale: SpaceScale::Full,
             level_view: false,
             level_render: LevelRender::Sdf,

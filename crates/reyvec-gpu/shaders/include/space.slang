@@ -84,6 +84,7 @@ static const uint MAX_OBJECTS = 4096;
 static const uint MAX_PROGRAM_WORDS = 16384;
 
 static const uint OBJECT_WORDS = 8; // как shape3d::OBJECT_WORDS
+static const uint OBJECT_BOX = 1u << 30; // как shape3d::OBJECT_BOX: в слове 3 коробка
 static const uint OBJECT_SHADOW_ONLY = 1; // как shape3d::OBJECT_SHADOW_ONLY
 static const uint OBJECT_NO_SHADOW = 8; // как shape3d::OBJECT_NO_SHADOW
 static const uint OBJECT_PLANE = 2; // как shape3d::OBJECT_PLANE
@@ -286,6 +287,16 @@ float2 scene_walk<let PICK : int>(float3 p, float near, bool proxies, bool plane
         {
             float3 center = float3(asfloat(pc.scene[w + 4]), asfloat(pc.scene[w + 5]), asfloat(pc.scene[w + 6]));
             float outside = length(p - center) - radius;
+            // Коробка вокруг той же середины (М.1в, shape3d::box_word): у доски и балки
+            // шар огромен, коробка почти по форме.
+            uint packed = pc.scene[w + 3];
+            if ((flags & OBJECT_PLANE) == 0 && (packed & OBJECT_BOX) != 0)
+            {
+                float3 h = float3(float(packed & 1023u), float((packed >> 10) & 1023u), float((packed >> 20) & 1023u)) * (radius / 1023.0);
+                // Со знаком: внутри коробки — минус до её стенки (не больше, чем внутри формы).
+                float3 q = abs(p - center) - h;
+                outside = max(outside, length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0));
+            }
             if (outside >= best.x)
             {
                 if (PICK != 0)
