@@ -2337,6 +2337,16 @@ impl Demo {
         self.path_ref.enabled = on && self.space_path != vk::Pipeline::null();
     }
 
+    /// Режим «качество» (трассировка путей каждый кадр) включён.
+    pub fn path_live(&self) -> bool {
+        self.path_ref.live
+    }
+
+    /// Включает и выключает режим «качество».
+    pub fn set_path_live(&mut self, on: bool) {
+        self.path_ref.live = on && self.space_path != vk::Pipeline::null();
+    }
+
     /// Сколько кадров эталон 3D уже накопил; `None` — он выключен.
     pub fn path_samples(&self) -> Option<u32> {
         self.path_ref.samples()
@@ -4247,6 +4257,9 @@ impl Demo {
                     .prepare(ctx, res, view_proj, ray_extent, &packed.words);
             } else {
                 self.path_ref.forget(res);
+                if self.path_ref.live && !level {
+                    space_path = Some(self.path_ref.live_frame());
+                }
             }
             crate::space::set_view_proj(&mut packed.words, view_proj);
             crate::space::set_field(
@@ -5092,7 +5105,7 @@ impl Demo {
             });
         }
         // Эталон 3D: вместо всех проходов — трассировка путей, сумма копится в буфере.
-        if let Some(path) = frame.space_path {
+        if let Some(path) = frame.space_path.filter(|p| !p.live) {
             let out = graph.create("эталон 3D", ext, SPACE_COLOR_FORMAT);
             let pipeline = self.space_path;
             graph.add_pass(
@@ -5370,6 +5383,41 @@ impl Demo {
                     d.cmd_end_rendering(cmd);
                 }
             });
+        }
+        // Режим «качество» (путь ReSTIR, шаг 2): от точки буфера геометрии — путь света,
+        // по одному на пиксель; тени, отражения и освещение быстрого режима не нужны.
+        if let Some(path) = frame.space_path.filter(|p| p.live) {
+            let out = graph.create("путь 3D", ext, SPACE_COLOR_FORMAT);
+            let pipeline = self.space_path;
+            let uses = [
+                (gbuffer, Access::ComputeSampled),
+                (out, Access::ComputeWrite),
+            ];
+            graph.add_pass("путь 3D", &uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        gbuffer: p.texture(gbuffer),
+                        target: p.storage(out),
+                        meshes: path.count,
+                        ..SpaceSlots::default()
+                    },
+                    crate::path_ref::PATH_BOUNCES | PATH_LIVE,
+                );
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл буфер геометрии в чтение, а картинку в запись; буфер
+                // сцены этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    bindless.bind_compute(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                }
+            });
+            return (gbuffer, out, None, Some(out), None, None);
         }
         // Тени и затенение в углах (7.4): мягкие, поэтому в половинном разрешении —
         // точка на квадрат 2×2 пикселя, вчетверо меньше лучей (7.6б). «Сцена»
@@ -6861,6 +6909,9 @@ const REFLECT_BLUR_VERTICAL: u32 = 2;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
 const CONE_TILE: u32 = 8;
 /// Освещённая сцена «3D» в уменьшенном разрешении (7.14), до растяжения на кадр.
+/// Флаг прохода «путь 3D»: режим «качество», путь от буфера геометрии (PATH_LIVE в
+/// raymarch_path.slang).
+const PATH_LIVE: u32 = 16;
 const SPACE_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
 const SHADOW3D_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;

@@ -898,6 +898,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Режим «качество» (трассировка путей каждый кадр): включён ли.
+    pub fn path_live(&self) -> bool {
+        self.demo.as_ref().is_some_and(|d| d.path_live())
+    }
+
+    /// Включает и выключает режим «качество».
+    pub fn set_path_live(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_path_live(on);
+        }
+    }
+
     /// Сколько кадров накопил эталон 3D; `None` — выключен.
     pub fn path_samples(&self) -> Option<u32> {
         self.demo.as_ref().and_then(|d| d.path_samples())

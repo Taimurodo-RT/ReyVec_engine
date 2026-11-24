@@ -1697,6 +1697,10 @@ pub struct Material3 {
     /// сцены — слово 7 записи материала.
     #[serde(default)]
     pub rough: f32,
+    /// Шарик лампы (путь ReSTIR): его свет уже учтён как свет лампы, поэтому путь,
+    /// рассеявшийся раньше, его свечение не считает. В файле сцены не пишется.
+    #[serde(skip)]
+    pub bulb: bool,
 }
 
 /// Флаг материала: сетка на поверхности.
@@ -1704,6 +1708,8 @@ pub const MATERIAL_GRID: u32 = 1;
 /// Флаг материала (8.14б2): у полигонов с ним цвет умножается на текстуру; номер
 /// текстуры — слово 5 записи материала.
 pub const MATERIAL_TEXTURED: u32 = 2;
+/// Флаг материала: шарик лампы ([`Material3::bulb`]).
+pub const MATERIAL_BULB: u32 = 4;
 
 /// Лампа: точечный источник света с мягкой тенью.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1923,7 +1929,9 @@ pub fn pack_scene_cached(
     for m in materials {
         out.extend(m.color.map(f32::to_bits));
         out.push(
-            (u32::from(m.grid) * MATERIAL_GRID) | (u32::from(m.texture != 0) * MATERIAL_TEXTURED),
+            (u32::from(m.grid) * MATERIAL_GRID)
+                | (u32::from(m.texture != 0) * MATERIAL_TEXTURED)
+                | (u32::from(m.bulb) * MATERIAL_BULB),
         );
         out.extend([
             m.glow.to_bits(),
@@ -2501,6 +2509,7 @@ mod tests {
             texture: 0,
             shine: 0.0,
             rough: 0.0,
+            bulb: false,
         }];
         let lamps = [Lamp3 {
             at: [1.0, 2.0, 3.0],

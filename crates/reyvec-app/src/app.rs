@@ -506,6 +506,10 @@ impl App {
                 r.set_glossy(on);
                 tracing::info!("Размытые отражения 3D {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::PathLive(on) => {
+                r.set_path_live(on);
+                tracing::info!("Качество 3D {}", if on { "вкл" } else { "выкл" });
+            }
             PanelAction::PathRef(on) => {
                 r.set_path_ref(on);
                 tracing::info!("Эталон 3D {}", if on { "вкл" } else { "выкл" });
@@ -810,6 +814,7 @@ impl App {
                 reflections: renderer.reflections(),
                 glossy: renderer.glossy(),
                 path_ref: renderer.path_ref(),
+                path_live: renderer.path_live(),
                 path_samples: renderer.path_samples(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),
