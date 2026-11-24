@@ -47,6 +47,9 @@ static const uint PATH_LIVE = 16;
 // Бит pc.flags (шаг 3): прямой свет первой точки — ReSTIR DI (include/restir.slang); запасы
 // этого кадра до соседей готовит проход «ReSTIR: кандидаты».
 static const uint PATH_RESTIR = 32;
+// Бит pc.flags (шаг 5): свет для шумодава — в pc.target свет без цвета первой точки, в
+// pc.cone (номер в images[]) — цвет первой точки и доля дымки.
+static const uint PATH_SPLIT = 64;
 // Сколько соседей берёт пиксель и как далеко (пикселей).
 static const uint RESTIR_NEIGHBORS = 4;
 static const float RESTIR_RADIUS = 16.0;
@@ -126,15 +129,16 @@ float3 restir_direct(int2 px, uint w, uint h, float3 p, float3 n, float3 q, floa
 // Свет, пришедший в глаз по лучу из `origin` по `dir` (длина до дальней плоскости
 // `limit`). `spread` — ширина пикселя на метр пути, `px` — пиксель.
 // `first` — готовое первое попадание (x — длина, −1 — небо; y — материал; zw — нормаль
-// в октаэдре), если `known`.
+// в октаэдре), если `known`. Дымку путь не добавляет: `first_dist` — длина до первой точки
+// (−1 — небо), `first_albedo` — её цвет (для шумодава, который чистит свет без цвета).
 float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint bounces, bool known, float4 first,
-           bool restir, uint w, uint h)
+           bool restir, uint w, uint h, out float first_dist, out float3 first_albedo)
 {
+    first_albedo = float3(1.0, 1.0, 1.0);
     float3 light = float3(0.0, 0.0, 0.0);
     float3 weight = float3(1.0, 1.0, 1.0);
     float travelled = 0.0;
     float first_t = -1.0;
-    float3 first_dir = dir;
     // Путь ещё не рассеивался (глаз или зеркальные отскоки): небо видно как небо.
     bool seen = true;
     for (uint k = 0; k <= bounces; k++)
@@ -168,6 +172,8 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         basis(dir, side, up);
         float width = spread * travelled;
         SurfaceMaterial sm = surface_material(p, dir, hit.y, n, side * width, up * width, px, -1, false);
+        if (k == 0)
+            first_albedo = max(sm.albedo, float3(0.03, 0.03, 0.03));
         // Шарик лампы, встреченный после рассеяния, не светит: свет лампы уже взят явным
         // лучом к ней (иначе он учёлся бы дважды, и были бы яркие точки).
         if (seen || (pc.scene[sm.at + 3] & MATERIAL_BULB) == 0)
@@ -211,13 +217,14 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         origin = q;
         dir = cosine_dir(n);
     }
-    // Дымка — как у быстрого режима, по первой точке.
-    if (first_t >= 0.0)
-    {
-        float fog = 1.0 - exp(-0.0025 * first_t * first_t * 0.1);
-        light = lerp(light, sky(first_dir), saturate(fog));
-    }
+    first_dist = first_t;
     return light;
+}
+
+// Дымка — как у быстрого режима, по первой точке (длина `t`, −1 — небо).
+float fog_at(float t)
+{
+    return t >= 0.0 ? saturate(1.0 - exp(-0.0025 * t * t * 0.1)) : 0.0;
 }
 
 [shader("compute")]
@@ -239,10 +246,23 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     Ray next = screen_ray(screen + float2(2.0 / float(w), 0.0));
     float spread = length(next.dir - ray.dir);
     float4 first = live ? gbuffer_load(px) : float4(0.0, 0.0, 0.0, 0.0);
-    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, pc.flags & 15, live, first, restir, w, h);
+    float first_dist;
+    float3 albedo;
+    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, pc.flags & 15, live, first, restir, w, h,
+                    first_dist, albedo);
     // Светлячки (редкий путь в яркое) не дают NaN и бесконечностей.
     if (any(isnan(c)) || any(isinf(c)))
         c = float3(0.0, 0.0, 0.0);
+    float fog = fog_at(first_dist);
+    if ((pc.flags & PATH_SPLIT) != 0)
+    {
+        // Для шумодава: свет без цвета первой точки и без дымки, цвет и дымка — отдельно
+        // (их соберёт «шумодав: сборка»).
+        images[pc.target][id.xy] = float4(c / albedo, 1.0);
+        images[pc.cone][id.xy] = float4(albedo, fog);
+        return;
+    }
+    c = lerp(c, sky(ray.dir), fog);
     if (live)
     {
         images[pc.target][id.xy] = float4(c, 1.0);

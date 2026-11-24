@@ -910,6 +910,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Шумодав режима «качество»: включён ли.
+    pub fn path_denoise(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.path_denoise())
+    }
+
+    /// Включает и выключает шумодав режима «качество».
+    pub fn set_path_denoise(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_path_denoise(on);
+        }
+    }
+
     /// ReSTIR DI в режиме «качество»: включён ли.
     pub fn path_restir(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.path_restir())

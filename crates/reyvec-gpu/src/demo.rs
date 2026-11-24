@@ -833,6 +833,8 @@ pub(crate) struct Demo {
     space_path: vk::Pipeline,
     /// Кандидаты ReSTIR DI режима «качество» (raymarch_restir.slang).
     space_restir: vk::Pipeline,
+    /// Шумодав режима «качество» (raymarch_denoise.slang).
+    space_denoise: vk::Pipeline,
     /// Счётчики лучей 3D включены (флажок на панели, 7.18д2).
     space_counters_on: bool,
     /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
@@ -1262,6 +1264,7 @@ impl Demo {
             path_ref: crate::path_ref::PathRef::new(),
             space_path: vk::Pipeline::null(),
             space_restir: vk::Pipeline::null(),
+            space_denoise: vk::Pipeline::null(),
             space_counters_on: false,
             level_field_apart: true,
             space_free: true,
@@ -1657,6 +1660,11 @@ impl Demo {
                     &ctx.device,
                     layout,
                     shaders.compute("raymarch_restir"),
+                )?;
+                demo.space_denoise = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_denoise"),
                 )?;
             }
             demo.bloom_down = build(
@@ -2359,6 +2367,16 @@ impl Demo {
     #[cfg(test)]
     pub fn set_path_bounces(&mut self, bounces: u32) {
         self.path_ref.bounces = bounces;
+    }
+
+    /// Шумодав режима «качество» включён.
+    pub fn path_denoise(&self) -> bool {
+        self.path_ref.denoise
+    }
+
+    /// Включает и выключает шумодав режима «качество».
+    pub fn set_path_denoise(&mut self, on: bool) {
+        self.path_ref.denoise = on;
     }
 
     /// ReSTIR DI в режиме «качество» включён.
@@ -4283,7 +4301,11 @@ impl Demo {
                     .prepare(ctx, res, view_proj, ray_extent, &packed.words);
             } else {
                 self.path_ref.forget(res);
-                if self.path_ref.live && !level && self.space_restir != vk::Pipeline::null() {
+                if self.path_ref.live
+                    && !level
+                    && self.space_restir != vk::Pipeline::null()
+                    && self.space_denoise != vk::Pipeline::null()
+                {
                     let (frame, prev) = self.path_ref.live_frame(ctx, res, view_proj, ray_extent);
                     space_path = Some(frame);
                     restir_prev = prev;
@@ -5054,6 +5076,98 @@ impl Demo {
         });
     }
 
+    /// Шумодав режима «качество» (путь ReSTIR, шаг 5, raymarch_denoise.slang): свет `light`
+    /// копится по времени (память — буфер `path.history`), потом размывается с оглядкой на
+    /// края (SVGF, DENOISE_PASSES проходов с шагом 1, 2, 4…) и умножается на цвет первой
+    /// точки `albedo` с дымкой в картинку `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn add_denoise_passes<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        bindless: &'a Bindless,
+        frame: FrameData,
+        path: crate::path_ref::PathFrame,
+        gbuffer: ImageHandle,
+        light: ImageHandle,
+        albedo: ImageHandle,
+        out: ImageHandle,
+    ) {
+        let layout = bindless.pipeline_layout;
+        let camera = frame.space_camera;
+        let ext = frame.space_extent;
+        let pipeline = self.space_denoise;
+        // (имя, вход, выход, вид прохода и шаг)
+        let mut steps = Vec::new();
+        let timed = graph.create("свет 3D: время", ext, SPACE_COLOR_FORMAT);
+        steps.push(("шумодав: время", light, timed, DENOISE_TEMPORAL));
+        let mut from = timed;
+        for k in 0..DENOISE_PASSES {
+            let to = graph.create("свет 3D: размытый", ext, SPACE_COLOR_FORMAT);
+            steps.push((
+                "шумодав: размытие",
+                from,
+                to,
+                DENOISE_ATROUS | (1 << k) << 8,
+            ));
+            from = to;
+        }
+        steps.push(("шумодав: сборка", from, out, DENOISE_COMPOSE));
+        for (name, src, dst, flags) in steps {
+            let compose = flags == DENOISE_COMPOSE;
+            let mut uses = vec![
+                (gbuffer, Access::ComputeSampled),
+                (src, Access::ComputeSampled),
+                (dst, Access::ComputeWrite),
+            ];
+            if compose {
+                uses.push((albedo, Access::ComputeSampled));
+            }
+            let temporal = flags == DENOISE_TEMPORAL;
+            graph.add_pass(name, &uses, move |p| {
+                let push = space_push(
+                    &camera,
+                    ext,
+                    frame.time,
+                    frame.space_address,
+                    SpaceSlots {
+                        gbuffer: p.texture(gbuffer),
+                        shadows: if compose { p.texture(albedo) } else { 0 },
+                        target: p.storage(dst),
+                        cone: p.texture(src),
+                        meshes: path.count,
+                        edges: path.history,
+                    },
+                    flags,
+                );
+                // Память читал и писал этот же проход прошлого кадра.
+                let order = [vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    )];
+                let (d, cmd) = (p.device, p.cmd);
+                // SAFETY: граф перевёл входы в чтение, а выход в запись; буфер памяти
+                // удаляется только отложенно, барьер упорядочивает его с прошлым кадром;
+                // буфер сцены этого кадра жив, пока кадр рисуется.
+                unsafe {
+                    if temporal {
+                        d.cmd_pipeline_barrier2(
+                            cmd,
+                            &vk::DependencyInfo::default().memory_barriers(&order),
+                        );
+                    }
+                    bindless.bind_compute(d, cmd);
+                    d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                    d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                }
+            });
+        }
+    }
+
     /// Проходы сцены «3D» до освещения: лучи, тени, края и (при уменьшенном разрешении или
     /// прямом выводе в окно `direct`, 7.20а) освещение. Оно красит свою картинку «цвет 3D»,
     /// а при прямом выводе и разрешении 100 % — сразу окно (с шумом против полос).
@@ -5470,8 +5584,32 @@ impl Demo {
                     }
                 });
             }
-            let flags = path.bounces | PATH_LIVE | if path.restir { PATH_RESTIR } else { 0 };
-            graph.add_pass("путь 3D", &uses, move |p| {
+            // С шумодавом (шаг 5) путь пишет свет без цвета первой точки и отдельно цвет с
+            // дымкой; картинку собирает «шумодав: сборка».
+            let denoise = path.history != 0;
+            let split = denoise.then(|| {
+                (
+                    graph.create("свет 3D", ext, SPACE_COLOR_FORMAT),
+                    graph.create("цвет первой точки 3D", ext, SPACE_COLOR_FORMAT),
+                )
+            });
+            let mut path_uses = vec![(gbuffer, Access::ComputeSampled)];
+            match split {
+                Some((light, albedo)) => {
+                    path_uses.push((light, Access::ComputeWrite));
+                    path_uses.push((albedo, Access::ComputeWrite));
+                }
+                None => path_uses.push((out, Access::ComputeWrite)),
+            }
+            let flags = path.bounces
+                | PATH_LIVE
+                | if path.restir { PATH_RESTIR } else { 0 }
+                | if denoise { PATH_SPLIT } else { 0 };
+            graph.add_pass("путь 3D", &path_uses, move |p| {
+                let (target, aux) = match split {
+                    Some((light, albedo)) => (p.storage(light), p.storage(albedo)),
+                    None => (p.storage(out), 0),
+                };
                 let push = space_push(
                     &camera,
                     ext,
@@ -5479,7 +5617,8 @@ impl Demo {
                     frame.space_address,
                     SpaceSlots {
                         gbuffer: p.texture(gbuffer),
-                        target: p.storage(out),
+                        target,
+                        cone: aux,
                         meshes: path.count,
                         edges: path.sums,
                         ..SpaceSlots::default()
@@ -5504,6 +5643,9 @@ impl Demo {
                     d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
                 }
             });
+            if let Some((light, albedo)) = split {
+                self.add_denoise_passes(graph, bindless, frame, path, gbuffer, light, albedo, out);
+            }
             return (gbuffer, out, None, Some(out), None, None);
         }
         // Тени и затенение в углах (7.4): мягкие, поэтому в половинном разрешении —
@@ -6584,6 +6726,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_reflect_blur, None);
             ctx.device.destroy_pipeline(self.space_path, None);
             ctx.device.destroy_pipeline(self.space_restir, None);
+            ctx.device.destroy_pipeline(self.space_denoise, None);
             ctx.device.destroy_pipeline(self.space_upscale, None);
             ctx.device.destroy_pipeline(self.space_present, None);
             ctx.device.destroy_pipeline(self.space_shade_present, None);
@@ -6631,6 +6774,7 @@ impl Demo {
         self.space_reflect_blur = vk::Pipeline::null();
         self.space_path = vk::Pipeline::null();
         self.space_restir = vk::Pipeline::null();
+        self.space_denoise = vk::Pipeline::null();
         self.space_upscale = vk::Pipeline::null();
         self.space_present = vk::Pipeline::null();
         self.space_shade_present = vk::Pipeline::null();
@@ -7003,6 +7147,13 @@ const CONE_TILE: u32 = 8;
 const PATH_LIVE: u32 = 16;
 /// Флаг прохода «путь 3D»: прямой свет первой точки — ReSTIR DI (PATH_RESTIR).
 const PATH_RESTIR: u32 = 32;
+/// Флаг прохода «путь 3D»: свет для шумодава отдельно от цвета первой точки (PATH_SPLIT).
+const PATH_SPLIT: u32 = 64;
+/// Виды проходов шумодава (как DENOISE_* в raymarch_denoise.slang) и число размытий.
+const DENOISE_TEMPORAL: u32 = 1;
+const DENOISE_ATROUS: u32 = 2;
+const DENOISE_COMPOSE: u32 = 3;
+const DENOISE_PASSES: u32 = 4;
 const SPACE_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
 const SHADOW3D_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;

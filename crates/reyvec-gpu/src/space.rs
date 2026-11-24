@@ -46,8 +46,8 @@ const MESH_RAY: usize = 57 + 16 * SUN_CASCADES;
 /// Где в разделе моделей начало раздела изменившихся квадратов «теней 3D» (опыт Р3,
 /// пишет [`set_dirty_tiles`]; 0 — его нет, считаются все точки).
 const MESH_DIRTY: usize = MESH_RAY + 1;
-/// Где в разделе моделей матрица камеры прошлого кадра (ReSTIR DI, путь ReSTIR шаг 3), за
-/// ней слово «прошлый кадр годится» (1 — запасы прошлого кадра можно брать).
+/// Где в разделе моделей матрица камеры прошлого кадра (путь ReSTIR, шаги 3 и 5), за ней
+/// слово «что из прошлого кадра годится» (биты `path_ref::PREV_*`).
 const MESH_PREV_VIEW_PROJ: usize = MESH_DIRTY + 1;
 /// Сторона квадрата «теней 3D» (точек половинного размера), который пересчитывается или
 /// берётся из прошлого кадра целиком (опыт Р3). Как DIRTY_TILE в `raymarch_shadow.slang`.
@@ -696,16 +696,14 @@ pub(crate) fn set_view_proj(words: &mut [u32], view_proj: glam::Mat4) {
     }
 }
 
-/// Камера прошлого кадра для ReSTIR DI (`None` — запасов прошлого кадра нет).
-pub(crate) fn set_prev_view_proj(words: &mut [u32], prev: Option<glam::Mat4>) {
+/// Камера прошлого кадра режима «качество» и что из прошлого кадра годится (биты
+/// `path_ref::PREV_*`); `None` — прошлого кадра нет.
+pub(crate) fn set_prev_view_proj(words: &mut [u32], prev: Option<(glam::Mat4, u32)>) {
     if let Some(at) = mesh_section(words) {
-        write_matrix(
-            words,
-            at + MESH_PREV_VIEW_PROJ,
-            prev.unwrap_or(glam::Mat4::IDENTITY),
-        );
+        let (matrix, valid) = prev.unwrap_or((glam::Mat4::IDENTITY, 0));
+        write_matrix(words, at + MESH_PREV_VIEW_PROJ, matrix);
         if let Some(w) = words.get_mut(at + MESH_PREV_VIEW_PROJ + 16) {
-            *w = u32::from(prev.is_some());
+            *w = valid;
         }
     }
 }
