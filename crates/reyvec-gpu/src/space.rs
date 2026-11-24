@@ -1120,6 +1120,7 @@ mod tests {
         let scenes = [
             ("factory", include_str!("../../../scenes/3d/factory.ron")),
             ("forge", include_str!("../../../scenes/3d/forge.ron")),
+            ("mirrors", include_str!("../../../scenes/3d/mirrors.ron")),
             ("mixed", include_str!("../../../scenes/3d/mixed.ron")),
             ("models", include_str!("../../../scenes/3d/models.ron")),
             ("space", include_str!("../../../scenes/3d/space.ron")),

@@ -69,6 +69,9 @@ pub struct MaterialEntry {
     pub glow: f32,
     #[serde(default)]
     pub grid: bool,
+    /// Блеск (Л1): 0 — не отражает, 1 — зеркало.
+    #[serde(default)]
+    pub shine: f32,
 }
 
 /// Лампа в файле. `bulb` — радиус светящегося шарика на месте лампы (0 — без шарика).
@@ -315,6 +318,7 @@ impl SpaceScene {
                 glow: m.glow,
                 grid: m.grid,
                 texture: 0,
+                shine: m.shine,
             });
         }
         let mut object_materials = Vec::new();
@@ -393,6 +397,7 @@ impl SpaceScene {
                                     glow: 0.0,
                                     grid: false,
                                     texture: texture.unwrap_or(0),
+                                    shine: 0.0,
                                 });
                                 materials.len() as u32 - 1
                             }
@@ -501,6 +506,7 @@ impl SpaceScene {
                     glow: BULB_GLOW,
                     grid: false,
                     texture: 0,
+                    shine: 0.0,
                 });
                 materials.len() as u32 - 1
             }));

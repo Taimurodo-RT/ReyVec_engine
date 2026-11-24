@@ -585,6 +585,18 @@ float4 gbuffer_load(int2 px)
     return unpack_gbuffer(textures_u[pc.gbuffer].Load(int3(px, 0)).xy);
 }
 
+// Картинка теней 3D (pc.shadows, младшие 16 бит). Старшие 16 бит у проходов «края 3D» и
+// «освещение 3D» — картинка отражений (Л1, raymarch_reflect.slang) плюс 1; 0 — её нет.
+uint shadow_slot()
+{
+    return pc.shadows & 0xffff;
+}
+
+uint reflect_slot()
+{
+    return pc.shadows >> 16;
+}
+
 int2 gbuffer_size()
 {
     uint w, h;

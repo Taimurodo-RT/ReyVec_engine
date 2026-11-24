@@ -874,6 +874,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Отражения у блестящих материалов сцены «3D» (Л1): включены ли.
+    pub fn reflections(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.reflections())
+    }
+
+    /// Включает и выключает отражения (Л1).
+    pub fn set_reflections(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_reflections(on);
+        }
+    }
+
     /// Шаг луча отсеивает предметы и по коробке (М.1в): включено ли.
     pub fn space_object_boxes(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.space_object_boxes())

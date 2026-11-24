@@ -577,6 +577,7 @@ fn render(
             demo.set_sun_cache(tests::SUN_CACHE.get());
             demo.set_shadow_reuse(tests::SHADOW_REUSE.get());
             demo.set_tensor_bench(tests::TENSOR_BENCH.get(), 0);
+            demo.set_reflections(tests::REFLECTIONS.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
         r.pool = d
@@ -938,6 +939,8 @@ pub(crate) mod tests {
         /// Тени из прошлого кадра (опыт Р3): снимаемому кадру предшествует кадр с той же
         /// камерой на 1/20 секунды раньше.
         pub(super) static SHADOW_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Отражения у блестящих материалов (Л1).
+        pub(super) static REFLECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Замер фильтра на тензорных ядрах (опыт Р4), картинка 1920×1088.
         pub(super) static TENSOR_BENCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Ответы замера фильтра последнего кадра.
@@ -1303,6 +1306,64 @@ pub(crate) mod tests {
             "различаются {differ} из {pixels} точек"
         );
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
+    /// Л1: блестящие материалы сцены «зеркала» отражают сцену (флажок «Отражения 3D»
+    /// меняет заметную часть кадра), а сцена без блестящих с ним не меняется вовсе.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn mirrors_reflect_the_scene() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 320,
+            height: 240,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/mirrors.ron").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let on = render_headless(&options, &scene).expect("кадр с отражениями");
+        REFLECTIONS.set(false);
+        let off = render_headless(&options, &scene);
+        REFLECTIONS.set(true);
+        let off = off.expect("кадр без отражений");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        // Зеркальная стена и хромовый шар занимают заметную часть кадра: отражение
+        // меняет их сильно, пол — слабо.
+        let (changed, worst, mean) = image_diff(&on.image, &off.image);
+        let pixels = (on.image.width * on.image.height) as usize;
+        eprintln!(
+            "отражения: отличается {changed} пикселей из {pixels}, наибольшая {worst}, в среднем {mean:.2}"
+        );
+        assert!(
+            changed * 5 >= pixels,
+            "отражения почти ничего не меняют: {changed}"
+        );
+        assert!(worst >= 64, "отражения слабые: {worst}");
+        // Сцена без блестящих материалов с включёнными отражениями — кадр тот же: проход
+        // не запускается.
+        let plain = HeadlessScene {
+            files: crate::UserFiles::default(),
+            ..scene
+        };
+        let a = render_headless(&options, &plain).expect("кадр примера");
+        REFLECTIONS.set(false);
+        let b = render_headless(&options, &plain);
+        REFLECTIONS.set(true);
+        let (changed, _, _) = image_diff(&a.image, &b.expect("кадр примера без отражений").image);
+        assert_eq!(changed, 0, "без блестящих материалов кадр не меняется");
     }
 
     /// Склад из стеллажей по 59 деталей рисуется тремя способами: детали — отдельные
