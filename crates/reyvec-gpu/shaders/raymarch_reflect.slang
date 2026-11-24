@@ -6,9 +6,16 @@
 // без затенения в углах. Ушёл в небо — цвет неба. Один отскок: в зеркале зеркало
 // видно матовым.
 //
-// Результат (RGBA16F, размер буфера геометрии): rgb — цвет отражения, a — 1, если
-// пиксель блестящий (0 — отражения нет). «Освещение 3D» и «края 3D» смешивают его с
-// цветом поверхности по доле Френеля (shade_surface в include/shade3d.slang).
+// Результат (RGBA16F, размер буфера геометрии): rgb — цвет отражения, a — длина луча
+// отражения до попадания (небо — REFLECT_SKY), 0 — отражения нет. «Освещение 3D» и «края
+// 3D» смешивают его с цветом поверхности по доле Френеля (shade_surface в
+// include/shade3d.slang).
+//
+// Шероховатые материалы (Л2, слово 7 записи материала): отражение потом размывает
+// raymarch_reflect_blur.slang, поэтому лучи у них — только в левом верхнем пикселе
+// квадрата 2×2 (вчетверо меньше лучей), остальные пишут 0 и получат цвет от соседей при
+// размытии. Так — только с флагом REFLECT_FLAG_ROUGH (иначе шероховатость не
+// учитывается, и отражения везде резкие).
 //
 // Полигоны (модели из треугольников) в отражениях не видны: их нет в поле сцены.
 
@@ -29,6 +36,11 @@ float4 fs_main(VertexOut input) : SV_Target
 // Как далеко идёт луч отражения, метров, и сколько у него шагов.
 static const float REFLECT_FAR = 80.0;
 static const int REFLECT_STEPS = 160;
+// Длина «до неба» в альфе результата.
+static const float REFLECT_SKY = 100.0;
+// Флаг констант этого прохода (Л2): размытые отражения включены. Бит освещения
+// SPACE_FLAG_DITHER, этому проходу он не нужен.
+static const uint REFLECT_FLAG_ROUGH = 64;
 
 // Шагание луча отражения из `origin` по `dir`, как march_pixel (перелёт с откатом,
 // плоскости формулой), но без конусов и полигонов. x — длина до попадания (−1 — небо),
@@ -89,7 +101,7 @@ float2 march_reflect(float3 origin, float3 dir, out bool plane, out float3 norma
 // Цвет того, что видно из точки `p` (нормаль `n`, луч глаза прошёл до неё `t` метров)
 // в зеркальном направлении `dir`. `spread` — ширина пикселя на метр пути (для сетки пола
 // в отражении).
-float3 reflected(float3 p, float3 n, float3 dir, float t, float spread, int2 px)
+float4 reflected(float3 p, float3 n, float3 dir, float t, float spread, int2 px)
 {
     float3 from = p + n * (0.01 + 0.002 * t);
     bool plane;
@@ -97,7 +109,7 @@ float3 reflected(float3 p, float3 n, float3 dir, float t, float spread, int2 px)
     count_ray();
     float2 hit = march_reflect(from, dir, plane, normal);
     if (hit.x < 0.0)
-        return sky(dir);
+        return float4(sky(dir), REFLECT_SKY);
     float3 at = from + dir * hit.x;
     float total = t + hit.x;
     if (!plane)
@@ -119,7 +131,8 @@ float3 reflected(float3 p, float3 n, float3 dir, float t, float spread, int2 px)
     float3 side = normalize(cross(dir, abs(dir.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0)));
     float3 up = cross(side, dir);
     float w = spread * total;
-    return shade_surface(at, dir, total, hit.y, normal, shadows, side * w, up * w, px, -1, false);
+    float3 color = shade_surface(at, dir, total, hit.y, normal, shadows, side * w, up * w, px, -1, false);
+    return float4(color, max(hit.x, 1e-3));
 }
 
 [shader("compute")]
@@ -136,7 +149,9 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     if (g.x >= 0.0)
     {
         uint material = min(uint(g.y + 0.5), max(pc.scene[3], 1) - 1);
-        if (material_shine(material) > 0.0)
+        bool skip = (pc.flags & REFLECT_FLAG_ROUGH) != 0 && material_rough(material) > 0.0
+            && any((px & 1) != 0);
+        if (material_shine(material) > 0.0 && !skip)
         {
             float2 screen = float2((float(px.x) + 0.5) / float(w) * 2.0 - 1.0, 1.0 - (float(px.y) + 0.5) / float(h) * 2.0);
             Ray ray = screen_ray(screen);
@@ -145,7 +160,7 @@ void cs_main(uint3 id : SV_DispatchThreadID)
             float3 n = oct_decode(g.zw);
             float3 p = ray.origin + ray.dir * g.x;
             float3 dir = reflect(ray.dir, n);
-            result = float4(reflected(p, n, dir, g.x, spread, px), 1.0);
+            result = reflected(p, n, dir, g.x, spread, px);
         }
     }
     images[pc.target][id.xy] = result;

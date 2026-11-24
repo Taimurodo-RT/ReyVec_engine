@@ -1693,6 +1693,10 @@ pub struct Material3 {
     /// В буфере сцены — слово 6 записи материала.
     #[serde(default)]
     pub shine: f32,
+    /// Шероховатость блеска (Л2): 0 — резкое отражение, 1 — сильно размытое. В буфере
+    /// сцены — слово 7 записи материала.
+    #[serde(default)]
+    pub rough: f32,
 }
 
 /// Флаг материала: сетка на поверхности.
@@ -1925,7 +1929,7 @@ pub fn pack_scene_cached(
             m.glow.to_bits(),
             m.texture,
             m.shine.clamp(0.0, 1.0).to_bits(),
-            0,
+            m.rough.clamp(0.0, 1.0).to_bits(),
         ]);
     }
     for l in lamps {
@@ -2496,6 +2500,7 @@ mod tests {
             grid: true,
             texture: 0,
             shine: 0.0,
+            rough: 0.0,
         }];
         let lamps = [Lamp3 {
             at: [1.0, 2.0, 3.0],

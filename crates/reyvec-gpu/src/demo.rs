@@ -699,6 +699,8 @@ pub(crate) struct FrameData {
     space_compute: bool,
     /// Проход «отражения 3D» (Л1): в кадре есть блестящие материалы и флажок включён.
     space_reflect: bool,
+    /// Размытие отражений (Л2): в кадре есть блестящие шероховатые материалы.
+    space_rough: bool,
     /// Сглаживание краёв форм (7.6о): список пикселей краёв (адрес и сам буфер) и буфер
     /// для чтения его счётчика процессором (7.18б). `None` — выключено.
     space_edges: Option<(vk::DeviceAddress, vk::Buffer, vk::Buffer)>,
@@ -819,6 +821,10 @@ pub(crate) struct Demo {
     reflections: bool,
     /// Их проход (raymarch_reflect.slang); null — нет записи в картинки.
     space_reflect: vk::Pipeline,
+    /// Размытые отражения шероховатых материалов (Л2, флажок «Размытые отражения 3D»).
+    glossy: bool,
+    /// Их размытие (raymarch_reflect_blur.slang).
+    space_reflect_blur: vk::Pipeline,
     /// Счётчики лучей 3D включены (флажок на панели, 7.18д2).
     space_counters_on: bool,
     /// Поле уровня считается до перебора объектов (7.18д3); `false` — как раньше, в общем
@@ -1243,6 +1249,8 @@ impl Demo {
             space_post_aa: vk::Pipeline::null(),
             reflections: true,
             space_reflect: vk::Pipeline::null(),
+            glossy: true,
+            space_reflect_blur: vk::Pipeline::null(),
             space_counters_on: false,
             level_field_apart: true,
             space_free: true,
@@ -1623,6 +1631,11 @@ impl Demo {
                     &ctx.device,
                     layout,
                     shaders.compute("raymarch_reflect"),
+                )?;
+                demo.space_reflect_blur = crate::pipeline::compute_pipeline(
+                    &ctx.device,
+                    layout,
+                    shaders.compute("raymarch_reflect_blur"),
                 )?;
             }
             demo.bloom_down = build(
@@ -2289,6 +2302,16 @@ impl Demo {
     /// Включает и выключает отражения (Л1).
     pub fn set_reflections(&mut self, on: bool) {
         self.reflections = on;
+    }
+
+    /// Размытые отражения шероховатых материалов (Л2).
+    pub fn glossy(&self) -> bool {
+        self.glossy
+    }
+
+    /// Включает и выключает размытые отражения (Л2): выключенные — везде резкие.
+    pub fn set_glossy(&mut self, on: bool) {
+        self.glossy = on;
     }
 
     /// Идёт ли в кадре сглаживание по картинке: включено и шейдер собран.
@@ -4034,6 +4057,7 @@ impl Demo {
         let mut space_vertices = 0;
         let mut space_textured = false;
         let mut space_reflect = false;
+        let mut space_rough = false;
         let mut space_shadow_maps = 0;
         let mut space_counters = None;
         let mut space_ray = None;
@@ -4164,6 +4188,10 @@ impl Demo {
             space_reflect = self.reflections
                 && self.space_reflect != vk::Pipeline::null()
                 && materials.iter().any(|m| m.shine > 0.0);
+            space_rough = space_reflect
+                && self.glossy
+                && self.space_reflect_blur != vk::Pipeline::null()
+                && materials.iter().any(|m| m.shine > 0.0 && m.rough > 0.0);
             let culling = level || !self.space.culling_off;
             self.space_culled = culling;
             let mut packed = crate::space::pack_cached(
@@ -4447,6 +4475,7 @@ impl Demo {
             },
             space_compute,
             space_reflect,
+            space_rough,
             space_edges,
             space_counters,
             space_ray,
@@ -5444,6 +5473,7 @@ impl Demo {
         // Отражения (Л1): из каждой блестящей точки буфера геометрии — луч по зеркальному
         // направлению; цвет того, что он встретил, смешивают с поверхностью «края 3D» и
         // «освещение 3D».
+        let rough = frame.space_rough;
         let reflect = frame.space_reflect.then(|| {
             let image = graph.create("отражения 3D", ext, REFLECT_FORMAT);
             let mut uses = vec![
@@ -5464,7 +5494,7 @@ impl Demo {
                         target: p.storage(image),
                         ..SpaceSlots::default()
                     },
-                    map_flags(p),
+                    map_flags(p) | (u32::from(rough) * REFLECT_FLAG_ROUGH),
                 );
                 let (d, cmd) = (p.device, p.cmd);
                 // SAFETY: граф перевёл буфер геометрии (и карты теней) в чтение, а картинку
@@ -5476,7 +5506,52 @@ impl Demo {
                     d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
                 }
             });
-            image
+            if !rough {
+                return image;
+            }
+            // Размытые отражения (Л2): по строке, потом по столбцу, с оглядкой на края.
+            let along = graph.create("отражения 3D: по строке", ext, REFLECT_FORMAT);
+            let blurred = graph.create("отражения 3D: размытые", ext, REFLECT_FORMAT);
+            for (src, dst, vertical) in [(image, along, false), (along, blurred, true)] {
+                let mut uses = vec![
+                    (gbuffer, Access::ComputeSampled),
+                    (src, Access::ComputeSampled),
+                    (dst, Access::ComputeWrite),
+                ];
+                if vertical {
+                    uses.push((image, Access::ComputeSampled));
+                }
+                graph.add_pass("отражения 3D: размытие", &uses, move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            gbuffer: p.texture(gbuffer),
+                            target: p.storage(dst),
+                            cone: p.texture(src),
+                            meshes: p.texture(image),
+                            ..SpaceSlots::default()
+                        },
+                        u32::from(vertical) * REFLECT_BLUR_VERTICAL,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл буфер геометрии и резкие отражения в чтение, а
+                    // цель в запись; буфер сцены этого кадра жив, пока кадр рисуется.
+                    unsafe {
+                        bindless.bind_compute(d, cmd);
+                        d.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::COMPUTE,
+                            self.space_reflect_blur,
+                        );
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                    }
+                });
+            }
+            blurred
         });
         // Сглаживание краёв форм (7.6о): поиск пикселей краёв, потом по четыре луча
         // внутри каждого. «Сцена» берёт готовый цвет краёв из картинки краёв.
@@ -6280,6 +6355,7 @@ impl Demo {
             ctx.device.destroy_pipeline(self.space_shade_small, None);
             ctx.device.destroy_pipeline(self.space_post_aa, None);
             ctx.device.destroy_pipeline(self.space_reflect, None);
+            ctx.device.destroy_pipeline(self.space_reflect_blur, None);
             ctx.device.destroy_pipeline(self.space_upscale, None);
             ctx.device.destroy_pipeline(self.space_present, None);
             ctx.device.destroy_pipeline(self.space_shade_present, None);
@@ -6324,6 +6400,7 @@ impl Demo {
         self.space_shade_small = vk::Pipeline::null();
         self.space_post_aa = vk::Pipeline::null();
         self.space_reflect = vk::Pipeline::null();
+        self.space_reflect_blur = vk::Pipeline::null();
         self.space_upscale = vk::Pipeline::null();
         self.space_present = vk::Pipeline::null();
         self.space_shade_present = vk::Pipeline::null();
@@ -6683,6 +6760,11 @@ const SHADOW_MAP_SIZE: u32 = 1024;
 const EDGE_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Картинка отражений (Л1, raymarch_reflect.slang): цвет может быть ярче 1.
 const REFLECT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+/// Флаг прохода отражений (Л2, REFLECT_FLAG_ROUGH в raymarch_reflect.slang): у
+/// шероховатых — луч на квадрат 2×2, остальное даст размытие.
+const REFLECT_FLAG_ROUGH: u32 = 64;
+/// Флаг размытия отражений (raymarch_reflect_blur.slang): по столбцу, а не по строке.
+const REFLECT_BLUR_VERTICAL: u32 = 2;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
 const CONE_TILE: u32 = 8;
 /// Освещённая сцена «3D» в уменьшенном разрешении (7.14), до растяжения на кадр.
