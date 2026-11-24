@@ -159,9 +159,10 @@ void builder_merge(inout ReservoirBuilder b, Reservoir other, float cap, float3 
 }
 
 // Что из прошлого кадра годится (слово после матрицы камеры прошлого кадра): запасы ReSTIR
-// и память шумодава (как PREV_* в space.rs).
+// и память шумодава, запасы ReSTIR GI (как PREV_* в path_ref.rs).
 static const uint PREV_RESTIR = 1;
 static const uint PREV_HISTORY = 2;
+static const uint PREV_GI = 4;
 
 // Пиксель прошлого кадра для точки `p` (матрица камеры прошлого кадра — в разделе моделей);
 // false — прошлого кадра нет, его данные `what` не годятся или точка вне него.

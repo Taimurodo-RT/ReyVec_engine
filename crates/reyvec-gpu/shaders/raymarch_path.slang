@@ -25,6 +25,11 @@
 // пиксель без накопления; pc.meshes — номер кадра (для случайных чисел). Сумма не пишется.
 // С битом PATH_RESTIR (шаг 3) прямой свет первой точки — ReSTIR DI: pc.edges — буфер
 // запасов (include/restir.slang).
+// С битом PATH_GI (шаг 4) отражённый свет первой точки — ReSTIR GI (include/restir_gi.slang):
+// путь ведёт от неё только отражённую долю (всегда, с весом доли), а рассеянное
+// продолжение — отдельный путь (gi_path), который не входит в картинку, а становится
+// кандидатом запаса (слой 1, вместе с запасом этого места из прошлого кадра); свет из
+// запасов соседей добавит проход «ReSTIR GI: соседи». Нужен PATH_SPLIT. Зеркала — как без GI.
 //
 // Не видно: модели из треугольников (их нет в поле сцены).
 
@@ -36,6 +41,7 @@
 #include "include/trace3d.slang"
 #include "include/light3d.slang"
 #include "include/restir.slang"
+#include "include/restir_gi.slang"
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
@@ -50,6 +56,8 @@ static const uint PATH_RESTIR = 32;
 // Бит pc.flags (шаг 5): свет для шумодава — в pc.target свет без цвета первой точки, в
 // pc.cone (номер в images[]) — цвет первой точки и доля дымки.
 static const uint PATH_SPLIT = 64;
+// Бит pc.flags (шаг 4): отражённый свет первой точки — ReSTIR GI.
+static const uint PATH_GI = 128;
 // Сколько соседей берёт пиксель и как далеко (пикселей).
 static const uint RESTIR_NEIGHBORS = 4;
 static const float RESTIR_RADIUS = 16.0;
@@ -130,17 +138,24 @@ float3 restir_direct(int2 px, uint w, uint h, float3 p, float3 n, float3 q, floa
 // `limit`). `spread` — ширина пикселя на метр пути, `px` — пиксель.
 // `first` — готовое первое попадание (x — длина, −1 — небо; y — материал; zw — нормаль
 // в октаэдре), если `known`. Дымку путь не добавляет: `first_dist` — длина до первой точки
-// (−1 — небо), `first_albedo` — её цвет (для шумодава, который чистит свет без цвета).
+// (−1 — небо), `first_albedo` — её цвет (для шумодава, который чистит свет без цвета),
+// `first_normal` — нормаль в ней. `seen` — путь ещё не рассеивался (небо видно как небо).
+// С `gi` рассеянное продолжение первой точки путь не ведёт (его свет — ReSTIR GI): там, где
+// оно было бы, `gi_found`, а `gi_q`/`gi_n` — точка над поверхностью и нормаль, откуда его
+// вести (gi_path). Отражённая доля тогда идёт всегда, с весом доли.
 float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint bounces, bool known, float4 first,
-           bool restir, uint w, uint h, out float first_dist, out float3 first_albedo)
+           bool restir, bool gi, bool seen, uint w, uint h, out float first_dist, out float3 first_albedo,
+           out float3 first_normal, out bool gi_found, out float3 gi_q, out float3 gi_n)
 {
     first_albedo = float3(1.0, 1.0, 1.0);
+    first_normal = -dir;
+    gi_found = false;
+    gi_q = float3(0.0, 0.0, 0.0);
+    gi_n = float3(0.0, 1.0, 0.0);
     float3 light = float3(0.0, 0.0, 0.0);
     float3 weight = float3(1.0, 1.0, 1.0);
     float travelled = 0.0;
     float first_t = -1.0;
-    // Путь ещё не рассеивался (глаз или зеркальные отскоки): небо видно как небо.
-    bool seen = true;
     for (uint k = 0; k <= bounces; k++)
     {
         bool plane;
@@ -168,6 +183,8 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
             float mean;
             n = normal_at(p, travelled, false, mean);
         }
+        if (k == 0)
+            first_normal = n;
         float3 side, up;
         basis(dir, side, up);
         float width = spread * travelled;
@@ -184,12 +201,23 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         // Прямой свет — всегда, с долей рассеянного: случайным выбирается только, куда
         // идёт путь дальше (иначе у зеркал редкие яркие точки рассеянного света).
         float3 direct = float3(0.0, 0.0, 0.0);
-        if (k == 0 && restir)
+        if (k == 0 && restir && known)
             direct = restir_direct(px, w, h, p, n, q, dir, sm, hit.x, spread);
         else if (share < 1.0)
             direct = restir ? sampled_light(q, n, dir, sm) : direct_light(q, n, dir, sm);
         light += weight * (1.0 - share) * direct;
-        if (rnd() < share)
+        // ReSTIR GI: рассеянное продолжение — отдельно (gi_path), отражённое — всегда.
+        bool split = k == 0 && gi && bounces > 0 && !gi_mirror(gi_material(hit.y));
+        if (split)
+        {
+            gi_found = true;
+            gi_q = q;
+            gi_n = n;
+            if (share <= 0.0)
+                break;
+            weight *= share;
+        }
+        if (split || rnd() < share)
         {
             // Зеркальный отскок: с вероятностью доли Френеля, поэтому вес тот же.
             float3 r = reflect(dir, n);
@@ -221,6 +249,49 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
     return light;
 }
 
+// Рассеянное продолжение первой точки для ReSTIR GI: из точки `q` с нормалью `n` — отскок
+// по косинусу и путь дальше (на отскок короче). Точка x_s, куда он пришёл (`pos`, `normal`;
+// небо — далеко по лучу), и её свет — кандидат запаса. `restir` — прямой свет по выбору
+// (RIS), как у дальних точек основного пути.
+float3 gi_path(float3 q, float3 n, float spread, int2 px, uint bounces, bool restir, uint w, uint h, out float3 pos,
+               out float3 normal)
+{
+    float3 dir = cosine_dir(n);
+    float d;
+    float3 albedo, inner_q, inner_n;
+    bool inner;
+    float3 radiance = path(q, dir, 80.0, spread, px, bounces - 1u, false, float4(0.0, 0.0, 0.0, 0.0), restir, false,
+                           false, w, h, d, albedo, normal, inner, inner_q, inner_n);
+    pos = d >= 0.0 ? q + dir * d : q + dir * GI_SKY;
+    if (d < 0.0)
+        normal = -dir;
+    if (any(isnan(radiance)) || any(isinf(radiance)))
+        radiance = float3(0.0, 0.0, 0.0);
+    return max(radiance, float3(0.0, 0.0, 0.0));
+}
+
+// Кандидат ReSTIR GI пикселя `px` (первая точка — `first`) и запас этого места в прошлом
+// кадре — в слой 1.
+void gi_candidate(int2 px, uint w, uint h, Ray ray, float4 first, bool found, float3 pos, float3 normal,
+                  float3 radiance)
+{
+    if (first.x < 0.0 || gi_mirror(gi_material(first.y)))
+    {
+        gi_store(1u, px, w, h, gi_empty(float3(0.0, 0.0, 0.0), float3(0.0, 1.0, 0.0)));
+        return;
+    }
+    float3 p = ray.origin + ray.dir * first.x;
+    float3 n = oct_decode(first.zw);
+    float3 q = p + n * (0.01 + 0.002 * first.x);
+    GiBuilder b = gi_builder(p, n);
+    if (found)
+        gi_add_own(b, pos, normal, radiance, q);
+    int2 prev;
+    if (previous_pixel(p, w, h, PREV_GI, prev))
+        gi_merge(b, gi_load(0u, prev, w, h), GI_HISTORY, q, first.x);
+    gi_store(1u, px, w, h, gi_finish(b));
+}
+
 // Дымка — как у быстрого режима, по первой точке (длина `t`, −1 — небо).
 float fog_at(float t)
 {
@@ -246,10 +317,23 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     Ray next = screen_ray(screen + float2(2.0 / float(w), 0.0));
     float spread = length(next.dir - ray.dir);
     float4 first = live ? gbuffer_load(px) : float4(0.0, 0.0, 0.0, 0.0);
+    bool gi = live && (pc.flags & PATH_GI) != 0;
     float first_dist;
     float3 albedo;
-    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, pc.flags & 15, live, first, restir, w, h,
-                    first_dist, albedo);
+    float3 first_normal;
+    bool gi_found;
+    float3 gi_q, gi_n;
+    uint bounces = pc.flags & 15;
+    float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, bounces, live, first, restir, gi, true, w, h,
+                    first_dist, albedo, first_normal, gi_found, gi_q, gi_n);
+    if (gi)
+    {
+        float3 gi_pos = float3(0.0, 0.0, 0.0), gi_normal = float3(0.0, 1.0, 0.0);
+        float3 gi_radiance = float3(0.0, 0.0, 0.0);
+        if (gi_found)
+            gi_radiance = gi_path(gi_q, gi_n, spread, px, bounces, restir, w, h, gi_pos, gi_normal);
+        gi_candidate(px, w, h, ray, first, gi_found, gi_pos, gi_normal, gi_radiance);
+    }
     // Светлячки (редкий путь в яркое) не дают NaN и бесконечностей.
     if (any(isnan(c)) || any(isinf(c)))
         c = float3(0.0, 0.0, 0.0);

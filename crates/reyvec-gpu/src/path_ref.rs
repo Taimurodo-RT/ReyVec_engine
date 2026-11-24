@@ -28,17 +28,23 @@ pub(crate) struct PathFrame {
     pub bounces: u32,
     /// Шумодав (шаг 5): адрес буфера его памяти, 0 — шумодава нет.
     pub history: vk::DeviceAddress,
+    /// ReSTIR GI (шаг 4): запасы отражённого света — в буфере `sums` после запасов DI.
+    pub gi: bool,
 }
 
 /// Что из прошлого кадра годится (как PREV_* в include/restir.slang).
 pub(crate) const PREV_RESTIR: u32 = 1;
 pub(crate) const PREV_HISTORY: u32 = 2;
+pub(crate) const PREV_GI: u32 = 4;
 /// Слов памяти шумодава на пиксель (как HISTORY_WORDS в raymarch_denoise.slang).
 const HISTORY_WORDS: u64 = 10;
 
 /// Слов на запас пикселя (как RESTIR_WORDS в include/restir.slang) и слоёв запасов.
 const RESTIR_WORDS: u64 = 8;
 const RESTIR_LAYERS: u64 = 2;
+/// Слов на запас ReSTIR GI (как GI_WORDS в include/restir_gi.slang) и слоёв.
+const GI_WORDS: u64 = 11;
+const GI_LAYERS: u64 = 2;
 
 /// Сколько отскоков у пути.
 pub(crate) const PATH_BOUNCES: u32 = 4;
@@ -55,7 +61,12 @@ pub(crate) struct PathRef {
     pub restir: bool,
     /// Сколько отскоков у пути (тесты ставят 0 — только прямой свет).
     pub bounces: u32,
+    /// ReSTIR GI в режиме «качество» (флажок на панели).
+    pub gi: bool,
+    /// Запасы DI и GI (один буфер: у прохода одно место для адреса).
     restir_buffer: Option<(BufferId, u64)>,
+    /// Что было в буфере запасов в прошлом кадре: (DI, GI).
+    restir_last: (bool, bool),
     /// Шумодав режима «качество» (флажок на панели).
     pub denoise: bool,
     history_buffer: Option<(BufferId, u64)>,
@@ -76,7 +87,9 @@ impl PathRef {
             live_frame: 0,
             restir: true,
             bounces: PATH_BOUNCES,
+            gi: true,
             restir_buffer: None,
+            restir_last: (false, false),
             denoise: true,
             history_buffer: None,
             prev: None,
@@ -139,6 +152,7 @@ impl PathRef {
             restir: false,
             bounces: self.bounces,
             history: 0,
+            gi: false,
         };
         let size = (extent.width, extent.height);
         let same = self
@@ -152,14 +166,21 @@ impl PathRef {
             ctx,
             res,
             &mut self.restir_buffer,
-            self.restir,
-            pixels * RESTIR_WORDS * 4 * RESTIR_LAYERS,
+            self.restir || self.gi,
+            pixels * 4 * (RESTIR_WORDS * RESTIR_LAYERS + GI_WORDS * GI_LAYERS),
             "ReSTIR: запасы",
         ) {
             frame.sums = address;
-            frame.restir = true;
-            valid |= u32::from(!fresh) * PREV_RESTIR;
+            frame.restir = self.restir;
+            frame.gi = self.gi;
+            let (di_was, gi_was) = if fresh {
+                (false, false)
+            } else {
+                self.restir_last
+            };
+            valid |= (u32::from(di_was) * PREV_RESTIR) | (u32::from(gi_was) * PREV_GI);
         }
+        self.restir_last = (frame.restir, frame.gi);
         if let Some((address, fresh)) = keep_buffer(
             ctx,
             res,
@@ -224,6 +245,7 @@ impl PathRef {
             restir: false,
             bounces: self.bounces,
             history: 0,
+            gi: false,
         };
         self.count = self.count.saturating_add(1);
         Some(frame)

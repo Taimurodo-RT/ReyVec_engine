@@ -2389,6 +2389,16 @@ impl Demo {
         self.path_ref.restir = on;
     }
 
+    /// ReSTIR GI в режиме «качество» включён.
+    pub fn path_gi(&self) -> bool {
+        self.path_ref.gi
+    }
+
+    /// Включает и выключает ReSTIR GI.
+    pub fn set_path_gi(&mut self, on: bool) {
+        self.path_ref.gi = on;
+    }
+
     /// Сколько кадров эталон 3D уже накопил; `None` — он выключен.
     pub fn path_samples(&self) -> Option<u32> {
         self.path_ref.samples()
@@ -5079,7 +5089,8 @@ impl Demo {
     /// Шумодав режима «качество» (путь ReSTIR, шаг 5, raymarch_denoise.slang): свет `light`
     /// копится по времени (память — буфер `path.history`), потом размывается с оглядкой на
     /// края (SVGF, DENOISE_PASSES проходов с шагом 1, 2, 4…) и умножается на цвет первой
-    /// точки `albedo` с дымкой в картинку `out`.
+    /// точки `albedo` с дымкой в картинку `out`. Без памяти (шумодав выключен, свет разделён
+    /// ради ReSTIR GI) — только сборка.
     #[allow(clippy::too_many_arguments)]
     fn add_denoise_passes<'a>(
         &'a self,
@@ -5098,10 +5109,17 @@ impl Demo {
         let pipeline = self.space_denoise;
         // (имя, вход, выход, вид прохода и шаг)
         let mut steps = Vec::new();
-        let timed = graph.create("свет 3D: время", ext, SPACE_COLOR_FORMAT);
-        steps.push(("шумодав: время", light, timed, DENOISE_TEMPORAL));
-        let mut from = timed;
-        for k in 0..DENOISE_PASSES {
+        let mut from = light;
+        // Без шумодава (path.history == 0, а свет разделён ради ReSTIR GI) — только сборка.
+        let passes = if path.history != 0 {
+            let timed = graph.create("свет 3D: время", ext, SPACE_COLOR_FORMAT);
+            steps.push(("шумодав: время", light, timed, DENOISE_TEMPORAL));
+            from = timed;
+            DENOISE_PASSES
+        } else {
+            0
+        };
+        for k in 0..passes {
             let to = graph.create("свет 3D: размытый", ext, SPACE_COLOR_FORMAT);
             steps.push((
                 "шумодав: размытие",
@@ -5584,10 +5602,10 @@ impl Demo {
                     }
                 });
             }
-            // С шумодавом (шаг 5) путь пишет свет без цвета первой точки и отдельно цвет с
-            // дымкой; картинку собирает «шумодав: сборка».
+            // С шумодавом (шаг 5) и с ReSTIR GI (шаг 4) путь пишет свет без цвета первой
+            // точки и отдельно цвет с дымкой; картинку собирает «шумодав: сборка».
             let denoise = path.history != 0;
-            let split = denoise.then(|| {
+            let split = (denoise || path.gi).then(|| {
                 (
                     graph.create("свет 3D", ext, SPACE_COLOR_FORMAT),
                     graph.create("цвет первой точки 3D", ext, SPACE_COLOR_FORMAT),
@@ -5604,7 +5622,8 @@ impl Demo {
             let flags = path.bounces
                 | PATH_LIVE
                 | if path.restir { PATH_RESTIR } else { 0 }
-                | if denoise { PATH_SPLIT } else { 0 };
+                | if path.gi { PATH_GI } else { 0 }
+                | if split.is_some() { PATH_SPLIT } else { 0 };
             graph.add_pass("путь 3D", &path_uses, move |p| {
                 let (target, aux) = match split {
                     Some((light, albedo)) => (p.storage(light), p.storage(albedo)),
@@ -5631,7 +5650,7 @@ impl Demo {
                 // сцены этого кадра жив, пока кадр рисуется; буфер запасов (если есть)
                 // удаляется только отложенно, барьер упорядочивает его с «кандидатами».
                 unsafe {
-                    if path.restir {
+                    if path.restir || path.gi {
                         d.cmd_pipeline_barrier2(
                             cmd,
                             &vk::DependencyInfo::default().memory_barriers(&barrier),
@@ -5643,7 +5662,50 @@ impl Demo {
                     d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
                 }
             });
-            if let Some((light, albedo)) = split {
+            if let Some((mut light, albedo)) = split {
+                if path.gi {
+                    // ReSTIR GI: запасы соседей, луч видимости, свет — к свету пути.
+                    let gathered = graph.create("свет 3D: с отражённым", ext, SPACE_COLOR_FORMAT);
+                    let uses = [
+                        (gbuffer, Access::ComputeSampled),
+                        (light, Access::ComputeSampled),
+                        (gathered, Access::ComputeWrite),
+                    ];
+                    let restir = self.space_restir;
+                    graph.add_pass("ReSTIR GI: соседи", &uses, move |p| {
+                        let push = space_push(
+                            &camera,
+                            ext,
+                            frame.time,
+                            frame.space_address,
+                            SpaceSlots {
+                                gbuffer: p.texture(gbuffer),
+                                target: p.storage(gathered),
+                                cone: p.texture(light),
+                                meshes: path.count,
+                                edges: path.sums,
+                                ..SpaceSlots::default()
+                            },
+                            RESTIR_GI_NEIGHBORS,
+                        );
+                        let barrier = order();
+                        let (d, cmd) = (p.device, p.cmd);
+                        // SAFETY: граф перевёл буфер геометрии и свет пути в чтение, а выход
+                        // в запись; буфер запасов удаляется только отложенно, барьер
+                        // упорядочивает его с «путём 3D»; буфер сцены этого кадра жив.
+                        unsafe {
+                            d.cmd_pipeline_barrier2(
+                                cmd,
+                                &vk::DependencyInfo::default().memory_barriers(&barrier),
+                            );
+                            bindless.bind_compute(d, cmd);
+                            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, restir);
+                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                            d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                        }
+                    });
+                    light = gathered;
+                }
                 self.add_denoise_passes(graph, bindless, frame, path, gbuffer, light, albedo, out);
             }
             return (gbuffer, out, None, Some(out), None, None);
@@ -7149,6 +7211,10 @@ const PATH_LIVE: u32 = 16;
 const PATH_RESTIR: u32 = 32;
 /// Флаг прохода «путь 3D»: свет для шумодава отдельно от цвета первой точки (PATH_SPLIT).
 const PATH_SPLIT: u32 = 64;
+/// Флаг прохода «путь 3D»: отражённый свет первой точки — ReSTIR GI (PATH_GI).
+const PATH_GI: u32 = 128;
+/// Флаг прохода ReSTIR: «ReSTIR GI: соседи» вместо «кандидатов» (как в raymarch_restir.slang).
+const RESTIR_GI_NEIGHBORS: u32 = 1;
 /// Виды проходов шумодава (как DENOISE_* в raymarch_denoise.slang) и число размытий.
 const DENOISE_TEMPORAL: u32 = 1;
 const DENOISE_ATROUS: u32 = 2;

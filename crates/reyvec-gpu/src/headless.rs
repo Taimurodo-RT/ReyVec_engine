@@ -583,6 +583,7 @@ fn render(
             demo.set_path_live(tests::LIVE_FRAMES.get() > 0);
             demo.set_path_restir(tests::PATH_RESTIR.get());
             demo.set_path_denoise(tests::PATH_DENOISE.get());
+            demo.set_path_gi(tests::PATH_GI.get());
             demo.set_path_bounces(tests::PATH_BOUNCES.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -965,6 +966,8 @@ pub(crate) mod tests {
             const { std::cell::Cell::new(crate::path_ref::PATH_BOUNCES) };
         /// Шумодав режима «качество».
         pub(super) static PATH_DENOISE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        /// ReSTIR GI в режиме «качество».
+        pub(super) static PATH_GI: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// ReSTIR DI в режиме «качество».
         pub(super) static PATH_RESTIR: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Размытые отражения шероховатых материалов (Л2).
@@ -1503,7 +1506,7 @@ pub(crate) mod tests {
             (b_restir / b_ref - 1.0).abs() < 0.15,
             "ReSTIR и эталон разные по яркости: {b_restir} и {b_ref}"
         );
-        // Шумодав: яркость та же, а до эталона — вдвое ближе, чем шумный кадр.
+        // Шумодав: яркость та же, а до эталона — в полтора раза ближе, чем шумный кадр.
         let b_clean = brightness(&clean.image);
         let (_, _, noisy) = image_diff(&restir.image, &shots[2].image);
         let (_, _, denoised) = image_diff(&clean.image, &shots[2].image);
@@ -1514,8 +1517,9 @@ pub(crate) mod tests {
             (b_clean / b_ref - 1.0).abs() < 0.1,
             "шумодав меняет яркость: {b_clean} и {b_ref}"
         );
+        // Порог полуторный: с ReSTIR GI и шумный кадр уже заметно чище.
         assert!(
-            denoised * 2.0 < noisy,
+            denoised * 1.5 < noisy,
             "шумодав почти не убирает шум: {noisy} и {denoised}"
         );
         // Шум: от 4 кадров к 16 картинка меняется сильнее, чем от 16 к 64.
@@ -1644,6 +1648,40 @@ pub(crate) mod tests {
         assert!(
             (b_clean / b_full - 1.0).abs() < 0.15,
             "шумодав в зале меняет яркость: {b_clean} и {b_full}"
+        );
+        // ReSTIR GI (шаг 4): без шумодава, восьмой кадр — отражённый свет из запасов ближе к
+        // эталону, чем один путь на пиксель, и не темнее.
+        PATH_DENOISE.set(false);
+        LIVE_FRAMES.set(8);
+        PATH_GI.set(false);
+        let plain = render_headless(&options, &scene);
+        PATH_GI.set(true);
+        let gi = render_headless(&options, &scene);
+        LIVE_FRAMES.set(0);
+        PATH_DENOISE.set(true);
+        let (plain, gi) = (
+            plain.expect("кадр без ReSTIR GI"),
+            gi.expect("кадр с ReSTIR GI"),
+        );
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            for (name, image) in [("hall-nogi", &plain), ("hall-gi", &gi)] {
+                let _ = std::fs::write(format!("{dir}/{name}.rgba"), &image.image.rgba);
+            }
+        }
+        let (b_plain, b_gi) = (brightness(&plain.image), brightness(&gi.image));
+        let (_, _, off_plain) = image_diff(&plain.image, &full.image);
+        let (_, _, off_gi) = image_diff(&gi.image, &full.image);
+        eprintln!(
+            "ReSTIR GI: яркость без него {b_plain:.1} (отличие {off_plain:.2}), с ним {b_gi:.1} ({off_gi:.2})"
+        );
+        assert!(
+            b_gi > b_full * 0.85 && b_gi < b_full * 1.15,
+            "ReSTIR GI меняет яркость: {b_gi} при эталоне {b_full}"
+        );
+        assert!(
+            off_gi < off_plain,
+            "ReSTIR GI не убирает шум: {off_plain} и {off_gi}"
         );
     }
 
