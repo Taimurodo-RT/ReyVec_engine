@@ -99,7 +99,11 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     radius = clamp(radius, 2.0, REFLECT_BLUR_MAX);
     float stride = max(radius / float(REFLECT_TAPS), 1.0);
     int taps = int(ceil(radius / stride));
-    float sigma = radius * 0.5;
+    // Вес сходит к нулю ровно на краю пятна (колокол минус его значение на краю): иначе
+    // яркое в отражении (неоновая трубка, 8.16) обрывалось по краю пятна ступенькой, и на
+    // полу вместо мягкого отсвета лежал прямоугольник.
+    float sigma = radius * 0.4;
+    float edge = exp(-0.5 * (radius / sigma) * (radius / sigma));
     float3 n = oct_decode(g.zw);
     float3 p = ray.origin + ray.dir * g.x;
     bool vertical = (pc.flags & BLUR_VERTICAL) != 0;
@@ -121,7 +125,7 @@ void cs_main(uint3 id : SV_DispatchThreadID)
             continue;
         // Сходство поверхности — по самой точке `q` (у пикселя чётной строки по строке).
         float weight = surface_weight(q, size, p, g.x, n, m);
-        weight *= exp(-0.5 * (off / sigma) * (off / sigma));
+        weight *= max(exp(-0.5 * (off / sigma) * (off / sigma)) - edge, 0.0);
         sum += v.rgb * weight;
         total += weight;
     }

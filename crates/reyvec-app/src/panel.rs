@@ -844,7 +844,8 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 actions.push(PanelAction::LightField(field));
             }
         }
-        if info.scene_id.uses_lights() {
+        // Свечение есть и у сцены «3D» (8.16): светящиеся материалы, блики, шарики ламп.
+        if info.scene_id.uses_lights() || info.scene_id == DemoScene::Space {
             let mut glow = info.glow;
             if ui
                 .checkbox(&mut glow, "Свечение и мягкие пересветы (B)")
@@ -856,6 +857,8 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
             {
                 actions.push(PanelAction::Glow(glow));
             }
+        }
+        if info.scene_id.uses_lights() {
             let mut cascades = info.cascades;
             if ui
                 .checkbox(&mut cascades, "Свет каскадами лучей, опыт (C)")

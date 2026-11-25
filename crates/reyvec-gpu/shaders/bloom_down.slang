@@ -11,7 +11,7 @@ struct Push
 {
     uint source;    // картинка, которую уменьшаем (mode 0: кадр сцены)
     uint light;     // mode 0: картинка света (light.slang)
-    uint mode;
+    uint mode;      // 0 — кадр со светом, 1 — уменьшение вдвое, 2 — кадр без света (3D)
     float threshold; // mode 0: с какой яркости начинается свечение
     float2 texel;   // размер точки цели в долях картинки (1 / размер)
 };
@@ -64,6 +64,9 @@ float4 fs_main(VertexOut input) : SV_Target
         float3 lit = scene * l.rgb + l.rgb * l.a * 0.6;
         return float4(bright_part(lit), 1.0);
     }
+    // Сцена «3D» (8.16): свет уже в кадре, картинки света нет.
+    if (pc.mode == 2)
+        return float4(bright_part(at(uv)), 1.0);
     uint w, h;
     textures[pc.source].GetDimensions(w, h);
     float2 s = 1.0 / float2(w, h);

@@ -16,9 +16,21 @@
 
 #include "include/space.slang"
 #include "include/dither.slang"
+#include "include/tonemap.slang"
+
+// Свечение (8.16): картинка ореола ярких мест (bloom_up.slang) — в поле `cone` констант,
+// сила — GLOW_STRENGTH, как у present.slang. Вместе с ним яркость выше белого мягко
+// сводится к белому.
+static const uint UPSCALE_FLAG_GLOW = 256;
+static const float GLOW_STRENGTH = 0.08;
 
 float4 finish(float3 c, float2 position)
 {
+    if ((pc.flags & UPSCALE_FLAG_GLOW) != 0)
+    {
+        float2 uv = position / float2(pc.height * pc.aspect, pc.height);
+        c = tonemap(c + textures[pc.cone].SampleLevel(samplers[0], uv, 0.0).rgb * GLOW_STRENGTH);
+    }
     if ((pc.flags & SPACE_FLAG_DITHER) != 0)
         c = dither(c, position);
     return float4(c, 1.0);
