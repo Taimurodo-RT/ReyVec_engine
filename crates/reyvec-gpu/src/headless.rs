@@ -584,6 +584,7 @@ fn render(
             demo.set_path_restir(tests::PATH_RESTIR.get());
             demo.set_path_denoise(tests::PATH_DENOISE.get());
             demo.set_path_gi(tests::PATH_GI.get());
+            demo.set_path_cache(tests::PATH_CACHE.get());
             demo.set_path_bounces(tests::PATH_BOUNCES.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -968,6 +969,8 @@ pub(crate) mod tests {
         pub(super) static PATH_DENOISE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// ReSTIR GI в режиме «качество».
         pub(super) static PATH_GI: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        /// Кэш света в режиме «качество».
+        pub(super) static PATH_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// ReSTIR DI в режиме «качество».
         pub(super) static PATH_RESTIR: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Размытые отражения шероховатых материалов (Л2).
@@ -1683,6 +1686,41 @@ pub(crate) mod tests {
             off_gi < off_plain,
             "ReSTIR GI не убирает шум: {off_plain} и {off_gi}"
         );
+        // Кэш света (шаг 5б): с шумодавом, 16-й кадр — яркость как у эталона, а путь
+        // дешевле (по времени прохода «путь 3D», если видеокарта его замеряет).
+        LIVE_FRAMES.set(16);
+        PATH_CACHE.set(false);
+        let uncached = render_headless(&options, &scene);
+        PATH_CACHE.set(true);
+        LIVE_FRAMES.set(0);
+        let uncached = uncached.expect("кадр без кэша света");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/hall-nocache.rgba"), &uncached.image.rgba);
+        }
+        let path_ms = |image: &HeadlessImage| {
+            image
+                .gpu_timings
+                .as_ref()
+                .and_then(|t| t.passes.iter().find(|p| p.name == "путь 3D").map(|p| p.ms))
+        };
+        let b_uncached = brightness(&uncached.image);
+        let (_, _, off_uncached) = image_diff(&uncached.image, &full.image);
+        eprintln!(
+            "кэш света: без него {b_uncached:.1} (отличие {off_uncached:.2}, путь {:?} мс), с ним {b_clean:.1} ({off:.2}, путь {:?} мс)",
+            path_ms(&uncached),
+            path_ms(&clean)
+        );
+        assert!(
+            (b_uncached / b_full - 1.0).abs() < 0.15,
+            "без кэша света другая яркость: {b_uncached} и {b_full}"
+        );
+        if let (Some(slow), Some(fast)) = (path_ms(&uncached), path_ms(&clean)) {
+            assert!(
+                fast < slow,
+                "кэш света не ускоряет путь: {fast} и {slow} мс"
+            );
+        }
     }
 
     /// Склад из стеллажей по 59 деталей рисуется тремя способами: детали — отдельные

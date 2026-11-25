@@ -79,6 +79,8 @@ pub(crate) enum PanelAction {
     PathRestir(bool),
     /// ReSTIR GI в режиме «качество» (путь ReSTIR, шаг 4).
     PathGi(bool),
+    /// Кэш света режима «качество» (путь ReSTIR, шаг 5б).
+    PathCache(bool),
     /// Шумодав режима «качество» (путь ReSTIR, шаг 5).
     PathDenoise(bool),
     /// Разрешение сцены «3D» (7.14).
@@ -233,6 +235,8 @@ pub(crate) struct PanelInfo<'a> {
     pub path_denoise: bool,
     /// ReSTIR GI режима «качество» включён.
     pub path_gi: bool,
+    /// Кэш света режима «качество» включён.
+    pub path_cache: bool,
     /// Сколько кадров он накопил.
     pub path_samples: Option<u32>,
     /// Разрешение сцены «3D» (7.14).
@@ -1174,6 +1178,23 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::PathGi(path_gi));
+            }
+            let mut path_cache = info.path_cache;
+            if ui
+                .add_enabled(
+                    info.path_live,
+                    egui::Checkbox::new(&mut path_cache, "Кэш света (быстрее)"),
+                )
+                .on_hover_text(
+                    "Путь ReSTIR, шаг 5б: свет, отражённый точками мира, копится в \
+                 клетках (ближе к камере — мельче). Путь после первого отскока берёт \
+                 свет из клетки и обрывается — лучей втрое-вчетверо меньше. Клетки \
+                 наполняет каждый 16-й пиксель, свет догоняет за десятые доли секунды. \
+                 Выключите, чтобы сравнить скорость и вид",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::PathCache(path_cache));
             }
             let mut path_denoise = info.path_denoise;
             if ui
@@ -2219,6 +2240,7 @@ mod tests {
             path_restir: true,
             path_denoise: true,
             path_gi: true,
+            path_cache: true,
             path_samples: None,
             space_scale: SpaceScale::Full,
             level_view: false,

@@ -922,6 +922,18 @@ impl WindowRenderer {
         }
     }
 
+    /// Кэш света режима «качество»: включён ли.
+    pub fn path_cache(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.path_cache())
+    }
+
+    /// Включает и выключает кэш света режима «качество».
+    pub fn set_path_cache(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_path_cache(on);
+        }
+    }
+
     /// Шумодав режима «качество»: включён ли.
     pub fn path_denoise(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.path_denoise())

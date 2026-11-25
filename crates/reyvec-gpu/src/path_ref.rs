@@ -30,6 +30,9 @@ pub(crate) struct PathFrame {
     pub history: vk::DeviceAddress,
     /// ReSTIR GI (шаг 4): запасы отражённого света — в буфере `sums` после запасов DI.
     pub gi: bool,
+    /// Кэш света (шаг 5б): `Some(стереть)` — таблица в буфере `sums` после запасов GI;
+    /// `стереть` — она новая или сдвинулась (другой размер кадра), её надо обнулить.
+    pub cache: Option<bool>,
 }
 
 /// Что из прошлого кадра годится (как PREV_* в include/restir.slang).
@@ -45,6 +48,8 @@ const RESTIR_LAYERS: u64 = 2;
 /// Слов на запас ReSTIR GI (как GI_WORDS в include/restir_gi.slang) и слоёв.
 const GI_WORDS: u64 = 11;
 const GI_LAYERS: u64 = 2;
+/// Байт таблицы кэша света (CACHE_SIZE ячеек по CACHE_WORDS слов, include/light_cache.slang).
+const CACHE_BYTES: u64 = (1 << 21) * 8 * 4;
 
 /// Сколько отскоков у пути.
 pub(crate) const PATH_BOUNCES: u32 = 4;
@@ -63,6 +68,10 @@ pub(crate) struct PathRef {
     pub bounces: u32,
     /// ReSTIR GI в режиме «качество» (флажок на панели).
     pub gi: bool,
+    /// Кэш света в режиме «качество» (флажок на панели).
+    pub cache: bool,
+    /// Размер кадра, под который в прошлом кадре лежала таблица кэша.
+    cache_last: Option<(u32, u32)>,
     /// Запасы DI и GI (один буфер: у прохода одно место для адреса).
     restir_buffer: Option<(BufferId, u64)>,
     /// Что было в буфере запасов в прошлом кадре: (DI, GI).
@@ -88,6 +97,8 @@ impl PathRef {
             restir: true,
             bounces: PATH_BOUNCES,
             gi: true,
+            cache: true,
+            cache_last: None,
             restir_buffer: None,
             restir_last: (false, false),
             denoise: true,
@@ -127,6 +138,7 @@ impl PathRef {
     /// Кадр без режима «качество»: буферы запасов и памяти шумодава отдаются.
     pub fn forget_live(&mut self, res: &mut GpuResources) {
         self.prev = None;
+        self.cache_last = None;
         for slot in [&mut self.restir_buffer, &mut self.history_buffer] {
             if let Some((id, _)) = slot.take() {
                 res.destroy_buffer(id);
@@ -153,6 +165,7 @@ impl PathRef {
             bounces: self.bounces,
             history: 0,
             gi: false,
+            cache: None,
         };
         let size = (extent.width, extent.height);
         let same = self
@@ -166,13 +179,17 @@ impl PathRef {
             ctx,
             res,
             &mut self.restir_buffer,
-            self.restir || self.gi,
-            pixels * 4 * (RESTIR_WORDS * RESTIR_LAYERS + GI_WORDS * GI_LAYERS),
+            self.restir || self.gi || self.cache,
+            pixels * 4 * (RESTIR_WORDS * RESTIR_LAYERS + GI_WORDS * GI_LAYERS)
+                + if self.cache { CACHE_BYTES } else { 0 },
             "ReSTIR: запасы",
         ) {
             frame.sums = address;
             frame.restir = self.restir;
             frame.gi = self.gi;
+            if self.cache {
+                frame.cache = Some(fresh || self.cache_last != Some(size));
+            }
             let (di_was, gi_was) = if fresh {
                 (false, false)
             } else {
@@ -181,6 +198,7 @@ impl PathRef {
             valid |= (u32::from(di_was) * PREV_RESTIR) | (u32::from(gi_was) * PREV_GI);
         }
         self.restir_last = (frame.restir, frame.gi);
+        self.cache_last = frame.cache.map(|_| size);
         if let Some((address, fresh)) = keep_buffer(
             ctx,
             res,
@@ -246,6 +264,7 @@ impl PathRef {
             bounces: self.bounces,
             history: 0,
             gi: false,
+            cache: None,
         };
         self.count = self.count.saturating_add(1);
         Some(frame)
