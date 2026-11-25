@@ -25,6 +25,9 @@ float3 normal_at(float3 p, float t, bool shapes, out float mean)
     // Наклон поля по четырём точкам тетраэдра: дешевле шести и без перекоса. Точки
     // перебираются циклом, а не четырьмя вызовами подряд: так scene() встраивается в
     // шейдер один раз, и драйверы (особенно программный lavapipe) собирают его быстро.
+    // Плоскости (пол, стены) в наклон не входят: их точки берут нормаль формулой, а у
+    // формы, стоящей на плоскости, наклон с ней у самого стыка смотрел вдоль плоскости —
+    // низ стены светился, как пол под лампами (белые точки по стыку в режиме «качество»).
     const float e = 0.001;
     float near = 0.0005 * max(t, 1.0) + NORMAL_NEAR;
     bool full = (pc.scene[11] & SCENE_FULL_NORMAL) != 0;
@@ -37,7 +40,7 @@ float3 normal_at(float3 p, float t, bool shapes, out float mean)
         count_normal();
         uint winner;
         float second;
-        float d = scene_pick(p + dir * e, full || only != SCENE_ALL ? 1e9 : near, shapes, !shapes, only, winner, second).x;
+        float d = scene_pick(p + dir * e, full || only != SCENE_ALL ? 1e9 : near, shapes, false, only, winner, second).x;
         if (k == 0 && !full && winner != SCENE_ALL && second - d > NORMAL_GAP)
             only = winner;
         n += dir * d;
