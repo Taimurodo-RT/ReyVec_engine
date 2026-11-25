@@ -32,7 +32,6 @@ pub(crate) enum PanelAction {
     Zoom(bool),
     LightField(bool),
     Glow(bool),
-    Cascades(bool),
     Dither(bool),
     /// Сглаживание краёв форм сцены «3D» (7.6о).
     SpaceSmooth(bool),
@@ -306,8 +305,6 @@ pub(crate) struct PanelInfo<'a> {
     pub light_field: bool,
     /// Свечение и мягкий переход к белому в сцене «лампы и тени».
     pub glow: bool,
-    /// Опыт 4.6: свет каскадами лучей.
-    pub cascades: bool,
     /// Шум против полос при выводе.
     pub dither: bool,
 }
@@ -856,20 +853,6 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::Glow(glow));
-            }
-        }
-        if info.scene_id.uses_lights() {
-            let mut cascades = info.cascades;
-            if ui
-                .checkbox(&mut cascades, "Свет каскадами лучей, опыт (C)")
-                .on_hover_text(
-                    "Другой способ считать свет (radiance cascades): из каждой точки лучи во \
-                 все стороны, а не к каждой лампе. Свет огибает углы и затекает в щели, \
-                 а цена почти не зависит от числа ламп. Для сравнения с обычным",
-                )
-                .changed()
-            {
-                actions.push(PanelAction::Cascades(cascades));
             }
         }
         let mut dither = info.dither;
@@ -2375,7 +2358,6 @@ mod tests {
             fill_mode: FillMode::PerShape,
             light_field: false,
             glow: true,
-            cascades: false,
             dither: true,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();
