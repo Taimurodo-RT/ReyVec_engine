@@ -1536,6 +1536,87 @@ pub(crate) mod tests {
         assert!(late < early, "накопление не убирает шум: {early} и {late}");
     }
 
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn wall_seams_have_no_bright_dots() {
+        // Замечание Романа после R5в: «на стыках стен мерцание, белые точки». Низ стены у
+        // пола брал нормаль с полом вместе (наклон поля с плоскостью), смотрел вверх и
+        // светился под лампами, как пол, но цветом стены — по светлой точке на каждой
+        // ступеньке стыка, в режиме «качество» (в быстром их прятали лучи краёв). Угол зала
+        // с ламп, только прямой свет ко всем лампам без ReSTIR — кадр без шума: светлых
+        // точек ярче соседей быть не должно.
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let (width, height) = (320usize, 240usize);
+        let scene = HeadlessScene {
+            width: width as u32,
+            height: height as u32,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(
+                    include_str!("../../../scenes/3d/lamps.ron")
+                        .replace(
+                            "camera: Some((eye: (6.0, 2.2, 4.5), look_at: (-2.0, 1.0, -2.0))),",
+                            "camera: Some((eye: (3.5, 1.4, 1.5), look_at: (8.15, 1.6, 6.15))),",
+                        )
+                        .into(),
+                ),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        PATH_BOUNCES.set(0);
+        PATH_RESTIR.set(false);
+        PATH_GI.set(false);
+        PATH_CACHE.set(false);
+        PATH_DENOISE.set(false);
+        LIVE_FRAMES.set(1);
+        let shot = render_headless(&options, &scene);
+        LIVE_FRAMES.set(0);
+        PATH_DENOISE.set(true);
+        PATH_CACHE.set(true);
+        PATH_GI.set(true);
+        PATH_RESTIR.set(true);
+        PATH_BOUNCES.set(crate::path_ref::PATH_BOUNCES);
+        let shot = shot.expect("кадр режима «качество»");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/seams.rgba"), &shot.image.rgba);
+        }
+        let lum = |x: usize, y: usize| {
+            let p = &shot.image.rgba[(y * width + x) * 4..];
+            (u32::from(p[0]) + u32::from(p[1]) + u32::from(p[2])) / 3
+        };
+        // Светлее срединного из квадрата 5×5 вокруг больше чем на 12 ступеней.
+        let mut dots = Vec::new();
+        // Верх кадра с лампами (их шары ярче всего вокруг) не смотрим: стыки внизу.
+        for y in height / 3..height - 2 {
+            for x in 2..width - 2 {
+                let mut around: Vec<u32> =
+                    (0..25).map(|k| lum(x + k % 5 - 2, y + k / 5 - 2)).collect();
+                around.sort_unstable();
+                if lum(x, y) > around[12] + 12 {
+                    dots.push((x, y));
+                }
+            }
+        }
+        println!(
+            "светлых точек: {} {:?}",
+            dots.len(),
+            &dots[..dots.len().min(12)]
+        );
+        assert!(dots.is_empty(), "светлые точки на стыках: {dots:?}");
+    }
+
     /// ReSTIR DI (путь ReSTIR, шаг 3) в зале с 48 лампами, только прямой свет (без
     /// отскоков: их шум заслонил бы разницу): запасы прошлых кадров убирают шум (восьмой
     /// кадр ближе к эталону, чем первый), потемнения нет, ошибок валидации нет.
