@@ -421,7 +421,14 @@ impl Editor {
         let Some(r) = self.renderer.as_mut() else {
             return false;
         };
-        match shape.load() {
+        // Вернулись с другой вкладки — из текста в памяти (у уровня там несохранённые
+        // правки), впервые — из файла.
+        let scene = if shape.text.is_empty() {
+            shape.load()
+        } else {
+            shape.rebuild()
+        };
+        match scene {
             Some(text) => r.set_space_file_in(&text, Some(shape.root.clone())),
             None => tracing::warn!(
                 "Модель {} не прочиталась: {}",
@@ -496,6 +503,35 @@ impl Editor {
         }
     }
 
+    /// В уровне 3D «Мира» есть несохранённые правки.
+    fn level_dirty(&self) -> bool {
+        self.level_3d().is_some_and(shapes::ShapeView::dirty)
+    }
+
+    /// Сохранить уровень 3D «Мира» (Ctrl+S, Р.13). `false` — не записался.
+    fn save_level(&mut self) -> bool {
+        let level = if self.shape_in_assets {
+            self.parked.as_mut().map(|s| &mut s.view)
+        } else {
+            self.shape.as_mut()
+        };
+        let Some(level) = level.filter(|l| l.dirty()) else {
+            return true;
+        };
+        match level.save() {
+            Ok(()) => {
+                files::drop_autosave(&level.path);
+                tracing::info!("Уровень сохранён: {}", level.name);
+                self.restore = None;
+                true
+            }
+            Err(e) => {
+                tracing::warn!("Уровень {} не сохранён: {e}", level.name);
+                false
+            }
+        }
+    }
+
     /// Открыть уровень (сцену 2D или 3D) во «Мире» вместо прежнего (Р.12). Несохранённые
     /// правки сцены 2D — сначала вопрос, `force` — уже спросили.
     fn open_level(&mut self, path: PathBuf, force: bool) {
@@ -503,7 +539,7 @@ impl Editor {
             tracing::warn!("Во время игры другой уровень не открыть: сначала «Стоп»");
             return;
         }
-        if !force && self.doc.as_ref().is_some_and(SceneDoc::dirty) {
+        if !force && (self.doc.as_ref().is_some_and(SceneDoc::dirty) || self.level_dirty()) {
             self.ui.ask_open(path);
             return;
         }
@@ -519,6 +555,18 @@ impl Editor {
                 Err(e) => return tracing::warn!("{e}"),
             };
             self.put_shape(shape);
+            let text = self
+                .shape
+                .as_ref()
+                .map(|s| s.text.clone())
+                .unwrap_or_default();
+            self.restore = files::pending_autosave(&path, &text);
+            self.autosaved.clear();
+            if self.restore.is_some() {
+                tracing::warn!(
+                    "Есть автосохранение с несохранёнными правками: «Файл → Восстановить автосохранение»"
+                );
+            }
         } else {
             if !self.open_scene(path.clone()) {
                 return;
@@ -654,7 +702,7 @@ impl Editor {
             return;
         };
         self.shape_written = Instant::now();
-        match shape.write(text) {
+        match shape.edit(text) {
             Some(scene) => r.set_space_file_in(&scene, Some(shape.root.clone())),
             None => tracing::warn!(
                 "Модель {}: {}",
@@ -816,9 +864,15 @@ impl Editor {
                 | Action::ClayGrow { .. }
                 | Action::ClayDab(_)
                 | Action::ClayEnd => return self.shape_action(action),
+                // Ctrl+S: уровень 3D сохраняется, как сцена 2D (модель пишется сразу).
+                Action::Save => {
+                    if !self.shape_in_assets {
+                        self.save_level();
+                    }
+                    return;
+                }
                 // Правки сцены, пока открыта модель, сцену не трогают (Delete, Ctrl+C…).
                 Action::Edit { .. }
-                | Action::Save
                 | Action::Copy { .. }
                 | Action::Paste { .. }
                 | Action::Duplicate(_)
@@ -834,6 +888,7 @@ impl Editor {
                 _ => {}
             }
         }
+        let level_open = self.level_3d().is_some();
         let (Some(r), Some(w)) = (self.renderer.as_mut(), self.window.clone()) else {
             return;
         };
@@ -931,6 +986,7 @@ impl Editor {
                 let saved = self.doc.as_mut().filter(|d| d.dirty()).map(SceneDoc::save);
                 match saved {
                     Some(Err(e)) => tracing::warn!("Сцена не сохранена, окно остаётся: {e}"),
+                    _ if !self.save_level() => {}
                     _ => self.close(event_loop),
                 }
             }
@@ -1057,10 +1113,13 @@ impl Editor {
             | Action::RemovePart { .. } => self.apply_doc(action),
             Action::SavePrefab(path) => self.save_prefab(&path),
             Action::OpenScene(path) => self.open_level(path, false),
-            Action::SaveAndOpen(path) => match self.doc.as_mut().map(SceneDoc::save) {
-                Some(Err(e)) => tracing::warn!("Сцена не сохранена: {e}"),
-                _ => self.open_level(path, true),
-            },
+            Action::SaveAndOpen(path) => {
+                match self.doc.as_mut().filter(|d| d.dirty()).map(SceneDoc::save) {
+                    Some(Err(e)) => tracing::warn!("Сцена не сохранена: {e}"),
+                    _ if !self.save_level() => {}
+                    _ => self.open_level(path, true),
+                }
+            }
             Action::DiscardAndOpen(path) => {
                 self.revert_doc();
                 self.open_level(path, true);
@@ -1073,6 +1132,17 @@ impl Editor {
                 match std::fs::write(&path, files::NEW_SCENE) {
                     Ok(()) => self.open_level(path, false),
                     Err(e) => tracing::warn!("Не создать сцену «{}»: {e}", path.display()),
+                }
+            }
+            Action::RestoreAutosave if level_open => {
+                if let Some(t) = self.restore.take() {
+                    self.ui.open_workspace("Мир");
+                    self.sync_side();
+                    self.shape_action(Action::ShapeText {
+                        text: t,
+                        commit: true,
+                    });
+                    tracing::info!("Правки из автосохранения вернулись (Ctrl+Z — отменить)");
                 }
             }
             Action::RestoreAutosave => {
@@ -1131,14 +1201,18 @@ impl Editor {
             return;
         }
         self.autosave_at = Instant::now();
-        let (Some(doc), Some(path)) = (&self.doc, &self.config.scene_file) else {
-            return;
+        // Уровень 3D — его правки, иначе сцена 2D.
+        let (path, text) = match (self.level_3d(), &self.doc, &self.config.scene_file) {
+            (Some(l), _, _) if l.dirty() => (l.path.clone(), l.text.clone()),
+            (Some(_), _, _) => return,
+            (None, Some(doc), Some(path)) if doc.dirty() => (path.clone(), doc.text().to_owned()),
+            _ => return,
         };
-        if !doc.dirty() || doc.text() == self.autosaved {
+        if text == self.autosaved {
             return;
         }
-        match files::write_autosave(path, doc.text()) {
-            Ok(()) => self.autosaved = doc.text().to_owned(),
+        match files::write_autosave(&path, &text) {
+            Ok(()) => self.autosaved = text,
             Err(e) => tracing::warn!("Автосохранение не записалось: {e}"),
         }
     }
@@ -1217,7 +1291,10 @@ impl Editor {
     }
 
     fn close_or_ask(&mut self, event_loop: &ActiveEventLoop) {
-        if self.doc.as_ref().is_some_and(SceneDoc::dirty) || self.ui.code_dirty() {
+        if self.doc.as_ref().is_some_and(SceneDoc::dirty)
+            || self.level_dirty()
+            || self.ui.code_dirty()
+        {
             self.ui.ask_close();
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -1485,6 +1562,7 @@ impl Editor {
 
         let view = self.view();
         let level_3d = self.level_3d().map(|s| s.path.clone());
+        let level_dirty = self.level_dirty();
         let (Some(window), Some(renderer), Some(state)) =
             (&self.window, &mut self.renderer, &mut self.egui_state)
         else {
@@ -1535,7 +1613,11 @@ impl Editor {
             scene_name: &scene_name,
             error: error.as_deref(),
             view,
-            dirty: doc.is_some_and(SceneDoc::dirty),
+            dirty: if level_3d.is_some() {
+                level_dirty
+            } else {
+                doc.is_some_and(SceneDoc::dirty)
+            },
             can_undo: doc.is_some_and(SceneDoc::can_undo),
             can_redo: doc.is_some_and(SceneDoc::can_redo),
             can_save: self.config.scene_file.is_some(),
