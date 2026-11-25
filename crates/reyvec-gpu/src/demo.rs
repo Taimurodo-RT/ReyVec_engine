@@ -5684,7 +5684,12 @@ impl Demo {
                 | if path.gi { PATH_GI } else { 0 }
                 | if path.cache.is_some() { PATH_CACHE } else { 0 }
                 | if path.gi_quarter { PATH_GI_QUARTER } else { 0 }
-                | if split.is_some() { PATH_SPLIT } else { 0 };
+                | if split.is_some() { PATH_SPLIT } else { 0 }
+                // Кэш солнца (R5е): та же карта, что у «теней 3D», картинка вне графа.
+                | frame
+                    .space_sun
+                    .filter(|s| s.ready)
+                    .map_or(0, |s| PATH_SUN_STATIC | (s.slot << 16));
             graph.add_pass("путь 3D", &path_uses, move |p| {
                 let (target, aux) = match split {
                     Some((light, albedo)) => (p.storage(light), p.storage(albedo)),
@@ -7286,6 +7291,9 @@ const PATH_CACHE: u32 = 256;
 /// Флаг прохода «путь 3D»: новый отскок ReSTIR GI у одного пикселя квадрата 2×2 за кадр;
 /// группы запуска — по месту в квадрате, их число по сторонам чётное (PATH_GI_QUARTER).
 const PATH_GI_QUARTER: u32 = 512;
+/// Флаг прохода «путь 3D»: карта кэша солнца готова, её номер — в старших 16 битах флагов
+/// (PATH_SUN_STATIC в raymarch_path.slang).
+const PATH_SUN_STATIC: u32 = 1024;
 /// Флаги «ReSTIR: кандидаты» для «кэш света: сводка»: свести, стереть (raymarch_restir.slang).
 const CACHE_RESOLVE: u32 = 2;
 const CACHE_CLEAR: u32 = 4;

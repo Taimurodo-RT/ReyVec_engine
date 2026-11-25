@@ -168,9 +168,27 @@ float3 light_seen(LightSample s, float3 q)
     return s.light;
 }
 
+// Кэш солнца в пути (R5е): ставит «путь 3D», если карта неподвижного готова (номер
+// картинки — в старших 16 битах pc.flags, как у «теней 3D»). Карта знает точно, что
+// неподвижное не затеняет точку (луч тени шагает только по движущимся) или что точка в
+// полной тени неподвижного (без луча: в закрытом зале — под крышей везде). Иначе — живой
+// луч по всем предметам. Эталон кэш не берёт.
+static bool g_sun_static = false;
+
 float3 sun_light(float3 q, float3 n, float3 dir, SurfaceMaterial sm)
 {
     if (!sun_on())
         return float3(0.0, 0.0, 0.0);
-    return light_seen(light_sample(0u, float2(rnd(), rnd()), q, n, dir, sm), q);
+    LightSample s = light_sample(0u, float2(rnd(), rnd()), q, n, dir, sm);
+    if (g_sun_static && any(s.light > 0.0))
+    {
+        int known = sun_static_known(q);
+        if (known == 0)
+            return float3(0.0, 0.0, 0.0);
+        g_skip_still = known > 0;
+        float3 light = light_seen(s, q);
+        g_skip_still = false;
+        return light;
+    }
+    return light_seen(s, q);
 }
