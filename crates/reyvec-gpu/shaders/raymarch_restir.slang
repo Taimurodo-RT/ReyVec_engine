@@ -46,9 +46,9 @@ void gi_neighbors(int2 px, uint w, uint h)
     seed_rng(uint2(px), pc.meshes, 2u);
     float4 light = textures[pc.cone].Load(int3(px, 0));
     float4 g = gbuffer_load(px);
-    if (g.x < 0.0 || gi_mirror(gi_material(g.y)))
+    if (g.x < 0.0)
     {
-        // Небо и зеркала (их путь считается без GI): свет пути как есть.
+        // Небо: свет пути как есть.
         images[pc.target][px] = light;
         return;
     }

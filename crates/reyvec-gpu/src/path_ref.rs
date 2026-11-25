@@ -41,6 +41,7 @@ pub(crate) struct PathFrame {
 pub(crate) const PREV_RESTIR: u32 = 1;
 pub(crate) const PREV_HISTORY: u32 = 2;
 pub(crate) const PREV_GI: u32 = 4;
+pub(crate) const PREV_STILL: u32 = 8;
 /// Слов памяти шумодава на пиксель (как HISTORY_WORDS в raymarch_denoise.slang).
 const HISTORY_WORDS: u64 = 10;
 
@@ -216,6 +217,10 @@ impl PathRef {
         ) {
             frame.history = address;
             valid |= u32::from(!fresh) * PREV_HISTORY;
+        }
+        // Камера та же: зеркала копят свет так же долго, как остальное (шумодав).
+        if same == Some(view_proj) {
+            valid |= PREV_STILL;
         }
         (frame, same.map(|m| (m, valid)))
     }

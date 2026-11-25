@@ -246,7 +246,7 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
             }
         }
         // ReSTIR GI: рассеянное продолжение — отдельно (gi_path), отражённое — всегда.
-        bool split = k == 0 && gi && bounces > 0 && !gi_mirror(gi_material(hit.y));
+        bool split = k == 0 && gi && bounces > 0;
         if (split)
         {
             gi_found = true;
@@ -323,7 +323,7 @@ float3 gi_path(float3 q, float3 n, float spread, int2 px, uint bounces, bool res
 void gi_candidate(int2 px, uint w, uint h, Ray ray, float4 first, bool found, float3 pos, float3 normal,
                   float3 radiance)
 {
-    if (first.x < 0.0 || gi_mirror(gi_material(first.y)))
+    if (first.x < 0.0)
     {
         gi_store(1u, px, w, h, gi_empty(float3(0.0, 0.0, 0.0), float3(0.0, 1.0, 0.0)));
         return;
