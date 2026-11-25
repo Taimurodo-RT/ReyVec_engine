@@ -51,7 +51,7 @@ void gi_neighbors(int2 px, uint w, uint h)
     float3 p = ray.origin + ray.dir * g.x;
     float3 n = oct_decode(g.zw);
     float3 q = p + n * (0.01 + 0.002 * g.x);
-    GiBuilder b = gi_builder(p, n);
+    GiBuilder b = gi_builder(q, n);
     gi_merge(b, gi_load(1u, px, w, h), 1e30, q, g.x);
     float radius = clamp(GI_REACH / max(spread * g.x, 1e-5), 2.0, GI_RADIUS);
     for (uint k = 0; k < GI_NEIGHBORS; k++)
