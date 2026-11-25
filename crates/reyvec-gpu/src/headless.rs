@@ -184,6 +184,8 @@ struct Resources<'a> {
     demo: Option<Demo>,
     transients: TransientPool,
     timer: Option<GpuTimer>,
+    /// Интерфейс игры поверх кадра (только в тестах, И.1).
+    game_ui: Option<crate::game_ui::GameUiRenderer>,
 }
 
 impl Drop for Resources<'_> {
@@ -194,6 +196,9 @@ impl Drop for Resources<'_> {
             let _ = d.device_wait_idle();
             if let Some(demo) = self.demo.take() {
                 demo.destroy(self.ctx);
+            }
+            if let Some(ui) = self.game_ui.take() {
+                ui.destroy(self.ctx);
             }
             self.transients.destroy(self.ctx);
             if let Some(mut timer) = self.timer.take() {
@@ -373,6 +378,7 @@ fn render(
         demo: None,
         transients: TransientPool::new(),
         timer: None,
+        game_ui: None,
     };
     let extent = vk::Extent2D { width, height };
     let size = u64::from(width) * u64::from(height) * 4;
@@ -556,6 +562,22 @@ fn render(
                 demo.set_level_edit(tests::LEVEL_EDIT.get());
             }
         }
+        // Интерфейс игры из файла .rui поверх кадра (И.1).
+        #[cfg(test)]
+        if let Some(src) = tests::GAME_UI.get() {
+            let gpu = r.gpu.as_mut().expect("ресурсы созданы выше");
+            let mut ui = crate::game_ui::GameUiRenderer::new(
+                ctx,
+                gpu,
+                &ShaderLibrary::new(false),
+                FORMAT,
+                1,
+            )?;
+            let mut screen = reyvec_ui::UiScreen::parse(src).expect("экран разбирается");
+            let (draw, atlas) = screen.draw_with_atlas([width as f32, height as f32]);
+            ui.set(ctx, gpu, Some((draw, atlas, 1)))?;
+            r.game_ui = Some(ui);
+        }
         // Проверка на чтение незаполненной памяти (8.0).
         #[cfg(test)]
         r.transients
@@ -691,6 +713,10 @@ fn render(
             );
         }
         let particles = demo.particle_stats();
+        let game_ui_data = match r.game_ui.as_mut() {
+            Some(ui) => ui.prepare(ctx, gpu, 0, extent)?,
+            None => None,
+        };
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();
         let target = graph.import(
@@ -703,6 +729,9 @@ fn render(
             None,
         );
         demo.add_passes(&mut graph, &gpu.bindless, data, target);
+        if let (Some(d), Some(ui)) = (game_ui_data, r.game_ui.as_ref()) {
+            ui.add_pass(&mut graph, &gpu.bindless, d, target);
+        }
         let buffer = r.buffer;
         // Последний проход копирует готовую картинку в буфер, который читает процессор.
         graph.add_pass("чтение", &[(target, Access::TransferSrc)], move |p| {
@@ -890,6 +919,9 @@ pub(crate) mod tests {
 
     thread_local! {
         /// Кадр без запечённого поля (для сравнения с кадром с полем).
+        /// Экран интерфейса игры (.rui) поверх кадра (И.1).
+        pub(super) static GAME_UI: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
         pub(super) static FIELD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Кадр с «углами из поля» (7.10г).
         pub(super) static AO_FROM_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -4351,6 +4383,66 @@ pub(crate) mod tests {
 
     /// Нужен драйвер Vulkan. В CI запускается на программном lavapipe:
     /// `cargo test -p reyvec-gpu -- --include-ignored`.
+    /// Интерфейс игры (И.1): скруглённый блок с обводкой и буквы поверх кадра.
+    /// Окно 480×270 — четверть экрана 1920×1080, все размеры файла делятся на 4.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn game_ui_draws_blocks_and_text() {
+        const SRC: &str = r#"
+            screen Test {
+                Rect().size(400, 200).background(#FF0000).radius(80)
+                    .border(#0000FF, 16).anchor(top_left, margin: 40)
+                Text("Ш").font(240).color(#FFFFFF).anchor(bottom_right, margin: 40)
+            }
+        "#;
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let plain = render_triangle_headless(&options, 480, 270).expect("кадр без интерфейса");
+        tests::GAME_UI.set(Some(SRC));
+        let img = render_triangle_headless(&options, 480, 270);
+        tests::GAME_UI.set(None);
+        let img = img.expect("кадр с интерфейсом");
+        assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+
+        // Блок: окно 10..110 × 10..60, скругление 20, обводка 4 пикселя.
+        let center = img.pixel(60, 35);
+        assert!(
+            center[0] > 250 && center[1] < 5 && center[2] < 5,
+            "середина блока {center:?}"
+        );
+        let border = img.pixel(60, 11);
+        assert!(
+            border[2] > 250 && border[0] < 5,
+            "обводка сверху {border:?}"
+        );
+        // Угол прямоугольника срезан скруглением: там кадр, как без интерфейса.
+        assert_eq!(img.pixel(11, 11), plain.pixel(11, 11), "угол блока");
+        // Рядом с блоком интерфейса нет.
+        assert_eq!(img.pixel(130, 35), plain.pixel(130, 35), "справа от блока");
+
+        // Буква в правом нижнем углу: много светлых точек, которых не было без
+        // интерфейса, и есть промежуточные (край сглажен).
+        let (mut white, mut soft) = (0, 0);
+        for y in 150..260 {
+            for x in 360..470 {
+                let (a, b) = (img.pixel(x, y), plain.pixel(x, y));
+                if a == b {
+                    continue;
+                }
+                if a[0] > 245 && a[1] > 245 && a[2] > 245 {
+                    white += 1;
+                } else {
+                    soft += 1;
+                }
+            }
+        }
+        assert!(white > 300, "светлых точек буквы {white}");
+        assert!(soft > 20, "точек на краю буквы {soft}");
+    }
+
     #[test]
     #[ignore = "нужен драйвер Vulkan"]
     fn triangle_is_drawn() {

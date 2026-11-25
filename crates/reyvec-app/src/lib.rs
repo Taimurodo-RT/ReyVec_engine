@@ -13,6 +13,7 @@ mod game_ui;
 mod gamepad;
 mod logging;
 mod panel;
+mod rui_demo;
 pub mod snapshot;
 mod sound;
 

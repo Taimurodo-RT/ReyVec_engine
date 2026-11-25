@@ -1,0 +1,18 @@
+[package]
+name = "reyvec-ui"
+description = "ReyVec: интерфейс игры — язык экранов .rui (вид SwiftUI), раскладка (taffy) и список прямоугольников и букв для рисования. Без видеокарты."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+reyvec-text.workspace = true
+reyvec-vector.workspace = true
+taffy.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -38,6 +38,7 @@ mod demo;
 mod demo_load;
 mod demo_vector;
 mod field;
+mod game_ui;
 mod graph;
 mod headless;
 mod lab;

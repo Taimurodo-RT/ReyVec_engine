@@ -7,6 +7,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::context::{Core, GpuContext, GpuOptions};
 use crate::demo::{Demo, DemoScene, Msaa};
+use crate::game_ui::GameUiRenderer;
 use crate::graph::{Access, GraphReport, ImageHandle, ImageState, RenderGraph, TransientPool};
 use crate::headless::FrameImage;
 use crate::pipeline::color_range;
@@ -160,6 +161,8 @@ pub struct WindowRenderer {
     /// Просили ли компактный кадр сцены (видеокарта может не уметь).
     compact_scene_wanted: bool,
     ui: Option<UiRenderer>,
+    /// Интерфейс игры из `reyvec-ui` (проход «интерфейс», решение 0022).
+    game_ui: Option<GameUiRenderer>,
     /// Изменения текстур панели, ещё не попавшие на видеокарту. Копятся, пока кадры
     /// пропускаются (окно свёрнуто): иначе, например, атлас шрифта потерялся бы.
     ui_textures: egui::TexturesDelta,
@@ -249,6 +252,7 @@ impl WindowRenderer {
             msaa_wanted: Msaa::for_adapter(ctx.adapter.kind),
             compact_scene_wanted: true,
             ui: None,
+            game_ui: None,
             ui_textures: egui::TexturesDelta::default(),
             shaders: ShaderLibrary::new(options.hot_reload),
             transients: TransientPool::new(),
@@ -1186,6 +1190,19 @@ impl WindowRenderer {
         self.needs_recreate = true;
     }
 
+    /// Интерфейс игры для следующих кадров (решение 0022): список рисования экрана
+    /// `reyvec-ui`, атлас его букв и номер версии файла (`key`). Атлас загружается на
+    /// видеокарту, только когда `key` поменялся. `None` — интерфейса нет.
+    pub fn set_game_ui(
+        &mut self,
+        ui: Option<(&reyvec_ui::UiDraw, &reyvec_text::GlyphAtlas, u64)>,
+    ) -> Result<(), GpuError> {
+        match (self.game_ui.as_mut(), self.resources.as_mut()) {
+            (Some(r), Some(res)) => r.set(&self.ctx, res, ui),
+            _ => Ok(()),
+        }
+    }
+
     /// Рисует один кадр. `size`: текущий размер окна в пикселях, `time`: секунды с запуска,
     /// `ui`: панель egui поверх кадра (если есть).
     pub fn render(
@@ -1214,6 +1231,9 @@ impl WindowRenderer {
             unsafe { self.ctx.device.device_wait_idle() }.ctx("ожидание видеокарты")?;
             demo.reload(&self.ctx, res, &mut self.shaders, &changed);
             if let Some(ui) = self.ui.as_mut() {
+                ui.reload(&self.ctx, res, &mut self.shaders, &changed);
+            }
+            if let Some(ui) = self.game_ui.as_mut() {
                 ui.reload(&self.ctx, res, &mut self.shaders, &changed);
             }
         }
@@ -1369,6 +1389,10 @@ impl WindowRenderer {
                     }
                     _ => None,
                 };
+                let game_ui_data = match self.game_ui.as_mut() {
+                    Some(r) => r.prepare(&self.ctx, res, self.frame_index, scene_extent)?,
+                    None => None,
+                };
                 let snapshot = if self.snapshot_requested
                     && self.snapshot_pending.is_none()
                     && self.snapshot_supported
@@ -1417,9 +1441,17 @@ impl WindowRenderer {
                         let scene =
                             graph.create("окно просмотра", scene_extent, self.format.format);
                         demo.add_passes(&mut graph, &res.bindless, data, scene);
+                        if let (Some(d), Some(r)) = (game_ui_data, self.game_ui.as_ref()) {
+                            r.add_pass(&mut graph, &res.bindless, d, scene);
+                        }
                         add_view_pass(&mut graph, scene, target, rect);
                     }
-                    None => demo.add_passes(&mut graph, &res.bindless, data, target),
+                    None => {
+                        demo.add_passes(&mut graph, &res.bindless, data, target);
+                        if let (Some(d), Some(r)) = (game_ui_data, self.game_ui.as_ref()) {
+                            r.add_pass(&mut graph, &res.bindless, d, target);
+                        }
+                    }
                 }
                 if let (Some(data), Some(renderer)) = (ui_data, self.ui.as_ref()) {
                     renderer.add_pass(&mut graph, &res.bindless, data, target);
@@ -1667,6 +1699,9 @@ impl WindowRenderer {
                         if let Some(ui) = self.ui.as_mut() {
                             ui.set_format(&self.ctx, res, &self.shaders, format.format)?;
                         }
+                        if let Some(ui) = self.game_ui.as_mut() {
+                            ui.set_format(&self.ctx, res, &self.shaders, format.format)?;
+                        }
                     }
                 }
                 None => {
@@ -1682,6 +1717,13 @@ impl WindowRenderer {
                         demo.use_threads();
                     }
                     self.ui = Some(UiRenderer::new(
+                        &self.ctx,
+                        res,
+                        &self.shaders,
+                        format.format,
+                        FRAMES_IN_FLIGHT,
+                    )?);
+                    self.game_ui = Some(GameUiRenderer::new(
                         &self.ctx,
                         res,
                         &self.shaders,
@@ -1793,6 +1835,9 @@ impl Drop for WindowRenderer {
                 demo.destroy(&self.ctx);
             }
             if let Some(ui) = self.ui.take() {
+                ui.destroy(&self.ctx);
+            }
+            if let Some(ui) = self.game_ui.take() {
                 ui.destroy(&self.ctx);
             }
             self.ui_textures.clear();
