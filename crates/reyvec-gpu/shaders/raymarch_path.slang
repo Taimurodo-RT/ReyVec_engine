@@ -283,7 +283,7 @@ void gi_candidate(int2 px, uint w, uint h, Ray ray, float4 first, bool found, fl
     float3 p = ray.origin + ray.dir * first.x;
     float3 n = oct_decode(first.zw);
     float3 q = p + n * (0.01 + 0.002 * first.x);
-    GiBuilder b = gi_builder(p, n);
+    GiBuilder b = gi_builder(q, n);
     if (found)
         gi_add_own(b, pos, normal, radiance, q);
     int2 prev;
