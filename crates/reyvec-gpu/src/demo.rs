@@ -4345,6 +4345,9 @@ impl Demo {
             }
             crate::space::set_prev_view_proj(&mut packed.words, restir_prev);
             crate::space::set_view_proj(&mut packed.words, view_proj);
+            if !level {
+                crate::space::set_haze(&mut packed.words, self.space.haze);
+            }
             crate::space::set_field(
                 &mut packed.words,
                 space_field.map(|f| (f.field, &self.space_field.window)),

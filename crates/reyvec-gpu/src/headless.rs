@@ -1277,6 +1277,89 @@ pub(crate) mod tests {
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
+    /// Сцена «большой мир» (8.9–8.11): город 400 м помещается в пределы шейдера, кадр
+    /// рисуется без ошибок Vulkan, а сдвиг камеры на 2 см почти не меняет далёкое
+    /// (нет мерцания тонких вещей вдали).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn world_scene_is_steady() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let text = include_str!("../../../scenes/3d/world.ron");
+        let shot = |text: &str| {
+            let scene = HeadlessScene {
+                width: 640,
+                height: 360,
+                time: 1.0,
+                shader_error: false,
+                scene: DemoScene::Space,
+                msaa: Msaa::X4,
+                perceptual_edges: false,
+                fill: crate::FillMode::default(),
+                zoom: false,
+                files: crate::UserFiles {
+                    space: Some(text.into()),
+                    ..Default::default()
+                },
+                cascades: false,
+            };
+            render_headless(&options, &scene).expect("кадр")
+        };
+        let frame = shot(text);
+        let eye = "eye: (-30.0, 38.0,";
+        assert!(text.contains(eye), "камера сцены на своём месте");
+        let moved = shot(&text.replace(eye, "eye: (-29.98, 38.0,"));
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        let stats = frame.space_stats.as_ref().expect("числа сцены 3D");
+        eprintln!(
+            "мир: в кадре объектов {}, слов {}, {:?}, движется {}, процессор {:.2} + {:.2} мс, краёв {:?}",
+            stats.objects,
+            stats.words,
+            stats.frame,
+            stats.moving,
+            stats.build_ms,
+            stats.pack_ms,
+            stats.edge_pixels
+        );
+        if let Some(t) = &frame.gpu_timings {
+            eprintln!("мир: {}", t.describe());
+        }
+        // Сколько работы у лучей (события, на любой видеокарте те же).
+        SPACE_COUNTERS.set(true);
+        let counted = shot(text);
+        SPACE_COUNTERS.set(false);
+        let rays = counted.space_stats.expect("счётчики").rays.expect("лучи");
+        for (c, name) in rays.iter().zip(crate::counters::RAY_PASS_NAMES) {
+            eprintln!(
+                "мир, {name}: шагов {}, расчётов сцены {}, предметов {}, форм {}, примитивов {}",
+                c.steps, c.scene, c.objects, c.forms, c.prims
+            );
+        }
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/world.rgba"), &frame.image.rgba);
+            let _ = std::fs::write(format!("{dir}/world-moved.rgba"), &moved.image.rgba);
+        }
+        assert_eq!(stats.dropped, 0);
+        assert!(stats.overflow.is_none());
+        let pixels = (frame.image.width * frame.image.height) as usize;
+        let jumps = frame
+            .image
+            .rgba
+            .chunks_exact(4)
+            .zip(moved.image.rgba.chunks_exact(4))
+            .filter(|(x, y)| x[..3].iter().zip(&y[..3]).any(|(p, q)| p.abs_diff(*q) > 48))
+            .count();
+        eprintln!("мир: при сдвиге камеры на 2 см скачут {jumps} пикселей из {pixels}");
+        // Сейчас скачет 0,07 % (головки фонарей мельче пикселя); при 1920×1080 — 0,06 %.
+        assert!(
+            jumps * 500 <= pixels,
+            "даль мерцает: {jumps} пикселей из {pixels}"
+        );
+    }
+
     /// Сцена завода (8.7): больше 1000 объектов, те, что в кадре, помещаются в предел шейдера
     /// и буфер, кадр рисуется без ошибок проверки Vulkan. Время здесь не меряется
     /// (программная видеокарта) — его меряем на ПК.

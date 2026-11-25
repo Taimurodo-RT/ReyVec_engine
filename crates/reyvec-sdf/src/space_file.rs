@@ -142,6 +142,18 @@ pub struct SpaceFile {
     /// реймарчинг 0.26 мс вместо 0.45). `false` — пиксельным, для сравнения.
     #[serde(default = "yes")]
     pub compute: bool,
+    /// Дальность дымки, м: на этом расстоянии даль уходит в цвет неба на 63 %, на
+    /// полутора — на 90 %. Без поля — [`HAZE`] (сцены размером с комнату или цех); у
+    /// большого мира её ставят больше (8.10), иначе город тонет в дымке.
+    #[serde(default = "haze")]
+    pub haze: f32,
+}
+
+/// Дальность дымки по умолчанию, м (как было всегда: `exp(-0.00025 · t²)`).
+pub const HAZE: f32 = 63.2456;
+
+fn haze() -> f32 {
+    HAZE
 }
 
 fn yes() -> bool {
@@ -236,6 +248,8 @@ pub struct SpaceScene {
     pub view_culling_off: bool,
     /// Лучи глаза вычислительным шейдером (7.6м; `compute: false` — пиксельным).
     pub compute: bool,
+    /// Дальность дымки, м ([`SpaceFile::haze`]).
+    pub haze: f32,
     /// Файлы моделей форм (М.0), которые сцена прочитала.
     pub model_files: Vec<std::path::PathBuf>,
     /// Имена материалов файла по номерам, вместе с материалами моделей форм
@@ -542,6 +556,11 @@ impl SpaceScene {
             culling_off: !file.culling,
             view_culling_off: !file.view_culling,
             compute: file.compute,
+            haze: if file.haze.is_finite() {
+                file.haze.clamp(5.0, 5000.0)
+            } else {
+                HAZE
+            },
             model_files,
             material_names,
         })

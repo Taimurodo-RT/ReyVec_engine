@@ -1869,6 +1869,7 @@ fn space_file_name(path: &std::path::Path) -> String {
         "mirrors" => "зеркала",
         "lamps" => "зал с лампами",
         "effects" => "эффекты",
+        "world" => "большой мир",
         _ => return stem,
     };
     known.to_owned()

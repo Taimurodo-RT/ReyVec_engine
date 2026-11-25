@@ -309,6 +309,19 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Space, 1.0, false)
             },
         },
+        // 8.10а: сцена «большой мир» (`scenes/3d/world.ron`): город 400 м с вышками и
+        // холмами до 800 м, дымка сцены на 700 м.
+        Case {
+            name: "space-world-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/world.ron").into()),
+                    space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
         // М.1: склад из стеллажей по 59 деталей (`scenes/3d/warehouse.ron`) — с границами
         // частей внутри моделей (вид тот же, что без них).
         Case {

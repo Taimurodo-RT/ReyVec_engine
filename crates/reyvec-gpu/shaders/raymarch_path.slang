@@ -346,7 +346,7 @@ void gi_candidate(int2 px, uint w, uint h, Ray ray, float4 first, bool found, fl
 // Дымка — как у быстрого режима, по первой точке (длина `t`, −1 — небо).
 float fog_at(float t)
 {
-    return t >= 0.0 ? saturate(1.0 - exp(-0.0025 * t * t * 0.1)) : 0.0;
+    return t >= 0.0 ? haze_at(t) : 0.0;
 }
 
 [shader("compute")]

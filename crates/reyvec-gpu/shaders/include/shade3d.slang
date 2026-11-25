@@ -6,6 +6,17 @@
 
 #include "mesh.slang"
 
+// Доля дымки на расстоянии `t`: даль уходит в цвет неба. Дальность — слово 14 заголовка
+// сцены (поле `haze` файла сцены, м), 0 — обычная 63 м (как прежнее exp(−0,00025·t²)).
+float haze_at(float t)
+{
+    float reach = asfloat(pc.scene[14]);
+    if (reach <= 0.0)
+        reach = 63.2456;
+    float x = t / reach;
+    return saturate(1.0 - exp(-x * x));
+}
+
 // Небо: к горизонту светлее.
 float3 sky(float3 dir)
 {
@@ -248,8 +259,7 @@ float3 shade_surface(float3 p, float3 dir, float t, float mat, float3 n, float4 
     // Свечение: своя яркость, тень и свет на неё не влияют. Ярче 1 — ореол при выводе.
     color += albedo * glow;
     // Даль уходит в дымку неба (сетка не рябит у горизонта).
-    float fog = 1.0 - exp(-0.0025 * t * t * 0.1);
-    return lerp(color, sky(dir), saturate(fog));
+    return lerp(color, sky(dir), haze_at(t));
 }
 
 // То же для точки буфера геометрии `g` луча глаза через точку экрана `screen` с готовыми
