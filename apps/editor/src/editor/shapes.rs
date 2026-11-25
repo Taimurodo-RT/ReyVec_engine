@@ -164,8 +164,11 @@ pub(crate) struct ShapeView {
     pub error: Option<String>,
     /// Модель ещё ни разу не прочиталась: камера встанет по ней, когда прочитается.
     framed: bool,
-    /// Текст файла модели при последнем чтении или записи (М.3: из него дерево частей).
+    /// Текст модели или сцены 3D с правками (М.3: из него дерево частей). У модели он
+    /// всегда как в файле; у уровня 3D (Р.13) правки ждут Ctrl+S, как у сцены 2D.
     pub text: String,
+    /// Текст в файле: последнее чтение или сохранение.
+    saved: String,
     /// Детали, спрятанные «глазом» в дереве (пути в дереве `shape_edit`): на подставке их
     /// нет, в файле они остаются.
     pub hidden: Vec<Vec<usize>>,
@@ -221,6 +224,7 @@ impl ShapeView {
             error: None,
             framed: false,
             text: String::new(),
+            saved: String::new(),
             hidden: Vec::new(),
             preview: BTreeMap::new(),
             cost: super::cost::CostJob::default(),
@@ -234,12 +238,21 @@ impl ShapeView {
     pub(crate) fn load(&mut self) -> Option<String> {
         self.modified = modified(&self.path);
         match std::fs::read_to_string(&self.path) {
-            Ok(t) => self.text = t,
+            Ok(t) => {
+                self.saved.clone_from(&t);
+                self.text = t;
+            }
             Err(e) => {
                 self.error = Some(format!("не прочитать файл: {e}"));
                 return None;
             }
         }
+        self.rebuild()
+    }
+
+    /// Собрать сцену подставки (или сцену 3D) заново из текста [`ShapeView::text`], не
+    /// читая файл. Ответ — как у [`ShapeView::load`].
+    pub(crate) fn rebuild(&mut self) -> Option<String> {
         self.checked = Instant::now();
         if self.scene {
             return self.load_scene();
@@ -390,9 +403,33 @@ impl ShapeView {
         self.load()
     }
 
-    /// Сохранили ли файл модели с прошлого чтения (смотрит не чаще [`CHECK_EVERY`]).
+    /// Правка из редактора. Модель пишется в файл сразу (подставка «Форм»), уровень 3D —
+    /// только в памяти, до Ctrl+S (Р.13). Ответ — как у [`ShapeView::load`].
+    pub(crate) fn edit(&mut self, text: &str) -> Option<String> {
+        if !self.scene {
+            return self.write(text);
+        }
+        text.clone_into(&mut self.text);
+        self.rebuild()
+    }
+
+    /// Есть правки, которых нет в файле (бывает только у уровня 3D).
+    pub(crate) fn dirty(&self) -> bool {
+        self.text != self.saved
+    }
+
+    /// Записать правки в файл (Ctrl+S).
+    pub(crate) fn save(&mut self) -> Result<(), String> {
+        std::fs::write(&self.path, &self.text).map_err(|e| format!("не записать файл: {e}"))?;
+        self.saved.clone_from(&self.text);
+        self.modified = modified(&self.path);
+        Ok(())
+    }
+
+    /// Сохранили ли файл модели с прошлого чтения (смотрит не чаще [`CHECK_EVERY`]). Пока
+    /// есть несохранённые правки, файл с диска не берётся: правки важнее.
     pub(crate) fn changed(&mut self) -> bool {
-        if self.checked.elapsed() < CHECK_EVERY {
+        if self.checked.elapsed() < CHECK_EVERY || self.dirty() {
             return false;
         }
         self.checked = Instant::now();
@@ -1204,6 +1241,34 @@ mod tests {
         view.hidden = vec![vec![i]];
         let without: SpaceFile = ron::from_str(&view.stand_scene()).unwrap();
         assert_eq!(without.objects.len(), file.objects.len() - 1);
+    }
+
+    #[test]
+    fn level_edits_wait_for_save() {
+        // Уровень 3D (Р.13): правка — в памяти, файл тот же до Ctrl+S; модель — сразу.
+        let dir = std::env::temp_dir().join(format!("reyvec-level3d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("зал.ron");
+        let original = std::fs::read_to_string(scenes().join("lamps.ron")).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let mut view = ShapeView::open(path.clone()).unwrap();
+        assert!(view.load().is_some());
+        assert!(!view.dirty());
+        let edited = original.replacen("power: 1.2", "power: 2.5", 1);
+        assert!(view.edit(&edited).is_some());
+        assert!(view.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // Файл поменяли снаружи, а правки не сохранены — правки важнее.
+        view.checked = Instant::now() - CHECK_EVERY * 2;
+        assert!(!view.changed());
+        // Вернулись с другой вкладки — сцена из памяти, правка на месте.
+        assert!(view.rebuild().is_some());
+        assert_eq!(view.text, edited);
+        view.save().unwrap();
+        assert!(!view.dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -377,6 +377,8 @@ pub(crate) struct EditorUi {
     log_filter: LogFilter,
     /// Выбранная часть модели во «Формах» (путь в дереве частей).
     shape_selected: Vec<usize>,
+    /// Скопированная деталь модели или предмет сцены 3D (текст из файла).
+    shape_clipboard: Option<String>,
     /// Как новая деталь из палитры складывается с выбранной.
     shape_combine: shape_edit::Combine,
     /// Свёрнутые части в дереве модели.
@@ -462,6 +464,7 @@ impl EditorUi {
             ruler: None,
             log_filter: LogFilter::All,
             shape_selected: Vec::new(),
+            shape_clipboard: None,
             shape_combine: shape_edit::Combine::Add,
             shape_closed: HashSet::new(),
             shape_locked: HashSet::new(),
@@ -938,6 +941,9 @@ impl EditorUi {
             let del = del && !(shape.scene && self.lamp_delete(shape.text));
             for (on, cmd) in [
                 (f, PartCmd::Focus),
+                (copy && !cut, PartCmd::Copy),
+                (cut, PartCmd::Cut),
+                (paste.is_some(), PartCmd::Paste),
                 (dup, PartCmd::Duplicate),
                 (del, PartCmd::Remove),
             ] {
@@ -1110,7 +1116,16 @@ impl EditorUi {
                 .push(Action::ShapeCamera(ShapeCam::Focus(path)));
             return;
         }
+        if cmd == PartCmd::Paste {
+            return self.shape_paste(text, &root, &path);
+        }
         let Some(part) = root.at(&path) else { return };
+        if cmd == PartCmd::Copy {
+            if part.removable {
+                self.shape_clipboard = Some(text[part.outer.clone()].to_owned());
+            }
+            return;
+        }
         if self.part_locked(&path) {
             tracing::info!("Деталь закреплена: сначала снимите замок в иерархии");
             return;
@@ -1130,7 +1145,15 @@ impl EditorUi {
             root.at(&p).filter(|s| s.removable).map(|s| (s, p))
         };
         let (result, select) = match cmd {
-            PartCmd::Focus => return,
+            PartCmd::Focus | PartCmd::Copy | PartCmd::Paste => return,
+            PartCmd::Cut => {
+                if part.removable {
+                    self.shape_clipboard = Some(text[part.outer.clone()].to_owned());
+                }
+                let mut p = path.clone();
+                p.pop();
+                (shape_edit::remove(text, part), p)
+            }
             PartCmd::Duplicate => {
                 let mut p = path.clone();
                 if let Some(l) = p.last_mut() {
@@ -1165,6 +1188,39 @@ impl EditorUi {
                 self.actions.push(Action::ShapeText { text, commit: true });
             }
             Err(e) => tracing::warn!("Модель не правится: {e}"),
+        }
+    }
+
+    /// Вставить скопированное сразу за выбранным (в тот же список), а если выбрано то,
+    /// у чего свой список деталей, или ничего — в конец списка верхней части.
+    fn shape_paste(&mut self, text: &str, root: &shape_edit::Part, path: &[usize]) {
+        let Some(item) = self.shape_clipboard.clone() else {
+            return;
+        };
+        // У сцены 3D список предметов — сама верхняя часть.
+        let list_of = |p: &shape_edit::Part| {
+            p.list
+                .or_else(|| shape_edit::is_scene(p).then_some(p.outer.start))
+        };
+        let (open, index, mut select) = match path.split_last() {
+            Some((&last, up)) if root.at(path).is_some_and(|p| p.removable) => {
+                let Some(list) = root.at(up).and_then(list_of) else {
+                    return;
+                };
+                (list, last + 1, up.to_vec())
+            }
+            _ => {
+                let Some(list) = list_of(root) else { return };
+                (list, root.children.len(), Vec::new())
+            }
+        };
+        select.push(index);
+        match super::ron_edit::insert_item_at(text, open, index, &item) {
+            Ok(text) => {
+                self.shape_selected = select;
+                self.actions.push(Action::ShapeText { text, commit: true });
+            }
+            Err(e) => tracing::warn!("Не вставить: {e}"),
         }
     }
 
@@ -5710,6 +5766,10 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PartCmd {
     Focus,
+    /// Ctrl+C, Ctrl+X, Ctrl+V (Р.13): как у предметов сцены 2D.
+    Copy,
+    Cut,
+    Paste,
     Duplicate,
     Up,
     Down,
@@ -6674,6 +6734,73 @@ mod tests {
         let root = shape_edit::parse(&t).unwrap();
         let back = write_use_params(&t, root.at(&[0]).unwrap(), &BTreeMap::new()).unwrap();
         assert!(back.contains(r#"Use(model: "завод/конвейер")"#), "{back}");
+    }
+
+    #[test]
+    fn scene_objects_copy_cut_and_paste() {
+        // Р.13: в уровне 3D Ctrl+C, Ctrl+X, Ctrl+V работают с предметами, как в 2D.
+        let text = r##"(format: "reyvec-space", version: 1,
+    materials: [(name: "серый", color: "#808080")],
+    objects: [
+        (name: "ящик", material: "серый", shape: Box(size: (0.2, 0.2, 0.2))),
+        (name: "шар", material: "серый", at: (1.0, 0.0, 0.0), shape: Sphere(radius: 0.2)),
+    ],
+)"##;
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Edit);
+        shape_info.shape = Some(ShapeInfo {
+            name: "сцена",
+            spin: false,
+            free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            post_aa: false,
+            in_view: true,
+            passes: &[],
+            camera: reyvec_sdf::Camera3D::default(),
+            shift: [0.0; 3],
+            error: None,
+            text,
+            preview: &NO_PREVIEW,
+            cost: None,
+            scene: true,
+            root: std::path::Path::new("."),
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        ui.take_actions();
+        ui.shape_selected = vec![0];
+        frame(&ctx, &mut ui, &shape_info, vec![egui::Event::Copy]);
+        assert!(ui.take_actions().is_empty(), "копия файл не меняет");
+        assert!(ui.shape_clipboard.is_some(), "скопировано");
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            vec![egui::Event::Paste(String::new())],
+        );
+        let pasted = match ui.take_actions().as_slice() {
+            [Action::ShapeText { text, commit: true }] => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(pasted.matches("\"ящик\"").count(), 2, "{pasted}");
+        assert_eq!(ui.shape_selected, vec![1]);
+        let file: reyvec_sdf::space_file::SpaceFile = ron::from_str(&pasted).unwrap();
+        assert_eq!(file.objects.len(), 3);
+        // Вырезать — копия в буфере, предмета в файле нет.
+        ui.shape_selected = vec![1];
+        frame(&ctx, &mut ui, &shape_info, vec![egui::Event::Cut]);
+        let cut = match ui.take_actions().as_slice() {
+            [Action::ShapeText { text, .. }] => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(!cut.contains("\"шар\""));
+        assert!(
+            ui.shape_clipboard
+                .as_deref()
+                .is_some_and(|c| c.contains("\"шар\""))
+        );
     }
 
     #[test]
