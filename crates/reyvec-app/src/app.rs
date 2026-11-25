@@ -420,17 +420,6 @@ impl App {
                     if on { "вкл" } else { "выкл" }
                 );
             }
-            PanelAction::Cascades(on) => {
-                r.set_cascades(on);
-                tracing::info!(
-                    "Свет: {}",
-                    if on {
-                        "каскадами лучей (опыт)"
-                    } else {
-                        "лучами к источникам"
-                    }
-                );
-            }
             PanelAction::SpaceSmooth(on) => {
                 r.set_space_smooth(on);
                 tracing::info!("Сглаживание 3D: {}", if on { "вкл" } else { "выкл" });
@@ -879,7 +868,6 @@ impl App {
                 fill_mode: renderer.fill(),
                 light_field: renderer.light_field(),
                 glow: renderer.glow(),
-                cascades: renderer.cascades(),
                 dither: renderer.dither(),
             };
             panel.frame(window, &info, in_game.then_some((game_ui, &game_view)))
@@ -1476,21 +1464,6 @@ impl ApplicationHandler for App {
                 if let Some(r) = self.renderer.as_ref() {
                     let on = !r.dither();
                     self.apply(PanelAction::Dither(on));
-                }
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyC),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => {
-                if let Some(r) = self.renderer.as_ref() {
-                    let on = !r.cascades();
-                    self.apply(PanelAction::Cascades(on));
                 }
             }
             WindowEvent::KeyboardInput {

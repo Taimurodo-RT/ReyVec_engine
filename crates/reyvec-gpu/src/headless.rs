@@ -61,8 +61,6 @@ pub struct HeadlessScene {
     pub zoom: bool,
     /// Свои файлы для сцен «SVG» и «Motif»; без них там примеры.
     pub files: crate::UserFiles,
-    /// Опыт 4.6: свет каскадами лучей вместо лучей к источникам.
-    pub cascades: bool,
 }
 
 /// Сценарий игры для кадра без окна (проверка в движении, 6.4): где герой сцены «из
@@ -237,7 +235,6 @@ pub fn render_triangle_headless(
             fill: crate::FillMode::PerShape,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         },
     )
 }
@@ -484,7 +481,6 @@ fn render(
             // Шум против полос случайно сдвигает пиксели на ступень: эталоны сравниваются без
             // него.
             demo.set_dither(false);
-            demo.set_cascades(scene.cascades);
             // Тесты поля сравнивают кадры с полем и без него и с «углами из поля» и без них.
             #[cfg(test)]
             demo.set_space_field(!tests::FIELD_OFF.get());
@@ -884,7 +880,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::default(),
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let errors = validation_error_count();
         let img = render_headless(&options, &scene).expect("кадр без окна");
@@ -1090,7 +1085,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let level = |render| HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -1159,7 +1153,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let level = |render| HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -1260,7 +1253,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         for (name, scale, no_ms) in [
             ("обычно", crate::SpaceScale::Full, false),
@@ -1336,7 +1328,6 @@ pub(crate) mod tests {
                     space: Some(text.into()),
                     ..Default::default()
                 },
-                cascades: false,
             };
             render_headless(&options, &scene).expect("кадр")
         };
@@ -1418,7 +1409,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         GLOW.set(true);
         let frame = render_headless(&options, &scene);
@@ -1476,7 +1466,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let frame = render_headless(&options, &scene).expect("кадр");
         let stats = frame.space_stats.expect("числа сцены 3D");
@@ -1550,7 +1539,6 @@ pub(crate) mod tests {
                 space: Some(include_str!("../../../scenes/3d/effects.ron").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         GLOW.set(true);
         let on = render_headless(&options, &scene);
@@ -1610,7 +1598,6 @@ pub(crate) mod tests {
                 space: Some(include_str!("../../../scenes/3d/mirrors.ron").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let on = render_headless(&options, &scene).expect("кадр с отражениями");
         REFLECTIONS.set(false);
@@ -1683,7 +1670,6 @@ pub(crate) mod tests {
                 space: Some(include_str!("../../../scenes/3d/mirrors.ron").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let fast = render_headless(&options, &scene).expect("кадр быстрого режима");
         let mut shots = Vec::new();
@@ -1804,7 +1790,6 @@ pub(crate) mod tests {
                 space: Some(space.into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let mirrors = scene(include_str!("../../../scenes/3d/mirrors.ron"));
         let hall = scene(include_str!("../../../scenes/3d/lamps.ron"));
@@ -1883,7 +1868,6 @@ pub(crate) mod tests {
                 ),
                 ..Default::default()
             },
-            cascades: false,
         };
         PATH_BOUNCES.set(0);
         PATH_RESTIR.set(false);
@@ -1953,7 +1937,6 @@ pub(crate) mod tests {
                 space: Some(include_str!("../../../scenes/3d/lamps.ron").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         PATH_BOUNCES.set(0);
         PATH_DENOISE.set(false);
@@ -2170,7 +2153,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         SPACE_COUNTERS.set(true);
         let split = render_headless(&options, &scene);
@@ -2288,7 +2270,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let render = |rt: bool, counted: bool| {
             SPACE_RT.set(rt);
@@ -2392,7 +2373,6 @@ pub(crate) mod tests {
                     space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                     ..Default::default()
                 },
-                cascades: false,
             };
             let render = |cache: bool| {
                 SUN_CACHE.set(cache);
@@ -2490,7 +2470,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let render = |reuse: bool| {
             SHADOW_REUSE.set(reuse);
@@ -2546,7 +2525,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::default(),
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         TENSOR_BENCH.set(true);
         BENCH_OUT.set(None);
@@ -2606,7 +2584,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let bricks = render_headless(&options, &scene(file.to_owned())).expect("кадр");
         PLANE_SHADOWS.set(true);
@@ -2667,7 +2644,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let room = HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -2679,14 +2655,6 @@ pub(crate) mod tests {
         };
         let cases: Vec<(&str, HeadlessScene, Option<HeadlessPlay>)> = vec![
             ("2D-комната", base.clone(), Some(room.clone())),
-            (
-                "2D-комната, каскады",
-                HeadlessScene {
-                    cascades: true,
-                    ..base.clone()
-                },
-                Some(room.clone()),
-            ),
             (
                 "лаборатория",
                 HeadlessScene {
@@ -2839,7 +2807,6 @@ pub(crate) mod tests {
                 space: Some(SPACE.into()),
                 ..Default::default()
             },
-            cascades: false,
         }
     }
 
@@ -2945,7 +2912,6 @@ pub(crate) mod tests {
                 space: Some(space.into()),
                 ..Default::default()
             },
-            cascades: false,
         }
     }
 
@@ -3183,7 +3149,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         // Ящик в кадре 960×505 и почти чёрные пиксели на нём.
         let dark = |image: &FrameImage| {
@@ -3436,7 +3401,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let play = HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -3516,7 +3480,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         // Комната, подъёмник в коридоре и склон в конце.
         let plays = [
@@ -3684,7 +3647,6 @@ pub(crate) mod tests {
                 fill: crate::FillMode::Triangles,
                 zoom: false,
                 files: crate::UserFiles::default(),
-                cascades: false,
             };
             let play = HeadlessPlay {
                 start: Some(start),
@@ -3774,7 +3736,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         for scale in [crate::SpaceScale::Full, crate::SpaceScale::Half] {
             SPACE_SCALE.set(scale);
@@ -3929,7 +3890,6 @@ pub(crate) mod tests {
                     space: Some(scene_text(split).into()),
                     ..Default::default()
                 },
-                cascades: false,
             };
             let f = render_headless(&options, &scene);
             NO_MESH_MSAA.set(false);
@@ -4024,7 +3984,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let play = HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -4167,7 +4126,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let plain = render_headless(&options, &scene).expect("кадр");
         SPACE_COUNTERS.set(true);
@@ -4280,7 +4238,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         // Комната (точка теста уровня), у стола и у полки.
         for start in [[-0.6, -0.5], [0.0, -0.6], [0.4, -0.5]] {
@@ -4363,7 +4320,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let starts = [[-0.6, -0.5], [0.4, -0.5]];
         for render in [crate::LevelRender::Sdf, crate::LevelRender::Field] {
@@ -4452,7 +4408,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         for render in [crate::LevelRender::Sdf, crate::LevelRender::Field] {
             let play = HeadlessPlay {

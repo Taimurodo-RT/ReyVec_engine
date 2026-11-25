@@ -140,7 +140,6 @@ fn svg_matches_resvg() {
                 motif: None,
                 ..Default::default()
             },
-            cascades: false,
         };
         let frame = render_headless(&options, &scene)
             .expect("кадр без окна")
