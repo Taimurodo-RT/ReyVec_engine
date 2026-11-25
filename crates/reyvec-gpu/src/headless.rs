@@ -1538,6 +1538,74 @@ pub(crate) mod tests {
         assert!(late < early, "накопление не убирает шум: {early} и {late}");
     }
 
+    /// Кэш солнца в пути (R5е): в солнечной сцене «зеркала» кадр режима «качество» с кэшем
+    /// тот же, что без него (карта решает только то, что знает точно), а в закрытом зале с
+    /// лампами, где солнце везде за крышей, кадр тоже тот же, а лучей к солнцу нет.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn path_sun_cache_keeps_picture() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = |space: &'static str| HeadlessScene {
+            width: 160,
+            height: 120,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(space.into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        let mirrors = scene(include_str!("../../../scenes/3d/mirrors.ron"));
+        let hall = scene(include_str!("../../../scenes/3d/lamps.ron"));
+        LIVE_FRAMES.set(8);
+        let mut shots = Vec::new();
+        for cache in [false, true] {
+            SUN_CACHE.set(cache);
+            shots.push((
+                render_headless(&options, &mirrors),
+                render_headless(&options, &hall),
+            ));
+        }
+        SUN_CACHE.set(false);
+        LIVE_FRAMES.set(0);
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        let mut shots = shots
+            .into_iter()
+            .map(|(m, h)| (m.expect("кадр «зеркал»"), h.expect("кадр зала")));
+        let (plain, cached) = (shots.next().unwrap(), shots.next().unwrap());
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/sun-plain.rgba"), &plain.0.image.rgba);
+            let _ = std::fs::write(format!("{dir}/sun-cached.rgba"), &cached.0.image.rgba);
+        }
+        let (changed, worst, mean) = image_diff(&plain.0.image, &cached.0.image);
+        let path_ms = |image: &HeadlessImage| {
+            image
+                .gpu_timings
+                .as_ref()
+                .and_then(|t| t.passes.iter().find(|p| p.name == "путь 3D").map(|p| p.ms))
+        };
+        let (_, _, hall_mean) = image_diff(&plain.1.image, &cached.1.image);
+        eprintln!(
+            "кэш солнца в пути: «зеркала» — точек другого цвета {changed}, сильнее всего {worst}, в среднем {mean:.3}; зал — в среднем {hall_mean:.3}, путь {:?} → {:?} мс",
+            path_ms(&plain.1),
+            path_ms(&cached.1)
+        );
+        assert!(mean < 0.5, "кэш солнца меняет кадр «зеркал»: {mean}");
+        assert!(hall_mean < 0.5, "кэш солнца меняет кадр зала: {hall_mean}");
+        // Время только печатается: на lavapipe под нагрузкой соседних тестов оно скачет
+        // (зал 160×120 один: 23,8 → 18,4 мс), а ускорение мерит 5080.
+    }
+
     #[test]
     #[ignore = "нужен драйвер Vulkan"]
     fn wall_seams_have_no_bright_dots() {
