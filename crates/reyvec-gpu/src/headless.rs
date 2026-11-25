@@ -4110,8 +4110,10 @@ pub(crate) mod tests {
                     if pass == PASS_MARCH || pass == PASS_EDGES {
                         eprintln!("{what} {name}: было {o:?}");
                         eprintln!("{what} {name}: стало {n:?}");
+                        // Порог 92 %: с R5г нормаль не считает плоскости, и полная нормаль
+                        // сама стала дешевле (выигрыш у лучей краёв 10 → 9 %).
                         assert!(
-                            n.objects * 100 <= o.objects * 90,
+                            n.objects * 100 <= o.objects * 92,
                             "{what} {name}: {o:?} → {n:?}"
                         );
                         assert!(n.forms < o.forms, "{what} {name}: {o:?} → {n:?}");
