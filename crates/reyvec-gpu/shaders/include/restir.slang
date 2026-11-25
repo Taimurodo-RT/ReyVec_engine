@@ -163,6 +163,15 @@ void builder_merge(inout ReservoirBuilder b, Reservoir other, float cap, float3 
 static const uint PREV_RESTIR = 1;
 static const uint PREV_HISTORY = 2;
 static const uint PREV_GI = 4;
+// Камера не сдвинулась с прошлого кадра (та же матрица).
+static const uint PREV_STILL = 8;
+
+// Камера та же, что в прошлом кадре.
+bool camera_still()
+{
+    uint at = pc.scene[7];
+    return at != 0u && (pc.scene[at + MESH_PREV_VIEW_PROJ + 16] & PREV_STILL) != 0u;
+}
 
 // Пиксель прошлого кадра для точки `p` (матрица камеры прошлого кадра — в разделе моделей);
 // false — прошлого кадра нет, его данные `what` не годятся или точка вне него.

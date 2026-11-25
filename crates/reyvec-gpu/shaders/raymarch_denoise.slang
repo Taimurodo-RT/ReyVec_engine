@@ -36,7 +36,9 @@ static const uint DENOISE_COMPOSE = 3;
 static const uint HISTORY_WORDS = 10;
 // Память не длиннее стольких кадров: свет меняется — картинка догоняет за ~1/3 секунды.
 static const float HISTORY_MAX = 24.0;
-// У зеркал (отражение не связано с поверхностью) память короче, размытия нет.
+// У зеркал (отражение не связано с поверхностью) память короче, размытия нет. Пока камера
+// стоит, отражение на месте — зеркала копят столько же, сколько остальное: «блёстки»
+// (свет точки в отражении — один путь на пиксель) тают за доли секунды.
 static const float MIRROR_HISTORY = 4.0;
 
 uint material_id(float y)
@@ -99,7 +101,7 @@ void temporal(int2 px, uint w, uint h)
             len = float(meta & 0xffffu);
         }
     }
-    len = min(len + 1.0, mirror_like(m) ? MIRROR_HISTORY : HISTORY_MAX);
+    len = min(len + 1.0, mirror_like(m) && !camera_still() ? MIRROR_HISTORY : HISTORY_MAX);
     float alpha = 1.0 / len;
     float3 mixed = lerp(old, light, alpha);
     moments = lerp(moments, float2(lum, lum * lum), alpha);
