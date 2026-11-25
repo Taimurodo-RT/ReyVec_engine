@@ -33,6 +33,8 @@ pub(crate) struct PathFrame {
     /// Кэш света (шаг 5б): `Some(стереть)` — таблица в буфере `sums` после запасов GI;
     /// `стереть` — она новая или сдвинулась (другой размер кадра), её надо обнулить.
     pub cache: Option<bool>,
+    /// ReSTIR GI: новый отскок у одного пикселя квадрата 2×2 за кадр.
+    pub gi_quarter: bool,
 }
 
 /// Что из прошлого кадра годится (как PREV_* в include/restir.slang).
@@ -70,6 +72,8 @@ pub(crate) struct PathRef {
     pub gi: bool,
     /// Кэш света в режиме «качество» (флажок на панели).
     pub cache: bool,
+    /// ReSTIR GI: новый отскок у одного пикселя квадрата 2×2 за кадр (флажок на панели).
+    pub gi_quarter: bool,
     /// Размер кадра, под который в прошлом кадре лежала таблица кэша.
     cache_last: Option<(u32, u32)>,
     /// Запасы DI и GI (один буфер: у прохода одно место для адреса).
@@ -98,6 +102,7 @@ impl PathRef {
             bounces: PATH_BOUNCES,
             gi: true,
             cache: true,
+            gi_quarter: true,
             cache_last: None,
             restir_buffer: None,
             restir_last: (false, false),
@@ -166,6 +171,7 @@ impl PathRef {
             history: 0,
             gi: false,
             cache: None,
+            gi_quarter: false,
         };
         let size = (extent.width, extent.height);
         let same = self
@@ -187,6 +193,7 @@ impl PathRef {
             frame.sums = address;
             frame.restir = self.restir;
             frame.gi = self.gi;
+            frame.gi_quarter = self.gi && self.gi_quarter;
             if self.cache {
                 frame.cache = Some(fresh || self.cache_last != Some(size));
             }
@@ -265,6 +272,7 @@ impl PathRef {
             history: 0,
             gi: false,
             cache: None,
+            gi_quarter: false,
         };
         self.count = self.count.saturating_add(1);
         Some(frame)

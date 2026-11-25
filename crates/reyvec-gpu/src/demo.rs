@@ -2399,6 +2399,16 @@ impl Demo {
         self.path_ref.gi = on;
     }
 
+    /// ReSTIR GI: новый отскок у одного пикселя из 4 за кадр.
+    pub fn path_gi_quarter(&self) -> bool {
+        self.path_ref.gi_quarter
+    }
+
+    /// Включает и выключает отскок ReSTIR GI у одного пикселя из 4.
+    pub fn set_path_gi_quarter(&mut self, on: bool) {
+        self.path_ref.gi_quarter = on;
+    }
+
     /// Кэш света в режиме «качество» включён.
     pub fn path_cache(&self) -> bool {
         self.path_ref.cache
@@ -5673,6 +5683,7 @@ impl Demo {
                 | if path.restir { PATH_RESTIR } else { 0 }
                 | if path.gi { PATH_GI } else { 0 }
                 | if path.cache.is_some() { PATH_CACHE } else { 0 }
+                | if path.gi_quarter { PATH_GI_QUARTER } else { 0 }
                 | if split.is_some() { PATH_SPLIT } else { 0 };
             graph.add_pass("путь 3D", &path_uses, move |p| {
                 let (target, aux) = match split {
@@ -5709,7 +5720,12 @@ impl Demo {
                     bindless.bind_compute(d, cmd);
                     d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                     d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                    d.cmd_dispatch(cmd, ext.width.div_ceil(8), ext.height.div_ceil(8), 1);
+                    d.cmd_dispatch(
+                        cmd,
+                        ext.width.div_ceil(16) * 2,
+                        ext.height.div_ceil(16) * 2,
+                        1,
+                    );
                 }
             });
             if let Some((mut light, albedo)) = split {
@@ -7267,6 +7283,9 @@ const PATH_GI: u32 = 128;
 const RESTIR_GI_NEIGHBORS: u32 = 1;
 /// Флаг прохода «путь 3D»: кэш света (PATH_CACHE в raymarch_path.slang).
 const PATH_CACHE: u32 = 256;
+/// Флаг прохода «путь 3D»: новый отскок ReSTIR GI у одного пикселя квадрата 2×2 за кадр;
+/// группы запуска — по месту в квадрате, их число по сторонам чётное (PATH_GI_QUARTER).
+const PATH_GI_QUARTER: u32 = 512;
 /// Флаги «ReSTIR: кандидаты» для «кэш света: сводка»: свести, стереть (raymarch_restir.slang).
 const CACHE_RESOLVE: u32 = 2;
 const CACHE_CLEAR: u32 = 4;

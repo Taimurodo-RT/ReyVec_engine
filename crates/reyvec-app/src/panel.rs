@@ -81,6 +81,8 @@ pub(crate) enum PanelAction {
     PathGi(bool),
     /// Кэш света режима «качество» (путь ReSTIR, шаг 5б).
     PathCache(bool),
+    /// ReSTIR GI: новый отскок у одного пикселя из 4 за кадр.
+    PathGiQuarter(bool),
     /// Шумодав режима «качество» (путь ReSTIR, шаг 5).
     PathDenoise(bool),
     /// Разрешение сцены «3D» (7.14).
@@ -237,6 +239,8 @@ pub(crate) struct PanelInfo<'a> {
     pub path_gi: bool,
     /// Кэш света режима «качество» включён.
     pub path_cache: bool,
+    /// ReSTIR GI: новый отскок у одного пикселя из 4 за кадр.
+    pub path_gi_quarter: bool,
     /// Сколько кадров он накопил.
     pub path_samples: Option<u32>,
     /// Разрешение сцены «3D» (7.14).
@@ -1195,6 +1199,22 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::PathCache(path_cache));
+            }
+            let mut path_gi_quarter = info.path_gi_quarter;
+            if ui
+                .add_enabled(
+                    info.path_live && info.path_gi,
+                    egui::Checkbox::new(&mut path_gi_quarter, "Отражённый свет: отскок у 1 из 4"),
+                )
+                .on_hover_text(
+                    "Новый отскок для отражённого света в каждом кадре ведёт один пиксель \
+                 квадрата 2×2 (по очереди), остальные берут свет из своего прошлого и у \
+                 соседей. Отскоков вчетверо меньше; после резкого поворота камеры свет \
+                 новых мест чуть шумнее первые кадры. Выключите, чтобы сравнить",
+                )
+                .changed()
+            {
+                actions.push(PanelAction::PathGiQuarter(path_gi_quarter));
             }
             let mut path_denoise = info.path_denoise;
             if ui
@@ -2241,6 +2261,7 @@ mod tests {
             path_denoise: true,
             path_gi: true,
             path_cache: true,
+            path_gi_quarter: true,
             path_samples: None,
             space_scale: SpaceScale::Full,
             level_view: false,

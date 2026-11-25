@@ -585,6 +585,7 @@ fn render(
             demo.set_path_denoise(tests::PATH_DENOISE.get());
             demo.set_path_gi(tests::PATH_GI.get());
             demo.set_path_cache(tests::PATH_CACHE.get());
+            demo.set_path_gi_quarter(tests::PATH_GI_QUARTER.get());
             demo.set_path_bounces(tests::PATH_BOUNCES.get());
         }
         r.timer = GpuTimer::new(ctx, 1)?;
@@ -969,6 +970,8 @@ pub(crate) mod tests {
         pub(super) static PATH_DENOISE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// ReSTIR GI в режиме «качество».
         pub(super) static PATH_GI: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+        /// ReSTIR GI: новый отскок у одного пикселя из 4.
+        pub(super) static PATH_GI_QUARTER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Кэш света в режиме «качество».
         pub(super) static PATH_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// ReSTIR DI в режиме «качество».
@@ -1520,9 +1523,10 @@ pub(crate) mod tests {
             (b_clean / b_ref - 1.0).abs() < 0.1,
             "шумодав меняет яркость: {b_clean} и {b_ref}"
         );
-        // Порог полуторный: с ReSTIR GI и шумный кадр уже заметно чище.
+        // Порог 1,4: с ReSTIR GI и шумный кадр уже заметно чище, а с отскоком GI у одного
+        // пикселя из 4 восьмой кадр шумодава чуть шумнее (4,5 → 5,0 при 7,1 без него).
         assert!(
-            denoised * 1.5 < noisy,
+            denoised * 1.4 < noisy,
             "шумодав почти не убирает шум: {noisy} и {denoised}"
         );
         // Шум: от 4 кадров к 16 картинка меняется сильнее, чем от 16 к 64.
@@ -1719,6 +1723,34 @@ pub(crate) mod tests {
             assert!(
                 fast < slow,
                 "кэш света не ускоряет путь: {fast} и {slow} мс"
+            );
+        }
+        // Отскок ReSTIR GI у одного пикселя из 4: яркость та же, путь дешевле.
+        LIVE_FRAMES.set(16);
+        PATH_GI_QUARTER.set(false);
+        let every = render_headless(&options, &scene);
+        PATH_GI_QUARTER.set(true);
+        LIVE_FRAMES.set(0);
+        let every = every.expect("кадр с отскоком у каждого пикселя");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/hall-gi-every.rgba"), &every.image.rgba);
+        }
+        let b_every = brightness(&every.image);
+        let (_, _, off_every) = image_diff(&every.image, &full.image);
+        eprintln!(
+            "отскок GI у каждого: {b_every:.1} (отличие {off_every:.2}, путь {:?} мс); у 1 из 4: {b_clean:.1} ({off:.2}, путь {:?} мс)",
+            path_ms(&every),
+            path_ms(&clean)
+        );
+        assert!(
+            (b_clean / b_every - 1.0).abs() < 0.05,
+            "отскок у 1 из 4 меняет яркость: {b_clean} и {b_every}"
+        );
+        if let (Some(slow), Some(fast)) = (path_ms(&every), path_ms(&clean)) {
+            assert!(
+                fast < slow,
+                "отскок у 1 из 4 не ускоряет путь: {fast} и {slow} мс"
             );
         }
     }

@@ -518,6 +518,13 @@ impl App {
                 r.set_path_gi(on);
                 tracing::info!("ReSTIR GI {}", if on { "вкл" } else { "выкл" });
             }
+            PanelAction::PathGiQuarter(on) => {
+                r.set_path_gi_quarter(on);
+                tracing::info!(
+                    "ReSTIR GI: отскок у 1 из 4 {}",
+                    if on { "вкл" } else { "выкл" }
+                );
+            }
             PanelAction::PathCache(on) => {
                 r.set_path_cache(on);
                 tracing::info!("Кэш света {}", if on { "вкл" } else { "выкл" });
@@ -835,6 +842,7 @@ impl App {
                 path_denoise: renderer.path_denoise(),
                 path_gi: renderer.path_gi(),
                 path_cache: renderer.path_cache(),
+                path_gi_quarter: renderer.path_gi_quarter(),
                 path_samples: renderer.path_samples(),
                 space_scale: renderer.space_scale(),
                 level_view: renderer.scene() == DemoScene::File && renderer.level_view(),

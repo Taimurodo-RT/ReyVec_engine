@@ -62,6 +62,9 @@ static const uint PATH_GI = 128;
 // Бит pc.flags (шаг 5б): кэш света (include/light_cache.slang). Путь в точке отскока берёт
 // прямой свет и дальше — свет клетки кэша; учебные пиксели ведут путь целиком и наполняют кэш.
 static const uint PATH_CACHE = 256;
+// Бит pc.flags: новый рассеянный отскок для ReSTIR GI ведёт один пиксель квадрата 2×2 за
+// кадр (по очереди), остальные берут свет из своего запаса прошлого кадра и у соседей.
+static const uint PATH_GI_QUARTER = 512;
 
 // Кэш света в этом пикселе: 0 — нет, 1 — брать из кэша, 2 — учебный (наполнять).
 static uint g_cache = 0;
@@ -349,11 +352,21 @@ void cs_main(uint3 id : SV_DispatchThreadID)
 {
     uint w, h;
     images[pc.target].GetDimensions(w, h);
-    if (id.x >= w || id.y >= h)
+    // С PATH_GI_QUARTER группа запуска (8×8 потоков) — пиксели одного места в квадратах
+    // 2×2 внутри куска 16×16: тогда отскок ReSTIR GI ведут все потоки группы или никто
+    // (видеокарта считает потоки пачками, и один длинный путь в пачке держал бы всю
+    // пачку). Число групп по каждой стороне — чётное (демо округляет).
+    uint2 at_px = id.xy;
+    if ((pc.flags & PATH_GI_QUARTER) != 0)
+    {
+        uint2 group = id.xy / 8u, local = id.xy % 8u;
+        at_px = (group / 2u) * 16u + local * 2u + group % 2u;
+    }
+    if (at_px.x >= w || at_px.y >= h)
         return;
-    int2 px = int2(id.xy);
+    int2 px = int2(at_px);
     uint frame = pc.meshes;
-    seed_rng(id.xy, frame, 0u);
+    seed_rng(at_px, frame, 0u);
     bool live = (pc.flags & PATH_LIVE) != 0;
     bool restir = live && (pc.flags & PATH_RESTIR) != 0;
     float2 jitter = live ? float2(0.5, 0.5) : float2(rnd(), rnd());
@@ -381,6 +394,10 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     {
         float3 gi_pos = float3(0.0, 0.0, 0.0), gi_normal = float3(0.0, 1.0, 0.0);
         float3 gi_radiance = float3(0.0, 0.0, 0.0);
+        // Учебные пиксели кэша ведут его всегда: их пути наполняют кэш.
+        bool turn = (pc.flags & PATH_GI_QUARTER) == 0 || g_cache == 2u
+                    || (uint(px.x & 1) + 2u * uint(px.y & 1)) == (frame & 3u);
+        gi_found = gi_found && turn;
         if (gi_found)
             gi_radiance = gi_path(gi_q, gi_n, spread, px, bounces, restir, w, h, gi_pos, gi_normal);
         gi_candidate(px, w, h, ray, first, gi_found, gi_pos, gi_normal, gi_radiance);
@@ -393,22 +410,22 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     {
         // Для шумодава: свет без цвета первой точки и без дымки, цвет и дымка — отдельно
         // (их соберёт «шумодав: сборка»).
-        images[pc.target][id.xy] = float4(c / albedo, 1.0);
-        images[pc.cone][id.xy] = float4(albedo, fog);
+        images[pc.target][at_px] = float4(c / albedo, 1.0);
+        images[pc.cone][at_px] = float4(albedo, fog);
         return;
     }
     c = lerp(c, sky(ray.dir), fog);
     if (live)
     {
-        images[pc.target][id.xy] = float4(c, 1.0);
+        images[pc.target][at_px] = float4(c, 1.0);
         return;
     }
-    uint at = (id.y * w + id.x) * 4;
+    uint at = (at_px.y * w + at_px.x) * 4;
     float3 sum = c;
     if (frame > 0)
         sum += float3(asfloat(pc.edges[at]), asfloat(pc.edges[at + 1]), asfloat(pc.edges[at + 2]));
     pc.edges[at] = asuint(sum.x);
     pc.edges[at + 1] = asuint(sum.y);
     pc.edges[at + 2] = asuint(sum.z);
-    images[pc.target][id.xy] = float4(sum / float(frame + 1), 1.0);
+    images[pc.target][at_px] = float4(sum / float(frame + 1), 1.0);
 }
