@@ -578,6 +578,11 @@ fn render(
             demo.set_shadow_reuse(tests::SHADOW_REUSE.get());
             demo.set_tensor_bench(tests::TENSOR_BENCH.get(), 0);
             demo.set_reflections(tests::REFLECTIONS.get());
+            // Тесты 3D сверяют кадры пиксель в пиксель, а ореол разносит любое отличие
+            // по соседям: в 3D свечение включает только свой тест.
+            if scene.scene == DemoScene::Space {
+                demo.set_glow(tests::GLOW.get());
+            }
             demo.set_glossy(tests::GLOSSY.get());
             demo.set_path_ref(tests::PATH_FRAMES.get() > 0);
             demo.set_path_live(tests::LIVE_FRAMES.get() > 0);
@@ -957,6 +962,8 @@ pub(crate) mod tests {
         /// Тени из прошлого кадра (опыт Р3): снимаемому кадру предшествует кадр с той же
         /// камерой на 1/20 секунды раньше.
         pub(super) static SHADOW_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Свечение и переход к белому в сцене «3D» (8.16); в тестах по умолчанию выключено.
+        pub(super) static GLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Отражения у блестящих материалов (Л1).
         pub(super) static REFLECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Эталон 3D: сколько кадров копить (снимается последний); 0 — эталон выключен.
@@ -1343,6 +1350,67 @@ pub(crate) mod tests {
             "различаются {differ} из {pixels} точек"
         );
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
+    }
+
+    /// 8.16: в сцене «эффекты» светящиеся материалы дают ореол (стена рядом с неоновой
+    /// трубкой со свечением светлее), а яркость выше белого не обрезается по каналам:
+    /// самый яркий шар остаётся оранжевым, а не жёлтым пятном.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn effects_scene_glows() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 480,
+            height: 270,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/effects.ron").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        GLOW.set(true);
+        let on = render_headless(&options, &scene);
+        GLOW.set(false);
+        let off = render_headless(&options, &scene);
+        let (on, off) = (
+            on.expect("кадр со свечением"),
+            off.expect("кадр без свечения"),
+        );
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/effects-on.rgba"), &on.image.rgba);
+            let _ = std::fs::write(format!("{dir}/effects-off.rgba"), &off.image.rgba);
+        }
+        let (changed, worst, mean) = image_diff(&on.image, &off.image);
+        let pixels = (on.image.width * on.image.height) as usize;
+        eprintln!(
+            "свечение 3D: отличается {changed} пикселей из {pixels}, наибольшая {worst}, в среднем {mean:.2}"
+        );
+        assert!(
+            changed * 20 >= pixels,
+            "свечение почти ничего не меняет: {changed}"
+        );
+        // Ореол только добавляет свет там, где кадр не ярче белого: темнее не становится
+        // нигде, кроме мест ярче плеча перехода к белому (там канал может опуститься).
+        let darker = on
+            .image
+            .rgba
+            .chunks(4)
+            .zip(off.image.rgba.chunks(4))
+            .filter(|(a, b)| (0..3).all(|k| b[k] < 200) && (0..3).any(|k| a[k] + 2 < b[k]))
+            .count();
+        assert_eq!(darker, 0, "свечение затемнило {darker} пикселей");
     }
 
     /// Л1: блестящие материалы сцены «зеркала» отражают сцену (флажок «Отражения 3D»

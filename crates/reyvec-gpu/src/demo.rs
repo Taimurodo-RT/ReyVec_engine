@@ -4674,7 +4674,9 @@ impl Demo {
             let (_, _, _, color, _, _) =
                 self.add_space_passes(graph, bindless, frame, Some(target));
             if let Some(color) = color {
-                self.add_direct_output(graph, bindless, frame, color, target);
+                let bloom = (frame.scene == DemoScene::Space && self.glow)
+                    .then(|| self.add_bloom_passes(graph, bindless, frame, color, None));
+                self.add_direct_output(graph, bindless, frame, color, bloom, target);
             }
             return;
         }
@@ -4998,9 +5000,16 @@ impl Demo {
 
         let light = light.zip(field);
         // Свечение читает готовый кадр сцены, поэтому идёт после его сведения.
-        let bloom = light
-            .filter(|_| self.glow)
-            .map(|(l, _)| self.add_bloom_passes(graph, bindless, frame, scene, l));
+        // У сцены «3D» (8.16) картинки света нет: свет уже в кадре, свечение берёт его
+        // яркие места как есть (светящиеся материалы, блики, шарики ламп).
+        let bloom = if frame.scene == DemoScene::Space {
+            self.glow
+                .then(|| self.add_bloom_passes(graph, bindless, frame, scene, None))
+        } else {
+            light
+                .filter(|_| self.glow)
+                .map(|(l, _)| self.add_bloom_passes(graph, bindless, frame, scene, Some(l)))
+        };
         let mut uses = vec![(scene, Access::Sampled), (target, Access::ColorAttachment)];
         if let Some((l, f)) = light {
             uses.push((l, Access::Sampled));
@@ -5075,11 +5084,16 @@ impl Demo {
         bindless: &'a Bindless,
         frame: FrameData,
         color: ImageHandle,
+        bloom: Option<ImageHandle>,
         target: ImageHandle,
     ) {
         let layout = bindless.pipeline_layout;
-        let flags = u32::from(self.dither) * SPACE_FLAG_DITHER;
-        let uses = [(color, Access::Sampled), (target, Access::ColorAttachment)];
+        let flags = (u32::from(self.dither) * SPACE_FLAG_DITHER)
+            | (u32::from(bloom.is_some()) * UPSCALE_FLAG_GLOW);
+        let mut uses = vec![(color, Access::Sampled), (target, Access::ColorAttachment)];
+        if let Some(b) = bloom {
+            uses.push((b, Access::Sampled));
+        }
         graph.add_pass("вывод", &uses, move |p| {
             let push = space_push(
                 &frame.space_camera,
@@ -5088,6 +5102,7 @@ impl Demo {
                 frame.space_address,
                 SpaceSlots {
                     target: p.texture(color),
+                    cone: bloom.map_or(0, |b| p.texture(b)),
                     ..SpaceSlots::default()
                 },
                 flags,
@@ -6340,7 +6355,9 @@ impl Demo {
         // Сглаживание по картинке (8.12а) читает освещённую картинку, поэтому освещение
         // тогда всегда красит «цвет 3D», а не окно.
         let post_aa = frame.scene == DemoScene::Space && self.post_aa_on();
-        let window = direct.filter(|_| ext == frame.extent && !post_aa);
+        // Свечение 3D (8.16) тоже читает освещённую картинку.
+        let glow = frame.scene == DemoScene::Space && self.glow;
+        let window = direct.filter(|_| ext == frame.extent && !post_aa && !glow);
         let lit = (direct.is_some() || ext != frame.extent || post_aa).then(|| {
             let color = window.unwrap_or_else(|| graph.create("цвет 3D", ext, SPACE_COLOR_FORMAT));
             let mut uses = vec![
@@ -6584,7 +6601,7 @@ impl Demo {
         bindless: &'a Bindless,
         frame: FrameData,
         scene: ImageHandle,
-        light: ImageHandle,
+        light: Option<ImageHandle>,
     ) -> ImageHandle {
         let layout = bindless.pipeline_layout;
         let sizes = bloom_sizes(frame.extent);
@@ -6614,17 +6631,23 @@ impl Demo {
             let target = down[i];
             let source = if i == 0 { scene } else { down[i - 1] };
             let mut uses = vec![(source, Access::Sampled), (target, Access::ColorAttachment)];
-            if i == 0 {
+            if let (0, Some(light)) = (i, light) {
                 uses.push((light, Access::Sampled));
             }
             let pipeline = self.bloom_down;
             graph.add_pass("свечение", &uses, move |p| {
                 let mut push = [0u8; 24];
                 push[..4].copy_from_slice(&p.texture(source).to_ne_bytes());
-                if i == 0 {
+                if let (0, Some(light)) = (i, light) {
                     push[4..8].copy_from_slice(&p.texture(light).to_ne_bytes());
                 }
-                push[8..12].copy_from_slice(&u32::from(i > 0).to_ne_bytes());
+                // Шаг: 0 — кадр со светом, 1 — уменьшение, 2 — кадр без картинки света.
+                let mode = match (i, light) {
+                    (0, Some(_)) => 0u32,
+                    (0, None) => 2,
+                    _ => 1,
+                };
+                push[8..12].copy_from_slice(&mode.to_ne_bytes());
                 push[12..16].copy_from_slice(&GLOW_THRESHOLD.to_ne_bytes());
                 let t = texel(size);
                 push[16..20].copy_from_slice(&t[0].to_ne_bytes());
@@ -7256,6 +7279,9 @@ const SPACE_FLAG_SHADOW_MAP: u32 = 8;
 /// растяжения в проходе «вывод» (raymarch_upscale.slang) и у «освещения 3D» при 100 %
 /// (raymarch_shade.slang).
 const SPACE_FLAG_DITHER: u32 = 64;
+/// Флаг «вывода» прямого вывода «3D»: в поле `cone` — картинка свечения (8.16,
+/// UPSCALE_FLAG_GLOW в raymarch_upscale.slang).
+const UPSCALE_FLAG_GLOW: u32 = 256;
 /// Освещение умножает цвет материалов с текстурой на «цвет полигонов 3D» (8.14б2): её
 /// номер — старшие 16 бит `meshes` в константах.
 const SPACE_FLAG_MESH_COLOR: u32 = 128;
