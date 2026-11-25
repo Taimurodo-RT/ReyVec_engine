@@ -622,6 +622,10 @@ impl Editor {
         let Some(shape) = self.shape.as_ref() else {
             return;
         };
+        // Во время просмотра уровень не правится (как сцена 2D во время игры).
+        if self.play != PlayState::Edit {
+            return;
+        }
         let current = shape.text.clone();
         let next = match action {
             Action::ShapeText {
@@ -899,10 +903,14 @@ impl Editor {
             | Action::ClayDab(_)
             | Action::ClayEnd => {}
             Action::Play | Action::Simulate => {
-                if self.shape.is_some() {
-                    tracing::warn!(
-                        "Уровень 3D пока не запускается: играть можно в сценах 2D. \
-                         Откройте сцену 2D через «Файл → Открыть уровень»"
+                if let Some(level) = self.shape.as_ref() {
+                    // Уровень 3D (Р.14): героя в 3D у движка пока нет — идут анимации,
+                    // камера летает. Спрятанное в редакторе в игре видно.
+                    r.set_space_file_in(&level.text, Some(level.root.clone()));
+                    self.play = PlayState::Playing;
+                    tracing::info!(
+                        "Просмотр уровня 3D: W A S D — лететь, Q и E — вниз и вверх, \
+                         мышь — оглядеться, Esc или F5 — назад к правке"
                     );
                     return;
                 }
@@ -953,6 +961,14 @@ impl Editor {
                 self.play = PlayState::Edit;
                 self.ejected = false;
                 self.simulating = false;
+                if let Some(level) = self.shape.as_ref() {
+                    // Уровень 3D с начала: анимации на месте из файла, спрятанное снова
+                    // спрятано. Камера остаётся, где летала.
+                    self.anim = AnimClock::default();
+                    r.set_space_file_in(&level.stand_scene(), Some(level.root.clone()));
+                    tracing::info!("Просмотр остановлен, уровень с начала");
+                    return;
+                }
                 if let Some(logic) = r.scene_logic() {
                     logic.set_debug_paused(false);
                 }
