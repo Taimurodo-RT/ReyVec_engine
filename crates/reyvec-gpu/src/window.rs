@@ -922,6 +922,18 @@ impl WindowRenderer {
         }
     }
 
+    /// ReSTIR GI: новый отскок у одного пикселя из 4 за кадр.
+    pub fn path_gi_quarter(&self) -> bool {
+        self.demo.as_ref().is_none_or(|d| d.path_gi_quarter())
+    }
+
+    /// Включает и выключает отскок ReSTIR GI у одного пикселя из 4.
+    pub fn set_path_gi_quarter(&mut self, on: bool) {
+        if let Some(demo) = self.demo.as_mut() {
+            demo.set_path_gi_quarter(on);
+        }
+    }
+
     /// Кэш света режима «качество»: включён ли.
     pub fn path_cache(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| d.path_cache())
