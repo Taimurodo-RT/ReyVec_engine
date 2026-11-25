@@ -517,6 +517,13 @@ impl WindowRenderer {
         self.set_space_file(text);
     }
 
+    /// Папка, от которой считаются пути сцены «из файла» (скрипты, картинки): редактор
+    /// открывает сцену из другой папки проекта. Действует со следующего
+    /// [`WindowRenderer::switch_scene_file`] или [`WindowRenderer::set_scene_file`].
+    pub fn set_scene_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.files.scene_dir = dir;
+    }
+
     /// Другой файл сцены той же папки (N в сцене из файла, 6.13): персонаж встаёт на
     /// место из нового файла.
     pub fn switch_scene_file(&mut self, text: &str) {

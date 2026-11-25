@@ -231,8 +231,22 @@ fn main() -> ExitCode {
         recent.save(&recent_path);
     }
     let project_name = project.as_deref().map(|d| editor::project::read(d).name);
-    let scene_file = match (&args.scene_file, &project) {
-        (Some(p), _) => Some(PathBuf::from(p)),
+    // Уровень, на котором остановились в прошлый раз (2D или 3D), если файл ещё есть.
+    let mut level_3d = None;
+    let mut last_level = match (&args.scene_file, &args.shape, &project) {
+        (None, None, Some(dir)) => recent.level(dir),
+        (Some(p), _, _) => Some(PathBuf::from(p)),
+        _ => None,
+    };
+    if let Some(p) = &last_level
+        && editor::files::level_kind(p) == Some(true)
+    {
+        // Сцена 3D открывается во «Мире» поверх ничего: сцена 2D проекта ждёт за ней.
+        level_3d = Some(std::path::absolute(p).unwrap_or_else(|_| p.clone()));
+        last_level = None;
+    }
+    let scene_file = match (last_level, &project) {
+        (Some(p), _) => Some(p),
         (None, Some(dir)) => editor::project::first_scene(dir),
         (None, None) => {
             tracing::warn!("Папка проекта не найдена, открываю встроенный пример сцены");
@@ -259,10 +273,13 @@ fn main() -> ExitCode {
         vsync: !args.no_vsync,
         frameless: !args.window_frame,
         scene_file,
-        shape: args.shape.map(|p| {
-            let p = PathBuf::from(p);
-            std::path::absolute(&p).unwrap_or(p)
-        }),
+        shape: args
+            .shape
+            .map(|p| {
+                let p = PathBuf::from(p);
+                std::path::absolute(&p).unwrap_or(p)
+            })
+            .or(level_3d),
         assets: args.assets,
         project,
         start_screen,

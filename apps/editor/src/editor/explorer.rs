@@ -890,9 +890,10 @@ impl Explorer {
         let prefab = path.parent().is_some_and(|p| pf::file_name(p) == PREFABS);
         let out = if name.ends_with(".luau") {
             Out::OpenScript(path.to_path_buf())
-        } else if is_shape(&name) || (name.ends_with(".ron") && is_space_scene(path)) {
+        } else if is_shape(&name) {
             Out::OpenShape(path.to_path_buf())
-        } else if name.ends_with(".ron") && !prefab && is_scene_2d(path) {
+        } else if name.ends_with(".ron") && !prefab && (is_scene_2d(path) || is_space_scene(path)) {
+            // Уровень (сцена 2D или 3D) открывается во «Мире» вместо прежнего.
             Out::OpenScene(path.to_path_buf())
         } else {
             Out::OpenFile(path.to_path_buf())
@@ -2009,12 +2010,9 @@ impl Explorer {
     fn open_kind(&self, path: &Path) -> OpenKind {
         let name = pf::file_name(path).to_lowercase();
         let prefab = path.parent().is_some_and(|p| pf::file_name(p) == PREFABS);
-        if is_shape(&name)
-            || (name.ends_with(".ron") && is_space_scene(path))
-            || name.ends_with(".luau")
-        {
+        if is_shape(&name) || name.ends_with(".luau") {
             OpenKind::Editor
-        } else if name.ends_with(".ron") && !prefab && is_scene_2d(path) {
+        } else if name.ends_with(".ron") && !prefab && (is_scene_2d(path) || is_space_scene(path)) {
             OpenKind::World
         } else {
             OpenKind::System
@@ -3087,6 +3085,7 @@ mod tests {
             ),
             ("assets/a.svg", "<svg/>"),
             ("assets/m.shape.ron", "(format: \"reyvec-shape\")"),
+            ("scenes/zal.ron", "(format: \"reyvec-space\", version: 1)"),
         ]);
         let ctx = ctx();
         let mut ex = Explorer::new(Some(&t.0));
@@ -3160,6 +3159,18 @@ mod tests {
         );
         assert!(
             outs.contains(&Out::OpenScene(t.0.join("scenes/room.ron"))),
+            "{outs:?}"
+        );
+        // Сцена 3D — тоже уровень: во «Мир», а не в редактор моделей.
+        ex.selected = vec![t.0.join("scenes/zal.ron")];
+        let outs = frame(
+            &ctx,
+            &mut ex,
+            &mut time,
+            vec![key(Key::Enter, Modifiers::NONE)],
+        );
+        assert!(
+            outs.contains(&Out::OpenScene(t.0.join("scenes/zal.ron"))),
             "{outs:?}"
         );
         // Назад — снова assets; новая папка сразу ждёт имя.
