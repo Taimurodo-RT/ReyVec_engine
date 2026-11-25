@@ -1392,6 +1392,64 @@ pub(crate) mod tests {
         );
     }
 
+    /// Сцена «выставка» (итог этапа 8): всё, что умеет быстрый режим 3D, в одном кадре —
+    /// формы SDF, модели форм, модели glTF с текстурой, зеркало, глянец, свечение, солнце
+    /// и лампы. Кадр рисуется без ошибок Vulkan и не пуст.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn showroom_scene_renders() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/showroom.ron").into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+            cascades: false,
+        };
+        GLOW.set(true);
+        let frame = render_headless(&options, &scene);
+        GLOW.set(false);
+        let frame = frame.expect("кадр");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        let stats = frame.space_stats.as_ref().expect("числа сцены 3D");
+        eprintln!(
+            "выставка: в кадре объектов {}, {:?}, процессор {:.2} + {:.2} мс",
+            stats.objects, stats.frame, stats.build_ms, stats.pack_ms
+        );
+        if let Some(t) = &frame.gpu_timings {
+            eprintln!("выставка: {}", t.describe());
+        }
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/showroom.rgba"), &frame.image.rgba);
+        }
+        assert_eq!(stats.dropped, 0);
+        assert!(stats.overflow.is_none());
+        assert_eq!(stats.frame.proxies, 3, "у трёх моделей glTF свои тени");
+        let mut colors: Vec<[u8; 3]> = frame
+            .image
+            .rgba
+            .chunks_exact(4)
+            .map(|p| [p[0] / 32, p[1] / 32, p[2] / 32])
+            .collect();
+        colors.sort_unstable();
+        colors.dedup();
+        assert!(colors.len() > 40, "цветов {}", colors.len());
+    }
+
     /// Сцена завода (8.7): больше 1000 объектов, те, что в кадре, помещаются в предел шейдера
     /// и буфер, кадр рисуется без ошибок проверки Vulkan. Время здесь не меряется
     /// (программная видеокарта) — его меряем на ПК.
