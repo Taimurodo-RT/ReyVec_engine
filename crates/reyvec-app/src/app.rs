@@ -1891,6 +1891,7 @@ fn space_file_name(path: &std::path::Path) -> String {
         "lamps" => "зал с лампами",
         "effects" => "эффекты",
         "world" => "большой мир",
+        "showroom" => "выставка",
         _ => return stem,
     };
     known.to_owned()
