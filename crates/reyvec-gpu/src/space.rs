@@ -1027,6 +1027,11 @@ pub(crate) fn set_ao_field_only(words: &mut [u32]) {
     words[11] |= SCENE_AO_FIELD_ONLY;
 }
 
+/// Дальность дымки сцены, м (слово 14 заголовка; 0 — обычная, `HAZE` в шейдере).
+pub(crate) fn set_haze(words: &mut [u32], meters: f32) {
+    words[14] = meters.to_bits();
+}
+
 /// Солнца нет (2.5D-вид: уровень в помещении).
 pub(crate) fn set_no_sun(words: &mut [u32]) {
     words[11] |= SCENE_NO_SUN;
@@ -1125,6 +1130,35 @@ mod tests {
         set_shadow_maps(&mut set, &[glam::Mat4::IDENTITY]);
         set_sun_maps(&mut set, &[glam::Mat4::IDENTITY]);
         assert_eq!(set, empty, "без раздела моделей заголовок цел");
+    }
+
+    /// Большой мир (8.9): сколько стоит упаковка кадра города на процессоре — первый
+    /// кадр и следующие (неподвижное берётся из прошлого кадра). Время только печатается.
+    #[test]
+    fn world_pack_times() {
+        let text = include_str!("../../../scenes/3d/world.ron");
+        let scene = reyvec_sdf::SpaceScene::parse_in(text, None).unwrap();
+        let mut cache = PackCache::default();
+        for k in 0..5 {
+            let frame = scene.frame(1.0 + k as f32 / 60.0);
+            let start = std::time::Instant::now();
+            let packed = pack_cached(
+                &frame,
+                &scene.materials,
+                true,
+                true,
+                GridOptions::default(),
+                &mut cache,
+            );
+            eprintln!(
+                "мир, кадр {k}: упаковка {:.2} мс, слов {}, сетка {:?}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                packed.words.len(),
+                packed.grid
+            );
+            assert_eq!(packed.dropped, 0);
+            assert!(packed.overflow.is_none());
+        }
     }
 
     /// Тяжёлые модели делятся на детали-предметы, а все сцены 3D всё равно помещаются в
