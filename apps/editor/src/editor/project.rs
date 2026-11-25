@@ -143,6 +143,9 @@ pub(crate) struct RecentProject {
     pub path: PathBuf,
     /// Когда открывали: секунды от 1970 года.
     pub opened: u64,
+    /// Уровень, открытый в «Мире» последним: путь от папки проекта через «/».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
 }
 
 /// Недавние проекты и настройка стартового окна.
@@ -156,6 +159,11 @@ pub(crate) struct Recent {
 }
 
 /// Где лежит список недавних: `settings/projects.ron` рядом с программой.
+/// Путь для сравнения: без «.», «..» и разницы в регистре.
+fn key(p: &Path) -> String {
+    pf::normalize(p).to_string_lossy().to_lowercase()
+}
+
 pub(crate) fn recent_path() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -190,7 +198,7 @@ impl Recent {
     /// Проект открыли: наверх списка.
     pub(crate) fn touch(&mut self, dir: &Path) {
         let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
-        let key = |p: &Path| pf::normalize(p).to_string_lossy().to_lowercase();
+        let level = self.find(&dir).and_then(|r| r.level.clone());
         self.projects.retain(|r| key(&r.path) != key(&dir));
         let opened = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -200,6 +208,7 @@ impl Recent {
             RecentProject {
                 path: pf::normalize(&dir),
                 opened,
+                level,
             },
         );
         self.projects.truncate(RECENT_MAX);
@@ -211,6 +220,35 @@ impl Recent {
             .iter()
             .map(|r| r.path.as_path())
             .find(|p| is_project(p))
+    }
+
+    fn find(&self, dir: &Path) -> Option<&RecentProject> {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.projects.iter().find(|r| key(&r.path) == key(&dir))
+    }
+
+    /// В «Мире» открыли уровень `file` проекта `dir`: в следующий раз начать с него.
+    pub(crate) fn set_level(&mut self, dir: &Path, file: &Path) {
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let file = std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf());
+        let (file, base) = (pf::normalize(&file), pf::normalize(&dir));
+        let Ok(rel) = file.strip_prefix(&base) else {
+            return;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if self.find(&dir).is_none() {
+            self.touch(&dir);
+        }
+        if let Some(r) = self.projects.iter_mut().find(|r| key(&r.path) == key(&dir)) {
+            r.level = Some(rel);
+        }
+    }
+
+    /// Уровень, открытый последним в проекте `dir`, если файл ещё есть.
+    pub(crate) fn level(&self, dir: &Path) -> Option<PathBuf> {
+        let rel = self.find(dir)?.level.as_deref()?;
+        let p = dir.join(rel);
+        p.is_file().then_some(p)
     }
 
     /// Убрать из списка (сама папка не трогается).
@@ -358,6 +396,14 @@ mod tests {
         r.touch(&a);
         assert_eq!(r.projects.len(), 2);
         assert_eq!(r.last(), Some(a.as_path()));
+        // Последний уровень запоминается и переживает новое открытие проекта.
+        std::fs::write(b.join("scenes/зал.ron"), "x").unwrap();
+        r.set_level(&b, &b.join("scenes/зал.ron"));
+        r.touch(&b);
+        assert_eq!(r.level(&b), Some(b.join("scenes/зал.ron")));
+        assert_eq!(r.projects[0].level.as_deref(), Some("scenes/зал.ron"));
+        assert_eq!(r.level(&a), None);
+        r.touch(&a);
         r.skip_start = true;
         r.save(&path);
         let mut back = Recent::load(&path);

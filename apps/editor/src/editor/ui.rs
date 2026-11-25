@@ -6,7 +6,7 @@
 //! Поэтому интерфейс раскладывается и проверяется тестами без окна и видеокарты.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Layout, Margin, Pos2,
@@ -129,6 +129,10 @@ pub(crate) enum Action {
     ToggleHidden(Vec<usize>),
     /// Закрыть, сохранив правки.
     SaveAndClose,
+    /// Сохранить сцену и открыть уровень (Р.12).
+    SaveAndOpen(PathBuf),
+    /// Выбросить правки сцены и открыть уровень.
+    DiscardAndOpen(PathBuf),
     /// Закрыть без сохранения.
     ForceClose,
     /// Во время игры: камера перестаёт следить за героем, сцену можно двигать (F8).
@@ -298,8 +302,10 @@ pub(crate) struct Info<'a> {
     pub hidden: &'a HashSet<Vec<usize>>,
     /// В буфере обмена есть предмет.
     pub can_paste: bool,
-    /// Сцены в папке открытой: «Файл → Открыть».
-    pub scenes: &'a [std::path::PathBuf],
+    /// Уровни проекта: «Файл → Открыть уровень».
+    pub scenes: &'a [super::files::Level],
+    /// Уровень, открытый в «Мире» (сцена 2D или 3D).
+    pub level: Option<&'a Path>,
     /// Есть автосохранение, которое можно вернуть.
     pub can_restore: bool,
     /// Файл сцены «Мира» (его не переносят и не удаляют в проводнике).
@@ -359,6 +365,8 @@ pub(crate) struct EditorUi {
     ov: Overlay,
     /// Спросить, сохранить ли правки перед закрытием.
     asking_close: bool,
+    /// Открыть этот уровень, когда ответят, что делать с правками сцены (Р.12).
+    asking_open: Option<PathBuf>,
     /// Ещё выбранные, кроме главного (Ctrl+щелчок в иерархии, Shift+щелчок в сцене).
     more: Vec<Vec<usize>>,
     /// Инспектор закреплён на этом предмете: выбор других его не меняет.
@@ -448,6 +456,7 @@ impl EditorUi {
             drop_target: None,
             ov: Overlay::default(),
             asking_close: false,
+            asking_open: None,
             more: Vec::new(),
             pinned: None,
             ruler: None,
@@ -478,6 +487,16 @@ impl EditorUi {
         if let Some(i) = WORKSPACES.iter().position(|w| w.name == name) {
             self.workspace = i;
         }
+    }
+
+    /// Открыта вкладка «Ассеты» (с проводником или моделью во «Формах»).
+    pub(crate) fn in_assets(&self) -> bool {
+        WORKSPACES[self.workspace].name == ASSETS_WORKSPACE
+    }
+
+    /// Спросить, сохранить ли правки сцены перед тем, как открыть уровень `path`.
+    pub(crate) fn ask_open(&mut self, path: PathBuf) {
+        self.asking_open = Some(path);
     }
 
     /// Вместо сцены сейчас проводник «Ассетов»: движку незачем рисовать сцену крупно.
@@ -594,7 +613,7 @@ impl EditorUi {
             )
             .show(ui, |ui| status_bar(ui, info, &self.status));
         // «Играть» из «Ассетов» — игру видно только в «Мире».
-        if self.files_mode(info)
+        if self.in_assets()
             && self
                 .actions
                 .iter()
@@ -616,6 +635,7 @@ impl EditorUi {
                 self.close_dialog(&ctx, info);
             }
             self.projects_dialog(&ctx, info);
+            self.open_dialog(&ctx, info);
             return;
         }
         let panel_frame = Frame::NONE.fill(PANEL);
@@ -647,6 +667,7 @@ impl EditorUi {
             self.close_dialog(&ctx, info);
         }
         self.projects_dialog(&ctx, info);
+        self.open_dialog(&ctx, info);
     }
 
     /// В открытом скрипте несохранённые правки.
@@ -781,6 +802,50 @@ impl EditorUi {
         }
     }
 
+    /// «Сохранить правки перед тем, как открыть другой уровень?»
+    fn open_dialog(&mut self, ctx: &egui::Context, info: &Info) {
+        let Some(path) = self.asking_open.clone() else {
+            return;
+        };
+        let mut done = false;
+        let modal = egui::Modal::new(Id::unique("editor-open-level")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(
+                RichText::new("Сохранить правки?")
+                    .size(FONT_HEADING)
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(GAP_M);
+            ui.label(
+                RichText::new(format!(
+                    "В сцене {} есть несохранённые правки. Потом откроется «{}».",
+                    info.scene_name,
+                    pf_name(&path)
+                ))
+                .color(TEXT_DIM),
+            );
+            ui.add_space(GAP_XL);
+            ui.horizontal(|ui| {
+                let save =
+                    egui::Button::new(RichText::new("Сохранить и открыть").color(BG)).fill(ACCENT);
+                if ui.add_enabled(info.can_save, save).clicked() {
+                    self.actions.push(Action::SaveAndOpen(path.clone()));
+                    done = true;
+                }
+                if ui.button("Не сохранять").clicked() {
+                    self.actions.push(Action::DiscardAndOpen(path.clone()));
+                    done = true;
+                }
+                if ui.button("Отмена").clicked() {
+                    done = true;
+                }
+            });
+        });
+        if done || modal.should_close() {
+            self.asking_open = None;
+        }
+    }
+
     fn hotkeys(&mut self, ctx: &egui::Context, info: &Info) {
         use egui::{Key, Modifiers};
         let (f5, esc) = ctx.input(|i| (i.key_pressed(Key::F5), i.key_pressed(Key::Escape)));
@@ -791,7 +856,10 @@ impl EditorUi {
             });
         } else if esc && info.play != PlayState::Edit {
             self.actions.push(Action::Stop);
-        } else if esc && info.shape.is_some() && !ctx.egui_wants_keyboard_input() {
+        } else if esc
+            && info.shape.as_ref().is_some_and(|s| !s.scene)
+            && !ctx.egui_wants_keyboard_input()
+        {
             self.actions.push(Action::CloseShape);
             return;
         }
@@ -2134,10 +2202,12 @@ impl EditorUi {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = GAP_M;
-                    if ui
-                        .button(RichText::new("Закрыть").size(FONT_CHIP))
-                        .on_hover_text("Вернуться к сцене (Esc)")
-                        .clicked()
+                    // Уровень «Мира» не закрывают: вместо него открывают другой.
+                    if !shape.scene
+                        && ui
+                            .button(RichText::new("Закрыть").size(FONT_CHIP))
+                            .on_hover_text("Вернуться к проводнику (Esc)")
+                            .clicked()
                     {
                         actions.push(Action::CloseShape);
                     }
@@ -2528,26 +2598,29 @@ impl EditorUi {
                     actions.push(Action::NewScene);
                     ui.close();
                 }
-                ui.add_enabled_ui(free, |ui| {
-                    ui.menu_button("Открыть сцену", |ui| {
-                        ui.set_min_width(200.0);
+                // Уровень можно открыть и с правками: редактор спросит, сохранить ли их.
+                ui.add_enabled_ui(info.play == PlayState::Edit, |ui| {
+                    ui.menu_button("Открыть уровень", |ui| {
+                        ui.set_min_width(240.0);
                         if info.scenes.is_empty() {
-                            ui.label(RichText::new("Других сцен нет").color(MUTED));
+                            ui.label(RichText::new("В папке scenes уровней нет").color(MUTED));
                         }
-                        for p in info.scenes {
-                            let name = p
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let current = name == info.scene_name;
-                            if ui.selectable_label(current, name).clicked() && !current {
-                                actions.push(Action::OpenScene(p.clone()));
+                        for l in info.scenes {
+                            let current = info.level == Some(l.path.as_path());
+                            let text = if l.three_d {
+                                format!("{}   3D", l.name)
+                            } else {
+                                l.name.clone()
+                            };
+                            if ui.selectable_label(current, text).clicked() && !current {
+                                actions.push(Action::OpenScene(l.path.clone()));
                                 ui.close();
                             }
                         }
                     })
                     .response
-                    .on_disabled_hover_text(why);
+                    .on_hover_text("Уровень откроется в «Мире» вместо этого")
+                    .on_disabled_hover_text("Сначала остановите игру");
                 });
                 if ui
                     .add_enabled(
@@ -5949,6 +6022,7 @@ mod tests {
             hidden: &NO_HIDDEN,
             can_paste: false,
             scenes: &[],
+            level: None,
             can_restore: false,
             scene_path: None,
             ejected: false,
@@ -6067,8 +6141,21 @@ mod tests {
         assert!(ui.take_actions().is_empty(), "без нажатий нет действий");
         assert!(ui.viewport().is_some(), "окно сцены занято подставкой");
         let esc = key(egui::Key::Escape, egui::Modifiers::NONE);
-        frame(&ctx, &mut ui, &shape_info, vec![esc]);
+        frame(&ctx, &mut ui, &shape_info, vec![esc.clone()]);
         assert_eq!(ui.take_actions(), vec![Action::CloseShape]);
+        // Уровень 3D «Мира» Esc не закрывает: вместо него открывают другой (Р.12).
+        if let Some(s) = shape_info.shape.as_mut() {
+            s.scene = true;
+        }
+        frame(&ctx, &mut ui, &shape_info, vec![esc]);
+        assert!(ui.take_actions().is_empty());
+        // «Играть» из «Ассетов» с открытой моделью — переход в «Мир».
+        ui.open_workspace(ASSETS_WORKSPACE);
+        assert!(ui.in_assets());
+        let f5 = key(egui::Key::F5, egui::Modifiers::NONE);
+        frame(&ctx, &mut ui, &shape_info, vec![f5]);
+        assert_eq!(ui.take_actions(), vec![Action::Play]);
+        assert!(!ui.in_assets());
     }
 
     #[test]

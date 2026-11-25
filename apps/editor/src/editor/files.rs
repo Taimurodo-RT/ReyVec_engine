@@ -46,6 +46,68 @@ pub(crate) fn list_scenes(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// Уровень проекта для меню «Файл → Открыть уровень»: сцена 2D или 3D.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Level {
+    pub path: PathBuf,
+    /// Путь от папки уровней через «/» без `.ron`: «3d/склад».
+    pub name: String,
+    pub three_d: bool,
+}
+
+/// Что за уровень в файле: `Some(false)` — сцена 2D, `Some(true)` — сцена 3D, `None` —
+/// не уровень.
+pub(crate) fn level_kind(path: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.contains("\"reyvec-scene\"") {
+        Some(false)
+    } else if text.contains("\"reyvec-space\"") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Все уровни в папке `dir` и вложенных (кроме скрытых, `models` и `scripts`), по пути.
+pub(crate) fn list_levels(dir: &Path) -> Vec<Level> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Level>) {
+        if depth > 6 || out.len() >= 500 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for p in paths {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.starts_with('.') {
+                continue;
+            }
+            if p.is_dir() {
+                if name != "models" && name != "scripts" {
+                    walk(root, &p, depth + 1, out);
+                }
+            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ron"))
+                && let Some(three_d) = level_kind(&p)
+            {
+                let rel = p.strip_prefix(root).unwrap_or(&p).with_extension("");
+                out.push(Level {
+                    name: rel.to_string_lossy().replace('\\', "/"),
+                    path: p,
+                    three_d,
+                });
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, 0, &mut out);
+    out
+}
+
 /// Свободное имя для новой сцены: «новая сцена.ron», «новая сцена 2.ron»…
 pub(crate) fn new_scene_path(dir: &Path) -> PathBuf {
     let mut p = dir.join("новая сцена.ron");
@@ -90,6 +152,25 @@ pub(crate) fn drop_autosave(scene: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn levels_2d_and_3d_in_subfolders() {
+        let dir = std::env::temp_dir().join(format!("reyvec-levels-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("3d/models")).unwrap();
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::write(dir.join("комната.ron"), NEW_SCENE).unwrap();
+        std::fs::write(dir.join("3d/зал.ron"), "(format: \"reyvec-space\")").unwrap();
+        std::fs::write(dir.join("3d/models/m.ron"), "(format: \"reyvec-space\")").unwrap();
+        std::fs::write(dir.join("3d/заметка.ron"), "(просто: 1)").unwrap();
+        let levels = list_levels(&dir);
+        let names: Vec<_> = levels
+            .iter()
+            .map(|l| (l.name.as_str(), l.three_d))
+            .collect();
+        assert_eq!(names, [("3d/зал", true), ("комната", false)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn new_scene_lists_and_autosaves() {
