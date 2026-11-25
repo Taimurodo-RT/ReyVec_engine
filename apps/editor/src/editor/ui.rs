@@ -379,6 +379,8 @@ pub(crate) struct EditorUi {
     shape_selected: Vec<usize>,
     /// Скопированная деталь модели или предмет сцены 3D (текст из файла).
     shape_clipboard: Option<String>,
+    /// Идёт ли игра (из прошлого `draw`): окну сцены 3D, у которого нет `Info`.
+    play_now: PlayState,
     /// Как новая деталь из палитры складывается с выбранной.
     shape_combine: shape_edit::Combine,
     /// Свёрнутые части в дереве модели.
@@ -465,6 +467,7 @@ impl EditorUi {
             log_filter: LogFilter::All,
             shape_selected: Vec::new(),
             shape_clipboard: None,
+            play_now: PlayState::Edit,
             shape_combine: shape_edit::Combine::Add,
             shape_closed: HashSet::new(),
             shape_locked: HashSet::new(),
@@ -594,6 +597,7 @@ impl EditorUi {
     /// Раскладывает и рисует весь интерфейс.
     pub(crate) fn draw(&mut self, ui: &mut Ui, info: &Info) {
         let ctx = ui.ctx().clone();
+        self.play_now = info.play;
         self.hotkeys(&ctx, info);
         if self.frames.len() == FRAME_HISTORY {
             self.frames.pop_front();
@@ -2321,69 +2325,78 @@ impl EditorUi {
         self.viewport_hovered = response.hovered() || response.dragged();
         // Пока лепят глину (М.9б), левая кнопка у кисти: ручек нет.
         let sculpting = self.clay_file(shape).is_some();
+        // Игра в уровне 3D (Р.14): только полёт камеры — ни ручек, ни ламп, ни выбора.
+        let playing = shape.scene && self.play_now != PlayState::Edit;
         // Режимы ручек детали — столбик значков у левого края окна.
         let tools = Rect::from_min_size(
             rect.left_top() + vec2(12.0, 72.0),
             vec2(36.0, 3.0 * 28.0 + 8.0),
         );
-        ui.painter()
-            .rect_filled(tools, RADIUS_S, PANEL.gamma_multiply(0.9));
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(tools.shrink(4.0))
-                .layout(Layout::top_down(Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                // Пока лепят глину (М.9б), в столбике — кисти, а не ручки.
-                if sculpting {
-                    for b in clay::BRUSHES {
-                        if clay::brush_button(ui, b, self.clay.brush == b)
-                            .on_hover_text(clay::brush_hint(b))
+        if !playing {
+            ui.painter()
+                .rect_filled(tools, RADIUS_S, PANEL.gamma_multiply(0.9));
+        }
+        if !playing {
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(tools.shrink(4.0))
+                    .layout(Layout::top_down(Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    // Пока лепят глину (М.9б), в столбике — кисти, а не ручки.
+                    if sculpting {
+                        for b in clay::BRUSHES {
+                            if clay::brush_button(ui, b, self.clay.brush == b)
+                                .on_hover_text(clay::brush_hint(b))
+                                .clicked()
+                            {
+                                self.clay.brush = b;
+                            }
+                        }
+                        return;
+                    }
+                    for m in GizmoMode::ALL {
+                        if gizmo_button(ui, m, self.gizmo_mode == m)
+                            .on_hover_text(m.hint())
                             .clicked()
                         {
-                            self.clay.brush = b;
+                            self.gizmo_mode = m;
                         }
                     }
-                    return;
-                }
-                for m in GizmoMode::ALL {
-                    if gizmo_button(ui, m, self.gizmo_mode == m)
-                        .on_hover_text(m.hint())
-                        .clicked()
-                    {
-                        self.gizmo_mode = m;
-                    }
-                }
-            },
-        );
+                },
+            );
+        }
         // Левая кнопка — выбор и ручки детали (М.4), правая — повернуть, средняя —
         // сдвинуть.
         // Ручки модели не как в файле (М.6, «Посмотреть»): на подставке не то, что в
         // тексте, поэтому стрелки деталей спрятаны.
-        let gizmo = if shape.preview.is_empty() && !sculpting {
+        let gizmo = if shape.preview.is_empty() && !sculpting && !playing {
             self.shape_gizmo(ui, shape)
         } else {
             None
         };
         // Лампы сцены 3D (М.8б) — кружки поверх; мышь сначала им.
-        let dots = if shape.scene {
+        let dots = if shape.scene && !playing {
             self.lamp_dots(ui, shape, rect)
         } else {
             Vec::new()
         };
         let lamp_busy = shape.scene
+            && !playing
             && self.gizmo_drag.is_none()
             && self.lamp_pointer(ui, &response, shape, &dots);
-        let clay_busy = !lamp_busy && self.clay_pointer(ui, &response, shape);
-        if !lamp_busy && !clay_busy {
+        let clay_busy = !lamp_busy && !playing && self.clay_pointer(ui, &response, shape);
+        if !lamp_busy && !clay_busy && !playing {
             self.shape_pointer(ui, &response, shape, gizmo.as_ref());
         }
-        if shape.scene {
+        if shape.scene && !playing {
             self.scene_drop(ui, &response, shape, rect);
         }
         let d = response.drag_delta();
+        // В игре оглядываются и левой кнопкой: выбирать нечего.
         let camera_drag = response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle);
+            || response.dragged_by(egui::PointerButton::Middle)
+            || (playing && response.dragged_by(egui::PointerButton::Primary));
         if camera_drag && d != Vec2::ZERO {
             let pan = response.dragged_by(egui::PointerButton::Middle);
             self.actions.push(cam(if pan {
@@ -2408,7 +2421,7 @@ impl EditorUi {
             // W A S D, Q E ведут камеру в полёте и, как в других редакторах, пока зажата
             // правая кнопка (без неё W E R — ручки детали).
             let looking = ui.input(|i| i.pointer.secondary_down());
-            if (shape.free || looking) && !ui.ctx().egui_wants_keyboard_input() {
+            if (shape.free || looking || playing) && !ui.ctx().egui_wants_keyboard_input() {
                 let (dir, dt) = ui.input(|i| {
                     let k = |a: egui::Key, b: egui::Key| {
                         f32::from(u8::from(i.key_down(a))) - f32::from(u8::from(i.key_down(b)))
@@ -6801,6 +6814,71 @@ mod tests {
                 .as_deref()
                 .is_some_and(|c| c.contains("\"шар\""))
         );
+    }
+
+    #[test]
+    fn level_3d_play_flies_and_does_not_edit() {
+        // Р.14: в просмотре уровня 3D левая кнопка оглядывается, W летит, ничего не
+        // выбирается и не правится; Esc — назад к правке.
+        let text = r##"(format: "reyvec-space", version: 1,
+    materials: [(name: "серый", color: "#808080")],
+    objects: [(name: "ящик", material: "серый", shape: Box(size: (0.4, 0.4, 0.4)))],
+)"##;
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Playing);
+        shape_info.shape = Some(ShapeInfo {
+            name: "сцена",
+            spin: false,
+            free: true,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            post_aa: false,
+            in_view: true,
+            passes: &[],
+            camera: reyvec_sdf::Camera3D::default(),
+            shift: [0.0; 3],
+            error: None,
+            text,
+            preview: &NO_PREVIEW,
+            cost: None,
+            scene: true,
+            root: std::path::Path::new("."),
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        ui.take_actions();
+        let at = ui.viewport().expect("окно сцены").center();
+        frame(&ctx, &mut ui, &shape_info, pointer(at, Some(true)));
+        for k in 1..=4 {
+            frame(
+                &ctx,
+                &mut ui,
+                &shape_info,
+                pointer(at + vec2(8.0 * k as f32, 0.0), None),
+            );
+        }
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            pointer(at + vec2(32.0, 0.0), Some(false)),
+        );
+        let acts = ui.take_actions();
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ShapeCamera(ShapeCam::Orbit(_)))),
+            "{acts:?}"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::ShapeText { .. })),
+            "{acts:?}"
+        );
+        assert!(ui.shape_selected.is_empty(), "в игре не выбирают");
+        let esc = key(egui::Key::Escape, egui::Modifiers::NONE);
+        frame(&ctx, &mut ui, &shape_info, vec![esc]);
+        assert_eq!(ui.take_actions(), vec![Action::Stop]);
     }
 
     #[test]
