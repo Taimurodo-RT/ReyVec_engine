@@ -2399,6 +2399,16 @@ impl Demo {
         self.path_ref.gi = on;
     }
 
+    /// Кэш света в режиме «качество» включён.
+    pub fn path_cache(&self) -> bool {
+        self.path_ref.cache
+    }
+
+    /// Включает и выключает кэш света.
+    pub fn set_path_cache(&mut self, on: bool) {
+        self.path_ref.cache = on;
+    }
+
     /// Сколько кадров эталон 3D уже накопил; `None` — он выключен.
     pub fn path_samples(&self) -> Option<u32> {
         self.path_ref.samples()
@@ -5568,6 +5578,45 @@ impl Demo {
                             | vk::AccessFlags2::SHADER_STORAGE_WRITE,
                     )]
             };
+            if let Some(clear) = path.cache {
+                // Кэш света (шаг 5б): добавленное прошлым кадром — в среднее, старое —
+                // освободить; картинка — только для размера (от него зависит, где таблица).
+                let restir = self.space_restir;
+                let flags = CACHE_RESOLVE | if clear { CACHE_CLEAR } else { 0 };
+                graph.add_pass(
+                    "кэш света: сводка",
+                    &[(out, Access::ComputeWrite)],
+                    move |p| {
+                        let push = space_push(
+                            &camera,
+                            ext,
+                            frame.time,
+                            frame.space_address,
+                            SpaceSlots {
+                                target: p.storage(out),
+                                meshes: path.count,
+                                edges: path.sums,
+                                ..SpaceSlots::default()
+                            },
+                            flags,
+                        );
+                        let barrier = order();
+                        let (d, cmd) = (p.device, p.cmd);
+                        // SAFETY: буфер запасов удаляется только отложенно, барьер упорядочивает
+                        // таблицу с «путём 3D» прошлого кадра; буфер сцены этого кадра жив.
+                        unsafe {
+                            d.cmd_pipeline_barrier2(
+                                cmd,
+                                &vk::DependencyInfo::default().memory_barriers(&barrier),
+                            );
+                            bindless.bind_compute(d, cmd);
+                            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, restir);
+                            d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                            d.cmd_dispatch(cmd, CACHE_ROW / 8, CACHE_ENTRIES / CACHE_ROW / 8, 1);
+                        }
+                    },
+                );
+            }
             if path.restir {
                 let restir = self.space_restir;
                 graph.add_pass("ReSTIR: кандидаты", &uses, move |p| {
@@ -5623,6 +5672,7 @@ impl Demo {
                 | PATH_LIVE
                 | if path.restir { PATH_RESTIR } else { 0 }
                 | if path.gi { PATH_GI } else { 0 }
+                | if path.cache.is_some() { PATH_CACHE } else { 0 }
                 | if split.is_some() { PATH_SPLIT } else { 0 };
             graph.add_pass("путь 3D", &path_uses, move |p| {
                 let (target, aux) = match split {
@@ -5650,7 +5700,7 @@ impl Demo {
                 // сцены этого кадра жив, пока кадр рисуется; буфер запасов (если есть)
                 // удаляется только отложенно, барьер упорядочивает его с «кандидатами».
                 unsafe {
-                    if path.restir || path.gi {
+                    if path.restir || path.gi || path.cache.is_some() {
                         d.cmd_pipeline_barrier2(
                             cmd,
                             &vk::DependencyInfo::default().memory_barriers(&barrier),
@@ -7215,6 +7265,14 @@ const PATH_SPLIT: u32 = 64;
 const PATH_GI: u32 = 128;
 /// Флаг прохода ReSTIR: «ReSTIR GI: соседи» вместо «кандидатов» (как в raymarch_restir.slang).
 const RESTIR_GI_NEIGHBORS: u32 = 1;
+/// Флаг прохода «путь 3D»: кэш света (PATH_CACHE в raymarch_path.slang).
+const PATH_CACHE: u32 = 256;
+/// Флаги «ReSTIR: кандидаты» для «кэш света: сводка»: свести, стереть (raymarch_restir.slang).
+const CACHE_RESOLVE: u32 = 2;
+const CACHE_CLEAR: u32 = 4;
+/// Ячеек кэша света и сколько их в строке сетки запуска сводки (CACHE_SIZE, CACHE_ROW).
+const CACHE_ENTRIES: u32 = 1 << 21;
+const CACHE_ROW: u32 = 2048;
 /// Виды проходов шумодава (как DENOISE_* в raymarch_denoise.slang) и число размытий.
 const DENOISE_TEMPORAL: u32 = 1;
 const DENOISE_ATROUS: u32 = 2;

@@ -42,6 +42,7 @@
 #include "include/light3d.slang"
 #include "include/restir.slang"
 #include "include/restir_gi.slang"
+#include "include/light_cache.slang"
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
@@ -58,6 +59,16 @@ static const uint PATH_RESTIR = 32;
 static const uint PATH_SPLIT = 64;
 // Бит pc.flags (шаг 4): отражённый свет первой точки — ReSTIR GI.
 static const uint PATH_GI = 128;
+// Бит pc.flags (шаг 5б): кэш света (include/light_cache.slang). Путь в точке отскока берёт
+// прямой свет и дальше — свет клетки кэша; учебные пиксели ведут путь целиком и наполняют кэш.
+static const uint PATH_CACHE = 256;
+
+// Кэш света в этом пикселе: 0 — нет, 1 — брать из кэша, 2 — учебный (наполнять).
+static uint g_cache = 0;
+static uint g_cache_base = 0;
+static float3 g_eye = float3(0.0, 0.0, 0.0);
+// Сколько точек учебного пути запоминаем (дальше — не учим).
+static const uint CACHE_RECORDS = 8;
 // Сколько соседей берёт пиксель и как далеко (пикселей).
 static const uint RESTIR_NEIGHBORS = 4;
 static const float RESTIR_RADIUS = 16.0;
@@ -156,6 +167,9 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
     float3 weight = float3(1.0, 1.0, 1.0);
     float travelled = 0.0;
     float first_t = -1.0;
+    // Учебный путь: точки, свет к их концу прямого света и вес (для кэша).
+    float3 rec_p[CACHE_RECORDS], rec_n[CACHE_RECORDS], rec_light[CACHE_RECORDS], rec_weight[CACHE_RECORDS];
+    uint records = 0;
     for (uint k = 0; k <= bounces; k++)
     {
         bool plane;
@@ -206,6 +220,28 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         else if (share < 1.0)
             direct = restir ? sampled_light(q, n, dir, sm) : direct_light(q, n, dir, sm);
         light += weight * (1.0 - share) * direct;
+        // Кэш света: дальше прямого света — свет клетки (или запомнить точку для учёбы).
+        // Не в первой точке пикселя (её отражённый свет — путь или ReSTIR GI) и не у зеркал.
+        if (g_cache != 0u && (k > 0 || !known) && !gi_mirror(gi_material(hit.y)))
+        {
+            if (g_cache == 1u)
+            {
+                float3 cached;
+                if (cache_find(g_cache_base, p, n, g_eye, spread, cached))
+                {
+                    light += weight * cached;
+                    break;
+                }
+            }
+            else if (records < CACHE_RECORDS)
+            {
+                rec_p[records] = p;
+                rec_n[records] = n;
+                rec_light[records] = light;
+                rec_weight[records] = weight;
+                records++;
+            }
+        }
         // ReSTIR GI: рассеянное продолжение — отдельно (gi_path), отражённое — всегда.
         bool split = k == 0 && gi && bounces > 0 && !gi_mirror(gi_material(hit.y));
         if (split)
@@ -246,6 +282,15 @@ float3 path(float3 origin, float3 dir, float limit, float spread, int2 px, uint 
         dir = cosine_dir(n);
     }
     first_dist = first_t;
+    // Учебный путь: в клетку каждой запомненной точки — свет, пришедший после неё, на её вес.
+    for (uint i = 0; i < records; i++)
+    {
+        float3 wt = rec_weight[i];
+        float3 rest = light - rec_light[i];
+        float3 v = float3(wt.x > 1e-4 ? rest.x / wt.x : 0.0, wt.y > 1e-4 ? rest.y / wt.y : 0.0,
+                          wt.z > 1e-4 ? rest.z / wt.z : 0.0);
+        cache_add(g_cache_base, rec_p[i], rec_n[i], g_eye, spread, max(v, float3(0.0, 0.0, 0.0)));
+    }
     return light;
 }
 
@@ -324,6 +369,12 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     bool gi_found;
     float3 gi_q, gi_n;
     uint bounces = pc.flags & 15;
+    if (live && (pc.flags & PATH_CACHE) != 0)
+    {
+        g_cache = cache_training(id.xy, frame) ? 2u : 1u;
+        g_cache_base = cache_base(w, h);
+        g_eye = screen_ray(float2(0.0, 0.0)).origin;
+    }
     float3 c = path(ray.origin, ray.dir, ray.limit, spread, px, bounces, live, first, restir, gi, true, w, h,
                     first_dist, albedo, first_normal, gi_found, gi_q, gi_n);
     if (gi)

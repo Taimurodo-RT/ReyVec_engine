@@ -22,6 +22,18 @@ if [ -z "$win" ]; then
   cat "$LOG"
   exit 1
 fi
+# The window appears before startup ends (pipelines, RT setup take seconds on llvmpipe);
+# keys sent before the first frame pile up and two F12 make one snapshot. Wait for the
+# "window open" log line first.
+for _ in $(seq 1 600); do
+  grep -aq "Окно открыто" "$LOG" && break
+  sleep 0.1
+done
+if ! grep -aq "Окно открыто" "$LOG"; then
+  echo "window did not open within 60 s"
+  cat "$LOG"
+  exit 1
+fi
 sleep 2
 xdotool windowfocus "$win" 2>/dev/null || true
 # Hide the panel so the mouse is over the scene, then take the first snapshot.

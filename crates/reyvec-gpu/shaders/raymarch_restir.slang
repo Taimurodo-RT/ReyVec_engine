@@ -12,6 +12,9 @@
 // запасы соседей (слой 1), проверяет выбранную точку лучом видимости, итог пишет в слой 0
 // (его возьмёт следующий кадр) и добавляет свет к свету пути: pc.cone — вход, pc.target —
 // выход.
+//
+// С битом CACHE_RESOLVE — проход «кэш света: сводка» (шаг 5б, include/light_cache.slang):
+// по потоку на ячейку кэша, до «пути 3D»; с CACHE_CLEAR — стереть всё (буфер новый).
 
 [[vk::binding(2, 0)]] [format("rgba16f")] RWTexture2D<float4> images[];
 
@@ -22,6 +25,7 @@
 #include "include/light3d.slang"
 #include "include/restir.slang"
 #include "include/restir_gi.slang"
+#include "include/light_cache.slang"
 
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
@@ -30,6 +34,10 @@ float4 fs_main(VertexOut input) : SV_Target
 }
 
 static const uint RESTIR_GI_NEIGHBORS = 1;
+static const uint CACHE_RESOLVE = 2;
+static const uint CACHE_CLEAR = 4;
+// Ячеек кэша в строке сетки запуска сводки.
+static const uint CACHE_ROW = 2048;
 // Соседи — не дальше стольких метров по поверхности.
 static const float GI_REACH = 0.5;
 
@@ -89,6 +97,14 @@ void cs_main(uint3 id : SV_DispatchThreadID)
 {
     uint w, h;
     images[pc.target].GetDimensions(w, h);
+    if ((pc.flags & CACHE_RESOLVE) != 0)
+    {
+        // Сетка запуска — CACHE_SIZE ячеек строками по CACHE_ROW, картинка — только для размера.
+        uint entry = id.y * CACHE_ROW + id.x;
+        if (id.x < CACHE_ROW && entry < CACHE_SIZE)
+            cache_resolve(cache_base(w, h), entry, (pc.flags & CACHE_CLEAR) != 0);
+        return;
+    }
     if (id.x >= w || id.y >= h)
         return;
     int2 px = int2(id.xy);
