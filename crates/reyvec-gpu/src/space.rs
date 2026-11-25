@@ -1132,6 +1132,88 @@ mod tests {
         assert_eq!(set, empty, "без раздела моделей заголовок цел");
     }
 
+    /// Устойчивость к плохим числам в файле сцены (проверка этапа 8): нулевые, отрицательные
+    /// и огромные размеры, нулевые периоды и дальности не роняют сборку кадра — файл
+    /// правят на лету, и опечатка не должна закрывать песочницу.
+    #[test]
+    fn bad_numbers_in_a_scene_do_not_panic() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/showroom.ron");
+        let swaps: [(&str, &[&str]); 12] = [
+            (
+                "radius: 0.35",
+                &[
+                    "radius: 0.0",
+                    "radius: -1.0",
+                    "radius: 1e30",
+                    "radius: 1e-30",
+                ],
+            ),
+            (
+                "size: (1.0, 1.0, 1.0)",
+                &["size: (0.0, 0.0, 0.0)", "size: (-1.0, 1e30, 0.0)"],
+            ),
+            (
+                "thickness: 0.11",
+                &["thickness: 0.0", "thickness: 5.0", "thickness: -1.0"],
+            ),
+            (
+                "height: 0.9, bottom: 0.35, top: 0.05",
+                &[
+                    "height: 0.0, bottom: 0.0, top: 0.0",
+                    "height: -1.0, bottom: 1e30, top: -5.0",
+                ],
+            ),
+            (
+                "height: 0.8, radius: 0.16",
+                &["height: 0.0, radius: 0.0", "height: -3.0, radius: 1e20"],
+            ),
+            (
+                "smooth: 0.25",
+                &["smooth: 0.0", "smooth: -1.0", "smooth: 1e30"],
+            ),
+            (
+                "period: 1.6",
+                &["period: 0.0", "period: -1.0", "period: 1e-30"],
+            ),
+            ("period: 10.0", &["period: 0.0"]),
+            ("range: 6.0", &["range: 0.0", "range: -1.0", "range: 1e30"]),
+            ("scale: 0.5", &["scale: 0.0", "scale: -1.0", "scale: 1e30"]),
+            ("spin: (40.0, 60.0, 0.0)", &["spin: (1e30, -1e30, 1e30)"]),
+            (
+                "normal: (0.0, 1.0, 0.0)",
+                &["normal: (0.0, 0.0, 0.0)", "normal: (1e30, 0.0, 0.0)"],
+            ),
+        ];
+        for (from, tos) in swaps {
+            assert!(text.contains(from), "в сцене есть «{from}»");
+            for to in tos {
+                let bad = text.replacen(from, to, 1);
+                // Отказ с сообщением — тоже хороший ответ; главное — не паника.
+                let Ok(scene) = reyvec_sdf::SpaceScene::parse_in(&bad, Some(dir)) else {
+                    continue;
+                };
+                let mut cache = PackCache::default();
+                for time in [0.0, 1.0, 1e6] {
+                    let frame = scene.frame(time);
+                    let packed = pack_cached(
+                        &frame,
+                        &scene.materials,
+                        true,
+                        true,
+                        GridOptions::default(),
+                        &mut cache,
+                    );
+                    assert!(
+                        packed.words.len() <= MAX_WORDS,
+                        "«{to}»: слов {}",
+                        packed.words.len()
+                    );
+                }
+            }
+        }
+    }
+
     /// Большой мир (8.9): сколько стоит упаковка кадра города на процессоре — первый
     /// кадр и следующие (неподвижное берётся из прошлого кадра). Время только печатается.
     #[test]
