@@ -1,0 +1,39 @@
+// Пример экрана интерфейса игры (шаг И.1, решение 0022).
+// В песочнице: F3 показывает и прячет. Правка этого файла сразу видна в окне.
+// Размеры — в пикселях экрана 1920×1080, на другом окне всё растягивается.
+
+screen Demo {
+    // Меню в середине экрана.
+    Column(spacing: 14, align: stretch) {
+        Text("ReyVec").font(56).color(#F5A54A)
+        Text("Интерфейс игры из файла ui/demo.rui").font(20).color(#9AA3B5)
+
+        Rect().height(8)
+
+        Stack { Text("Продолжить").font(26) }
+            .padding(12, 24).background(#262B36).radius(10)
+        Stack { Text("Новая игра").font(26) }
+            .padding(12, 24).background(#262B36).radius(10)
+        Stack { Text("Настройки").font(26) }
+            .padding(12, 24).background(#262B36).radius(10)
+        Stack { Text("Выход").font(26).color(#FFB4B4) }
+            .padding(12, 24).background(#262B36).radius(10).border(#E5484D, 2)
+    }
+    .width(420)
+    .padding(36)
+    .background(#171A21E6)
+    .radius(20)
+    .border(#FFFFFF1A, 1)
+
+    // Полоска выносливости в левом нижнем углу.
+    Column(spacing: 6) {
+        Text("Выносливость").font(18).color(#C8D0DC)
+        Stack {
+            Rect().size(190, 12).background(#7FD36B).radius(6).align(left)
+        }
+        .size(260, 12)
+        .background(#00000080)
+        .radius(6)
+    }
+    .anchor(bottom_left, margin: 32)
+}

@@ -123,6 +123,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         modifiers: ModifiersState::empty(),
         gamepads: crate::gamepad::Gamepads::new(),
         game_ui: crate::game_ui::GameUi::new(),
+        rui_demo: crate::rui_demo::RuiDemo::new(),
         audio: reyvec_audio::Audio::new(true),
         fly: crate::fly::Fly::default(),
         last_frame: Instant::now(),
@@ -196,6 +197,8 @@ struct App {
     gamepads: crate::gamepad::Gamepads,
     /// Игровой интерфейс и настройка клавиш (6.10б).
     game_ui: crate::game_ui::GameUi,
+    /// Экран интерфейса игры из `ui/demo.rui` (И.1), F3.
+    rui_demo: crate::rui_demo::RuiDemo,
     /// Звук (6.7): звуки событий игры и музыка.
     audio: reyvec_audio::Audio,
     /// Полёт камерой в сцене «3D» (7.1) и время прошлого кадра для шага полёта.
@@ -884,6 +887,14 @@ impl App {
         if self.game_ui.take_quit() {
             return self.close(event_loop);
         }
+        // Интерфейс игры (И.1) рисуется поверх картинки сцены, её размера.
+        let ui_size = renderer
+            .view_rect()
+            .map_or([size.width, size.height], |r| [r[2], r[3]]);
+        let rui = self.rui_demo.frame([ui_size[0] as f32, ui_size[1] as f32]);
+        if let Err(e) = renderer.set_game_ui(rui) {
+            tracing::warn!("интерфейс игры не загрузился на видеокарту: {e}");
+        }
         match renderer.render([size.width, size.height], time, ui) {
             Ok(FrameStatus::Presented) => {
                 self.frames += 1;
@@ -1406,6 +1417,16 @@ impl ApplicationHandler for App {
                     self.apply(PanelAction::Glow(on));
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F3),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => self.rui_demo.toggle(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
