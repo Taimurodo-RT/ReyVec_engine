@@ -17,6 +17,7 @@ use egui::{
 use reyvec_story::format::{self, Change, Choice, Goal, Stage, Value, VarsFile};
 use reyvec_story::{Character, Dialog, LineSettings, Node, Problem, Quest, Story, View};
 
+use super::dialog_graph::{Around, DialogGraph, KINDS as NODE_KINDS, Speaker};
 use super::theme::*;
 
 /// Через сколько секунд после последней правки заметка сохраняется сама.
@@ -114,6 +115,10 @@ pub(crate) struct StoryUi {
     scroll_to: Option<String>,
     new_var: (String, usize),
     out: Vec<StoryOut>,
+    /// Схема карточек диалога (Сю.3).
+    graph: DialogGraph,
+    /// Диалог показан сценарием, а не схемой.
+    script: bool,
 }
 
 impl Default for StoryUi {
@@ -136,6 +141,8 @@ impl Default for StoryUi {
             scroll_to: None,
             new_var: (String::new(), 0),
             out: Vec::new(),
+            graph: DialogGraph::default(),
+            script: false,
         }
     }
 }
@@ -695,6 +702,18 @@ impl StoryUi {
             return;
         };
         self.nav_bar(ui, &item);
+        if let Item::Dialog(id) = &item {
+            self.dialog_bar(ui, id, now);
+            if !self.script {
+                if let Some(node) = self.scroll_to.take() {
+                    self.graph.focus(id, &node);
+                }
+                if self.dialog_schema(ui, id) {
+                    self.edited(&item, now);
+                }
+                return;
+            }
+        }
         let width = ui.available_width();
         let pad = ((width - READABLE) / 2.0).max(GAP_XXL * 2.0);
         egui::ScrollArea::vertical()
@@ -723,6 +742,79 @@ impl StoryUi {
                         }
                     });
             });
+    }
+
+    /// Полоса над диалогом: «Схема / Сценарий» и, на схеме, кнопки новых карточек.
+    fn dialog_bar(&mut self, ui: &mut Ui, id: &str, now: f64) {
+        ui.add_space(GAP_S);
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(GAP_L);
+            for (script, name) in [(false, "Схема"), (true, "Сценарий")] {
+                if ui.selectable_label(self.script == script, name).clicked() {
+                    self.script = script;
+                }
+            }
+            if self.script {
+                return;
+            }
+            if ui
+                .button("Разложить")
+                .on_hover_text("Расставить карточки столбцами от начала разговора")
+                .clicked()
+                && let Some(d) = self.story.dialogs.get_mut(id)
+            {
+                self.graph.arrange(d);
+                self.edited(&Item::Dialog(id.to_string()), now);
+            }
+            ui.separator();
+            ui.spacing_mut().button_padding = vec2(GAP_M, 2.0);
+            ui.spacing_mut().item_spacing.x = GAP_S;
+            let who = self
+                .story
+                .dialogs
+                .get(id)
+                .and_then(|d| d.with.first().cloned())
+                .unwrap_or_default();
+            for kind in NODE_KINDS {
+                let b = egui::Button::new(
+                    RichText::new(kind.title())
+                        .size(FONT_SMALL + 1.0)
+                        .color(Color32::WHITE),
+                )
+                .fill(kind.color())
+                .corner_radius(RADIUS_M);
+                if ui.add(b).on_hover_text(kind.hint()).clicked()
+                    && let Some(d) = self.story.dialogs.get_mut(id)
+                {
+                    self.graph.add(d, kind, &who);
+                    self.edited(&Item::Dialog(id.to_string()), now);
+                }
+            }
+        });
+        ui.add_space(GAP_S);
+    }
+
+    /// Схема карточек на всё оставшееся место. `true` — диалог поменялся.
+    fn dialog_schema(&mut self, ui: &mut Ui, id: &str) -> bool {
+        let speakers: Vec<Speaker> = self
+            .story
+            .characters
+            .values()
+            .map(|c| Speaker {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                color: parse_hex(&c.color).unwrap_or(TEXT),
+            })
+            .collect();
+        let dialogs: Vec<String> = self.story.dialogs.keys().cloned().collect();
+        let Some(d) = self.story.dialogs.get_mut(id) else {
+            return false;
+        };
+        let around = Around {
+            speakers: &speakers,
+            dialogs: &dialogs,
+        };
+        self.graph.draw(ui, d, &around)
     }
 
     fn tab_bar(&mut self, ui: &mut Ui) {
@@ -1023,8 +1115,8 @@ impl StoryUi {
         });
         callout(
             ui,
-            "Схема из карточек — следующий шаг (Сю.3). Пока диалог виден как сценарий: тексты \
-             реплик и вариантов можно править здесь, стрелки ведут к карточкам.",
+            "Сценарий — тот же диалог текстом: реплики и варианты можно править здесь. \
+             Новые карточки и стрелки — на схеме.",
         );
         let mut jump_to = None;
         let mut open = None;
