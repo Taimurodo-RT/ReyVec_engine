@@ -195,7 +195,9 @@ pub(crate) fn install(lua: &Lua, host: &SharedStory) -> mlua::Result<()> {
             })?;
             let new = from_lua(&name, was, &v).map_err(|e| err(lua, e))?;
             h.state.vars.insert(name, new);
-            Ok(())
+            // Переменная могла закончить стадию или провалить задание.
+            let StoryHost { story, state, .. } = &mut *h;
+            story.quest_tick(state).map_err(|e| err(lua, e))
         })?,
     )?;
     let h = Arc::clone(host);
@@ -237,6 +239,7 @@ pub(crate) fn install(lua: &Lua, host: &SharedStory) -> mlua::Result<()> {
             let StoryHost { story, state, .. } = &mut *g;
             story
                 .quest_add(state, &id, &goal, n.unwrap_or(1))
+                .and_then(|()| story.quest_tick(state))
                 .map_err(|e| err(lua, e))
         })?,
     )?;

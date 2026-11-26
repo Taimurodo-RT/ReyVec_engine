@@ -861,47 +861,11 @@ fn card_body(
         Node::Set { changes, .. } => {
             let mut drop = None;
             for (i, c) in changes.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    changed |= ui
-                        .add(
-                            TextEdit::singleline(&mut c.var)
-                                .id_salt(("var", i))
-                                .hint_text("переменная")
-                                .font(FontId::monospace(FONT_MONO))
-                                .desired_width(110.0)
-                                .margin(PAD_FIELD),
-                        )
-                        .changed();
-                    let mut add = c.add.is_some();
-                    egui::ComboBox::from_id_salt(("op", i))
-                        .width(40.0)
-                        .selected_text(if add { "+=" } else { "=" })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut add, false, "= записать");
-                            ui.selectable_value(&mut add, true, "+= прибавить");
-                        });
-                    if add != c.add.is_some() {
-                        if add {
-                            c.add = Some(1.0);
-                            c.to = None;
-                        } else {
-                            c.add = None;
-                            c.to = Some(Value::Bool(true));
-                        }
-                        changed = true;
-                    }
-                    if let Some(a) = c.add.as_mut() {
-                        changed |= ui.add(egui::DragValue::new(a).speed(0.1)).changed();
-                    } else if let Some(v) = c.to.as_mut() {
-                        changed |= value_field(ui, v, i);
-                    }
-                    if ui
-                        .add(egui::Button::new(RichText::new("×").color(MUTED)).frame(false))
-                        .clicked()
-                    {
-                        drop = Some(i);
-                    }
-                });
+                let (ch, del) = change_row(ui, c, ("var", i), 110.0);
+                changed |= ch;
+                if del {
+                    drop = Some(i);
+                }
             }
             if let Some(i) = drop {
                 changes.remove(i);
@@ -1079,6 +1043,63 @@ pub(crate) fn parse_value(s: &str) -> Value {
             .or_else(|_| s.parse::<f64>().map(Value::Float))
             .unwrap_or_else(|_| Value::Text(s.to_string())),
     }
+}
+
+/// Строка «переменная = значение» или «переменная += число» с крестиком. Возвращает
+/// (поменялась, убрать). Та же строка — в наградах задания.
+pub(crate) fn change_row(
+    ui: &mut Ui,
+    c: &mut Change,
+    salt: impl std::hash::Hash + std::fmt::Debug + Copy,
+    width: f32,
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut drop = false;
+    ui.horizontal(|ui| {
+        changed |= ui
+            .add(
+                TextEdit::singleline(&mut c.var)
+                    .id_salt(("change-var", salt))
+                    .hint_text("переменная")
+                    .font(FontId::monospace(FONT_MONO))
+                    .desired_width(width)
+                    .margin(PAD_FIELD),
+            )
+            .changed();
+        let mut add = c.add.is_some();
+        egui::ComboBox::from_id_salt(("change-op", salt))
+            .width(40.0)
+            .selected_text(if add { "+=" } else { "=" })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut add, false, "= записать");
+                ui.selectable_value(&mut add, true, "+= прибавить");
+            });
+        if add != c.add.is_some() {
+            if add {
+                c.add = Some(1.0);
+                c.to = None;
+            } else {
+                c.add = None;
+                c.to = Some(Value::Bool(true));
+            }
+            changed = true;
+        }
+        if let Some(a) = c.add.as_mut() {
+            changed |= ui.add(egui::DragValue::new(a).speed(0.1)).changed();
+        } else if let Some(v) = c.to.as_mut() {
+            ui.push_id(("change-val", salt), |ui| {
+                changed |= value_field(ui, v, 0);
+            });
+        }
+        if ui
+            .add(egui::Button::new(RichText::new("×").color(MUTED)).frame(false))
+            .on_hover_text("Убрать")
+            .clicked()
+        {
+            drop = true;
+        }
+    });
+    (changed, drop)
 }
 
 fn value_field(ui: &mut Ui, v: &mut Value, i: usize) -> bool {

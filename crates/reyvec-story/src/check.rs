@@ -335,7 +335,40 @@ fn check_quest_event(
     }
 }
 
-fn check_quests(story: &Story, out: &mut Vec<Problem>) {
+fn check_quests(story: &mut Story, out: &mut Vec<Problem>) {
+    let state = story.new_state();
+    let quests: Vec<crate::format::Quest> = story.quests.values().cloned().collect();
+    for q in &quests {
+        let file = story
+            .files
+            .get(&format!("q:{}", q.id))
+            .cloned()
+            .unwrap_or_default();
+        let mut cond = |story: &mut Story, place: &str, expr: &str| {
+            if expr.trim().is_empty() {
+                return;
+            }
+            if let Err(e) = story.conds.compile(expr) {
+                out.push(Problem::error(
+                    &file,
+                    place,
+                    format!("условие «{expr}»: {e}"),
+                ));
+            } else if let Err(e) = story.conds.eval(expr, &state) {
+                out.push(Problem::error(&file, place, e));
+            }
+        };
+        cond(story, "fail_when", &q.fail_when);
+        for s in &q.stages {
+            cond(story, &s.id, &s.done_when);
+        }
+        for c in &q.rewards {
+            let mut probe = story.new_state();
+            if let Err(e) = crate::play::apply(&mut probe, c) {
+                out.push(Problem::error(&file, "rewards", e));
+            }
+        }
+    }
     for q in story.quests.values() {
         let file = story
             .files
