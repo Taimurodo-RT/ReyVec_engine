@@ -25,6 +25,9 @@ use std::time::{Instant, SystemTime};
 
 use mlua::{Function, Lua, RegistryKey, Table, VmState};
 
+mod story;
+pub use story::{Func, QUEST_FUNCS, STORY_FUNCS, SharedStory, StoryHost};
+
 /// Сколько раз один вызов скрипта может пройти проверку Luau (она стоит на каждом обороте
 /// цикла и вызове функции), прежде чем его оборвут. Счёт, а не часы: раньше предел был
 /// 5 мс по часам, и вызов, который система на миг остановила (загруженный процессор,
@@ -175,6 +178,8 @@ pub struct Scripts {
     epoch: Instant,
     /// Сколько раз перечитаны файлы (для панели и тестов).
     pub reloads: u32,
+    /// Сюжет игры для `story.*` и `quest.*` (Сю.5).
+    story: Option<SharedStory>,
 }
 
 impl Default for Scripts {
@@ -214,7 +219,25 @@ impl Scripts {
             deadline,
             epoch,
             reloads: 0,
+            story: None,
         }
+    }
+
+    /// Даёт скриптам сюжет: таблицы `story` и `quest`. Возвращает общую копию — её ведёт
+    /// игра (разговор, сохранение). Вызывать до загрузки скриптов не обязательно: таблицы
+    /// видны всем скриптам сразу.
+    pub fn set_story(&mut self, story: reyvec_story::Story) -> SharedStory {
+        let host = Arc::new(std::sync::Mutex::new(StoryHost::new(story)));
+        if let Err(e) = story::install(&self.lua, &host) {
+            tracing::warn!("сюжет для скриптов: {e}");
+        }
+        self.story = Some(Arc::clone(&host));
+        host
+    }
+
+    /// Сюжет, если он есть.
+    pub fn story(&self) -> Option<&SharedStory> {
+        self.story.as_ref()
     }
 
     /// Загружает скрипт из файла (один и тот же файл — один раз). Ошибка не мешает:

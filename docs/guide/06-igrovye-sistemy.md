@@ -76,7 +76,7 @@ flowchart TB
 | Анимация | `crates/reyvec-game/src/anim.rs` (`Bone`, `Pose`, `Clip`) | нет |
 | Физика | `crates/reyvec-game/src/physics/` (тела, `joints.rs`, `soft.rs`); копия `third_party/rapier2d` 0.36.1 + `parry2d` 0.31.1 | нет |
 | Скрипты | `crates/reyvec-script` (`mlua` + Luau, `Scripts::reload_changed`) | нет |
-| Сюжет (Сю.1) | `crates/reyvec-story` (`format.rs`, `cond.rs`, `check.rs`, `play.rs`, `quest.rs`); пример — папка `story/` | нет |
+| Сюжет (Сю.1, Сю.5) | `crates/reyvec-story` (`format.rs`, `cond.rs`, `check.rs`, `play.rs`, `quest.rs`); для скриптов — `crates/reyvec-script/src/story.rs`; пример — папка `story/` и `scenes/scripts/kuznec.luau` | нет |
 | Звук | `crates/reyvec-audio` (`synth.rs`, `mixer.rs` поверх `cpal`) | нет |
 | Частицы | `crates/reyvec-gpu/src/particles.rs`, `shaders/particles.slang` | да |
 | Интерфейс игры (старый) | `crates/reyvec-app/src/game_ui.rs` (egui) | да |
@@ -119,6 +119,7 @@ flowchart TB
 - **Проверка** (`check.rs`): стрелки в никуда, неизвестные персонажи, переменные, задания и цели, подстановки `{имя}`, ошибки условий (каждое проверяется на начальном мире), неверные имена, карточки, до которых не дойти (предупреждение).
 - **Проигрыватель** (`play.rs`): `Story::talk` → `Story::step` до реплики, события, паузы или конца → `Talk::choose`. События `quest.*` выполняет сам сюжет, остальные получает игра. Ошибка в данных мягко заканчивает разговор и пишет причину в `Talk::error`; больше 1000 «тихих» карточек подряд — обрыв. Случайные карточки берут число из зерна в `State` (одно зерно — один путь).
 - **Состояние** `State` (переменные, задания, выбранные варианты, язык, зерно) — часть будущего сохранения.
+- **Скрипты (Сю.5).** Сцена при сборке ищет папку `story/` рядом с собой или до трёх папок выше (`SceneWorld::new` → `find_story_dir`) и отдаёт сюжет скриптам: `Scripts::set_story` кладёт в Luau таблицы `story` (`talk`, `busy`, `get`, `set`, `seen`) и `quest` (`start`, `add`, `stage`, `state`, `complete`, `fail`), только для чтения. Сюжет, его `State` и начатый разговор лежат в `StoryHost` под общим замком (`SharedStory`, `SceneWorld::story()`): скрипты меняют его, а вести разговор и сохранять будет игра (Сю.7). Неизвестное имя или значение не того вида — ошибка Luau со строкой скрипта (`kuznec.luau:4: нет диалога «…»`), как любая ошибка скрипта. Список функций с описаниями — `STORY_FUNCS`/`QUEST_FUNCS`, по нему подсказывает редактор кода; тест `story_functions_match_engine` сверяет его с таблицами.
 - **Проверки:** `cargo test -p reyvec-story` — весь пример «кузнец и руда», перевод, отметка выбранных вариантов, повтор по зерну, ошибки данных, песочница условий, запись файла и чтение обратно.
 
 ### Частицы

@@ -17,6 +17,7 @@ reyvec-svg.workspace = true
 reyvec-vector.workspace = true
 reyvec-game.workspace = true
 reyvec-script.workspace = true
+reyvec-story.workspace = true
 reyvec-sdf.workspace = true
 serde.workspace = true
 thiserror.workspace = true

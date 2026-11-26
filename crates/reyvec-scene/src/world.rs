@@ -465,8 +465,17 @@ impl SceneWorld {
             seed: 0x5eed,
             extra: phys::Extra::default(),
         });
+        let mut scripts = reyvec_script::Scripts::new();
+        // Сюжет проекта (Сю.5): папка `story/` рядом со сценой или выше.
+        if let Some(story_dir) = file.dir.as_deref().and_then(find_story_dir) {
+            let (story, problems) = reyvec_story::Story::load_dir(&story_dir);
+            for p in &problems {
+                tracing::warn!("сюжет: {} {}: {}", p.file, p.place, p.text);
+            }
+            scripts.set_story(story);
+        }
         world.insert_resource(ScriptRes {
-            scripts: reyvec_script::Scripts::new(),
+            scripts,
             until_check: SCRIPT_CHECK_STEPS,
         });
         let mut spawner = Spawner {
@@ -565,6 +574,12 @@ impl SceneWorld {
     pub fn refresh(&mut self) {
         let t = self.world.resource::<SceneTime>().0;
         self.update_at(t);
+    }
+
+    /// Сюжет сцены (папка `story/` проекта), если он есть: его состояние и начатый
+    /// скриптом разговор (`story.talk`).
+    pub fn story(&self) -> Option<reyvec_script::SharedStory> {
+        self.world.resource::<ScriptRes>().scripts.story().cloned()
     }
 
     /// Снимок для рисования после последнего [`SceneWorld::update`].
@@ -701,6 +716,16 @@ impl SceneWorld {
             .find(|(_, n)| n.as_str() == name)
             .map(|(e, _)| e)
     }
+}
+
+/// Папка `story/` проекта: рядом со сценой или в одной из папок выше (сцены обычно лежат
+/// в `scenes/`, сюжет — в корне проекта).
+fn find_story_dir(scene_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    scene_dir
+        .ancestors()
+        .take(4)
+        .map(|d| d.join("story"))
+        .find(|d| d.join("vars.ron").is_file() || d.join("dialogs").is_dir())
 }
 
 struct Spawner<'a> {

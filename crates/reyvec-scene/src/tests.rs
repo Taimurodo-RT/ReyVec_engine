@@ -1853,6 +1853,72 @@ fn script_level(dir: &std::path::Path, beetle: &str) -> SceneWorld {
     SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap()
 }
 
+/// Сю.5: скрипт кузнеца начинает разговор, когда герой подошёл; сюжет найден в папке
+/// проекта выше папки сцены.
+#[test]
+fn smith_script_starts_a_talk_when_the_hero_comes() {
+    use reyvec_game::Action::Right;
+    use reyvec_game::InputFrame;
+    let root = std::env::temp_dir().join(format!("reyvec-story-{}", std::process::id()));
+    let dir = root.join("scenes");
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../story");
+    for sub in ["", "characters", "dialogs", "quests", "lang"] {
+        std::fs::create_dir_all(root.join("story").join(sub)).unwrap();
+        for e in std::fs::read_dir(example.join(sub)).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(
+                    &p,
+                    root.join("story").join(sub).join(p.file_name().unwrap()),
+                )
+                .unwrap();
+            }
+        }
+    }
+    std::fs::write(
+        dir.join("scripts/kuznec.luau"),
+        "function update(me)\n  if me.touching and not story.busy() then\n    story.talk(\"kuznec.privet\")\n  end\nend\n",
+    )
+    .unwrap();
+    let text = minimal(
+        r##"nodes: [
+        (name: "пол", solids: [(at: (0.0, -0.9), size: (8.0, 0.2))]),
+        (name: "герой", at: (-1.0, -0.65), player: (size: (0.14, 0.28)), shapes: [Rect(at: (0.0, 0.0), size: (0.14, 0.28), color: "#fff")]),
+        (name: "кузнец", at: (-0.3, -0.62), script: "scripts/kuznec.luau", touch: (0.2, 0.3),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.2, 0.36), color: "#8a5a3a")]),
+    ]"##,
+    );
+    let file = SceneFile::parse_in(&text, Some(&dir)).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let story = w.story().expect("сюжет найден в папке выше сцены");
+    let mut t = steps(&mut w, 0, 30);
+    assert!(
+        story.lock().unwrap().talk.is_none(),
+        "герой далеко — разговора нет"
+    );
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    for _ in 0..90 {
+        t = steps(&mut w, t, 1);
+        if story.lock().unwrap().busy() {
+            break;
+        }
+    }
+    assert!(
+        w.snapshot().scripts.errors.is_empty(),
+        "{:?}",
+        w.snapshot().scripts
+    );
+    let h = story.lock().unwrap();
+    assert_eq!(
+        h.talk.as_ref().map(|t| t.dialog.as_str()),
+        Some("kuznec.privet")
+    );
+    drop(h);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn scripts_drive_an_enemy_and_a_coin_and_pick_up_edits() {
     use reyvec_game::Action::Right;
