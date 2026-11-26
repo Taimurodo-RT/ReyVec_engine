@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 reyvec-text.workspace = true
 reyvec-vector.workspace = true
+ron.workspace = true
+serde.workspace = true
 taffy.workspace = true
 thiserror.workspace = true
 

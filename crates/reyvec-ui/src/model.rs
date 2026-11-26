@@ -9,6 +9,7 @@
 use reyvec_vector::Color;
 
 use crate::UiError;
+use crate::lang::Texts;
 use crate::style::{Info, StyleSet, Vars};
 use crate::syntax::{Arg, Modifier, Node, Pos, ScreenDecl, ScreenKind, Value};
 
@@ -545,6 +546,9 @@ fn container_args(node: &Node, p: &mut Placement) -> Result<(), UiError> {
 #[derive(Clone)]
 struct Ctx<'a> {
     styles: &'a StyleSet,
+    /// Слова для `tr("ключ")` и язык, на котором их брать.
+    texts: &'a Texts,
+    lang: &'a str,
     vars: Vars,
     font: f32,
     color: Color,
@@ -943,6 +947,68 @@ fn flag(modifiers: &[Modifier], name: &str) -> Result<bool, UiError> {
     Ok(on)
 }
 
+/// Надпись: строка в кавычках или `tr("ключ", имя: значение)`.
+fn is_words(a: &Arg) -> bool {
+    a.name.is_none()
+        && match &a.value {
+            Value::Text(_) => true,
+            Value::Call(f, _) => f == "tr",
+            _ => false,
+        }
+}
+
+/// Текст надписи. У `tr` слова берутся из файла языка, а `{имя}` в них заменяется
+/// значением `имя:` из скобок: `tr("hud.coins", n: 5)` и «Монеты: {n}».
+fn words(a: &Arg, ctx: &Ctx<'_>) -> Result<String, UiError> {
+    let Value::Call(_, args) = &a.value else {
+        let Value::Text(t) = &a.value else {
+            unreachable!("проверено в is_words")
+        };
+        return Ok(t.clone());
+    };
+    let (key, rest) = match &args[..] {
+        [
+            Arg {
+                name: None,
+                value: Value::Text(k),
+                pos,
+            },
+            rest @ ..,
+        ] => ((k, *pos), rest),
+        _ => {
+            return Err(meaning(
+                a.pos,
+                "tr: сначала ключ в кавычках, потом подстановки по именам: tr(\"hud.coins\", n: 5)",
+            ));
+        }
+    };
+    let mut text = ctx.texts.get(ctx.lang, key.0, key.1)?;
+    for r in rest {
+        let Some(name) = &r.name else {
+            return Err(meaning(
+                r.pos,
+                "tr: подстановка пишется с именем, tr(\"hud.coins\", n: 5), а в тексте — {n}",
+            ));
+        };
+        let value = match ctx.vars.resolve(&r.value, r.pos)? {
+            Value::Number(n) if n.fract() == 0.0 && n.abs() < 1e9 => format!("{}", n as i64),
+            Value::Number(n) => format!("{n}"),
+            Value::Text(t) | Value::Name(t) => t,
+            other => {
+                return Err(meaning(
+                    r.pos,
+                    format!(
+                        "tr: подставить можно число или строку, а здесь {}",
+                        other.kind()
+                    ),
+                ));
+            }
+        };
+        text = text.replace(&format!("{{{name}}}"), &value);
+    }
+    Ok(text)
+}
+
 fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<Element, UiError> {
     let kind_name = node.kind.as_str();
     if !KINDS.contains(&kind_name) {
@@ -962,29 +1028,19 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
         "Button" => {
             match &node.args[..] {
                 [] => {}
-                [
-                    Arg {
-                        name: None,
-                        value: Value::Text(t),
-                        pos,
-                    },
-                ] if kids.is_none() => {
+                [a] if kids.is_none() && is_words(a) => {
                     kids = Some(vec![Node {
                         kind: "Text".into(),
-                        args: vec![Arg {
-                            name: None,
-                            value: Value::Text(t.clone()),
-                            pos: *pos,
-                        }],
+                        args: vec![a.clone()],
                         children: None,
                         modifiers: Vec::new(),
-                        pos: *pos,
+                        pos: a.pos,
                     }]);
                 }
                 _ => {
                     return Err(meaning(
                         node.pos,
-                        "Button: надпись в кавычках, Button(\"Играть\"), или блоки в { }",
+                        "Button: надпись в кавычках или по ключу, Button(\"Играть\") или Button(tr(\"menu.play\")), или блоки в { }",
                     ));
                 }
             }
@@ -1004,26 +1060,12 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
             Kind::Spacer
         }
         "Text" => {
-            let text = match node.args.first() {
-                Some(Arg {
-                    value: Value::Text(t),
-                    name: None,
-                    ..
-                }) if node.args.len() == 1 => t.clone(),
-                Some(Arg {
-                    value: Value::Call(f, _),
-                    pos,
-                    ..
-                }) if f == "tr" => {
-                    return Err(meaning(
-                        *pos,
-                        "tr(\"ключ\") — тексты на двух языках, шаг И.2в",
-                    ));
-                }
+            let text = match &node.args[..] {
+                [a] if is_words(a) => words(a, ctx)?,
                 _ => {
                     return Err(meaning(
                         node.pos,
-                        "Text: одна строка в кавычках, Text(\"Играть\")",
+                        "Text: одна строка в кавычках или ключ текста, Text(\"Играть\") или Text(tr(\"menu.play\"))",
                     ));
                 }
             };
@@ -1112,9 +1154,17 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
 
 /// Экран из объявления: корень — `Stack` на весь экран, модификаторы экрана — у корня.
 /// Корень сопоставляется со стилями по имени экрана: `style MainMenu { ... }`.
-pub fn screen(decl: &ScreenDecl, styles: &StyleSet, vars: &Vars) -> Result<Screen, UiError> {
+pub fn screen(
+    decl: &ScreenDecl,
+    styles: &StyleSet,
+    vars: &Vars,
+    texts: &Texts,
+    lang: &str,
+) -> Result<Screen, UiError> {
     let root_ctx = Ctx {
         styles,
+        texts,
+        lang,
         vars: vars.clone(),
         font: DEFAULT_FONT,
         color: Color::WHITE,
@@ -1207,7 +1257,7 @@ mod tests {
         styles.add_rules(&doc.styles, "экран");
         styles.themes = doc.themes.clone();
         let vars = styles.theme_vars((!styles.themes.is_empty()).then_some(0))?;
-        screen(&doc.screens[0], &styles, &vars)
+        screen(&doc.screens[0], &styles, &vars, &Texts::default(), "ru")
     }
 
     #[test]
