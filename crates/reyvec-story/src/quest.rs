@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 use crate::{State, Story};
 
 /// Где задание сейчас.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     /// Не взято.
     #[default]
@@ -28,7 +30,8 @@ impl Status {
 }
 
 /// Состояние одного задания.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct QuestState {
     pub status: Status,
     /// Текущая стадия (у выполненного — последняя).
