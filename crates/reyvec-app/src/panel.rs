@@ -1363,12 +1363,13 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 }
                 let mut cone_mid = info.cone_mid;
                 if ui
-                    .checkbox(&mut cone_mid, "Грубые лучи: средний уровень")
+                    .checkbox(&mut cone_mid, "Грубые лучи: средний уровень (опыт)")
                     .on_hover_text(
                         "8.10в2: после грубых лучей (квадраты 8×8 пикселей) идёт второй \
                      проход квадратами 2×2 — он подводит лучи пикселей ближе к формам, и им \
-                     остаётся меньше шагов. Картинка та же. Выключите, чтобы сравнить время \
-                     «реймарчинг» и «края 3D» с прежним (появится проход «лучи 3D средне»)",
+                     остаётся меньше шагов. Картинка та же. Замер на RTX 5080: сам проход \
+                     стоит дороже, чем экономит (кадр +0,9 мс), поэтому выключен. Включите, \
+                     чтобы сравнить (появится проход «лучи 3D средне»)",
                     )
                     .changed()
                 {
@@ -2279,7 +2280,7 @@ mod tests {
             edge_shadow_reuse: true,
             edge_far: false,
             edge_far_picture: false,
-            cone_mid: true,
+            cone_mid: false,
             brick_shadows: true,
             part_bounds: true,
             split_parts: true,

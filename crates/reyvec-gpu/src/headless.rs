@@ -586,7 +586,7 @@ fn render(
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
             demo.set_edge_far_meters(tests::EDGE_FAR.get());
             demo.set_edge_far_picture(tests::EDGE_FAR_PICTURE.get());
-            demo.set_cone_mid(!tests::NO_CONE_MID.get());
+            demo.set_cone_mid(tests::CONE_MID.get());
             demo.set_post_aa(tests::POST_AA.get());
             demo.set_space_triangles(tests::TRIANGLES.get());
             if tests::TRIANGLES.get() {
@@ -979,8 +979,8 @@ pub(crate) mod tests {
         pub(super) static EDGE_FAR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
         /// Края: вдали по картинке (8.10в).
         pub(super) static EDGE_FAR_PICTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-        /// Без среднего уровня конусов (8.10в2), как до него.
-        pub(super) static NO_CONE_MID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Средний уровень конусов (8.10в2, опыт).
+        pub(super) static CONE_MID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Сглаживание 3D по картинке вместо лучей краёв (8.12а); по умолчанию выключено.
         pub(super) static POST_AA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Режим «треугольники» для 3D (8.20б).
@@ -1494,11 +1494,11 @@ pub(crate) mod tests {
             },
         };
         let shot = |mid: bool| {
-            NO_CONE_MID.set(!mid);
+            CONE_MID.set(mid);
             SPACE_COUNTERS.set(true);
             let frame = render_headless(&options, &scene);
             SPACE_COUNTERS.set(false);
-            NO_CONE_MID.set(false);
+            CONE_MID.set(false);
             let frame = frame.expect("кадр");
             let rays = frame
                 .space_stats
@@ -4191,8 +4191,8 @@ pub(crate) mod tests {
             assert_eq!(rays[PASS_MARCH].rays, pixels, "{name}: луч на пиксель");
             assert_eq!(
                 rays[PASS_CONE].rays,
-                w.div_ceil(8) * h.div_ceil(8) + w.div_ceil(2) * h.div_ceil(2),
-                "{name}: конус на квадрат 8×8 и на квадрат 2×2 (8.10в2)"
+                w.div_ceil(8) * h.div_ceil(8),
+                "{name}: конус на квадрат 8×8"
             );
             let march = rays[PASS_MARCH];
             assert!(march.steps >= march.rays, "{name}: {march:?}");
