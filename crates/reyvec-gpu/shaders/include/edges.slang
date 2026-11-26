@@ -74,10 +74,6 @@ static const uint EDGE_CREASES = 0x100;
 // Бит 9 (8.2б): точные доли тени ненадёжных пикселей только там, где рядом проходит
 // граница тени (shadow_steady); остальные берутся из картинки теней.
 static const uint EDGE_SHADOW_REUSE = 0x200;
-// Бит слова 6: дальние края (пиксель накрывает больше порога EDGE_FAR_WORD) в список не
-// попадают — их сглаживает проход «сглаживание 3D» по картинке (8.10в,
-// raymarch_post_aa.slang).
-static const uint EDGE_FAR_PICTURE = 0x400;
 
 // Первое слово долей света ненадёжных пикселей в кадре из `wh` пикселей.
 uint edge_parts_at(uint wh)

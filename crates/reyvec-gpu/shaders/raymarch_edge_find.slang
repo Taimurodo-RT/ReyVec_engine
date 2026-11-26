@@ -175,14 +175,6 @@ void cs_main(uint3 id : SV_DispatchThreadID, uint lane : SV_GroupIndex)
         count_edge(px, int2(w, h), g0, reason, across);
     counters_flush(PASS_EDGE_FIND, counter_spread(px));
 #endif
-    // Дальние края по картинке (8.10в): край, где пиксель накрывает больше порога, лучей
-    // не получает — его смягчит «сглаживание 3D». У пикселя неба глубина — соседа за краем.
-    if (edge && (pc.edges[6] & EDGE_FAR_PICTURE) != 0)
-    {
-        float t = g0.x >= 0.0 ? g0.x : gbuffer_load(across).x;
-        if (t >= 0.0 && pixel_footprint(px, int2(w, h), t) > asfloat(pc.edges[EDGE_FAR_WORD]))
-            edge = false;
-    }
     if (edge)
     {
         // Картинка теней — половина кадра с округлением вверх (как в demo.rs).

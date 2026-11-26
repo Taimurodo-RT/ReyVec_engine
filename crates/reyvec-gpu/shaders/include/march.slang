@@ -96,12 +96,7 @@ float4 march_pixel(int2 px, float2 screen, int sub, float2 center, float start)
     limit = min(limit, plane.x);
     // Доп. лучи краёв (8.23) начинают не раньше `start` — чуть ближе ближайшей точки
     // соседних пикселей: до неё пусто и у них. Основной проход передаёт 0.
-    // Картинка конусов — первого прохода (точка на квадрат 8×8) или среднего (8.10в2,
-    // точка на квадрат 2×2): какая из двух, видно по её ширине.
-    uint cone_w, cone_h;
-    textures[pc.cone].GetDimensions(cone_w, cone_h);
-    int cone_tile = float(cone_w) * 4.0 > pc.aspect * pc.height ? 2 : 8;
-    float t = min(max(textures[pc.cone].Load(int3(px / cone_tile, 0)).x, start), limit);
+    float t = min(max(textures[pc.cone].Load(int3(px / 8, 0)).x, start), limit);
     float2 hit = float2(-1.0, 0.0);
     bool shape_point = false;
     // Шаг с «перелётом» (over-relaxation, Keinert и др., «Enhanced Sphere Tracing»,

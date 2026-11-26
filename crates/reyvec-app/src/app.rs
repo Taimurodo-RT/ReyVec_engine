@@ -564,20 +564,6 @@ impl App {
                     if on { "вкл" } else { "выкл" }
                 );
             }
-            PanelAction::ConeMid(on) => {
-                r.set_cone_mid(on);
-                tracing::info!(
-                    "3D: средний уровень грубых лучей {}",
-                    if on { "вкл" } else { "выкл" }
-                );
-            }
-            PanelAction::EdgeFarPicture(on) => {
-                r.set_edge_far_picture(on);
-                tracing::info!(
-                    "Края 3D: вдали по картинке {}",
-                    if on { "вкл" } else { "выкл" }
-                );
-            }
             PanelAction::EdgeFar(on) => {
                 r.set_edge_far(on);
                 tracing::info!(
@@ -837,8 +823,6 @@ impl App {
                 edge_creases: renderer.edge_creases(),
                 edge_shadow_reuse: renderer.edge_shadow_reuse(),
                 edge_far: renderer.edge_far(),
-                edge_far_picture: renderer.edge_far_picture(),
-                cone_mid: renderer.cone_mid(),
                 brick_shadows: renderer.brick_shadows(),
                 part_bounds: reyvec_sdf::shape3d::part_bounds(),
                 split_parts: reyvec_sdf::shape3d::split_parts(),
