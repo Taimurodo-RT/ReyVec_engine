@@ -858,6 +858,10 @@ pub(crate) struct Demo {
     /// этого числа метров (8.11б, опыт; 0 — выключено, как по умолчанию; во включённом
     /// виде — [`EDGE_FAR_METERS`]).
     edge_far: f32,
+    /// Края: вдали по картинке (8.10в, опыт): край, где пиксель накрывает больше
+    /// [`EDGE_FAR_METERS`], не получает доп. лучей — его смягчает «сглаживание 3D» по
+    /// картинке; ближние края остаются с лучами.
+    edge_far_picture: bool,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -1271,6 +1275,7 @@ impl Demo {
             edge_creases: true,
             edge_shadow_reuse: true,
             edge_far: 0.0,
+            edge_far_picture: false,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -2556,6 +2561,26 @@ impl Demo {
     /// Включает и выключает 8.11б.
     pub fn set_edge_far(&mut self, on: bool) {
         self.edge_far = if on { EDGE_FAR_METERS } else { 0.0 };
+    }
+
+    /// Края: вдали по картинке (8.10в).
+    pub fn edge_far_picture(&self) -> bool {
+        self.edge_far_picture
+    }
+
+    /// Включает и выключает 8.10в.
+    pub fn set_edge_far_picture(&mut self, on: bool) {
+        self.edge_far_picture = on;
+    }
+
+    /// 8.10в работает: включено, сглаживание 3D лучами идёт (не целиком по картинке), и
+    /// оба шейдера есть.
+    fn far_picture_on(&self) -> bool {
+        self.edge_far_picture
+            && self.space_smooth
+            && !self.post_aa_on()
+            && self.space_edges != vk::Pipeline::null()
+            && self.space_post_aa != vk::Pipeline::null()
     }
 
     /// 8.11б с другим порогом (метров; 0 — выключено), для подбора порога в тестах.
@@ -6068,8 +6093,15 @@ impl Demo {
             // теней у границы (8.2б, EDGE_SHADOW_REUSE).
             let probe = self.edge_probe.word()
                 | if self.edge_creases { 0x100 } else { 0 }
-                | if self.edge_shadow_reuse { 0x200 } else { 0 };
-            let far = self.edge_far;
+                | if self.edge_shadow_reuse { 0x200 } else { 0 }
+                | if self.far_picture_on() { 0x400 } else { 0 };
+            // Порог дальних краёв: у 8.10в — всегда EDGE_FAR_METERS (дальние края в
+            // список не попадают, двух лучей у них нет).
+            let far = if self.far_picture_on() {
+                EDGE_FAR_METERS
+            } else {
+                self.edge_far
+            };
             // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
             // расходятся, — край, даже если буфер геометрии у соседей одинаков.
             // Тени — для счётчиков краёв (8.11а): вариант со счётчиками освещает пиксель
@@ -6340,7 +6372,16 @@ impl Demo {
         // прямо в окно.
         // Сглаживание по картинке (8.12а) читает освещённую картинку, поэтому освещение
         // тогда всегда красит «цвет 3D», а не окно.
-        let post_aa = frame.scene == DemoScene::Space && self.post_aa_on();
+        // С 8.10в оно же идёт после лучей краёв и трогает только дальние края: порог (метров
+        // на пиксель при высоте 1080, как у поиска краёв) уходит в pc.flags; 0 — все края.
+        let far_picture =
+            frame.scene == DemoScene::Space && frame.space_edges.is_some() && self.far_picture_on();
+        let post_aa = frame.scene == DemoScene::Space && (self.post_aa_on() || far_picture);
+        let post_aa_far = if far_picture {
+            (EDGE_FAR_METERS * 1080.0 / ext.height.max(1) as f32).to_bits()
+        } else {
+            0
+        };
         // Свечение 3D (8.16) тоже читает освещённую картинку.
         let glow = frame.scene == DemoScene::Space && self.glow;
         let window = direct.filter(|_| ext == frame.extent && !post_aa && !glow);
@@ -6417,7 +6458,7 @@ impl Demo {
                             gbuffer: p.texture(gbuffer),
                             ..SpaceSlots::default()
                         },
-                        0,
+                        post_aa_far,
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл освещённую картинку в чтение, а сглаженную в

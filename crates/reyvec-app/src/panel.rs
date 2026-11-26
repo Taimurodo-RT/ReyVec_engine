@@ -58,6 +58,8 @@ pub(crate) enum PanelAction {
     EdgeShadowReuse(bool),
     /// Два луча вместо четырёх на дальних краях (8.11б).
     EdgeFar(bool),
+    /// Края: вдали по картинке (8.10в).
+    EdgeFarPicture(bool),
     /// Тени моделей от кирпичей поля (8.15).
     BrickShadows(bool),
     /// Границы частей внутри моделей (М.1).
@@ -214,6 +216,8 @@ pub(crate) struct PanelInfo<'a> {
     pub edge_shadow_reuse: bool,
     /// Два луча вместо четырёх на дальних краях (8.11б).
     pub edge_far: bool,
+    /// Края: вдали по картинке (8.10в).
+    pub edge_far_picture: bool,
     /// Тени моделей от кирпичей поля (8.15).
     pub brick_shadows: bool,
     /// Границы частей внутри моделей (М.1).
@@ -1339,6 +1343,20 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 {
                     actions.push(PanelAction::EdgeFar(far));
                 }
+                let mut far_picture = info.edge_far_picture;
+                if ui
+                    .checkbox(&mut far_picture, "Края: вдали по картинке (опыт)")
+                    .on_hover_text(
+                        "8.10в: края, где пиксель накрывает больше 4 см сцены (дальние \
+                     предметы), не получают доп. лучей — их смягчает быстрое сглаживание по \
+                     готовой картинке. Ближние края остаются с точными лучами. В большом \
+                     мире с холма так пропадает почти весь проход «края 3D». Включите и \
+                     сравните вид вдали и время кадра",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::EdgeFarPicture(far_picture));
+                }
                 let mut bricks = info.brick_shadows;
                 if ui
                     .checkbox(&mut bricks, "Тени моделей: кирпич поля")
@@ -2243,6 +2261,7 @@ mod tests {
             edge_creases: true,
             edge_shadow_reuse: true,
             edge_far: false,
+            edge_far_picture: false,
             brick_shadows: true,
             part_bounds: true,
             split_parts: true,
