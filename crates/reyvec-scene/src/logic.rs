@@ -67,6 +67,8 @@ struct Shared {
     input_us: AtomicU64,
     /// Мышь для физики (6.13): пишет окно, читает поток логики в начале шага.
     pointer: Mutex<Pointer>,
+    /// Сюжет текущего мира (Сю.7): окно диалога читает реплику и пишет ответ.
+    story: Mutex<Option<reyvec_script::SharedStory>>,
 }
 
 /// Поток логики сцены.
@@ -99,6 +101,7 @@ impl SceneLogic {
             input: InputShared::new(),
             input_us: AtomicU64::new(0),
             pointer: Mutex::new(Pointer::default()),
+            story: Mutex::new(world.story()),
         });
         let (tx, rx) = channel();
         let (reply_tx, reply_rx) = channel();
@@ -240,6 +243,12 @@ impl SceneLogic {
         self.shared.input.age_ms(stamp)
     }
 
+    /// Сюжет текущего мира (папка `story/` проекта), если он есть: окно диалога и журнал
+    /// игры читают его, ответы игрока пишут в [`reyvec_script::StoryHost::answer`].
+    pub fn story(&self) -> Option<reyvec_script::SharedStory> {
+        self.shared.story.lock().expect("сюжет").clone()
+    }
+
     /// Сколько шагов логики сделано.
     pub fn steps(&self) -> u64 {
         self.shared.steps.load(Ordering::Relaxed)
@@ -284,8 +293,10 @@ fn run(
             match command {
                 // Файл сцены сохранили: персонаж остаётся там, где был.
                 // Другой файл (`keep_player` — нет): герой на месте из файла.
-                Command::Replace(new, keep_player) => {
+                Command::Replace(mut new, keep_player) => {
                     let body = world.player_body();
+                    new.keep_story_from(&world);
+                    *shared.story.lock().expect("сюжет") = new.story();
                     world = *new;
                     world.continue_from(start + step_index as f64 * step);
                     if let Some(body) = body

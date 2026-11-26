@@ -16,6 +16,7 @@ mod panel;
 mod rui_demo;
 pub mod snapshot;
 mod sound;
+mod story_window;
 
 pub use app::{AppConfig, AppError, RunSummary, run};
 pub use logging::{LogGuard, init_logging, init_logging_to};

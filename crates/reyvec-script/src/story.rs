@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mlua::{Lua, Table, Value as Lv};
-use reyvec_story::{State, Story, Talk, Value};
+use reyvec_story::{Shown, State, Step, Story, Talk, Value};
 
 /// Функция сюжета для скриптов: имя, аргументы, что делает. Редактор кода показывает эти
 /// списки в подсказках; тест `story_functions_match_engine` сверяет их с тем, что движок
@@ -71,10 +71,47 @@ pub const QUEST_FUNCS: &[Func] = &[
 pub struct StoryHost {
     pub story: Story,
     pub state: State,
-    /// Начатый разговор (его ведёт окно диалога игры).
+    /// Начатый разговор (его ведёт [`StoryHost::advance`] в шаге логики).
     pub talk: Option<Talk>,
-    /// Какие диалоги уже начинались (для `story.seen`).
-    pub talked: std::collections::BTreeSet<String>,
+    /// Что сейчас на экране: реплика или пауза до нажатия (рисует окно диалога).
+    pub screen: Option<Screen>,
+    /// Ответ игрока на то, что на экране; забирает следующий шаг логики.
+    pub answer: Option<Answer>,
+    /// Пауза карточки «Подождать» с секундами: сколько ещё ждать.
+    wait: f32,
+    /// События сюжета для игры (`Event` не `quest.*`), последние [`KEEP`]: «имя(аргументы)».
+    pub events: Vec<String>,
+    /// Ошибки разговоров и функций сюжета (последние [`KEEP`]) — для консоли и окна диалога.
+    pub problems: Vec<String>,
+}
+
+/// Сколько последних событий и ошибок сюжета хранить.
+pub const KEEP: usize = 20;
+
+/// Что окно диалога показывает игроку.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)] // одна штука на игру, копируется раз за реплику
+pub enum Screen {
+    /// Реплика; если у неё есть варианты — ждём выбор.
+    Line(Shown),
+    /// Карточка «Подождать» без секунд: до нажатия.
+    Pause,
+}
+
+/// Ответ игрока окну диалога.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    /// Дальше (реплика без вариантов или пауза).
+    Next,
+    /// Вариант ответа (с 0).
+    Choose(usize),
+}
+
+fn keep(list: &mut Vec<String>, text: String) {
+    list.push(text);
+    if list.len() > KEEP {
+        list.remove(0);
+    }
 }
 
 impl StoryHost {
@@ -83,8 +120,7 @@ impl StoryHost {
         Self {
             story,
             state,
-            talk: None,
-            talked: Default::default(),
+            ..Self::default()
         }
     }
 
@@ -99,21 +135,139 @@ impl StoryHost {
             return Ok(false);
         }
         let t = self.story.talk(dialog)?;
-        self.talked.insert(dialog.to_string());
+        self.state.talked.insert(dialog.to_string());
         self.talk = Some(t);
+        self.screen = None;
+        self.answer = None;
+        self.wait = 0.0;
         Ok(true)
     }
+
+    /// Сохранение сюжета (RON). Идущий разговор не сохраняется: после загрузки его
+    /// можно начать заново.
+    pub fn save(&self) -> Result<String, String> {
+        self.story.save(&self.state)
+    }
+
+    /// Загрузить сохранение: разговор обрывается, состояние — из текста.
+    pub fn load(&mut self, text: &str) -> Result<(), String> {
+        self.state = self.story.restore(text)?;
+        self.stop();
+        Ok(())
+    }
+
+    /// Оборвать разговор (загрузка, смена сцены).
+    pub fn stop(&mut self) {
+        self.talk = None;
+        self.screen = None;
+        self.answer = None;
+        self.wait = 0.0;
+    }
+
+    /// Ведёт разговор на шаг логики `dt` секунд: берёт ответ игрока, идёт по карточкам до
+    /// реплики, паузы или конца. Возвращает функцию скрипта, которую позвала карточка
+    /// «Скрипт»: её надо позвать без замка на сюжете и снова вызвать `advance(0)`.
+    pub fn advance(&mut self, dt: f32) -> Option<(String, Vec<Value>)> {
+        let Self {
+            story,
+            state,
+            talk,
+            screen,
+            answer,
+            wait,
+            events,
+            problems,
+        } = self;
+        let Some(t) = talk.as_mut() else {
+            *screen = None;
+            return None;
+        };
+        if screen.is_some() {
+            let a = answer.take()?;
+            if t.waiting() {
+                // Реплика с вариантами: «дальше» не годится, нужен выбор.
+                let Answer::Choose(i) = a else {
+                    return None;
+                };
+                if !t.choose(i, state) {
+                    return None;
+                }
+            }
+            *screen = None;
+        }
+        *answer = None;
+        if *wait > 0.0 {
+            *wait -= dt;
+            if *wait > 0.0 {
+                return None;
+            }
+            *wait = 0.0;
+        }
+        // Предел на случай сюжета из одних событий по кругу (сам проигрыватель
+        // ловит только круги из тихих карточек).
+        for _ in 0..64 {
+            match story.step(t, state) {
+                Step::Line(s) => {
+                    *screen = Some(Screen::Line(s));
+                    return None;
+                }
+                Step::Event { name, args } => {
+                    let args: Vec<String> = args.iter().map(Value::show).collect();
+                    let text = format!("{name}({})", args.join(", "));
+                    tracing::info!("событие сюжета: {text}");
+                    keep(events, text);
+                }
+                Step::Run { func, args } => return Some((func, args)),
+                Step::Wait { seconds: Some(s) } => {
+                    *wait = s;
+                    if s > 0.0 {
+                        return None;
+                    }
+                }
+                Step::Wait { seconds: None } => {
+                    *screen = Some(Screen::Pause);
+                    return None;
+                }
+                Step::End => {
+                    if let Some(e) = &t.error {
+                        keep(problems, format!("диалог «{}»: {e}", t.dialog));
+                    }
+                    *talk = None;
+                    *screen = None;
+                    return None;
+                }
+            }
+        }
+        keep(
+            problems,
+            format!("диалог «{}»: события идут по кругу без реплик", t.dialog),
+        );
+        *talk = None;
+        *screen = None;
+        None
+    }
+
+    /// Ошибка функции сюжета (карточка «Скрипт»).
+    pub fn problem(&mut self, text: String) {
+        tracing::warn!("сюжет: {text}");
+        keep(&mut self.problems, text);
+    }
+}
+
+/// Идёт ли разговор (для игры: герой стоит, клавиши — окну диалога).
+pub fn talking(s: &SharedStory) -> bool {
+    lock(s).busy()
 }
 
 /// Общий сюжет: скрипты и игра держат одну и ту же копию.
 pub type SharedStory = Arc<Mutex<StoryHost>>;
 
-pub(crate) fn lock(s: &SharedStory) -> MutexGuard<'_, StoryHost> {
+pub fn lock(s: &SharedStory) -> MutexGuard<'_, StoryHost> {
     // Скрипт, упавший посреди вызова, не должен навсегда закрыть сюжет.
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn to_lua(lua: &Lua, v: &Value) -> mlua::Result<Lv> {
+pub(crate) fn to_lua(lua: &Lua, v: &Value) -> mlua::Result<Lv> {
     Ok(match v {
         Value::Bool(b) => Lv::Boolean(*b),
         Value::Int(i) => Lv::Integer(*i),
@@ -208,7 +362,7 @@ pub(crate) fn install(lua: &Lua, host: &SharedStory) -> mlua::Result<()> {
             if !h.story.dialogs.contains_key(&dialog) {
                 return Err(err(lua, format!("story.seen: нет диалога «{dialog}»")));
             }
-            Ok(h.talked.contains(&dialog))
+            Ok(h.state.talked.contains(&dialog))
         })?,
     )?;
 
@@ -454,5 +608,99 @@ mod tests {
         run(&mut s, "kuznec.luau", src);
         assert!(s.errors().is_empty(), "{:?}", s.errors());
         assert_eq!(lock(&host).talk.as_ref().unwrap().dialog, "kuznec.ruda");
+    }
+
+    fn line(h: &StoryHost) -> (String, usize) {
+        match &h.screen {
+            Some(Screen::Line(s)) => (s.text.clone(), s.choices.len()),
+            other => panic!("на экране {other:?}"),
+        }
+    }
+
+    /// Окно диалога (Сю.7): реплика ждёт «дальше», варианты — выбор, событие
+    /// `quest.start` берёт задание, конец закрывает окно. Сохранение помнит всё это.
+    #[test]
+    fn talk_runs_to_the_end_by_answers_and_is_saved() {
+        let (_s, host) = scripts();
+        let mut h = lock(&host);
+        assert!(h.talk("kuznec.privet").unwrap());
+        assert!(h.advance(0.016).is_none());
+        assert_eq!(line(&h).0, "Чего надо, чужак? Я кузнец, если что.");
+        // Без ответа ничего не меняется.
+        h.advance(0.016);
+        assert_eq!(line(&h).1, 0);
+        h.answer = Some(Answer::Next);
+        h.advance(0.016);
+        let (text, choices) = line(&h);
+        assert_eq!((text.as_str(), choices), ("Что тебе нужно?", 2));
+        // «Дальше» на вариантах не годится.
+        h.answer = Some(Answer::Next);
+        h.advance(0.016);
+        assert_eq!(line(&h).0, "Что тебе нужно?");
+        h.answer = Some(Answer::Choose(0));
+        h.advance(0.016);
+        assert!(line(&h).0.starts_with("Меч?"));
+        h.answer = Some(Answer::Next);
+        h.advance(0.016);
+        assert!(!h.busy() && h.screen.is_none(), "{:?}", h.screen);
+        assert_eq!(
+            h.story.quest_state(&h.state, "mech").status,
+            reyvec_story::Status::Active
+        );
+        assert!(h.problems.is_empty(), "{:?}", h.problems);
+
+        let saved = h.save().unwrap();
+        let (story, _) = Story::from_texts(reyvec_story::EXAMPLE);
+        let mut other = StoryHost::new(story);
+        other.load(&saved).unwrap();
+        assert_eq!(other.state, h.state);
+        assert!(other.state.talked.contains("kuznec.privet"));
+        assert!(other.load("(vars: 5)").is_err());
+    }
+
+    /// Карточка «Скрипт» зовёт функцию из файла скрипта, «Подождать» держит паузу.
+    #[test]
+    fn run_card_calls_a_script_function_and_wait_pauses() {
+        let mut texts: Vec<(&str, &str)> = reyvec_story::EXAMPLE.to_vec();
+        let dialog = r#"(
+            format: "reyvec-dialog", version: 1, id: "proba", with: ["kuznec"],
+            nodes: [
+                Run(id: "a", func: "nagrada", args: [3], next: "b"),
+                Wait(id: "b", seconds: Some(0.5), next: "c"),
+                Event(id: "c", name: "zvuk", args: ["molot"], next: "d"),
+                Wait(id: "d", next: "e"),
+                Run(id: "e", func: "netu", next: "f"),
+                End(id: "f"),
+            ],
+        )"#;
+        texts.push(("dialogs/proba.ron", dialog));
+        let (story, problems) = Story::from_texts(&texts);
+        assert!(problems.iter().all(|p| p.warning), "{problems:?}");
+        let mut s = Scripts::new();
+        let host = s.set_story(story);
+        s.load_text(
+            "nagrada.luau",
+            r#"function update(me) end
+               function nagrada(n) story.set("hero.money", story.get("hero.money") + n) end"#,
+        );
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+        lock(&host).talk("proba").unwrap();
+        s.story_step(0.1);
+        assert_eq!(lock(&host).state.vars["hero.money"], Value::Int(8));
+        // Пауза полсекунды: событие ещё не случилось.
+        s.story_step(0.3);
+        assert!(lock(&host).events.is_empty());
+        s.story_step(0.3);
+        assert_eq!(lock(&host).events, ["zvuk(molot)"]);
+        assert_eq!(lock(&host).screen, Some(Screen::Pause));
+        lock(&host).answer = Some(Answer::Next);
+        s.story_step(0.1);
+        let h = lock(&host);
+        assert!(!h.busy());
+        assert!(
+            h.problems[0].contains("нет функции netu()"),
+            "{:?}",
+            h.problems
+        );
     }
 }

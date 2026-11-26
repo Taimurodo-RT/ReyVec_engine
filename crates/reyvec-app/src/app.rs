@@ -774,6 +774,7 @@ impl App {
             } else {
                 Vec::new()
             },
+            story: renderer.scene_logic().and_then(|l| l.story()),
         };
         self.game_ui.file_hud = self.rui_demo.hud_ready();
         let game_ui = &mut self.game_ui;
@@ -1186,6 +1187,10 @@ impl ApplicationHandler for App {
             }
             // Щелчок по панели песочницы — панели, а не игре.
             if panel_took && down && input.is_mouse() && !self.game_ui.menu_open() {
+                return;
+            }
+            // Разговор и журнал сюжета (Сю.7): цифры, пробел, Enter, J.
+            if !repeat && self.game_ui.story_key(input, down) {
                 return;
             }
             let stack = schemes(

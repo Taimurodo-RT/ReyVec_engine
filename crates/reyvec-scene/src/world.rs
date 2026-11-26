@@ -401,6 +401,10 @@ struct LastPress(u64);
 #[derive(Resource)]
 struct LastStep(f64);
 
+/// Время сцены прошлого шага сюжета (паузы карточек «Подождать», Сю.7).
+#[derive(Resource)]
+struct StoryClock(f64);
+
 /// Насколько ниже места появления персонаж считается упавшим из уровня.
 const FALL_OUT: f64 = 5.0;
 /// Самый длинный шаг персонажа; если времени прошло больше, шагов делается несколько.
@@ -455,6 +459,7 @@ impl SceneWorld {
         world.init_resource::<Pending>();
         world.init_resource::<Events>();
         world.insert_resource(LastStep(0.0));
+        world.insert_resource(StoryClock(0.0));
         world.insert_resource(PhysicsRes {
             physics: Physics::new(reyvec_game::Tuning::default().gravity()),
             bodies: Vec::new(),
@@ -542,6 +547,7 @@ impl SceneWorld {
                 play,
                 physics_step,
                 run_scripts,
+                drive_story,
                 combat_look,
                 pose_bones,
                 propagate_again,
@@ -580,6 +586,28 @@ impl SceneWorld {
     /// скриптом разговор (`story.talk`).
     pub fn story(&self) -> Option<reyvec_script::SharedStory> {
         self.world.resource::<ScriptRes>().scripts.story().cloned()
+    }
+
+    /// Новый мир того же проекта (сцену сохранили или открыли другую): сюжет идёт дальше
+    /// с того же места — переменные, задания и начатый разговор берутся из `old`.
+    /// Сюжет мог поменяться в файлах: состояние сверяется с ним ([`reyvec_story::Story::restore`]).
+    pub fn keep_story_from(&mut self, old: &SceneWorld) {
+        let (Some(new), Some(old)) = (self.story(), old.story()) else {
+            return;
+        };
+        if std::sync::Arc::ptr_eq(&new, &old) {
+            return;
+        }
+        let old = reyvec_script::lock_story(&old);
+        let mut new = reyvec_script::lock_story(&new);
+        match old.save().and_then(|text| new.story.restore(&text)) {
+            Ok(state) => new.state = state,
+            Err(e) => tracing::warn!("сюжет при смене мира: {e}"),
+        }
+        if old.busy() {
+            new.talk = old.talk.clone();
+            new.screen = old.screen.clone();
+        }
     }
 
     /// Снимок для рисования после последнего [`SceneWorld::update`].
@@ -1249,6 +1277,7 @@ fn play(
     mut phys: ResMut<PhysicsRes>,
     mut players: Query<(&mut Player, &mut Placement)>,
     mut targets: Query<(Entity, &mut Target), Without<Player>>,
+    scripts: Res<ScriptRes>,
 ) {
     phys.dt = 0.0;
     let dt = (time.0 - last.0).clamp(0.0, 0.25);
@@ -1262,7 +1291,13 @@ fn play(
     {
         events.list.pop_front();
     }
-    let input = input.0;
+    // Идёт разговор (Сю.7): герой стоит, клавиши достаются окну диалога.
+    let talking = scripts.scripts.story().is_some_and(reyvec_script::talking);
+    let input = if talking {
+        InputFrame::default()
+    } else {
+        input.0
+    };
     pending.jump |= input.pressed(Action::Jump);
     pending.dash |= input.pressed(Action::Dash);
     pending.attack |= input.pressed(Action::Attack);
@@ -1711,6 +1746,13 @@ fn physics_step(
 
 /// Скрипты (6.9): на каждом шаге логики каждый предмет со скриптом решает, что делать.
 /// Раз в [`SCRIPT_CHECK_STEPS`] шагов изменённые файлы перечитываются.
+/// Ведёт начатый разговор сюжета (Сю.7): ответы игрока, паузы, карточки «Скрипт».
+fn drive_story(time: Res<SceneTime>, mut clock: ResMut<StoryClock>, mut res: ResMut<ScriptRes>) {
+    let dt = (time.0 - clock.0).clamp(0.0, 0.25) as f32;
+    clock.0 = time.0;
+    res.scripts.story_step(dt);
+}
+
 fn run_scripts(
     time: Res<SceneTime>,
     combat: Res<Combat>,

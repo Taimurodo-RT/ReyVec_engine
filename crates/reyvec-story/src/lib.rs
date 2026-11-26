@@ -70,8 +70,9 @@ pub struct Story {
     pub(crate) conds: cond::Conditions,
 }
 
-/// Состояние сюжета в игре — часть сохранения.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Состояние сюжета в игре — часть сохранения ([`Story::save`], [`Story::restore`]).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct State {
     pub vars: BTreeMap<String, Value>,
     pub quests: BTreeMap<String, QuestState>,
@@ -81,6 +82,8 @@ pub struct State {
     pub lang: String,
     /// Зерно случайных карточек: одинаковое зерно — одинаковый путь.
     pub seed: u64,
+    /// Какие диалоги уже начинались (`story.seen` в скриптах).
+    pub talked: BTreeSet<String>,
 }
 
 impl Story {
@@ -199,6 +202,37 @@ impl Story {
                 .collect(),
             ..State::default()
         }
+    }
+
+    /// Сохранение сюжета: текст RON с переменными, заданиями и выборами игрока.
+    pub fn save(&self, state: &State) -> Result<String, String> {
+        ron::ser::to_string_pretty(state, ron::ser::PrettyConfig::default())
+            .map_err(|e| format!("не сохранить сюжет: {e}"))
+    }
+
+    /// Состояние из сохранения. Сюжет мог поменяться после сохранения: новые переменные
+    /// и задания берутся из начала игры, а исчезнувшие выбрасываются. Переменная,
+    /// у которой поменялся вид (было число, стало да/нет), тоже берётся из начала.
+    pub fn restore(&self, text: &str) -> Result<State, String> {
+        let saved: State = ron::from_str(text).map_err(|e| format!("сохранение сюжета: {e}"))?;
+        let mut state = self.new_state();
+        for (name, v) in saved.vars {
+            if let Some(now) = state.vars.get_mut(&name)
+                && std::mem::discriminant(now) == std::mem::discriminant(&v)
+            {
+                *now = v;
+            }
+        }
+        for (id, q) in saved.quests {
+            if let Some(now) = state.quests.get_mut(&id) {
+                *now = q;
+            }
+        }
+        state.chosen = saved.chosen;
+        state.lang = saved.lang;
+        state.seed = saved.seed;
+        state.talked = saved.talked;
+        Ok(state)
     }
 
     /// Истинно ли условие Luau при этом состоянии.
