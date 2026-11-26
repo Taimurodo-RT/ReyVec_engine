@@ -862,6 +862,8 @@ pub(crate) struct Demo {
     /// [`EDGE_FAR_METERS`], не получает доп. лучей — его смягчает «сглаживание 3D» по
     /// картинке; ближние края остаются с лучами.
     edge_far_picture: bool,
+    /// Средний уровень конусов (8.10в2): второй проход грубых лучей квадратами 2×2.
+    cone_mid: bool,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -1276,6 +1278,7 @@ impl Demo {
             edge_shadow_reuse: true,
             edge_far: 0.0,
             edge_far_picture: false,
+            cone_mid: true,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -2571,6 +2574,16 @@ impl Demo {
     /// Включает и выключает 8.10в.
     pub fn set_edge_far_picture(&mut self, on: bool) {
         self.edge_far_picture = on;
+    }
+
+    /// Средний уровень конусов (8.10в2).
+    pub fn cone_mid(&self) -> bool {
+        self.cone_mid
+    }
+
+    /// Включает и выключает 8.10в2 (выключено — как до него, для сравнения).
+    pub fn set_cone_mid(&mut self, on: bool) {
+        self.cone_mid = on;
     }
 
     /// 8.10в работает: включено, сглаживание 3D лучами идёт (не целиком по картинке), и
@@ -5398,6 +5411,48 @@ impl Demo {
                 }
             },
         );
+        // Средний уровень конусов (8.10в2): точка на квадрат 2×2, начинает с длины своего
+        // квадрата 8×8. Лучи пикселей и краёв дальше берут начало из него.
+        let cone = if self.cone_mid {
+            let mid_tiles = vk::Extent2D {
+                width: ext.width.div_ceil(CONE_MID_TILE),
+                height: ext.height.div_ceil(CONE_MID_TILE),
+            };
+            let mid = graph.create("конусы 3D средние", mid_tiles, CONE_FORMAT);
+            graph.add_pass(
+                "лучи 3D средне",
+                &[(cone, Access::Sampled), (mid, Access::ColorAttachment)],
+                move |p| {
+                    let push = space_push(
+                        &camera,
+                        ext,
+                        frame.time,
+                        frame.space_address,
+                        SpaceSlots {
+                            cone: p.texture(cone),
+                            ..SpaceSlots::default()
+                        },
+                        CONE_MID_TILE,
+                    );
+                    let (d, cmd) = (p.device, p.cmd);
+                    // SAFETY: граф перевёл картинку первого прохода в чтение, а среднюю в
+                    // цель рисования; буфер сцены и буфер счётчиков этого кадра живы, пока
+                    // кадр рисуется.
+                    unsafe {
+                        begin_color_pass(d, cmd, p.view(mid), mid_tiles);
+                        bindless.bind(d, cmd);
+                        let pipeline = frame.space_counters.map_or(self.space_cone, |c| c.0.cone);
+                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
+                        d.cmd_draw(cmd, 3, 1, 0, 0);
+                        d.cmd_end_rendering(cmd);
+                    }
+                },
+            );
+            mid
+        } else {
+            cone
+        };
         // Полигональные модели (7.6ж): растеризация с глубиной в свой буфер геометрии
         // той же раскладки. «Реймарчинг» не шагает дальше них и берёт их точку, если
         // луч ни во что не попал раньше.
@@ -7211,6 +7266,8 @@ const REFLECT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const REFLECT_FLAG_ROUGH: u32 = 64;
 /// Флаг размытия отражений (raymarch_reflect_blur.slang): по столбцу, а не по строке.
 const REFLECT_BLUR_VERTICAL: u32 = 2;
+/// Сторона квадрата пикселей среднего уровня конусов (8.10в2).
+const CONE_MID_TILE: u32 = 2;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
 const CONE_TILE: u32 = 8;
 /// Освещённая сцена «3D» в уменьшенном разрешении (7.14), до растяжения на кадр.

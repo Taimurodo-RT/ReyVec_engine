@@ -586,6 +586,7 @@ fn render(
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
             demo.set_edge_far_meters(tests::EDGE_FAR.get());
             demo.set_edge_far_picture(tests::EDGE_FAR_PICTURE.get());
+            demo.set_cone_mid(!tests::NO_CONE_MID.get());
             demo.set_post_aa(tests::POST_AA.get());
             demo.set_space_triangles(tests::TRIANGLES.get());
             if tests::TRIANGLES.get() {
@@ -978,6 +979,8 @@ pub(crate) mod tests {
         pub(super) static EDGE_FAR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
         /// Края: вдали по картинке (8.10в).
         pub(super) static EDGE_FAR_PICTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Без среднего уровня конусов (8.10в2), как до него.
+        pub(super) static NO_CONE_MID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Сглаживание 3D по картинке вместо лучей краёв (8.12а); по умолчанию выключено.
         pub(super) static POST_AA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Режим «треугольники» для 3D (8.20б).
@@ -1461,6 +1464,76 @@ pub(crate) mod tests {
         assert!(left <= all && left * 10 > all * 9, "{left} из {all}");
         assert!(changed as u32 <= all - left, "{changed} > {}", all - left);
         assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+    }
+
+    /// Средний уровень конусов (8.10в2): в большом мире с холма расчётов сцены у лучей
+    /// (конусы, пиксели, края) заметно меньше, а кадр тот же, кроме россыпи пикселей на
+    /// предметах мельче пикселя.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn mid_cones_save_steps() {
+        use crate::counters::{PASS_CONE, PASS_EDGES, PASS_MARCH};
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/world.ron").into()),
+                ..Default::default()
+            },
+        };
+        let shot = |mid: bool| {
+            NO_CONE_MID.set(!mid);
+            SPACE_COUNTERS.set(true);
+            let frame = render_headless(&options, &scene);
+            SPACE_COUNTERS.set(false);
+            NO_CONE_MID.set(false);
+            let frame = frame.expect("кадр");
+            let rays = frame
+                .space_stats
+                .as_ref()
+                .and_then(|s| s.rays)
+                .expect("счётчики лучей");
+            let work = rays[PASS_CONE].scene + rays[PASS_MARCH].scene + rays[PASS_EDGES].scene;
+            (frame, work, rays[PASS_MARCH].scene)
+        };
+        let (plain, plain_work, plain_march) = shot(false);
+        let (mid, mid_work, mid_march) = shot(true);
+        assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+        let (changed, worst, mean) = image_diff(&plain.image, &mid.image);
+        eprintln!(
+            "мир: расчётов сцены у лучей {plain_work} → {mid_work}, из них реймарчинг \
+             {plain_march} → {mid_march}; кадр: отличается {changed} пикселей, худшее {worst}, \
+             среднее {mean:.4}"
+        );
+        // Сейчас 5,25 → 4,24 млн (−19 %), реймарчинг 2,42 → 1,28 млн.
+        assert!(mid_work * 10 < plain_work * 9, "{plain_work} → {mid_work}");
+        assert!(
+            mid_march * 3 < plain_march * 2,
+            "{plain_march} → {mid_march}"
+        );
+        // Кадр отличается россыпью отдельных пикселей (сейчас 2,2 %): предметы мельче
+        // пикселя вдали (головки фонарей, столбики) луч задевает или нет в зависимости от
+        // того, куда легли его шаги (попадание — ближе 0,05 % пути), а начало луча теперь
+        // другое. Сплошных отличий нет: средняя разница мала. Устойчивость к сдвигу камеры
+        // та же (world_scene_is_steady).
+        let pixels = plain.image.rgba.len() / 4;
+        assert!(
+            changed * 25 < pixels,
+            "кадр изменился: {changed} из {pixels}"
+        );
+        assert!(mean < 1.0, "средняя разница {mean}");
     }
 
     /// Сцена «выставка» (итог этапа 8): всё, что умеет быстрый режим 3D, в одном кадре —
@@ -4118,8 +4191,8 @@ pub(crate) mod tests {
             assert_eq!(rays[PASS_MARCH].rays, pixels, "{name}: луч на пиксель");
             assert_eq!(
                 rays[PASS_CONE].rays,
-                w.div_ceil(8) * h.div_ceil(8),
-                "{name}: конус на квадрат 8×8"
+                w.div_ceil(8) * h.div_ceil(8) + w.div_ceil(2) * h.div_ceil(2),
+                "{name}: конус на квадрат 8×8 и на квадрат 2×2 (8.10в2)"
             );
             let march = rays[PASS_MARCH];
             assert!(march.steps >= march.rays, "{name}: {march:?}");
