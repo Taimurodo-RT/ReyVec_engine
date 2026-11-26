@@ -758,6 +758,7 @@ impl StoryUi {
                         color: "#AEB5C4".into(),
                         about: String::new(),
                         lines: LineSettings::default(),
+                        relations: BTreeMap::new(),
                     },
                 );
                 s.files
@@ -1213,6 +1214,13 @@ impl StoryUi {
     fn character_view(&mut self, ui: &mut Ui, id: &str) -> bool {
         let mut changed = false;
         let mut rename = false;
+        let others: Vec<(String, String)> = self
+            .story
+            .characters
+            .values()
+            .filter(|o| o.id != id)
+            .map(|o| (o.id.clone(), o.name.clone()))
+            .collect();
         let Some(c) = self.story.characters.get_mut(id) else {
             return false;
         };
@@ -1247,6 +1255,18 @@ impl StoryUi {
                     ),
             )
             .changed();
+        changed |= relations_edit(ui, &mut c.relations, &others);
+        ui.add_space(GAP_L);
+        h2(ui, "Память");
+        muted(
+            ui,
+            &format!(
+                "В игре персонаж запоминает факты: событие «memory.add» в диалоге \
+                 (персонаж, имя факта, текст, важность 1–10) или npc.remember в скрипте. \
+                 Условия читают их так: memory.{id}.ruda_prinesena, relation.{id}.hero >= 2. \
+                 Неважное забывается: важность 1 — через 10 минут игры, 10 — никогда."
+            ),
+        );
         if rename {
             self.ask_rename(Kind::Character, id);
         }
@@ -2165,6 +2185,15 @@ pub(crate) fn backlinks(s: &Story, item: &Item) -> Vec<(Item, String)> {
                 {
                     why.push(format!("{name} в #{}", n.id()));
                 }
+                (Item::Character(id), Node::Event { name, args, .. })
+                    if reyvec_story::memory::texts_needed(name).is_some()
+                        && args
+                            .iter()
+                            .take(2)
+                            .any(|a| matches!(a, Value::Text(t) if t == id)) =>
+                {
+                    why.push(format!("{name} в #{}", n.id()));
+                }
                 (Item::Dialog(id), Node::Jump { dialog, .. }) if dialog == id && d.id != *id => {
                     why.push(format!("переход в #{}", n.id()));
                 }
@@ -2478,6 +2507,62 @@ fn callout(ui: &mut Ui, text: &str) {
 }
 
 /// Блок «Свойства», как у Obsidian: подпись слева, значение справа.
+/// «Отношения»: к кому и насколько (в начале игры). Сю.9.
+fn relations_edit(
+    ui: &mut Ui,
+    rel: &mut BTreeMap<String, i64>,
+    others: &[(String, String)],
+) -> bool {
+    let mut changed = false;
+    ui.add_space(GAP_L);
+    h2(ui, "Отношения");
+    muted(
+        ui,
+        "Как персонаж относится к другим в начале игры: 0 — никак, больше — лучше, \
+         меньше — хуже. Меняются в игре событием «relation.add».",
+    );
+    let mut remove = None;
+    for (whom, n) in rel.iter_mut() {
+        ui.horizontal(|ui| {
+            let name = others
+                .iter()
+                .find(|(id, _)| id == whom)
+                .map_or(whom.as_str(), |(_, n)| n.as_str());
+            ui.label(RichText::new(name).color(TEXT));
+            ui.label(RichText::new(whom.as_str()).monospace().color(MUTED));
+            changed |= ui.add(egui::DragValue::new(n).range(-100..=100)).changed();
+            if glyph_button(ui, Glyph::Close, "Убрать", false).clicked() {
+                remove = Some(whom.clone());
+            }
+        });
+    }
+    if let Some(w) = remove {
+        rel.remove(&w);
+        changed = true;
+    }
+    let free: Vec<&(String, String)> = others
+        .iter()
+        .filter(|(id, _)| !rel.contains_key(id))
+        .collect();
+    if !free.is_empty() {
+        let mut add = None;
+        egui::ComboBox::from_id_salt("story-relation-add")
+            .selected_text("+ отношение к…")
+            .show_ui(ui, |ui| {
+                for (id, name) in free {
+                    if ui.selectable_label(false, name.as_str()).clicked() {
+                        add = Some(id.clone());
+                    }
+                }
+            });
+        if let Some(id) = add {
+            rel.insert(id, 0);
+            changed = true;
+        }
+    }
+    changed
+}
+
 /// Маленькая кнопка «переименовать» рядом с именем в коде.
 fn rename_button(ui: &mut Ui) -> bool {
     ui.add(egui::Button::new(RichText::new("✎").color(MUTED)).frame(false))
@@ -2957,7 +3042,7 @@ mod tests {
         assert!(ruda[0].1.contains("переход"), "{ruda:?}");
         assert_eq!(
             smith[0].1,
-            "говорит: #chuzhak, #po_imeni, #vopros, #pro_mech, #proshchai"
+            "говорит: #spasibo, #chuzhak, #po_imeni, #vopros, #pro_mech, #proshchai"
         );
         let out = outlinks(&s, &Item::Dialog("kuznec.privet".into()));
         assert!(out.contains(&Item::Quest("mech".into())));

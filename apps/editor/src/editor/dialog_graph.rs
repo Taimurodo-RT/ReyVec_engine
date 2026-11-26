@@ -20,6 +20,31 @@ use reyvec_story::{Dialog, LineSettings, Node, View};
 use super::theme::*;
 
 /// Ширина карточки реплики и остальных.
+/// События, которые выполняет сам сюжет: имя, аргументы, что делает (меню «▾» у события).
+const EVENTS: &[(&str, &str, &str)] = &[
+    ("quest.start", "задание", "взять задание"),
+    ("quest.add", "задание, цель, сколько", "продвинуть цель"),
+    ("quest.stage", "задание, стадия", "перейти на стадию"),
+    ("quest.complete", "задание", "задание выполнено"),
+    ("quest.fail", "задание", "задание провалено"),
+    (
+        "memory.add",
+        "персонаж, факт, текст, важность",
+        "персонаж запомнил",
+    ),
+    ("memory.forget", "персонаж, факт", "персонаж забыл"),
+    (
+        "relation.add",
+        "персонаж, к кому, сколько",
+        "отношение лучше или хуже",
+    ),
+    (
+        "relation.set",
+        "персонаж, к кому, число",
+        "отношение — ровно",
+    ),
+];
+
 const LINE_W: f32 = 300.0;
 const NODE_W: f32 = 230.0;
 const HEADER_H: f32 = 30.0;
@@ -886,15 +911,32 @@ fn card_body(
             ports.push((Port::Next, row_y(&r)));
         }
         Node::Event { name, args, .. } => {
-            changed |= ui
-                .add(
-                    TextEdit::singleline(name)
-                        .hint_text("quest.start")
-                        .font(FontId::monospace(FONT_MONO))
-                        .desired_width(f32::INFINITY)
-                        .margin(PAD_FIELD),
-                )
-                .changed();
+            ui.horizontal(|ui| {
+                // Готовые события сюжета: задания (Сю.1), память и отношения (Сю.9).
+                let pick = ui.add(egui::Button::new("▾").frame(false));
+                egui::Popup::menu(&pick).show(|ui| {
+                    ui.set_min_width(300.0);
+                    for (e, a, about) in EVENTS {
+                        if ui
+                            .button(format!("{e}  ({a})"))
+                            .on_hover_text(*about)
+                            .clicked()
+                        {
+                            *name = (*e).to_string();
+                            changed = true;
+                        }
+                    }
+                });
+                changed |= ui
+                    .add(
+                        TextEdit::singleline(name)
+                            .hint_text("quest.start")
+                            .font(FontId::monospace(FONT_MONO))
+                            .desired_width(f32::INFINITY)
+                            .margin(PAD_FIELD),
+                    )
+                    .changed();
+            });
             changed |= args_field(ui, args);
             let r = out_row(ui, "дальше");
             ports.push((Port::Next, row_y(&r)));
@@ -1389,7 +1431,7 @@ mod tests {
         let before = format!("{:?}", d.nodes);
         let id = g.add(&mut d, Kind::Check, "kuznec");
         assert_eq!(id, "razvilka_1");
-        assert_eq!(d.nodes.len(), 11);
+        assert_eq!(d.nodes.len(), 13);
         // Удаление «vopros» обрывает стрелки, что в неё вели.
         g.remove(&mut d, "vopros");
         assert!(d.node("vopros").is_none());
@@ -1403,7 +1445,7 @@ mod tests {
         assert_eq!(format!("{:?}", d.nodes), before);
         assert!(!g.undo(&mut d));
         assert!(g.redo(&mut d));
-        assert_eq!(d.nodes.len(), 11);
+        assert_eq!(d.nodes.len(), 13);
     }
 
     #[test]
