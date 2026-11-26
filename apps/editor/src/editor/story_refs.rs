@@ -238,6 +238,10 @@ pub(super) fn search(story: &Story, query: &str) -> Vec<Hit> {
                         add(&it, place, &c.when);
                     }
                 }
+                Node::Generate { task, fallback, .. } => {
+                    add(&it, place, task);
+                    add(&it, place, fallback);
+                }
                 Node::Check { when, .. } => add(&it, place, when),
                 Node::Event { name, .. } => add(&it, place, name),
                 Node::Run { func, .. } => add(&it, place, func),
