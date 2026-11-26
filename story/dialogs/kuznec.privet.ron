@@ -6,7 +6,10 @@
     title: "Кузнец: приветствие",
     with: ["kuznec", "hero"],
     nodes: [
-        Check(id: "nachalo", at: (0, -55), when: "kuznec.znakom", yes: "po_imeni", no: "znakomstvo"),
+        Check(id: "nachalo", at: (0, -55), when: "kuznec.znakom", yes: "pomnit", no: "znakomstvo"),
+        // Сю.9: кузнец помнит руду — встречает теплее.
+        Check(id: "pomnit", at: (390, -330), when: "memory.kuznec.ruda_prinesena and relation.kuznec.hero > 0", yes: "spasibo", no: "po_imeni"),
+        Line(id: "spasibo", at: (780, -460), who: "kuznec", text: "{hero.name}! Спасибо ещё раз за руду. Меч скоро будет.", settings: (mood: "dobryi"), next: "vopros"),
         Set(id: "znakomstvo", at: (390, 60), changes: [(var: "kuznec.znakom", to: true)], next: "chuzhak"),
         Line(id: "chuzhak", at: (780, 60), who: "kuznec", text: "Чего надо, чужак? Я кузнец, если что.", next: "vopros"),
         Line(id: "po_imeni", at: (780, -200), who: "kuznec", text: "А, {hero.name}! Заходи.", settings: (mood: "dobryi"), next: "vopros"),

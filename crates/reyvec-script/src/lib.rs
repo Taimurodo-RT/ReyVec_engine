@@ -28,7 +28,7 @@ use reyvec_story::Value;
 
 mod story;
 pub use story::{
-    Answer, Func, KEEP, QUEST_FUNCS, STORY_FUNCS, Screen, SharedStory, StoryHost,
+    Answer, Func, KEEP, NPC_FUNCS, QUEST_FUNCS, STORY_FUNCS, Screen, SharedStory, StoryHost,
     lock as lock_story, talking,
 };
 

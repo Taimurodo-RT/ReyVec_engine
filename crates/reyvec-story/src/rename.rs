@@ -157,6 +157,41 @@ pub fn rename_in_expr(expr: &mut String, old: &str, new: &str) -> usize {
     n
 }
 
+/// Персонаж в условии: `memory.old.…`, `relation.old.…` и `relation.<кто>.old`.
+fn rename_npc_in_expr(expr: &mut String, old: &str, new: &str) -> usize {
+    let mut n = rename_in_expr(expr, &format!("memory.{old}"), &format!("memory.{new}"));
+    n += rename_in_expr(expr, &format!("relation.{old}"), &format!("relation.{new}"));
+    // «к кому»: `relation.kuznec.old` — имя после точки, целиком.
+    let needle = format!(".{old}");
+    let mut out = String::new();
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(i) = expr[from..].find(&needle) {
+        let at = from + i;
+        let end = at + needle.len();
+        from = end;
+        let start = expr[..at]
+            .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+            .map_or(0, |p| p + 1);
+        let head = &expr[start..at];
+        let after = expr[end..].chars().next();
+        if head.starts_with("relation.")
+            && head.matches('.').count() == 1
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        {
+            out.push_str(&expr[last..at + 1]);
+            out.push_str(new);
+            last = end;
+            n += 1;
+        }
+    }
+    if last > 0 {
+        out.push_str(&expr[last..]);
+        *expr = out;
+    }
+    n
+}
+
 fn rename_in_placeholders(text: &mut String, old: &str, new: &str) -> usize {
     let from = format!("{{{old}}}");
     let n = text.matches(&from).count();
@@ -279,9 +314,34 @@ impl Story {
                         *dialog = new.into();
                         1
                     }
-                    (Kind::Character, Node::Line { who, .. }) if who == old => {
-                        *who = new.into();
-                        1
+                    (Kind::Character, Node::Line { who, choices, .. }) => {
+                        let mut k = 0;
+                        if who == old {
+                            *who = new.into();
+                            k += 1;
+                        }
+                        for c in choices {
+                            k += rename_npc_in_expr(&mut c.when, old, new);
+                        }
+                        k
+                    }
+                    (Kind::Character, Node::Check { when, .. }) => {
+                        rename_npc_in_expr(when, old, new)
+                    }
+                    // Память и отношения (Сю.9): персонаж — первый аргумент, у отношений
+                    // и второй («к кому»).
+                    (Kind::Character, Node::Event { name, args, .. })
+                        if crate::memory::texts_needed(name).is_some() =>
+                    {
+                        let mut k = 0;
+                        let whom = usize::from(name.starts_with("relation."));
+                        for a in args.iter_mut().take(whom + 1) {
+                            if matches!(a, Value::Text(t) if t == old) {
+                                *a = Value::Text(new.into());
+                                k += 1;
+                            }
+                        }
+                        k
                     }
                     (Kind::Quest, Node::Event { name, args, .. })
                         if name.starts_with("quest.")
@@ -318,17 +378,30 @@ impl Story {
             }
         }
 
+        // Отношения в начале игры у других персонажей.
+        if kind == Kind::Character {
+            for c in self.characters.values_mut() {
+                if let Some(n) = c.relations.remove(old) {
+                    c.relations.insert(new.into(), n);
+                    r.places += 1;
+                    if !r.characters.contains(&c.id) {
+                        r.characters.push(c.id.clone());
+                    }
+                }
+            }
+        }
         // Условия и награды заданий.
         for q in self.quests.values_mut() {
             let mut n = 0;
-            let (from, to) = match kind {
-                Kind::Var => (old.to_string(), new.to_string()),
-                Kind::Quest => quest_ref.clone(),
-                _ => continue,
+            let fix = |e: &mut String| match kind {
+                Kind::Var => rename_in_expr(e, old, new),
+                Kind::Quest => rename_in_expr(e, &quest_ref.0, &quest_ref.1),
+                Kind::Character => rename_npc_in_expr(e, old, new),
+                Kind::Dialog => 0,
             };
-            n += rename_in_expr(&mut q.fail_when, &from, &to);
+            n += fix(&mut q.fail_when);
             for s in &mut q.stages {
-                n += rename_in_expr(&mut s.done_when, &from, &to);
+                n += fix(&mut s.done_when);
             }
             if kind == Kind::Var {
                 n += rename_changes(&mut q.rewards, old, new);

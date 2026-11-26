@@ -253,6 +253,9 @@ impl Story {
                 if let Some(op) = name.strip_prefix("quest.") {
                     self.quest_event(state, op, &args)?;
                     goto(talk, &next)
+                } else if crate::memory::texts_needed(&name).is_some() {
+                    self.memory_event(state, &name, &args)?;
+                    goto(talk, &next)
                 } else {
                     talk.pending = Pending::Then(next);
                     Some(Step::Event { name, args })

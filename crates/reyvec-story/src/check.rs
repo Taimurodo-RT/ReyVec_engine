@@ -55,8 +55,21 @@ impl std::fmt::Display for Problem {
 /// Проверяет весь сюжет и заодно разбирает все условия.
 pub fn check(story: &mut Story) -> Vec<Problem> {
     let mut out = Vec::new();
+    story.conds.characters = story.characters.keys().cloned().collect();
     check_vars(story, &mut out);
     for c in story.characters.values() {
+        for whom in c.relations.keys() {
+            if !story.characters.contains_key(whom) {
+                out.push(Problem::error(
+                    story
+                        .files
+                        .get(&format!("c:{}", c.id))
+                        .map_or("", String::as_str),
+                    "relations",
+                    format!("отношение к «{whom}», а такого персонажа нет"),
+                ));
+            }
+        }
         if !valid_id(&c.id) {
             out.push(Problem::error(
                 story
@@ -94,12 +107,18 @@ fn check_vars(story: &Story, out: &mut Vec<Problem>) {
                 format!("«{name}» — и переменная, и начало других имён ({name}.…)"),
             ));
         }
-        if name == "quest" || name.starts_with("quest.") {
-            out.push(Problem::error(
-                "vars.ron",
-                name,
-                "имя quest занято заданиями (quest.<задание>.state)",
-            ));
+        for (taken, what) in [
+            ("quest", "заданиями (quest.<задание>.state)"),
+            ("memory", "памятью персонажей (memory.<персонаж>.<факт>)"),
+            ("relation", "отношениями (relation.<персонаж>.<к кому>)"),
+        ] {
+            if name == taken || name.starts_with(&format!("{taken}.")) {
+                out.push(Problem::error(
+                    "vars.ron",
+                    name,
+                    format!("имя {taken} занято {what}"),
+                ));
+            }
         }
     }
 }
@@ -213,6 +232,17 @@ fn check_dialog(story: &mut Story, id: &str, out: &mut Vec<Problem>) {
             Node::Event { name, args, .. } => {
                 if let Some(op) = name.strip_prefix("quest.") {
                     check_quest_event(story, op, args, &file, place, out);
+                } else if let Some(need) = crate::memory::texts_needed(name) {
+                    check_memory_event(story, name, need, args, &file, place, out);
+                } else if name.starts_with("memory.") || name.starts_with("relation.") {
+                    out.push(Problem::error(
+                        &file,
+                        place,
+                        format!(
+                            "нет события {name} (есть memory.add, memory.forget, relation.add, \
+                             relation.set)"
+                        ),
+                    ));
                 }
             }
             Node::Jump { dialog, node, .. } => match story.dialogs.get(dialog) {
@@ -270,6 +300,48 @@ fn check_dialog(story: &mut Story, id: &str, out: &mut Vec<Problem>) {
                 "до карточки не дойти от начала",
             ));
         }
+    }
+}
+
+fn check_memory_event(
+    story: &Story,
+    name: &str,
+    need: usize,
+    args: &[Value],
+    file: &str,
+    place: &str,
+    out: &mut Vec<Problem>,
+) {
+    let text = |i: usize| match args.get(i) {
+        Some(Value::Text(t)) => Some(t.as_str()),
+        _ => None,
+    };
+    if (0..need).any(|i| text(i).is_none()) {
+        out.push(Problem::error(
+            file,
+            place,
+            format!("{name}: первые {need} аргумента — текст (персонаж, …)"),
+        ));
+        return;
+    }
+    let npc = text(0).unwrap_or("");
+    if !story.characters.contains_key(npc) {
+        out.push(Problem::error(
+            file,
+            place,
+            format!("нет персонажа «{npc}»"),
+        ));
+    }
+    let second = text(1).unwrap_or("");
+    if name.starts_with("relation.") && !story.characters.contains_key(second) {
+        out.push(Problem::error(
+            file,
+            place,
+            format!("нет персонажа «{second}»"),
+        ));
+    }
+    if name.starts_with("memory.") && !valid_id(second) {
+        out.push(Problem::error(file, place, bad_id(second)));
     }
 }
 

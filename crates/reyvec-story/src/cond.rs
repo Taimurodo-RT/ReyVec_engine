@@ -22,6 +22,8 @@ const BUDGET: u32 = 10_000;
 /// Набор разобранных условий.
 pub struct Conditions {
     lua: Lua,
+    /// Имена персонажей: у каждого есть `memory.<имя>` и `relation.<имя>` (Сю.9).
+    pub(crate) characters: Vec<String>,
     compiled: HashMap<String, Result<Function, String>>,
     left: Arc<AtomicU32>,
 }
@@ -49,6 +51,7 @@ impl Conditions {
         });
         Self {
             lua,
+            characters: Vec::new(),
             compiled: HashMap::new(),
             left,
         }
@@ -121,6 +124,39 @@ impl Conditions {
             quests.raw_set(id.as_str(), t)?;
         }
         env.raw_set("quest", quests)?;
+        // Память и отношения (Сю.9): чего персонаж не помнит — false, отношение без
+        // записи — 0, а не nil (иначе каждое условие пришлось бы писать с `or`).
+        let no = self.lua.create_table()?;
+        no.raw_set(
+            "__index",
+            self.lua
+                .create_function(|_, _: mlua::MultiValue| Ok(false))?,
+        )?;
+        let zero = self.lua.create_table()?;
+        zero.raw_set(
+            "__index",
+            self.lua.create_function(|_, _: mlua::MultiValue| Ok(0))?,
+        )?;
+        let memory = self.lua.create_table()?;
+        let relation = self.lua.create_table()?;
+        for npc in &self.characters {
+            let facts = self.lua.create_table()?;
+            let rel = self.lua.create_table()?;
+            if let Some(m) = state.memory.get(npc) {
+                for f in &m.facts {
+                    facts.raw_set(f.key.as_str(), true)?;
+                }
+                for (whom, n) in &m.relations {
+                    rel.raw_set(whom.as_str(), *n)?;
+                }
+            }
+            facts.set_metatable(Some(no.clone()))?;
+            rel.set_metatable(Some(zero.clone()))?;
+            memory.raw_set(npc.as_str(), facts)?;
+            relation.raw_set(npc.as_str(), rel)?;
+        }
+        env.raw_set("memory", memory)?;
+        env.raw_set("relation", relation)?;
         let meta = self.lua.create_table()?;
         meta.raw_set("__index", self.lua.globals())?;
         env.set_metatable(Some(meta))?;

@@ -66,6 +66,22 @@ pub const QUEST_FUNCS: &[Func] = &[
     func("fail", "(задание)", "задание провалено"),
 ];
 
+/// `npc.*` (Сю.9): память и отношения персонажей.
+pub const NPC_FUNCS: &[Func] = &[
+    func(
+        "remember",
+        "(персонаж, факт, текст [, важность])",
+        "персонаж запомнил (важность 1–10, по умолчанию 5; 10 — навсегда)",
+    ),
+    func("knows", "(персонаж, факт)", "помнит ли персонаж факт"),
+    func("forget", "(персонаж, факт)", "персонаж забыл факт"),
+    func(
+        "relation",
+        "(персонаж, к кому [, прибавить])",
+        "отношение (число); с третьим аргументом — сначала прибавить",
+    ),
+];
+
 /// Сюжет игры, его состояние и идущий разговор.
 #[derive(Default)]
 pub struct StoryHost {
@@ -178,6 +194,8 @@ impl StoryHost {
             events,
             problems,
         } = self;
+        // Время игры идёт и без разговора: слабые факты памяти забываются.
+        story.memory_tick(state, f64::from(dt));
         let Some(t) = talk.as_mut() else {
             *screen = None;
             return None;
@@ -441,11 +459,67 @@ pub(crate) fn install(lua: &Lua, host: &SharedStory) -> mlua::Result<()> {
             story.quest_fail(state, &id).map_err(|e| err(lua, e))
         })?,
     )?;
+    // npc.*: память и отношения (Сю.9).
+    let npc = lua.create_table()?;
+    let h = Arc::clone(host);
+    npc.set(
+        "remember",
+        lua.create_function(
+            move |lua, (who, key, text, imp): (String, String, Option<String>, Option<f64>)| {
+                let mut g = lock(&h);
+                let StoryHost { story, state, .. } = &mut *g;
+                let imp = imp.unwrap_or(5.0).clamp(1.0, 10.0) as u8;
+                story
+                    .remember(state, &who, &key, text.as_deref().unwrap_or(""), imp)
+                    .map_err(|e| err(lua, format!("npc.remember: {e}")))
+            },
+        )?,
+    )?;
+    let h = Arc::clone(host);
+    npc.set(
+        "knows",
+        lua.create_function(move |lua, (who, key): (String, String)| {
+            let g = lock(&h);
+            if !g.story.characters.contains_key(&who) {
+                return Err(err(lua, format!("npc.knows: нет персонажа «{who}»")));
+            }
+            Ok(g.state.memory.get(&who).is_some_and(|m| m.knows(&key)))
+        })?,
+    )?;
+    let h = Arc::clone(host);
+    npc.set(
+        "forget",
+        lua.create_function(move |lua, (who, key): (String, String)| {
+            let mut g = lock(&h);
+            let StoryHost { story, state, .. } = &mut *g;
+            story
+                .forget(state, &who, &key)
+                .map_err(|e| err(lua, format!("npc.forget: {e}")))
+        })?,
+    )?;
+    let h = Arc::clone(host);
+    npc.set(
+        "relation",
+        lua.create_function(
+            move |lua, (who, whom, add): (String, String, Option<i64>)| {
+                let mut g = lock(&h);
+                let StoryHost { story, state, .. } = &mut *g;
+                let r = story
+                    .relate(state, &who, &whom, add.unwrap_or(0), true)
+                    .map_err(|e| err(lua, format!("npc.relation: {e}")))?;
+                // Отношение могло закончить стадию задания.
+                story.quest_tick(state).map_err(|e| err(lua, e))?;
+                Ok(r)
+            },
+        )?,
+    )?;
     story.set_readonly(true);
     quest.set_readonly(true);
+    npc.set_readonly(true);
     let g: Table = lua.globals();
     g.raw_set("story", story)?;
     g.raw_set("quest", quest)?;
+    g.raw_set("npc", npc)?;
     Ok(())
 }
 
@@ -480,7 +554,11 @@ mod tests {
     #[test]
     fn story_functions_match_engine() {
         let (s, _) = scripts();
-        for (table, funcs) in [("story", STORY_FUNCS), ("quest", QUEST_FUNCS)] {
+        for (table, funcs) in [
+            ("story", STORY_FUNCS),
+            ("quest", QUEST_FUNCS),
+            ("npc", NPC_FUNCS),
+        ] {
             let t: Table = s.lua.globals().get(table).unwrap();
             let mut got: Vec<String> = t.pairs::<String, Lv>().map(|p| p.unwrap().0).collect();
             got.sort();
@@ -701,6 +779,47 @@ mod tests {
             h.problems[0].contains("нет функции netu()"),
             "{:?}",
             h.problems
+        );
+    }
+
+    /// Сю.9: скрипт запоминает и меняет отношение, условие сюжета это видит.
+    #[test]
+    fn npc_memory_from_a_script_reaches_conditions() {
+        let (mut s, host) = scripts();
+        run(
+            &mut s,
+            "pamyat.luau",
+            r#"function update(me)
+                assert(not npc.knows("kuznec", "ruda_prinesena"))
+                npc.remember("kuznec", "ruda_prinesena", "Герой принёс руду", 8)
+                assert(npc.knows("kuznec", "ruda_prinesena"))
+                -- В начале игры кузнец к герою −1 (story/characters/kuznec.ron).
+                assert(npc.relation("kuznec", "hero") == -1)
+                assert(npc.relation("kuznec", "hero", 3) == 2)
+            end"#,
+        );
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+        let mut h = lock(&host);
+        let StoryHost { story, state, .. } = &mut *h;
+        assert!(
+            story
+                .eval(
+                    "memory.kuznec.ruda_prinesena and relation.kuznec.hero >= 2 \
+                     and not memory.kuznec.drugoe",
+                    state
+                )
+                .unwrap()
+        );
+        drop(h);
+        run(
+            &mut s,
+            "oshibka.luau",
+            r#"function update(me) npc.remember("boris", "x", "y") end"#,
+        );
+        assert!(
+            s.errors().join("").contains("нет персонажа «boris»"),
+            "{:?}",
+            s.errors()
         );
     }
 }

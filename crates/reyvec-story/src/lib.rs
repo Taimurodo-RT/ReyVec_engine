@@ -19,6 +19,7 @@
 pub mod check;
 pub mod cond;
 pub mod format;
+pub mod memory;
 pub mod play;
 pub mod quest;
 pub mod rename;
@@ -85,6 +86,10 @@ pub struct State {
     pub seed: u64,
     /// Какие диалоги уже начинались (`story.seen` в скриптах).
     pub talked: BTreeSet<String>,
+    /// Память и отношения персонажей (Сю.9): имя персонажа → что помнит.
+    pub memory: BTreeMap<String, memory::Memory>,
+    /// Сколько секунд идёт игра (по этому времени забываются факты).
+    pub time: f64,
 }
 
 impl Story {
@@ -201,6 +206,21 @@ impl Story {
                 .keys()
                 .map(|id| (id.clone(), QuestState::default()))
                 .collect(),
+            // Отношения в начале игры — из файлов персонажей.
+            memory: self
+                .characters
+                .values()
+                .filter(|c| !c.relations.is_empty())
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        memory::Memory {
+                            facts: Vec::new(),
+                            relations: c.relations.clone(),
+                        },
+                    )
+                })
+                .collect(),
             ..State::default()
         }
     }
@@ -233,6 +253,13 @@ impl Story {
         state.lang = saved.lang;
         state.seed = saved.seed;
         state.talked = saved.talked;
+        // Память — только тех, кто ещё есть в сюжете.
+        for (npc, m) in saved.memory {
+            if self.characters.contains_key(&npc) {
+                state.memory.insert(npc, m);
+            }
+        }
+        state.time = saved.time;
         Ok(state)
     }
 
