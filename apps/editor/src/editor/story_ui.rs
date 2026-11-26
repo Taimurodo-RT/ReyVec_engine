@@ -22,6 +22,18 @@ use super::story_play::Player;
 use super::story_refs::{self, Rename, RenameAnswer, Script};
 use super::theme::*;
 use reyvec_story::rename::Kind;
+use reyvec_story::writer::Suggest;
+
+/// Варианты от модели (Сю.11): для какой реплики, что просили, что пришло.
+pub(crate) struct Suggested {
+    dialog: String,
+    node: String,
+    what: Suggest,
+    got: Result<Vec<String>, String>,
+}
+
+/// Сколько вариантов просить у модели за раз.
+const SUGGESTIONS: usize = 3;
 
 /// Через сколько секунд после последней правки заметка сохраняется сама.
 const AUTOSAVE_S: f64 = 1.0;
@@ -138,6 +150,8 @@ pub(crate) struct StoryUi {
     renaming: Option<Rename>,
     /// Строка поиска по тексту (вкладка «Поиск»).
     search: String,
+    /// Что предложила модель для выбранной реплики (Сю.11).
+    suggested: Option<Suggested>,
 }
 
 impl Default for StoryUi {
@@ -167,6 +181,7 @@ impl Default for StoryUi {
             scripts_at: f64::NEG_INFINITY,
             renaming: None,
             search: String::new(),
+            suggested: None,
         }
     }
 }
@@ -932,10 +947,39 @@ impl StoryUi {
                 self.graph.arrange(d);
                 self.edited(&Item::Dialog(id.to_string()), now);
             }
+            // Выбрана реплика — модель может предложить варианты (Сю.11).
+            let line = self.graph.selected.clone().filter(|n| {
+                self.story
+                    .dialogs
+                    .get(id)
+                    .and_then(|d| d.node(n))
+                    .is_some_and(|n| matches!(n, Node::Line { .. }))
+            });
+            if let Some(node) = line {
+                for (what, name, hint) in [
+                    (
+                        Suggest::Line,
+                        "✦ Другими словами",
+                        "Модель предложит, как ещё сказать эту реплику",
+                    ),
+                    (
+                        Suggest::Answers,
+                        "✦ Ответы игрока",
+                        "Модель предложит варианты ответа игрока на реплику",
+                    ),
+                ] {
+                    if ui.button(name).on_hover_text(hint).clicked() {
+                        self.suggest(id, &node, what);
+                    }
+                }
+            }
         });
         if self.script {
             ui.add_space(GAP_S);
             return;
+        }
+        if self.suggestions_strip(ui, id) {
+            self.edited(&Item::Dialog(id.to_string()), now);
         }
         ui.add_space(GAP_S);
         ui.horizontal_wrapped(|ui| {
@@ -966,6 +1010,104 @@ impl StoryUi {
             }
         });
         ui.add_space(GAP_S);
+    }
+
+    /// Спросить модель о вариантах для реплики `node`.
+    pub(crate) fn suggest(&mut self, dialog: &str, node: &str, what: Suggest) {
+        let got = self.story.suggest(dialog, node, what, SUGGESTIONS);
+        self.suggested = Some(Suggested {
+            dialog: dialog.into(),
+            node: node.into(),
+            what,
+            got,
+        });
+    }
+
+    /// Взять вариант `i`: заменить текст реплики или добавить ответ игрока.
+    pub(crate) fn take_suggestion(&mut self, i: usize) -> bool {
+        let Some(sg) = &self.suggested else {
+            return false;
+        };
+        let Some(text) = sg.got.as_ref().ok().and_then(|v| v.get(i)).cloned() else {
+            return false;
+        };
+        let Some(Node::Line {
+            text: line,
+            choices,
+            next,
+            ..
+        }) = self
+            .story
+            .dialogs
+            .get_mut(&sg.dialog)
+            .and_then(|d| d.nodes.iter_mut().find(|n| n.id() == sg.node))
+        else {
+            return false;
+        };
+        match sg.what {
+            Suggest::Line => *line = text,
+            Suggest::Answers => {
+                // Первый ответ забирает стрелку «дальше», остальные пока никуда не ведут.
+                choices.push(Choice {
+                    text,
+                    when: String::new(),
+                    next: std::mem::take(next),
+                    key: String::new(),
+                });
+            }
+        }
+        if let Some(Suggested { got: Ok(v), .. }) = &mut self.suggested {
+            v.remove(i);
+        }
+        true
+    }
+
+    /// Полоса с вариантами модели под кнопками диалога. `true` — диалог поменялся.
+    fn suggestions_strip(&mut self, ui: &mut Ui, id: &str) -> bool {
+        let Some(sg) = &self.suggested else {
+            return false;
+        };
+        if sg.dialog != id || self.graph.selected.as_deref() != Some(sg.node.as_str()) {
+            return false;
+        }
+        let mut take = None;
+        let mut close = false;
+        ui.add_space(GAP_S);
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(GAP_L);
+            match &sg.got {
+                Err(e) if e == "модель не подключена" => {
+                    muted(
+                        ui,
+                        "Модель не подключена: варианты появятся, когда выберем модель \
+                         (облако по ключу или своя на ПК).",
+                    );
+                }
+                Err(e) => {
+                    ui.label(RichText::new(format!("Модель не помогла: {e}")).color(BAD));
+                }
+                Ok(v) if v.is_empty() => muted(ui, "Все варианты взяты."),
+                Ok(v) => {
+                    muted(ui, "Взять:");
+                    for (i, t) in v.iter().enumerate() {
+                        if ui.button(t).clicked() {
+                            take = Some(i);
+                        }
+                    }
+                }
+            }
+            if ui
+                .add(egui::Button::new(RichText::new("×").color(MUTED)).frame(false))
+                .on_hover_text("Убрать варианты")
+                .clicked()
+            {
+                close = true;
+            }
+        });
+        if close {
+            self.suggested = None;
+        }
+        take.is_some_and(|i| self.take_suggestion(i))
     }
 
     /// Схема карточек на всё оставшееся место. `true` — диалог поменялся.
@@ -3153,6 +3295,48 @@ mod tests {
 
     /// Сю.8: переименовали диалог — поправились переход в другом диалоге, перевод, файл и
     /// скрипт кузнеца; перечитанный сюжет без ошибок.
+    #[test]
+    fn model_suggestions_replace_the_line_and_add_answers() {
+        use reyvec_story::writer::{Canned, Reply};
+        let mut ui = StoryUi::default();
+        ui.story = Story::from_texts(reyvec_story::EXAMPLE).0;
+        ui.suggest("kuznec.privet", "chuzhak", Suggest::Line);
+        assert!(
+            matches!(&ui.suggested, Some(Suggested { got: Err(e), .. }) if e.contains("не подключена"))
+        );
+        assert!(!ui.take_suggestion(0));
+        ui.story.writer = Some(Box::new(Canned {
+            reply: Ok(Reply {
+                text: "Ну?".into(),
+                events: Vec::new(),
+            }),
+            asked: Default::default(),
+        }));
+        ui.suggest("kuznec.privet", "chuzhak", Suggest::Answers);
+        assert!(ui.take_suggestion(0));
+        let node = |ui: &StoryUi| {
+            ui.story.dialogs["kuznec.privet"]
+                .node("chuzhak")
+                .unwrap()
+                .clone()
+        };
+        let Node::Line { choices, next, .. } = node(&ui) else {
+            panic!()
+        };
+        assert_eq!(choices.len(), 1);
+        assert_eq!(
+            (choices[0].text.as_str(), choices[0].next.as_str()),
+            ("Ну?", "vopros")
+        );
+        assert!(next.is_empty(), "стрелку «дальше» забрал ответ");
+        ui.suggest("kuznec.privet", "chuzhak", Suggest::Line);
+        assert!(ui.take_suggestion(0));
+        let Node::Line { text, .. } = node(&ui) else {
+            panic!()
+        };
+        assert_eq!(text, "Ну?");
+    }
+
     #[test]
     fn rename_fixes_story_files_and_scripts() {
         let tmp = std::env::temp_dir().join(format!("reyvec-story-rename-{}", std::process::id()));
