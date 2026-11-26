@@ -58,10 +58,6 @@ pub(crate) enum PanelAction {
     EdgeShadowReuse(bool),
     /// Два луча вместо четырёх на дальних краях (8.11б).
     EdgeFar(bool),
-    /// Края: вдали по картинке (8.10в).
-    EdgeFarPicture(bool),
-    /// Средний уровень грубых лучей (8.10в2).
-    ConeMid(bool),
     /// Тени моделей от кирпичей поля (8.15).
     BrickShadows(bool),
     /// Границы частей внутри моделей (М.1).
@@ -218,10 +214,6 @@ pub(crate) struct PanelInfo<'a> {
     pub edge_shadow_reuse: bool,
     /// Два луча вместо четырёх на дальних краях (8.11б).
     pub edge_far: bool,
-    /// Края: вдали по картинке (8.10в).
-    pub edge_far_picture: bool,
-    /// Средний уровень грубых лучей (8.10в2).
-    pub cone_mid: bool,
     /// Тени моделей от кирпичей поля (8.15).
     pub brick_shadows: bool,
     /// Границы частей внутри моделей (М.1).
@@ -1347,34 +1339,6 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 {
                     actions.push(PanelAction::EdgeFar(far));
                 }
-                let mut far_picture = info.edge_far_picture;
-                if ui
-                    .checkbox(&mut far_picture, "Края: вдали по картинке (опыт)")
-                    .on_hover_text(
-                        "8.10в: края, где пиксель накрывает больше 4 см сцены (дальние \
-                     предметы), не получают доп. лучей — их смягчает быстрое сглаживание по \
-                     готовой картинке. Ближние края остаются с точными лучами. В большом \
-                     мире с холма так пропадает почти весь проход «края 3D». Включите и \
-                     сравните вид вдали и время кадра",
-                    )
-                    .changed()
-                {
-                    actions.push(PanelAction::EdgeFarPicture(far_picture));
-                }
-                let mut cone_mid = info.cone_mid;
-                if ui
-                    .checkbox(&mut cone_mid, "Грубые лучи: средний уровень (опыт)")
-                    .on_hover_text(
-                        "8.10в2: после грубых лучей (квадраты 8×8 пикселей) идёт второй \
-                     проход квадратами 2×2 — он подводит лучи пикселей ближе к формам, и им \
-                     остаётся меньше шагов. Картинка та же. Замер на RTX 5080: сам проход \
-                     стоит дороже, чем экономит (кадр +0,9 мс), поэтому выключен. Включите, \
-                     чтобы сравнить (появится проход «лучи 3D средне»)",
-                    )
-                    .changed()
-                {
-                    actions.push(PanelAction::ConeMid(cone_mid));
-                }
                 let mut bricks = info.brick_shadows;
                 if ui
                     .checkbox(&mut bricks, "Тени моделей: кирпич поля")
@@ -2279,8 +2243,6 @@ mod tests {
             edge_creases: true,
             edge_shadow_reuse: true,
             edge_far: false,
-            edge_far_picture: false,
-            cone_mid: false,
             brick_shadows: true,
             part_bounds: true,
             split_parts: true,

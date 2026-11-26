@@ -786,30 +786,6 @@ impl WindowRenderer {
         }
     }
 
-    /// Средний уровень конусов (8.10в2).
-    pub fn cone_mid(&self) -> bool {
-        self.demo.as_ref().is_some_and(|d| d.cone_mid())
-    }
-
-    /// Включает и выключает 8.10в2.
-    pub fn set_cone_mid(&mut self, on: bool) {
-        if let Some(demo) = self.demo.as_mut() {
-            demo.set_cone_mid(on);
-        }
-    }
-
-    /// Края: вдали по картинке (8.10в).
-    pub fn edge_far_picture(&self) -> bool {
-        self.demo.as_ref().is_some_and(|d| d.edge_far_picture())
-    }
-
-    /// Включает и выключает 8.10в.
-    pub fn set_edge_far_picture(&mut self, on: bool) {
-        if let Some(demo) = self.demo.as_mut() {
-            demo.set_edge_far_picture(on);
-        }
-    }
-
     /// Тени моделей от кирпичей поля (8.15): включено ли.
     pub fn brick_shadows(&self) -> bool {
         self.demo.as_ref().is_none_or(|d| !d.plane_shadows())

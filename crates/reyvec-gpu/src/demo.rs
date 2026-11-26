@@ -858,13 +858,6 @@ pub(crate) struct Demo {
     /// этого числа метров (8.11б, опыт; 0 — выключено, как по умолчанию; во включённом
     /// виде — [`EDGE_FAR_METERS`]).
     edge_far: f32,
-    /// Края: вдали по картинке (8.10в, опыт): край, где пиксель накрывает больше
-    /// [`EDGE_FAR_METERS`], не получает доп. лучей — его смягчает «сглаживание 3D» по
-    /// картинке; ближние края остаются с лучами.
-    edge_far_picture: bool,
-    /// Средний уровень конусов (8.10в2, опыт; выключен: на RTX 5080 сам проход дороже
-    /// выигрыша): второй проход грубых лучей квадратами 2×2.
-    cone_mid: bool,
     /// Нормаль всегда по всей сцене (7.18д5; только для сравнения в тестах).
     #[cfg(test)]
     full_normal: bool,
@@ -1278,8 +1271,6 @@ impl Demo {
             edge_creases: true,
             edge_shadow_reuse: true,
             edge_far: 0.0,
-            edge_far_picture: false,
-            cone_mid: false,
             #[cfg(test)]
             full_normal: false,
             #[cfg(test)]
@@ -2565,36 +2556,6 @@ impl Demo {
     /// Включает и выключает 8.11б.
     pub fn set_edge_far(&mut self, on: bool) {
         self.edge_far = if on { EDGE_FAR_METERS } else { 0.0 };
-    }
-
-    /// Края: вдали по картинке (8.10в).
-    pub fn edge_far_picture(&self) -> bool {
-        self.edge_far_picture
-    }
-
-    /// Включает и выключает 8.10в.
-    pub fn set_edge_far_picture(&mut self, on: bool) {
-        self.edge_far_picture = on;
-    }
-
-    /// Средний уровень конусов (8.10в2).
-    pub fn cone_mid(&self) -> bool {
-        self.cone_mid
-    }
-
-    /// Включает и выключает 8.10в2 (выключено — как до него, для сравнения).
-    pub fn set_cone_mid(&mut self, on: bool) {
-        self.cone_mid = on;
-    }
-
-    /// 8.10в работает: включено, сглаживание 3D лучами идёт (не целиком по картинке), и
-    /// оба шейдера есть.
-    fn far_picture_on(&self) -> bool {
-        self.edge_far_picture
-            && self.space_smooth
-            && !self.post_aa_on()
-            && self.space_edges != vk::Pipeline::null()
-            && self.space_post_aa != vk::Pipeline::null()
     }
 
     /// 8.11б с другим порогом (метров; 0 — выключено), для подбора порога в тестах.
@@ -5412,48 +5373,6 @@ impl Demo {
                 }
             },
         );
-        // Средний уровень конусов (8.10в2): точка на квадрат 2×2, начинает с длины своего
-        // квадрата 8×8. Лучи пикселей и краёв дальше берут начало из него.
-        let cone = if self.cone_mid {
-            let mid_tiles = vk::Extent2D {
-                width: ext.width.div_ceil(CONE_MID_TILE),
-                height: ext.height.div_ceil(CONE_MID_TILE),
-            };
-            let mid = graph.create("конусы 3D средние", mid_tiles, CONE_FORMAT);
-            graph.add_pass(
-                "лучи 3D средне",
-                &[(cone, Access::Sampled), (mid, Access::ColorAttachment)],
-                move |p| {
-                    let push = space_push(
-                        &camera,
-                        ext,
-                        frame.time,
-                        frame.space_address,
-                        SpaceSlots {
-                            cone: p.texture(cone),
-                            ..SpaceSlots::default()
-                        },
-                        CONE_MID_TILE,
-                    );
-                    let (d, cmd) = (p.device, p.cmd);
-                    // SAFETY: граф перевёл картинку первого прохода в чтение, а среднюю в
-                    // цель рисования; буфер сцены и буфер счётчиков этого кадра живы, пока
-                    // кадр рисуется.
-                    unsafe {
-                        begin_color_pass(d, cmd, p.view(mid), mid_tiles);
-                        bindless.bind(d, cmd);
-                        let pipeline = frame.space_counters.map_or(self.space_cone, |c| c.0.cone);
-                        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                        d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, &push);
-                        d.cmd_draw(cmd, 3, 1, 0, 0);
-                        d.cmd_end_rendering(cmd);
-                    }
-                },
-            );
-            mid
-        } else {
-            cone
-        };
         // Полигональные модели (7.6ж): растеризация с глубиной в свой буфер геометрии
         // той же раскладки. «Реймарчинг» не шагает дальше них и берёт их точку, если
         // луч ни во что не попал раньше.
@@ -6149,15 +6068,8 @@ impl Demo {
             // теней у границы (8.2б, EDGE_SHADOW_REUSE).
             let probe = self.edge_probe.word()
                 | if self.edge_creases { 0x100 } else { 0 }
-                | if self.edge_shadow_reuse { 0x200 } else { 0 }
-                | if self.far_picture_on() { 0x400 } else { 0 };
-            // Порог дальних краёв: у 8.10в — всегда EDGE_FAR_METERS (дальние края в
-            // список не попадают, двух лучей у них нет).
-            let far = if self.far_picture_on() {
-                EDGE_FAR_METERS
-            } else {
-                self.edge_far
-            };
+                | if self.edge_shadow_reuse { 0x200 } else { 0 };
+            let far = self.edge_far;
             // Поиск краёв читает и образцы полигонов (7.18е2): пиксель, где они
             // расходятся, — край, даже если буфер геометрии у соседей одинаков.
             // Тени — для счётчиков краёв (8.11а): вариант со счётчиками освещает пиксель
@@ -6428,16 +6340,7 @@ impl Demo {
         // прямо в окно.
         // Сглаживание по картинке (8.12а) читает освещённую картинку, поэтому освещение
         // тогда всегда красит «цвет 3D», а не окно.
-        // С 8.10в оно же идёт после лучей краёв и трогает только дальние края: порог (метров
-        // на пиксель при высоте 1080, как у поиска краёв) уходит в pc.flags; 0 — все края.
-        let far_picture =
-            frame.scene == DemoScene::Space && frame.space_edges.is_some() && self.far_picture_on();
-        let post_aa = frame.scene == DemoScene::Space && (self.post_aa_on() || far_picture);
-        let post_aa_far = if far_picture {
-            (EDGE_FAR_METERS * 1080.0 / ext.height.max(1) as f32).to_bits()
-        } else {
-            0
-        };
+        let post_aa = frame.scene == DemoScene::Space && self.post_aa_on();
         // Свечение 3D (8.16) тоже читает освещённую картинку.
         let glow = frame.scene == DemoScene::Space && self.glow;
         let window = direct.filter(|_| ext == frame.extent && !post_aa && !glow);
@@ -6514,7 +6417,7 @@ impl Demo {
                             gbuffer: p.texture(gbuffer),
                             ..SpaceSlots::default()
                         },
-                        post_aa_far,
+                        0,
                     );
                     let (d, cmd) = (p.device, p.cmd);
                     // SAFETY: граф перевёл освещённую картинку в чтение, а сглаженную в
@@ -7267,8 +7170,6 @@ const REFLECT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 const REFLECT_FLAG_ROUGH: u32 = 64;
 /// Флаг размытия отражений (raymarch_reflect_blur.slang): по столбцу, а не по строке.
 const REFLECT_BLUR_VERTICAL: u32 = 2;
-/// Сторона квадрата пикселей среднего уровня конусов (8.10в2).
-const CONE_MID_TILE: u32 = 2;
 /// Сторона квадрата пикселей, который накрывает один конус (как в raymarch_cone.slang).
 const CONE_TILE: u32 = 8;
 /// Освещённая сцена «3D» в уменьшенном разрешении (7.14), до растяжения на кадр.
