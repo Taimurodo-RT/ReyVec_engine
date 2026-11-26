@@ -4253,7 +4253,13 @@ impl Demo {
                 self.space_field.skip();
             } else if self.space_field_bake != vk::Pipeline::null() {
                 // Поле — по всем предметам, до отсева по взгляду.
-                let programs = crate::space::field_programs(&frame);
+                // Выключенному полю (7.12) формы не нужны: раньше они всё равно собирались
+                // каждый кадр (в городе — 2–3 мс процессора впустую).
+                let programs = if self.space_field.enabled {
+                    crate::space::field_programs(&frame)
+                } else {
+                    Vec::new()
+                };
                 space_field = self
                     .space_field
                     .prepare(ctx, res, slot, space_camera.eye, programs);
@@ -4265,7 +4271,13 @@ impl Demo {
             let ray_aspect = ray_extent.width as f32 / ray_extent.height.max(1) as f32;
             let view_proj = space_camera.view_proj(ray_aspect);
             let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
-            self.space_view_culled = level || !self.space.view_culling_off;
+            // Большой мир (в прошлом кадре у сетки отсева была мелкая сетка, 8.10б) по
+            // взгляду не отсеивается: сетке всё равно, сколько предметов за кадром, а
+            // готовое с прошлого кадра (программы форм, списки клеток) годится, только
+            // пока набор предметов тот же. С отсевом каждый поворот камеры пересобирал
+            // сетку города — 6–12 мс процессора вместо 2.
+            let big_world = !level && self.space_grid.is_some_and(|g| g.fine.is_some());
+            self.space_view_culled = level || !(self.space.view_culling_off || big_world);
             if self.space_view_culled {
                 // У уровня солнца нет: его заслонки не держим, иначе в кадр комнаты
                 // тянулся бы коридор (разбор 2026-11-07).
@@ -4563,6 +4575,7 @@ impl Demo {
                     .filter(|r| r.reuse)
                     .and(self.shadow_reuse.last_counts),
             });
+            self.space_pack_cache.recycle(packed.words);
         } else {
             self.space_field.skip();
             self.space_stats = None;

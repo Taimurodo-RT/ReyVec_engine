@@ -39,6 +39,10 @@ def union(parts):
     return "Union(shapes: [" + ", ".join(parts) + "])"
 
 
+def intersect(parts):
+    return "Intersect(shapes: [" + ", ".join(parts) + "])"
+
+
 def rnd(i, j, k):
     """Repeatable number 0..1 for block (i, j), stream k."""
     x = math.sin(i * 127.1 + j * 311.7 + k * 74.7) * 43758.5453
@@ -104,10 +108,15 @@ for i in range(BLOCKS):
             # Porch.
             move((0.0, -h / 2 + 0.15, d / 2 + 0.6), box((2.0, 0.3, 1.2))),
         ]))
-        # Roof: a flat slab with a ridge box turned 45 degrees.
+        # Roof: a flat slab with a gable on it. The gable is the upper half of a box turned
+        # 45 degrees; its ends are flush with the slab (a 10 cm lip there is thinner than
+        # a pixel from the street and draws as dashes).
         obj(f"крыша {tag}", roof, (hx, h + 0.15, hz), union([
             box((w + 0.6, 0.3, d + 0.6)),
-            move((0.0, 0.15, 0.0), box((w + 0.4, d * 0.5, d * 0.5)), (45.0, 0.0, 0.0)),
+            intersect([
+                move((0.0, 0.15, 0.0), box((w + 0.6, d * 0.5, d * 0.5)), (45.0, 0.0, 0.0)),
+                move((0.0, d * 0.25, 0.0), box((w + 0.6, d * 0.5, d))),
+            ]),
         ]))
         # Windows: a row per floor on the south and north walls, one glowing object.
         panes = []
