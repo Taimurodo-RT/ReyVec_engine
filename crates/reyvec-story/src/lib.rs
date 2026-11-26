@@ -21,6 +21,7 @@ pub mod cond;
 pub mod format;
 pub mod play;
 pub mod quest;
+pub mod rename;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;

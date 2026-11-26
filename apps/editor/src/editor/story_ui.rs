@@ -19,7 +19,9 @@ use reyvec_story::{Character, Dialog, LineSettings, Node, Problem, Quest, Story,
 
 use super::dialog_graph::{Around, DialogGraph, KINDS as NODE_KINDS, Speaker, change_row};
 use super::story_play::Player;
+use super::story_refs::{self, Rename, RenameAnswer, Script};
 use super::theme::*;
+use reyvec_story::rename::Kind;
 
 /// Через сколько секунд после последней правки заметка сохраняется сама.
 const AUTOSAVE_S: f64 = 1.0;
@@ -43,6 +45,8 @@ const FONT_NOTE: f32 = 15.0;
 /// Что попросили у окна редактора.
 pub(crate) enum StoryOut {
     Log(Color32, String),
+    /// Открыть скрипт на строке (из «Ссылок» и поиска, Сю.8).
+    OpenScript(PathBuf, usize),
 }
 
 /// Заметка: что можно открыть во вкладке.
@@ -78,6 +82,7 @@ enum Side {
     Outline,
     Problems,
     Play,
+    Search,
 }
 
 /// Значки, нарисованные линиями.
@@ -125,6 +130,14 @@ pub(crate) struct StoryUi {
     player: Player,
     /// Диалог показан сценарием, а не схемой.
     script: bool,
+    /// Скрипты проекта (Сю.8): где имена сюжета используются в коде.
+    scripts: Vec<Script>,
+    /// Когда скрипты перечитаны.
+    scripts_at: f64,
+    /// Открытое окно переименования.
+    renaming: Option<Rename>,
+    /// Строка поиска по тексту (вкладка «Поиск»).
+    search: String,
 }
 
 impl Default for StoryUi {
@@ -150,6 +163,10 @@ impl Default for StoryUi {
             graph: DialogGraph::default(),
             player: Player::default(),
             script: false,
+            scripts: Vec::new(),
+            scripts_at: f64::NEG_INFINITY,
+            renaming: None,
+            search: String::new(),
         }
     }
 }
@@ -281,6 +298,122 @@ impl StoryUi {
         self.problems = reyvec_story::check::check(&mut self.story);
     }
 
+    fn reload_scripts(&mut self, now: f64) {
+        self.scripts = self
+            .loaded_for
+            .as_deref()
+            .map(story_refs::project_scripts)
+            .unwrap_or_default();
+        self.scripts_at = now;
+    }
+
+    /// Открыть окно переименования.
+    fn ask_rename(&mut self, kind: Kind, old: &str) {
+        self.renaming = Some(Rename::new(kind, old));
+        self.scripts_at = f64::NEG_INFINITY;
+    }
+
+    fn rename_window(&mut self, ctx: &egui::Context) {
+        let Some(mut r) = self.renaming.take() else {
+            return;
+        };
+        match story_refs::rename_window(
+            ctx,
+            &mut r,
+            &self.story,
+            &self.scripts,
+            self.loaded_for.as_deref(),
+        ) {
+            RenameAnswer::Keep => self.renaming = Some(r),
+            RenameAnswer::Cancel => {}
+            RenameAnswer::Apply => self.rename(r.kind, &r.old, r.new.trim()),
+        }
+    }
+
+    /// Переименовать во всём сюжете и в скриптах проекта (Сю.8) и сразу сохранить.
+    pub(crate) fn rename(&mut self, kind: Kind, old: &str, new: &str) {
+        self.save_dirty();
+        let r = match self.story.rename(kind, old, new) {
+            Ok(r) => r,
+            Err(e) => {
+                self.out
+                    .push((BAD, format!("Не переименовать «{old}»: {e}")).into());
+                return;
+            }
+        };
+        for id in &r.dialogs {
+            self.dirty.insert(Item::Dialog(id.clone()));
+        }
+        for id in &r.quests {
+            self.dirty.insert(Item::Quest(id.clone()));
+        }
+        for id in &r.characters {
+            self.dirty.insert(Item::Character(id.clone()));
+        }
+        for code in &r.langs {
+            self.dirty.insert(Item::Lang(code.clone()));
+        }
+        if r.vars {
+            self.dirty.insert(Item::Vars);
+        }
+        self.save_dirty();
+        if let (Some(dir), Some((from, to))) = (&self.dir, &r.moved)
+            && from != to
+            && let Err(e) = std::fs::remove_file(dir.join(from))
+        {
+            self.out
+                .push((BAD, format!("Сюжет: не убрать старый файл {from}: {e}")).into());
+        }
+        // Скрипты проекта: свежие с диска, чтобы не затереть правки из редактора кода.
+        self.reload_scripts(self.scripts_at.max(0.0));
+        let mut in_scripts = 0;
+        let mut files = 0;
+        for (path, text) in &self.scripts {
+            let (fixed, n) = reyvec_story::rename::luau_rename(text, kind, old, new);
+            if n == 0 {
+                continue;
+            }
+            match std::fs::write(path, fixed) {
+                Ok(()) => {
+                    in_scripts += n;
+                    files += 1;
+                }
+                Err(e) => self
+                    .out
+                    .push((BAD, format!("Не записать {}: {e}", path.display())).into()),
+            }
+        }
+        self.scripts_at = f64::NEG_INFINITY;
+        // Открытые вкладки и история переходов — на новое имя.
+        let swap = |it: &mut Item| {
+            let new_item = match (&*it, kind) {
+                (Item::Dialog(id), Kind::Dialog) if id == old => Item::Dialog(new.into()),
+                (Item::Quest(id), Kind::Quest) if id == old => Item::Quest(new.into()),
+                (Item::Character(id), Kind::Character) if id == old => Item::Character(new.into()),
+                _ => return,
+            };
+            *it = new_item;
+        };
+        self.tabs.iter_mut().for_each(swap);
+        self.back.iter_mut().for_each(swap);
+        self.forward.iter_mut().for_each(swap);
+        let scripts = if in_scripts > 0 {
+            format!(", в скриптах — {in_scripts} (файлов: {files})")
+        } else {
+            String::new()
+        };
+        self.out.push(
+            (
+                GOOD,
+                format!(
+                    "Переименовано «{old}» → «{new}»: мест в сюжете — {}{scripts}",
+                    r.places
+                ),
+            )
+                .into(),
+        );
+    }
+
     /// Рисует всё пространство «Сюжет» на месте `ui`.
     pub(crate) fn draw(&mut self, ui: &mut Ui) -> Vec<StoryOut> {
         let now = ui.input(|i| i.time);
@@ -337,6 +470,12 @@ impl StoryUi {
         );
         self.rightbar(&mut r);
         self.switcher(ui.ctx());
+        self.rename_window(ui.ctx());
+        // Скрипты могли поменяться в редакторе кода: перечитываются раз в пару секунд,
+        // пока видны ссылки или открыто переименование.
+        if (self.side == Side::Links || self.renaming.is_some()) && now - self.scripts_at > 2.0 {
+            self.reload_scripts(now);
+        }
         std::mem::take(&mut self.out)
     }
 
@@ -772,6 +911,13 @@ impl StoryUi {
                 self.side = Side::Play;
                 self.player.start(&mut self.story, id);
             }
+            if ui
+                .button(RichText::new(format!("✎ {id}")).monospace())
+                .on_hover_text("Переименовать диалог везде: в других диалогах и скриптах")
+                .clicked()
+            {
+                self.ask_rename(Kind::Dialog, id);
+            }
             if self.script {
                 return;
             }
@@ -980,6 +1126,7 @@ impl StoryUi {
         );
         ui.add_space(GAP_L);
         let mut remove = None;
+        let mut rename = None;
         egui::Grid::new("story-vars")
             .num_columns(4)
             .spacing(vec2(GAP_XL, GAP_M))
@@ -1007,16 +1154,24 @@ impl StoryUi {
                         changed = true;
                     }
                     changed |= value_edit(ui, v, &name);
-                    if glyph_button(ui, Glyph::Close, "Удалить переменную", false).clicked()
-                    {
-                        remove = Some(name.clone());
-                    }
+                    ui.horizontal(|ui| {
+                        if rename_button(ui) {
+                            rename = Some(name.clone());
+                        }
+                        if glyph_button(ui, Glyph::Close, "Удалить переменную", false).clicked()
+                        {
+                            remove = Some(name.clone());
+                        }
+                    });
                     ui.end_row();
                 }
             });
         if let Some(name) = remove {
             self.story.vars.remove(&name);
             changed = true;
+        }
+        if let Some(name) = rename {
+            self.ask_rename(Kind::Var, &name);
         }
         ui.add_space(GAP_L);
         ui.horizontal(|ui| {
@@ -1057,6 +1212,7 @@ impl StoryUi {
 
     fn character_view(&mut self, ui: &mut Ui, id: &str) -> bool {
         let mut changed = false;
+        let mut rename = false;
         let Some(c) = self.story.characters.get_mut(id) else {
             return false;
         };
@@ -1064,6 +1220,7 @@ impl StoryUi {
         properties(ui, |ui| {
             prop(ui, "Имя в коде", |ui| {
                 ui.label(RichText::new(&c.id).monospace().color(TEXT_DIM));
+                rename |= rename_button(ui);
             });
             prop(ui, "Цвет имени", |ui| {
                 let mut rgb = parse_hex(&c.color).unwrap_or(TEXT_DIM);
@@ -1090,6 +1247,9 @@ impl StoryUi {
                     ),
             )
             .changed();
+        if rename {
+            self.ask_rename(Kind::Character, id);
+        }
         changed
     }
 
@@ -1107,6 +1267,7 @@ impl StoryUi {
             })
             .collect();
         let dialogs: Vec<String> = self.story.dialogs.keys().cloned().collect();
+        let mut rename = false;
         let Some(d) = self.story.dialogs.get_mut(id) else {
             return false;
         };
@@ -1115,6 +1276,7 @@ impl StoryUi {
         properties(ui, |ui| {
             prop(ui, "Имя в коде", |ui| {
                 ui.label(RichText::new(&d.id).monospace().color(TEXT_DIM));
+                rename |= rename_button(ui);
             });
             prop(ui, "Участники", |ui| {
                 let mut with = d.with.join(", ");
@@ -1287,11 +1449,15 @@ impl StoryUi {
         if let Some(item) = open {
             self.open(item, false);
         }
+        if rename {
+            self.ask_rename(Kind::Dialog, id);
+        }
         changed
     }
 
     fn quest_view(&mut self, ui: &mut Ui, id: &str) -> bool {
         let mut changed = false;
+        let mut rename_quest = false;
         let Some(q) = self.story.quests.get_mut(id) else {
             return false;
         };
@@ -1299,6 +1465,7 @@ impl StoryUi {
         properties(ui, |ui| {
             prop(ui, "Имя в коде", |ui| {
                 ui.label(RichText::new(&q.id).monospace().color(TEXT_DIM));
+                rename_quest |= rename_button(ui);
             });
             prop(ui, "Описание", |ui| {
                 changed |= ui
@@ -1531,6 +1698,9 @@ impl StoryUi {
         ui.add_space(GAP_L);
         h2(ui, "Как увидит игрок");
         journal_preview(ui, q);
+        if rename_quest {
+            self.ask_rename(Kind::Quest, id);
+        }
         changed
     }
 
@@ -1590,6 +1760,7 @@ impl StoryUi {
                 (Side::Links, "Ссылки".to_string()),
                 (Side::Outline, "Структура".to_string()),
                 (Side::Play, "Проиграть".to_string()),
+                (Side::Search, "Поиск".to_string()),
                 (
                     Side::Problems,
                     if self.problems.is_empty() {
@@ -1641,6 +1812,7 @@ impl StoryUi {
                             self.open(it, false);
                         }
                     }
+                    self.script_links(ui, &item);
                     let out = outlinks(&self.story, &item);
                     if !out.is_empty() {
                         ui.add_space(GAP_L);
@@ -1660,6 +1832,7 @@ impl StoryUi {
                         }
                     }
                 }
+                Side::Search => self.search_view(ui),
                 Side::Outline => {
                     caption(ui, "Структура");
                     let marks: Vec<(String, String)> = match &item {
@@ -1738,6 +1911,97 @@ impl StoryUi {
                     }
                 }
             });
+    }
+
+    /// «В скриптах»: строки скриптов проекта, где стоит имя заметки (у «Мира» — имена
+    /// переменных). Щелчок открывает скрипт на этой строке.
+    fn script_links(&mut self, ui: &mut Ui, item: &Item) {
+        let mut uses = Vec::new();
+        match story_refs::name_of(item) {
+            Some((kind, id)) => {
+                for u in story_refs::script_uses(&self.scripts, kind, id) {
+                    uses.push((String::new(), u));
+                }
+            }
+            None if *item == Item::Vars => {
+                for var in self.story.vars.keys() {
+                    for u in story_refs::script_uses(&self.scripts, Kind::Var, var) {
+                        uses.push((format!("{var}: "), u));
+                    }
+                }
+            }
+            None => {}
+        }
+        if uses.is_empty() {
+            return;
+        }
+        ui.add_space(GAP_L);
+        caption(ui, "В скриптах");
+        for (what, u) in uses {
+            let file = self
+                .loaded_for
+                .as_deref()
+                .and_then(|p| u.path.strip_prefix(p).ok())
+                .unwrap_or(&u.path)
+                .display()
+                .to_string();
+            let r = ui.add(
+                egui::Button::new(RichText::new(format!("{what}{file}:{}", u.line)).color(TEXT))
+                    .frame(false),
+            );
+            ui.label(
+                RichText::new(&u.text)
+                    .monospace()
+                    .color(MUTED)
+                    .size(FONT_SMALL),
+            );
+            if r.clicked() {
+                self.out.push(StoryOut::OpenScript(u.path.clone(), u.line));
+            }
+        }
+    }
+
+    /// Поиск по всем текстам сюжета (Сю.8).
+    fn search_view(&mut self, ui: &mut Ui) {
+        caption(ui, "Поиск по тексту");
+        ui.add(
+            TextEdit::singleline(&mut self.search)
+                .id(Id::unique("story-search"))
+                .hint_text("слова из реплик, журнала, условий…")
+                .desired_width(f32::INFINITY)
+                .margin(PAD_FIELD),
+        );
+        let hits = story_refs::search(&self.story, &self.search);
+        if self.search.trim().chars().count() >= 2 {
+            muted(ui, &format!("Найдено: {}", hits.len()));
+        }
+        let mut open = None;
+        for h in hits.iter().take(200) {
+            let place = if h.place.is_empty() {
+                String::new()
+            } else {
+                format!(" #{}", h.place)
+            };
+            let r = ui.add(
+                egui::Button::new(
+                    RichText::new(format!("{}{place}", item_title(&self.story, &h.item)))
+                        .color(TEXT_DIM)
+                        .size(FONT_SMALL),
+                )
+                .frame(false),
+            );
+            ui.label(RichText::new(&h.text).color(TEXT));
+            ui.add_space(GAP_S);
+            if r.clicked() {
+                open = Some(h.clone());
+            }
+        }
+        if let Some(h) = open {
+            self.open(h.item, false);
+            if !h.place.is_empty() {
+                self.scroll_to = Some(h.place);
+            }
+        }
     }
 
     // ---- Быстрый переход.
@@ -2214,6 +2478,13 @@ fn callout(ui: &mut Ui, text: &str) {
 }
 
 /// Блок «Свойства», как у Obsidian: подпись слева, значение справа.
+/// Маленькая кнопка «переименовать» рядом с именем в коде.
+fn rename_button(ui: &mut Ui) -> bool {
+    ui.add(egui::Button::new(RichText::new("✎").color(MUTED)).frame(false))
+        .on_hover_text("Переименовать везде: в сюжете и в скриптах проекта")
+        .clicked()
+}
+
 fn properties(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     caption(ui, "Свойства");
     Frame::NONE
@@ -2745,6 +3016,48 @@ mod tests {
         assert_eq!(again.story.characters["kuznec"].about, "Новый характер");
         assert_eq!(again.story.vars["derevnya.sgorela"], Value::Bool(false));
         assert!(again.story.quests.contains_key("novoe_zadanie"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Сю.8: переименовали диалог — поправились переход в другом диалоге, перевод, файл и
+    /// скрипт кузнеца; перечитанный сюжет без ошибок.
+    #[test]
+    fn rename_fixes_story_files_and_scripts() {
+        let tmp = std::env::temp_dir().join(format!("reyvec-story-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for (rel, text) in reyvec_story::EXAMPLE {
+            let p = tmp.join("story").join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+        }
+        let script = tmp.join("scenes/scripts/kuznec.luau");
+        std::fs::create_dir_all(script.parent().unwrap()).unwrap();
+        std::fs::write(
+            &script,
+            include_str!("../../../../scenes/scripts/kuznec.luau"),
+        )
+        .unwrap();
+        let mut ui = StoryUi::default();
+        ui.sync(Some(&tmp));
+        ui.open(Item::Dialog("kuznec.ruda".into()), true);
+        ui.rename(Kind::Dialog, "kuznec.ruda", "kuznec.ruda_prinesena");
+        assert_eq!(
+            ui.current(),
+            Some(Item::Dialog("kuznec.ruda_prinesena".into()))
+        );
+        assert!(!tmp.join("story/dialogs/kuznec.ruda.ron").exists());
+        assert!(tmp.join("story/dialogs/kuznec.ruda_prinesena.ron").exists());
+        let code = std::fs::read_to_string(&script).unwrap();
+        assert!(
+            code.contains("story.talk(\"kuznec.ruda_prinesena\")"),
+            "{code}"
+        );
+        ui.rename(Kind::Var, "hero.ruda", "hero.kuski_rudy");
+        let mut again = StoryUi::default();
+        again.sync(Some(&tmp));
+        assert!(again.problems.is_empty(), "{:?}", again.problems);
+        assert!(again.story.lang["en"].contains_key("kuznec.ruda_prinesena.nachalo"));
+        assert!(again.story.vars.contains_key("hero.kuski_rudy"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
