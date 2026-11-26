@@ -1878,7 +1878,10 @@ pub fn pack_scene_cached(
     let materials_at = objects_at + objects.len() * OBJECT_WORDS;
     let lamps_at = materials_at + materials.len() * MATERIAL_WORDS;
     let code_at = lamps_at + lamps.len() * LAMP_WORDS;
-    let mut out = vec![
+    // Память слов прошлого кадра, если её вернули ([`GridCache::recycle_words`]).
+    let mut out = std::mem::take(&mut cache.spare_words);
+    out.clear();
+    out.extend([
         objects.len() as u32,
         objects_at as u32,
         materials_at as u32,
@@ -1895,7 +1898,7 @@ pub fn pack_scene_cached(
         0,
         0,
         0,
-    ];
+    ]);
     let mut start = code_at;
     let field = level_field.then(|| level_field_object(objects)).flatten();
     let planes = plane_objects(objects);
@@ -1962,6 +1965,7 @@ pub fn pack_scene_cached(
         let at = out.len();
         grid.write(at, &mut out);
     }
+    cache.recycle(grid);
     out
 }
 

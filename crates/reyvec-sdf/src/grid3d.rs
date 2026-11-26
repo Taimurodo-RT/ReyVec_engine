@@ -113,6 +113,17 @@ pub struct GridCache {
     base_bounds: Vec<Bound>,
     base_pairs: Vec<(u32, u32)>,
     base_free: Vec<f32>,
+    /// Готовые клетки и списки одного неподвижного (8.10б2): кадр начинает с их копии и
+    /// переписывает только клетки, которых касается движущееся. Раньше списки всех
+    /// клеток собирались из пар каждый кадр (в городе — 300 тыс. пар, 1,5 мс).
+    base_cells: Vec<Cell>,
+    base_items: Vec<u32>,
+    /// Память клеток, списков и слов сцены прошлого кадра ([`GridCache::recycle`]): новая
+    /// память под мегабайты каждый кадр стоила дороже самой работы (страницы приходят
+    /// от системы пустыми, и первое обращение к каждой — остановка).
+    spare_cells: Vec<Cell>,
+    spare_items: Vec<u32>,
+    pub(crate) spare_words: Vec<u32>,
     /// Где лежит мелкая сетка ([`Grid::fine`]): выбирается по неподвижному вместе с ним.
     fine_box: Option<FineBox>,
     /// Готовое для мелкой сетки (то же, что здесь, но в её клетках).
@@ -169,11 +180,35 @@ impl GridCache {
             }
             pair.1 = bounds[found[k] as usize].index;
         }
+        // То же в готовых списках клеток: старый номер → новый.
+        let old_top = self.base_bounds.iter().map(|b| b.index).max().unwrap_or(0);
+        let mut renumber = vec![0u32; old_top as usize + 1];
+        for (b, &p) in self.base_bounds.iter().zip(&found) {
+            renumber[b.index as usize] = bounds[p as usize].index;
+        }
+        for i in &mut self.base_items {
+            *i = renumber[*i as usize];
+        }
         for (b, &p) in self.base_bounds.iter_mut().zip(&found) {
             *b = bounds[p as usize];
         }
         self.base = found;
         true
+    }
+
+    /// Отдаёт память отслужившей сетки кадра следующему кадру.
+    pub fn recycle(&mut self, grid: Grid) {
+        self.spare_cells = grid.cells;
+        self.spare_items = grid.items;
+        if let (Some(fine), Some(cache)) = (grid.fine, self.fine.as_mut()) {
+            cache.recycle(*fine);
+        }
+    }
+
+    /// Отдаёт память слов сцены прошлого кадра следующему
+    /// ([`crate::shape3d::pack_scene_cached`]).
+    pub fn recycle_words(&mut self, words: Vec<u32>) {
+        self.spare_words = words;
     }
 
     /// Забыть всё: следующий кадр считается целиком.
@@ -183,25 +218,6 @@ impl GridCache {
             ..Self::default()
         };
     }
-}
-
-/// Две последовательности пар, каждая по порядку объектов, — в одну по порядку объектов
-/// (пары одного объекта идут подряд и остаются подряд).
-fn merge_by_object(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
-    let (mut i, mut j) = (0, 0);
-    while i < a.len() && j < b.len() {
-        if a[i].1 <= b[j].1 {
-            out.push(a[i]);
-            i += 1;
-        } else {
-            out.push(b[j]);
-            j += 1;
-        }
-    }
-    out.extend_from_slice(&a[i..]);
-    out.extend_from_slice(&b[j..]);
-    out
 }
 
 fn object_bounds(objects: &[Program], boxes: bool) -> Vec<Bound> {
@@ -380,12 +396,16 @@ impl Grid {
             cache.base_pairs.clear();
             grid.touch(&cache.base_bounds, &mut cache.base_pairs);
             cache.base_free.clear();
+            grid.fill_lists(&cache.base_pairs);
             if options.free {
                 cache
                     .base_free
                     .resize(grid.cells_len(), grid.free_cap(squared));
                 grid.add_free(&cache.base_bounds, &mut cache.base_free, squared);
+                grid.finish_free(&cache.base_free, squared, None);
             }
+            cache.base_cells = std::mem::take(&mut grid.cells);
+            cache.base_items = std::mem::take(&mut grid.items);
             cache.rebuilds += 1;
         }
         let mut in_base = vec![false; bounds.len()];
@@ -400,11 +420,15 @@ impl Grid {
             .collect();
         let mut pairs = Vec::with_capacity(rest.len() * 32);
         grid.touch(&rest, &mut pairs);
-        grid.fill_lists(&merge_by_object(&cache.base_pairs, &pairs));
-        if options.free {
+        grid.cells = std::mem::take(&mut cache.spare_cells);
+        grid.items = std::mem::take(&mut cache.spare_items);
+        grid.cells.clone_from(&cache.base_cells);
+        grid.items.clone_from(&cache.base_items);
+        grid.add_lists(&mut pairs);
+        if options.free && !rest.is_empty() {
             let mut free = cache.base_free.clone();
             grid.add_free(&rest, &mut free, squared);
-            grid.finish_free(&free, squared);
+            grid.finish_free(&free, squared, Some(&rest));
         }
         cache.moved = rest.len();
         cache.key = Some(key);
@@ -625,6 +649,28 @@ impl Grid {
         }
     }
 
+    /// Дописывает пары (клетка, объект) движущегося в готовые списки: список каждой
+    /// задетой клетки переписывается в конец `items` — сначала что было, потом новые по
+    /// порядку объектов. Остальные клетки не трогаются.
+    fn add_lists(&mut self, pairs: &mut [(u32, u32)]) {
+        pairs.sort_unstable();
+        let mut k = 0;
+        while k < pairs.len() {
+            let c = pairs[k].0;
+            let cell = self.cells[c as usize];
+            let start = self.items.len() as u32;
+            self.items
+                .extend_from_within(cell.start as usize..(cell.start + cell.count) as usize);
+            while k < pairs.len() && pairs[k].0 == c {
+                self.items.push(pairs[k].1);
+                k += 1;
+            }
+            let cell = &mut self.cells[c as usize];
+            cell.start = start;
+            cell.count = self.items.len() as u32 - start;
+        }
+    }
+
     /// Свободное расстояние клеток (7.18д4): для клетки — наименьшее по конечным объектам
     /// не из её списка расстояние от её коробки до границы, но не больше [`FREE_CAP`]
     /// (объекты списка шаг считает точно, им оценка не нужна; до 8.8а они тоже входили, и
@@ -642,37 +688,42 @@ impl Grid {
         }
     }
 
+    /// Клетки, свободное расстояние которых может менять граница `b` (ближе
+    /// [`FREE_CAP`] к ней): первая и последняя по осям; `None` — таких нет.
+    fn free_range(&self, b: &Bound) -> Option<([usize; 3], [usize; 3])> {
+        let reach = b.r + FREE_CAP;
+        let mut first = [0; 3];
+        let mut last = [0; 3];
+        for k in 0..3 {
+            let (o, n) = (self.origin[k], self.dims[k] as f32);
+            let a = ((b.lo[k] - reach - o) / self.cell).floor().max(0.0);
+            let z = ((b.hi[k] + reach - o) / self.cell).floor().min(n - 1.0);
+            if z < 0.0 || a > z {
+                return None;
+            }
+            first[k] = a as usize;
+            last[k] = z as usize;
+        }
+        Some((first, last))
+    }
+
     /// Вклад границ `bounds` в свободное расстояние клеток `free` (квадраты, если
     /// `squared`; начальное значение — [`Grid::free_cap`]).
     fn add_free(&self, bounds: &[Bound], free: &mut [f32], squared: bool) {
-        let [nx, ny, nz] = self.dims.map(|d| d as usize);
+        let [nx, ny, _] = self.dims.map(|d| d as usize);
         // Квадрат зазора по оси между отрезком клетки `k` и отрезком границы `b0..b1`.
         let axis = |b0: f32, b1: f32, o: f32, k: usize| {
             let lo = o + k as f32 * self.cell;
             let g = gap(lo, lo + self.cell, b0, b1);
             g * g
         };
-        let range = |b0: f32, b1: f32, reach: f32, o: f32, n: usize| {
-            let a = ((b0 - reach - o) / self.cell).floor().max(0.0) as usize;
-            let b = ((b1 + reach - o) / self.cell).floor().min(n as f32 - 1.0);
-            (a, if b < 0.0 { None } else { Some(b as usize) })
-        };
         let (mut gx, mut gy, mut gz) = (Vec::new(), Vec::new(), Vec::new());
         for b in bounds {
             let r = b.r;
             let reach = r + FREE_CAP;
-            let (x0, Some(x1)) = range(b.lo.x, b.hi.x, reach, self.origin.x, nx) else {
+            let Some(([x0, y0, z0], [x1, y1, z1])) = self.free_range(b) else {
                 continue;
             };
-            let (y0, Some(y1)) = range(b.lo.y, b.hi.y, reach, self.origin.y, ny) else {
-                continue;
-            };
-            let (z0, Some(z1)) = range(b.lo.z, b.hi.z, reach, self.origin.z, nz) else {
-                continue;
-            };
-            if x0 > x1 || y0 > y1 || z0 > z1 {
-                continue;
-            }
             gx.clear();
             gx.extend((x0..=x1).map(|k| axis(b.lo.x, b.hi.x, self.origin.x, k)));
             gy.clear();
@@ -711,12 +762,34 @@ impl Grid {
         }
     }
 
-    /// Свободное расстояние клеток из [`Grid::add_free`].
-    fn finish_free(&mut self, free: &[f32], squared: bool) {
-        for (cell, &f) in self.cells.iter_mut().zip(free) {
+    /// Свободное расстояние клеток из [`Grid::add_free`]: всех или (`near`) только тех,
+    /// что могли поменяться от границ `near` — остальные уже посчитаны.
+    fn finish_free(&mut self, free: &[f32], squared: bool, near: Option<&[Bound]>) {
+        let mm = |f: f32| {
             let f = if squared { f.sqrt() } else { f };
             // Внутри шара разность отрицательна: свободного места нет.
-            cell.free_mm = ((f * 1000.0).floor() - 1.0).clamp(0.0, 65535.0) as u16;
+            ((f * 1000.0).floor() - 1.0).clamp(0.0, 65535.0) as u16
+        };
+        let Some(near) = near else {
+            for (cell, &f) in self.cells.iter_mut().zip(free) {
+                cell.free_mm = mm(f);
+            }
+            return;
+        };
+        let [nx, ny, _] = self.dims.map(|d| d as usize);
+        for b in near {
+            let Some(([x0, y0, z0], [x1, y1, z1])) = self.free_range(b) else {
+                continue;
+            };
+            for z in z0..=z1 {
+                for y in y0..=y1 {
+                    let row = (z * ny + y) * nx;
+                    let span = row + x0..=row + x1;
+                    for (cell, &f) in self.cells[span.clone()].iter_mut().zip(&free[span]) {
+                        cell.free_mm = mm(f);
+                    }
+                }
+            }
         }
     }
 
@@ -766,12 +839,18 @@ impl Grid {
                 .as_ref()
                 .map_or(0, |_| (unbounded_at + self.unbounded.len()) as u32),
         ]);
-        for c in &self.cells {
+        // Место сразу под все клетки: в городе их 180 тысяч, и дописывание по два
+        // слова стоило миллисекунду.
+        let first = out.len();
+        out.resize(first + self.cells.len() * CELL_WORDS, 0);
+        for (c, w) in self
+            .cells
+            .iter()
+            .zip(out[first..].chunks_exact_mut(CELL_WORDS))
+        {
             debug_assert!(c.count < 1 << 16);
-            out.extend([
-                items_at as u32 + c.start,
-                c.count | (u32::from(c.free_mm) << 16),
-            ]);
+            w[0] = items_at as u32 + c.start;
+            w[1] = c.count | (u32::from(c.free_mm) << 16);
         }
         out.extend(&self.items);
         out.extend(&self.unbounded);
