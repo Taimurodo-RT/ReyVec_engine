@@ -1147,6 +1147,21 @@ impl ApplicationHandler for App {
         if let (Some(panel), Some(window)) = (self.panel.as_mut(), &self.window) {
             panel_took = panel.on_window_event(window, &event);
         }
+        // Экран интерфейса из ui/demo.rui (И.2б): пока он показан, его кнопки получают
+        // мышь, Tab, стрелки и Enter раньше игры и камеры.
+        if !panel_took {
+            let offset = self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.view_rect())
+                .map_or([0.0, 0.0], |r| [r[0] as f32, r[1] as f32]);
+            if self
+                .rui_demo
+                .on_event(&event, offset, self.modifiers.shift_key())
+            {
+                return;
+            }
+        }
         let in_game = self
             .renderer
             .as_ref()

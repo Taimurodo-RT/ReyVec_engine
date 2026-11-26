@@ -101,10 +101,42 @@ pub struct UiQuad {
     pub kind: QuadKind,
 }
 
+/// Нажимаемый блок на экране: где он и как называется.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiTarget {
+    /// Путь в дереве: номера детей от корня экрана.
+    pub path: Vec<usize>,
+    /// В пикселях окна: левый, верхний, правый, нижний.
+    pub rect: [f32; 4],
+    pub disabled: bool,
+    /// `.id(…)` блока или, если его нет, первая надпись внутри.
+    pub name: String,
+}
+
+/// Что случилось с интерфейсом от мыши или клавиатуры.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UiEvent {
+    /// Нажата кнопка: её `.id` (или надпись, если `.id` нет).
+    Click(String),
+}
+
+/// Клавиши, которые понимает интерфейс.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiKey {
+    /// Tab, стрелки вниз и вправо: следующая кнопка.
+    Next,
+    /// Shift+Tab, стрелки вверх и влево: прежняя.
+    Prev,
+    /// Enter или пробел: нажать выбранную.
+    Activate,
+}
+
 /// Список рисования экрана: в порядке «снизу вверх».
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UiDraw {
     pub quads: Vec<UiQuad>,
+    /// Нажимаемые блоки в порядке файла (по нему ходит Tab).
+    pub targets: Vec<UiTarget>,
     /// Размер окна, под который разложен экран.
     pub viewport: [f32; 2],
 }
@@ -128,6 +160,14 @@ pub struct UiScreen {
     fresh: bool,
     /// Растёт при каждой сборке экранов: тогда меняется и атлас букв.
     generation: u64,
+    /// Над какой кнопкой мышь, какая нажата и какая выбрана клавиатурой (пути в дереве).
+    hover: Option<Vec<usize>>,
+    pressed: Option<Vec<usize>>,
+    focus: Option<Vec<usize>>,
+    /// Состояния поменялись: вид блоков пересчитать перед рисованием.
+    restyle: bool,
+    /// Окно, язык и способ ввода для `.when(…)`.
+    env: model::Env,
 }
 
 impl UiScreen {
@@ -275,6 +315,11 @@ impl UiScreen {
             draw: UiDraw::default(),
             fresh: false,
             generation: 0,
+            hover: None,
+            pressed: None,
+            focus: None,
+            restyle: false,
+            env: model::Env::default(),
         };
         let first = (!ui.styles.themes.is_empty()).then_some(0);
         ui.rebuild(first)?;
@@ -300,7 +345,174 @@ impl UiScreen {
         self.theme = theme;
         self.fresh = false;
         self.generation += 1;
+        // Пути в новом дереве могут вести к другим блокам: состояния — заново.
+        self.hover = None;
+        self.pressed = None;
+        self.focus = None;
+        // Условия `.when` при сборке считались для окна 1920×1080: пересчитать под своё.
+        self.restyle = true;
         Ok(())
+    }
+
+    /// Язык игры для `.when(lang: en)`.
+    pub fn set_lang(&mut self, lang: &str) {
+        if self.env.lang != lang {
+            lang.clone_into(&mut self.env.lang);
+            self.restyle = true;
+        }
+    }
+
+    /// Чем игрок пользуется сейчас, для `.when(input: keyboard)`: `mouse`, `keyboard`,
+    /// `gamepad`. Мышь и клавиши интерфейса ставят его сами.
+    pub fn set_input(&mut self, input: &str) {
+        if self.env.input != input {
+            input.clone_into(&mut self.env.input);
+            self.restyle = true;
+        }
+    }
+
+    /// Мышь в точке окна `p` (пиксели, как у [`Self::draw`]). `true` — она над кнопкой.
+    pub fn pointer_move(&mut self, p: [f32; 2]) -> bool {
+        self.set_input("mouse");
+        let hit = self
+            .draw
+            .targets
+            .iter()
+            .rev()
+            .find(|t| {
+                !t.disabled
+                    && p[0] >= t.rect[0]
+                    && p[0] < t.rect[2]
+                    && p[1] >= t.rect[1]
+                    && p[1] < t.rect[3]
+            })
+            .map(|t| t.path.clone());
+        if hit != self.hover {
+            // Как в меню игр: наведённая мышью кнопка становится и выбранной.
+            if hit.is_some() {
+                self.focus.clone_from(&hit);
+            }
+            self.hover = hit;
+            self.restyle = true;
+        }
+        self.hover.is_some()
+    }
+
+    /// Мышь ушла из окна.
+    pub fn pointer_leave(&mut self) {
+        if self.hover.take().is_some() || self.pressed.take().is_some() {
+            self.restyle = true;
+        }
+    }
+
+    /// Кнопка мыши нажата. `true` — над кнопкой интерфейса: нажатие его, не игры.
+    pub fn pointer_down(&mut self) -> bool {
+        if self.hover.is_none() {
+            return false;
+        }
+        self.pressed.clone_from(&self.hover);
+        self.restyle = true;
+        true
+    }
+
+    /// Кнопка мыши отпущена: если над той же кнопкой, что была нажата, — это нажатие.
+    pub fn pointer_up(&mut self) -> Option<UiEvent> {
+        let pressed = self.pressed.take()?;
+        self.restyle = true;
+        (self.hover.as_ref() == Some(&pressed))
+            .then(|| self.target_name(&pressed))
+            .flatten()
+            .map(UiEvent::Click)
+    }
+
+    /// Клавиша. `None` — ничего не нажато (фокус мог сдвинуться).
+    pub fn key(&mut self, key: UiKey) -> Option<UiEvent> {
+        self.set_input("keyboard");
+        let order: Vec<&UiTarget> = self.draw.targets.iter().filter(|t| !t.disabled).collect();
+        if order.is_empty() {
+            return None;
+        }
+        let now = self
+            .focus
+            .as_ref()
+            .and_then(|f| order.iter().position(|t| t.path == *f));
+        let step = |forward: bool| match now {
+            None => {
+                if forward {
+                    0
+                } else {
+                    order.len() - 1
+                }
+            }
+            Some(i) if forward => (i + 1) % order.len(),
+            Some(i) => (i + order.len() - 1) % order.len(),
+        };
+        match key {
+            UiKey::Next | UiKey::Prev => {
+                let i = step(key == UiKey::Next);
+                self.focus = Some(order[i].path.clone());
+                // Подсветка одна: выбранная клавиатурой, а не та, где осталась мышь.
+                self.hover = None;
+                self.restyle = true;
+                None
+            }
+            UiKey::Activate => {
+                let i = now?;
+                Some(UiEvent::Click(order[i].name.clone()))
+            }
+        }
+    }
+
+    /// Какая кнопка сейчас выбрана (её имя, как в [`UiEvent::Click`]).
+    pub fn focused(&self) -> Option<String> {
+        self.focus.as_ref().and_then(|f| self.target_name(f))
+    }
+
+    fn target_name(&self, path: &[usize]) -> Option<String> {
+        self.draw
+            .targets
+            .iter()
+            .find(|t| t.path == path)
+            .map(|t| t.name.clone())
+    }
+
+    /// Ставит блокам их состояния и пересчитывает вид.
+    fn apply_states(&mut self) {
+        let Some(screen) = self.screens.get_mut(self.current) else {
+            return;
+        };
+        clear_dynamic(&mut screen.root);
+        for (path, bit) in [
+            (&self.hover, model::HOVER),
+            (&self.pressed, model::PRESSED),
+            (&self.focus, model::FOCUS),
+        ] {
+            if let Some(path) = path {
+                let mut el = &mut screen.root;
+                let mut ok = true;
+                for i in path {
+                    match el.children.get_mut(*i) {
+                        Some(c) => el = c,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    el.dynamic |= bit;
+                }
+            }
+        }
+        // Модификаторы проверены при сборке: ошибки здесь не бывает.
+        let _ = model::restyle(
+            &mut screen.root,
+            model::DEFAULT_FONT,
+            Color::WHITE,
+            0,
+            &self.env,
+        );
+        self.fresh = false;
     }
 
     /// Файлы, из которых собран экран: сам экран и подключённые. Правка любого —
@@ -382,6 +594,15 @@ impl UiScreen {
     /// Список рисования под окно `viewport` (пиксели). Раскладка считается заново,
     /// только если размер окна поменялся.
     pub fn draw(&mut self, viewport: [f32; 2]) -> &UiDraw {
+        if self.env.width != viewport[0] || self.env.height != viewport[1] {
+            self.env.width = viewport[0];
+            self.env.height = viewport[1];
+            self.restyle = true;
+        }
+        if self.restyle {
+            self.restyle = false;
+            self.apply_states();
+        }
         if !self.fresh || self.draw.viewport != viewport {
             self.draw = self.lay_out(viewport);
             self.fresh = true;
@@ -399,6 +620,7 @@ impl UiScreen {
     fn lay_out(&self, viewport: [f32; 2]) -> UiDraw {
         let mut out = UiDraw {
             quads: Vec::new(),
+            targets: Vec::new(),
             viewport,
         };
         if viewport[0] <= 0.0 || viewport[1] <= 0.0 {
@@ -452,6 +674,7 @@ impl UiScreen {
             1.0,
             scale,
             &mut next_text,
+            &mut Vec::new(),
             &mut out,
         );
         out
@@ -467,6 +690,7 @@ impl UiScreen {
         opacity: f32,
         scale: f32,
         next_text: &mut usize,
+        path: &mut Vec<usize>,
         out: &mut UiDraw,
     ) {
         let Ok(layout) = tree.layout(node) else {
@@ -477,6 +701,14 @@ impl UiScreen {
         let (w, h) = (layout.size.width, layout.size.height);
         let opacity = opacity * el.look.opacity;
         let rect = [x * scale, y * scale, (x + w) * scale, (y + h) * scale];
+        if el.interactive {
+            out.targets.push(UiTarget {
+                path: path.clone(),
+                rect,
+                disabled: el.disabled,
+                name: el.id.clone().or_else(|| first_text(el)).unwrap_or_default(),
+            });
+        }
         let border = el.look.border.map_or((0.0, [0.0; 4]), |(c, width)| {
             (width * scale, faded(c, opacity))
         });
@@ -517,10 +749,36 @@ impl UiScreen {
         let Ok(children) = tree.children(node) else {
             return;
         };
-        for (child, el) in children.into_iter().zip(&el.children) {
-            self.paint(tree, child, el, [x, y], opacity, scale, next_text, out);
+        for (i, (child, el)) in children.into_iter().zip(&el.children).enumerate() {
+            path.push(i);
+            self.paint(
+                tree,
+                child,
+                el,
+                [x, y],
+                opacity,
+                scale,
+                next_text,
+                path,
+                out,
+            );
+            path.pop();
         }
     }
+}
+
+fn clear_dynamic(el: &mut Element) {
+    el.dynamic = 0;
+    for c in &mut el.children {
+        clear_dynamic(c);
+    }
+}
+
+fn first_text(el: &Element) -> Option<String> {
+    if let Kind::Text(t) = &el.kind {
+        return Some(t.text.clone());
+    }
+    el.children.iter().find_map(first_text)
 }
 
 fn rui_path(dir: &Path, path: &str) -> PathBuf {
@@ -1101,5 +1359,175 @@ mod tests {
         let other = ui.themes()[1].to_owned();
         assert!(ui.set_theme(&other).unwrap());
         assert!(!ui.draw([1920.0, 1080.0]).quads.is_empty());
+    }
+
+    const MENU: &str = r##"
+        style Button {
+            .background(#101010).padding(10)
+            .hover { .background(#202020).color(#FF0000) }
+            .pressed { .background(#303030) }
+            .focus { .border(#FFFFFF, 2) }
+            .disabled { .opacity(0.5) }
+        }
+        screen M {
+            Column {
+                Button("Играть").id(play).size(200, 40)
+                Button("Настройки").size(200, 40)
+                Button("Выход").size(200, 40).disabled()
+                Button("Мой цвет").size(200, 40).background(#050505)
+            }.align(top_left)
+        }
+    "##;
+
+    fn center(ui: &UiScreen, i: usize) -> [f32; 2] {
+        let r = ui.draw.targets[i].rect;
+        [(r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0]
+    }
+
+    fn text_color(e: &Element) -> [bool; 3] {
+        match &e.kind {
+            Kind::Text(t) => [t.color.r > 0.9, t.color.g > 0.9, t.color.b > 0.9],
+            _ => panic!("ждали текст"),
+        }
+    }
+
+    #[test]
+    fn hover_and_press_restyle_the_button_and_its_text() {
+        let mut ui = UiScreen::parse(MENU).unwrap();
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(ui.draw.targets.len(), 4);
+        assert_eq!(ui.draw.targets[0].name, "play");
+        assert_eq!(ui.draw.targets[1].name, "Настройки");
+        assert_eq!(bg(el(&ui, &[0, 0])), [16, 16, 16]);
+        // Мышь над первой кнопкой: её фон и цвет надписи внутри меняются.
+        assert!(ui.pointer_move(center(&ui, 0)));
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[0, 0])), [32, 32, 32]);
+        assert_eq!(text_color(el(&ui, &[0, 0, 0])), [true, false, false]);
+        // Наведённая кнопка ещё и выбрана: рамка из .focus.
+        assert!(el(&ui, &[0, 0]).look.border.is_some());
+        assert_eq!(bg(el(&ui, &[0, 1])), [16, 16, 16]);
+        // Нажатие: свой вид, а отпускание над той же кнопкой — событие.
+        assert!(ui.pointer_down());
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[0, 0])), [48, 48, 48]);
+        assert_eq!(ui.pointer_up(), Some(UiEvent::Click("play".into())));
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[0, 0])), [32, 32, 32]);
+        // Нажал и увёл мышь — не нажатие.
+        assert!(ui.pointer_down());
+        ui.pointer_move(center(&ui, 1));
+        assert_eq!(ui.pointer_up(), None);
+        // Мимо кнопок: нажатие не интерфейса.
+        ui.pointer_move([1900.0, 1000.0]);
+        assert!(!ui.pointer_down());
+        // Свой фон у блока сильнее наведения из стиля (ступень важнее состояния).
+        ui.pointer_move(center(&ui, 3));
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[0, 3])), [5, 5, 5]);
+    }
+
+    #[test]
+    fn disabled_buttons_are_skipped() {
+        let mut ui = UiScreen::parse(MENU).unwrap();
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(el(&ui, &[0, 2]).look.opacity, 0.5);
+        assert!(!ui.pointer_move(center(&ui, 2)));
+        assert_eq!(ui.key(UiKey::Next), None);
+        assert_eq!(ui.focused().as_deref(), Some("play"));
+        ui.key(UiKey::Next);
+        ui.key(UiKey::Next);
+        assert_eq!(ui.focused().as_deref(), Some("Мой цвет"));
+        ui.key(UiKey::Next);
+        assert_eq!(ui.focused().as_deref(), Some("play"));
+        ui.key(UiKey::Prev);
+        assert_eq!(
+            ui.key(UiKey::Activate),
+            Some(UiEvent::Click("Мой цвет".into()))
+        );
+        ui.draw([1920.0, 1080.0]);
+        assert!(el(&ui, &[0, 3]).look.border.is_some());
+        assert!(el(&ui, &[0, 0]).look.border.is_none());
+    }
+
+    #[test]
+    fn place_among_siblings() {
+        let ui = UiScreen::parse(
+            r##"screen S { Column {
+                Rect().size(4).first { .background(#010101) }
+                Rect().size(4).even { .background(#020202) }
+                Rect().size(4).nth(3) { .background(#030303) }
+                Rect().size(4).last { .background(#040404) }
+            } }"##,
+        )
+        .unwrap();
+        assert_eq!(bg(el(&ui, &[0, 0])), [1, 1, 1]);
+        assert_eq!(bg(el(&ui, &[0, 1])), [2, 2, 2]);
+        assert_eq!(bg(el(&ui, &[0, 2])), [3, 3, 3]);
+        assert_eq!(bg(el(&ui, &[0, 3])), [4, 4, 4]);
+        // Нечётные тексты: первый и третий.
+        let ui = UiScreen::parse(
+            r#"style Text { .odd { .color(#00FF00) } }
+            screen S { Column { Text("a") Text("b") Text("c") } }"#,
+        )
+        .unwrap();
+        assert_eq!(text_color(el(&ui, &[0, 0])), [false, true, false]);
+        assert_eq!(text_color(el(&ui, &[0, 1])), [true, true, true]);
+    }
+
+    #[test]
+    fn state_mistakes_are_found_when_the_file_is_saved() {
+        let e = |src: &str| UiScreen::parse(src).err().unwrap().to_string();
+        let m = e("screen S { Button(\"a\").hover { .font(30) } }");
+        assert!(m.contains(".font в состоянии пока нельзя"), "{m}");
+        let m = e("screen S { Button(\"a\").hover { .backgrund(#000000) } }");
+        assert!(m.contains("Может, .background?"), "{m}");
+        let m = e("screen S { Button(\"a\").hover }");
+        assert!(m.contains("в фигурных скобках"), "{m}");
+        let m = e("screen S { Button(\"a\").padding(4) { .opacity(1) } }");
+        assert!(m.contains("не состояние"), "{m}");
+        let m = e("screen S { Button(12) }");
+        assert!(m.contains("надпись в кавычках"), "{m}");
+    }
+
+    #[test]
+    fn when_follows_the_window_language_and_input() {
+        let mut ui = UiScreen::parse(
+            r##"
+            style Rect {
+                .background(#010101)
+                when(width < 1280) { .background(#020202) }
+            }
+            screen S {
+                Rect().size(10)
+                Rect().size(10).when(lang: en) { .background(#030303) }
+                Rect().size(10).when(input: keyboard, height >= 700) { .background(#040404) }
+                Button("a").size(10)
+            }
+            "##,
+        )
+        .unwrap();
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[0])), [1, 1, 1]);
+        ui.draw([1000.0, 600.0]);
+        assert_eq!(bg(el(&ui, &[0])), [2, 2, 2]);
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[0])), [1, 1, 1]);
+        assert_eq!(bg(el(&ui, &[1])), [1, 1, 1]);
+        ui.set_lang("en");
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[1])), [3, 3, 3]);
+        // Клавиша интерфейса — значит, игрок на клавиатуре.
+        assert_eq!(bg(el(&ui, &[2])), [1, 1, 1]);
+        ui.key(UiKey::Next);
+        ui.draw([1920.0, 1080.0]);
+        assert_eq!(bg(el(&ui, &[2])), [4, 4, 4]);
+        ui.draw([1920.0, 600.0]);
+        assert_eq!(bg(el(&ui, &[2])), [1, 1, 1]);
+        let e = UiScreen::parse("screen S { Rect().when(depth < 3) { .opacity(1) } }")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains(".when: width < 1280"), "{e}");
     }
 }

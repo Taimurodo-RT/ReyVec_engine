@@ -326,6 +326,7 @@ mod tests {
                     },
                 },
             ],
+            targets: Vec::new(),
             viewport: [10.0, 10.0],
         };
         let bytes = quad_bytes(&draw, [256.0, 128.0]);

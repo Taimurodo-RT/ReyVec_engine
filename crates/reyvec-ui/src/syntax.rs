@@ -205,6 +205,8 @@ enum Tok {
     Minus,
     Star,
     Slash,
+    /// Сравнение для `.when`: `<`, `>`, `≤` (`<=`), `≥` (`>=`).
+    Cmp(char),
     Eof,
 }
 
@@ -228,6 +230,7 @@ impl Tok {
             Tok::Minus => "«-»".into(),
             Tok::Star => "«*»".into(),
             Tok::Slash => "«/»".into(),
+            Tok::Cmp(c) => format!("«{c}»"),
             Tok::Eof => "конец файла".into(),
         }
     }
@@ -351,6 +354,17 @@ fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
                 out.push((Tok::Color(color), pos));
                 let n = end - i;
                 step(n, &mut i, &mut col);
+            }
+            '<' | '>' => {
+                let eq = chars.get(i + 1) == Some(&'=');
+                let op = match (c, eq) {
+                    ('<', false) => '<',
+                    ('>', false) => '>',
+                    ('<', true) => '≤',
+                    _ => '≥',
+                };
+                out.push((Tok::Cmp(op), pos));
+                step(1 + usize::from(eq), &mut i, &mut col);
             }
             '-' if after_value
                 || !chars
@@ -686,6 +700,23 @@ impl Parser {
                     });
                 }
                 Tok::Dot => modifiers.extend(self.modifiers()?),
+                // `when(width < 1280) { ... }` — то же, что `.when(...) { ... }`.
+                Tok::Ident(w)
+                    if w == "when"
+                        && matches!(self.toks.get(self.at + 1), Some((Tok::LParen, _))) =>
+                {
+                    let pos = self.next().1;
+                    let args = self.args()?;
+                    self.expect(Tok::LBrace, "«{» после when(...)")?;
+                    let inner = self.modifiers()?;
+                    self.expect(Tok::RBrace, "«}» после модификаторов when")?;
+                    modifiers.push(Modifier {
+                        name: "when".into(),
+                        args,
+                        inner: Some(inner),
+                        pos,
+                    });
+                }
                 Tok::Ident(_) => nested.push(self.style_rule()?),
                 Tok::Eof => {
                     return Err(
@@ -814,8 +845,19 @@ impl Parser {
         }
     }
 
-    /// Значение с формулой: `+` и `-` слабее `*` и `/`, как в школе.
+    /// Значение с формулой и, для `.when`, сравнением: `width < 1280`.
     fn value(&mut self) -> Result<Value, UiError> {
+        let left = self.sum()?;
+        if let Tok::Cmp(op) = *self.peek() {
+            self.next();
+            let right = self.sum()?;
+            return Ok(Value::Op(Box::new(left), op, Box::new(right)));
+        }
+        Ok(left)
+    }
+
+    /// Формула: `+` и `-` слабее `*` и `/`, как в школе.
+    fn sum(&mut self) -> Result<Value, UiError> {
         let mut left = self.term()?;
         loop {
             let op = match self.peek() {

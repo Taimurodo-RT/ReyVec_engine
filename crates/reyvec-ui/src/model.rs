@@ -136,7 +136,39 @@ pub struct Element {
     pub classes: Vec<String>,
     /// Откуда взялось каждое свойство: имя модификатора и источник, последний победил.
     pub origins: Vec<(String, String)>,
+    /// Раскладка до модификаторов (у `Spacer` — рост 1, у корня — весь экран).
+    pub initial: Placement,
+    /// Модификаторы по лестнице, с подставленными переменными: по ним вид блока
+    /// пересчитывается, когда меняется состояние (наведение, нажатие, фокус).
+    pub script: Vec<Step>,
+    /// Место среди соседей (с нуля) и сколько соседей всего: для `.first`, `.odd`, `.nth`.
+    pub index: usize,
+    pub siblings: usize,
+    /// Блок нажимается мышью и выбирается клавиатурой (`Button`).
+    pub interactive: bool,
+    /// `.disabled()` и `.checked()` у самого блока.
+    pub disabled: bool,
+    pub checked: bool,
+    /// `.id(имя)`: как блок назван в событиях нажатия.
+    pub id: Option<String>,
+    /// Сейчас: наведена мышь, нажат, выбран клавиатурой ([`HOVER`], [`PRESSED`], [`FOCUS`]).
+    pub dynamic: u8,
 }
+
+/// Шаг пересчёта вида блока: модификатор (с источником) или значения в скобках у
+/// `Column` и `Row`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Step {
+    Mod(Modifier, String),
+    Args(Vec<Arg>, String),
+}
+
+/// Состояния блока (биты).
+pub const HOVER: u8 = 1;
+pub const PRESSED: u8 = 2;
+pub const FOCUS: u8 = 4;
+pub const DISABLED: u8 = 8;
+pub const CHECKED: u8 = 16;
 
 /// Экран: корень — `Stack` на весь экран.
 #[derive(Clone, Debug, PartialEq)]
@@ -146,7 +178,7 @@ pub struct Screen {
     pub root: Element,
 }
 
-const KINDS: &[&str] = &["Column", "Row", "Stack", "Rect", "Text", "Spacer"];
+const KINDS: &[&str] = &["Column", "Row", "Stack", "Rect", "Text", "Spacer", "Button"];
 const MODIFIERS: &[&str] = &[
     "class",
     "var",
@@ -165,9 +197,25 @@ const MODIFIERS: &[&str] = &[
     "opacity",
     "font",
     "color",
+    "id",
+    "hover",
+    "pressed",
+    "focus",
+    "disabled",
+    "checked",
+    "first",
+    "last",
+    "odd",
+    "even",
+    "nth",
+    "when",
 ];
-/// Модификаторы состояний: разбираются, но работают с шага И.2 (мышь и клавиатура).
-const STATES: &[&str] = &["hover", "pressed", "focus", "disabled", "checked"];
+/// Модификаторы состояний и места среди соседей: `.hover { ... }` действует, только когда
+/// условие выполнено.
+const STATES: &[&str] = &[
+    "hover", "pressed", "focus", "disabled", "checked", "first", "last", "odd", "even", "nth",
+    "when",
+];
 /// Размер текста без `.font`.
 pub const DEFAULT_FONT: f32 = 24.0;
 
@@ -324,12 +372,8 @@ fn align_word(arg: &Arg) -> Result<(Option<Edge>, Option<Edge>), UiError> {
 
 fn apply(m: &Modifier, el: &mut Element) -> Result<(), UiError> {
     let name = m.name.as_str();
-    if STATES.contains(&name) {
-        // Состояния — шаг И.2б: разбор уже есть, применять пока нечего.
-        return Ok(());
-    }
-    if matches!(name, "class" | "var") {
-        // Разобраны раньше, до сопоставления стилей.
+    if STATES.contains(&name) || matches!(name, "class" | "var" | "id") {
+        // Состояния — в [`replay`]; классы, переменные и имя — до сопоставления стилей.
         return Ok(());
     }
     if !MODIFIERS.contains(&name) {
@@ -504,6 +548,8 @@ struct Ctx<'a> {
     vars: Vars,
     font: f32,
     color: Color,
+    /// Постоянные состояния предков (`.disabled()`, `.checked()`).
+    states: u8,
     ancestors: Vec<Info>,
 }
 
@@ -601,12 +647,310 @@ fn record(origins: &mut Vec<(String, String)>, name: &str, from: &str) {
     origins.push((name.to_owned(), from.to_owned()));
 }
 
-fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
+/// Выполнено ли условие состояния `m` (`.hover`, `.nth(3)`, …) у блока `el` при
+/// состояниях `states`.
+fn state_on(m: &Modifier, el: &Element, states: u8, env: &Env) -> Result<bool, UiError> {
+    let n = el.index + 1;
+    Ok(match m.name.as_str() {
+        "when" => when(m, env)?,
+        "hover" => states & HOVER != 0,
+        "pressed" => states & PRESSED != 0,
+        "focus" => states & FOCUS != 0,
+        "disabled" => states & DISABLED != 0,
+        "checked" => states & CHECKED != 0,
+        "first" => el.index == 0,
+        "last" => n == el.siblings,
+        "odd" => !n.is_multiple_of(2),
+        "even" => n.is_multiple_of(2),
+        "nth" => match m.args.first() {
+            Some(a) if m.args.len() == 1 => number(a, ".nth")? as usize == n,
+            _ => {
+                return Err(meaning(
+                    m.pos,
+                    ".nth: номер среди соседей с единицы, .nth(3) { ... }",
+                ));
+            }
+        },
+        _ => false,
+    })
+}
+
+/// Окно и игра, от которых зависят условия `.when(…)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Env {
+    /// Размер окна в пикселях.
+    pub width: f32,
+    pub height: f32,
+    /// Язык игры: `ru`, `en`.
+    pub lang: String,
+    /// Чем игрок пользуется сейчас: `mouse`, `keyboard`, `gamepad`.
+    pub input: String,
+}
+
+impl Default for Env {
+    fn default() -> Self {
+        Self {
+            width: 1920.0,
+            height: 1080.0,
+            lang: "ru".into(),
+            input: "mouse".into(),
+        }
+    }
+}
+
+/// Условие `.when(width < 1280, lang: en)`: все части должны выполняться.
+fn when(m: &Modifier, env: &Env) -> Result<bool, UiError> {
+    let bad = |pos| {
+        meaning(
+            pos,
+            ".when: width < 1280, height >= 900, lang: en, input: gamepad — через запятую",
+        )
+    };
+    if m.args.is_empty() {
+        return Err(bad(m.pos));
+    }
+    let mut all = true;
+    for a in &m.args {
+        let ok = match (&a.name, &a.value) {
+            (Some(k), Value::Name(v)) if k == "lang" => env.lang == *v,
+            (Some(k), Value::Name(v)) if k == "input" => {
+                if !matches!(v.as_str(), "mouse" | "keyboard" | "gamepad") {
+                    return Err(meaning(a.pos, "input: mouse, keyboard или gamepad"));
+                }
+                env.input == *v
+            }
+            (None, Value::Op(l, op, r)) => {
+                let side = match l.as_ref() {
+                    Value::Name(n) if n == "width" => env.width,
+                    Value::Name(n) if n == "height" => env.height,
+                    _ => return Err(bad(a.pos)),
+                };
+                let Value::Number(v) = r.as_ref() else {
+                    return Err(bad(a.pos));
+                };
+                match op {
+                    '<' => side < *v,
+                    '>' => side > *v,
+                    '≤' => side <= *v,
+                    '≥' => side >= *v,
+                    _ => return Err(bad(a.pos)),
+                }
+            }
+            _ => return Err(bad(a.pos)),
+        };
+        all &= ok;
+    }
+    Ok(all)
+}
+
+/// Применяет модификаторы с состояниями: внутренние — только если состояние включено.
+fn run(
+    m: &Modifier,
+    from: &str,
+    el: &mut Element,
+    states: u8,
+    env: &Env,
+    origins: bool,
+) -> Result<(), UiError> {
+    if STATES.contains(&m.name.as_str()) {
+        let Some(inner) = &m.inner else {
+            if matches!(m.name.as_str(), "disabled" | "checked") {
+                // Флаг блока: `.disabled()`, разобран при сборке.
+                return Ok(());
+            }
+            return Err(meaning(
+                m.pos,
+                format!(
+                    ".{0} — состояние: что меняется, пишется в фигурных скобках, .{0} {{ .background(#3A4150) }}",
+                    m.name
+                ),
+            ));
+        };
+        if state_on(m, el, states, env)? {
+            let from = format!("{from}, .{}", m.name);
+            for i in inner {
+                run(i, &from, el, states, env, origins)?;
+            }
+        }
+        return Ok(());
+    }
+    apply(m, el)?;
+    if origins {
+        record(&mut el.origins, &m.name, from);
+    }
+    Ok(())
+}
+
+/// Вид блока заново по его модификаторам при состояниях `states` (без детей).
+fn replay(el: &mut Element, font: f32, color: Color, states: u8, env: &Env) -> Result<(), UiError> {
+    el.placement = el.initial;
+    el.look = Look::default();
+    el.font = font;
+    el.color = color;
+    el.origins.clear();
+    let script = std::mem::take(&mut el.script);
+    let result = (|| {
+        for step in &script {
+            match step {
+                Step::Mod(m, from) => run(m, from, el, states, env, true)?,
+                Step::Args(args, from) => {
+                    let node = Node {
+                        kind: el.type_name.clone(),
+                        args: args.clone(),
+                        children: None,
+                        modifiers: Vec::new(),
+                        pos: el.pos,
+                    };
+                    container_args(&node, &mut el.placement)?;
+                    for a in args {
+                        record(
+                            &mut el.origins,
+                            a.name.as_deref().unwrap_or("spacing"),
+                            from,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+    el.script = script;
+    result?;
+    if let Kind::Text(spec) = &mut el.kind {
+        spec.size = el.font;
+        spec.color = el.color;
+    }
+    Ok(())
+}
+
+/// Состояния блока при состояниях родителя `inherited`: свои флаги и то, что сейчас с ним
+/// делают мышь и клавиатура. Наведение и нажатие кнопки действуют и на всё внутри неё.
+fn states_of(el: &Element, inherited: u8) -> u8 {
+    inherited
+        | el.dynamic
+        | if el.disabled { DISABLED } else { 0 }
+        | if el.checked { CHECKED } else { 0 }
+}
+
+/// Вид блока и всего внутри него заново: после наведения, нажатия или смены фокуса.
+/// Размер текста при этом не меняется (его в состояниях менять нельзя).
+pub fn restyle(
+    el: &mut Element,
+    font: f32,
+    color: Color,
+    inherited: u8,
+    env: &Env,
+) -> Result<(), UiError> {
+    let states = states_of(el, inherited);
+    replay(el, font, color, states, env)?;
+    let (font, color) = (el.font, el.color);
+    for c in &mut el.children {
+        restyle(c, font, color, states, env)?;
+    }
+    Ok(())
+}
+
+/// Проверяет модификаторы в состояниях сразу при сборке, а не при первом наведении:
+/// ошибка должна быть видна, как только сохранён файл.
+fn check_states(m: &Modifier, el: &Element) -> Result<(), UiError> {
+    let Some(inner) = &m.inner else {
+        return Ok(());
+    };
+    if !STATES.contains(&m.name.as_str()) {
+        return Err(meaning(
+            m.pos,
+            format!(
+                "фигурные скобки бывают у состояний (.hover {{ }}, .pressed {{ }}, …), а .{} — не состояние",
+                m.name
+            ),
+        ));
+    }
+    state_on(m, el, 0, &Env::default())?;
+    for i in inner {
+        match i.name.as_str() {
+            "font" => {
+                return Err(meaning(
+                    i.pos,
+                    ".font в состоянии пока нельзя: размер текста раскладывается заранее. Цвет (.color) — можно",
+                ));
+            }
+            "var" | "class" | "id" => {
+                return Err(meaning(
+                    i.pos,
+                    format!(
+                        ".{} в состоянии не бывает: он нужен ещё до наведения",
+                        i.name
+                    ),
+                ));
+            }
+            _ => {}
+        }
+        let mut scratch = el.clone();
+        scratch.children.clear();
+        if STATES.contains(&i.name.as_str()) {
+            check_states(i, &scratch)?;
+        } else {
+            apply(i, &mut scratch)?;
+        }
+    }
+    Ok(())
+}
+
+/// `.id(play)` или `.id("play")`.
+fn id_of(modifiers: &[Modifier]) -> Result<Option<String>, UiError> {
+    let mut id = None;
+    for m in modifiers.iter().filter(|m| m.name == "id") {
+        match &m.args[..] {
+            [
+                Arg {
+                    name: None,
+                    value: Value::Name(n) | Value::Text(n),
+                    ..
+                },
+            ] => id = Some(n.clone()),
+            _ => return Err(meaning(m.pos, ".id: одно имя, .id(new_game)")),
+        }
+    }
+    Ok(id)
+}
+
+/// `.disabled()` или `.checked()` без фигурных скобок — флаг блока.
+fn flag(modifiers: &[Modifier], name: &str) -> Result<bool, UiError> {
+    let mut on = false;
+    for m in modifiers
+        .iter()
+        .filter(|m| m.name == name && m.inner.is_none())
+    {
+        on = match &m.args[..] {
+            [] => true,
+            [
+                Arg {
+                    name: None,
+                    value: Value::Name(v),
+                    ..
+                },
+            ] if v == "true" || v == "false" => v == "true",
+            _ => {
+                return Err(meaning(
+                    m.pos,
+                    format!(
+                        ".{name}() или .{name}(false); вид в этом состоянии — .{name} {{ ... }}"
+                    ),
+                ));
+            }
+        };
+    }
+    Ok(on)
+}
+
+fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<Element, UiError> {
     let kind_name = node.kind.as_str();
     if !KINDS.contains(&kind_name) {
         return Err(unknown(node.pos, "блок", kind_name, KINDS, ""));
     }
-    let mut placement = Placement::default();
+    let mut initial = Placement::default();
+    // `Button("Играть")` — короткая запись `Button { Text("Играть") }`.
+    let mut kids = node.children.clone();
     let kind = match kind_name {
         "Column" | "Row" => {
             if kind_name == "Column" {
@@ -614,6 +958,37 @@ fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
             } else {
                 Kind::Row
             }
+        }
+        "Button" => {
+            match &node.args[..] {
+                [] => {}
+                [
+                    Arg {
+                        name: None,
+                        value: Value::Text(t),
+                        pos,
+                    },
+                ] if kids.is_none() => {
+                    kids = Some(vec![Node {
+                        kind: "Text".into(),
+                        args: vec![Arg {
+                            name: None,
+                            value: Value::Text(t.clone()),
+                            pos: *pos,
+                        }],
+                        children: None,
+                        modifiers: Vec::new(),
+                        pos: *pos,
+                    }]);
+                }
+                _ => {
+                    return Err(meaning(
+                        node.pos,
+                        "Button: надпись в кавычках, Button(\"Играть\"), или блоки в { }",
+                    ));
+                }
+            }
+            Kind::Stack
         }
         "Stack" | "Rect" => {
             if let Some(a) = node.args.first() {
@@ -625,7 +1000,7 @@ fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
             Kind::Stack
         }
         "Spacer" => {
-            placement.grow = 1.0;
+            initial.grow = 1.0;
             Kind::Spacer
         }
         "Text" => {
@@ -642,7 +1017,7 @@ fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
                 }) if f == "tr" => {
                     return Err(meaning(
                         *pos,
-                        "tr(\"ключ\") — тексты на двух языках, шаг И.2",
+                        "tr(\"ключ\") — тексты на двух языках, шаг И.2в",
                     ));
                 }
                 _ => {
@@ -666,7 +1041,7 @@ fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
     };
     let mut el = Element {
         kind,
-        placement: Placement::default(),
+        placement: initial,
         look: Look::default(),
         font: ctx.font,
         color: ctx.color,
@@ -675,9 +1050,16 @@ fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
         type_name: me.kind.clone(),
         classes: me.classes.clone(),
         origins: Vec::new(),
+        initial,
+        script: Vec::new(),
+        index,
+        siblings,
+        interactive: kind_name == "Button",
+        disabled: flag(&node.modifiers, "disabled")?,
+        checked: flag(&node.modifiers, "checked")?,
+        id: id_of(&node.modifiers)?,
+        dynamic: 0,
     };
-    // Spacer растягивается, если стиль или сам блок не скажут иначе.
-    el.placement.grow = placement.grow;
     let (from_styles, own) = styled(ctx, &me, &node.modifiers)?;
     let vars = own_vars(
         ctx,
@@ -685,33 +1067,27 @@ fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
     )?;
     // Лестница: стили, потом значения в скобках у Column/Row, потом свои модификаторы.
     for (m, from) in &from_styles {
-        apply(&vars.resolve_modifier(m)?, &mut el)?;
-        record(&mut el.origins, &m.name, from);
+        el.script
+            .push(Step::Mod(vars.resolve_modifier(m)?, from.clone()));
     }
-    if matches!(el.kind, Kind::Column | Kind::Row) {
-        let resolved = Node {
-            args: vars.resolve_args(&node.args)?,
-            ..node.clone()
-        };
-        container_args(&resolved, &mut el.placement)?;
-        for a in &node.args {
-            let name = a.name.as_deref().unwrap_or("spacing");
-            record(
-                &mut el.origins,
-                name,
-                &format!("у блока (строка {})", a.pos.line),
-            );
-        }
+    if matches!(el.kind, Kind::Column | Kind::Row) && !node.args.is_empty() {
+        el.script.push(Step::Args(
+            vars.resolve_args(&node.args)?,
+            format!("у блока (строка {})", node.pos.line),
+        ));
     }
     for (m, from) in &own {
-        apply(&vars.resolve_modifier(m)?, &mut el)?;
-        record(&mut el.origins, &m.name, from);
+        el.script
+            .push(Step::Mod(vars.resolve_modifier(m)?, from.clone()));
     }
-    if let Kind::Text(spec) = &mut el.kind {
-        spec.size = el.font;
-        spec.color = el.color;
+    for step in &el.script {
+        if let Step::Mod(m, _) = step {
+            check_states(m, &el)?;
+        }
     }
-    if let Some(children) = &node.children {
+    let states = states_of(&el, ctx.states);
+    replay(&mut el, ctx.font, ctx.color, states, &Env::default())?;
+    if let Some(children) = &kids {
         if matches!(el.kind, Kind::Text(_) | Kind::Spacer) {
             return Err(meaning(
                 node.pos,
@@ -722,10 +1098,13 @@ fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
         inner.vars = vars;
         inner.font = el.font;
         inner.color = el.color;
+        inner.states = states;
         inner.ancestors.push(me);
+        let n = children.len();
         el.children = children
             .iter()
-            .map(|c| element(c, &inner))
+            .enumerate()
+            .map(|(i, c)| element(c, &inner, i, n))
             .collect::<Result<_, _>>()?;
     }
     Ok(el)
@@ -739,38 +1118,21 @@ pub fn screen(decl: &ScreenDecl, styles: &StyleSet, vars: &Vars) -> Result<Scree
         vars: vars.clone(),
         font: DEFAULT_FONT,
         color: Color::WHITE,
+        states: 0,
         ancestors: Vec::new(),
-    };
-    for m in &decl.modifiers {
-        if matches!(
-            m.name.as_str(),
-            "size" | "width" | "height" | "align" | "anchor"
-        ) {
-            return Err(meaning(
-                m.pos,
-                format!("экран всегда на весь экран: .{} у него не бывает", m.name),
-            ));
-        }
-    }
-    // Корень — тот же Stack, только с видом «имя экрана» для стилей.
-    let node = Node {
-        kind: "Stack".into(),
-        args: Vec::new(),
-        children: Some(decl.children.clone()),
-        modifiers: decl.modifiers.clone(),
-        pos: decl.pos,
     };
     let me = Info {
         kind: decl.name.clone(),
         classes: classes_of(&decl.modifiers)?,
     };
+    let initial = Placement {
+        width: Len::Percent(100.0),
+        height: Len::Percent(100.0),
+        ..Placement::default()
+    };
     let mut root = Element {
         kind: Kind::Stack,
-        placement: Placement {
-            width: Len::Percent(100.0),
-            height: Len::Percent(100.0),
-            ..Placement::default()
-        },
+        placement: initial,
         look: Look::default(),
         font: DEFAULT_FONT,
         color: Color::WHITE,
@@ -779,8 +1141,17 @@ pub fn screen(decl: &ScreenDecl, styles: &StyleSet, vars: &Vars) -> Result<Scree
         type_name: decl.name.clone(),
         classes: me.classes.clone(),
         origins: Vec::new(),
+        initial,
+        script: Vec::new(),
+        index: 0,
+        siblings: 1,
+        interactive: false,
+        disabled: false,
+        checked: false,
+        id: None,
+        dynamic: 0,
     };
-    let (from_styles, own) = styled(&root_ctx, &me, &node.modifiers)?;
+    let (from_styles, own) = styled(&root_ctx, &me, &decl.modifiers)?;
     let vars = own_vars(
         &root_ctx,
         &from_styles.iter().chain(own.iter()).collect::<Vec<_>>(),
@@ -795,9 +1166,15 @@ pub fn screen(decl: &ScreenDecl, styles: &StyleSet, vars: &Vars) -> Result<Scree
                 format!("экран всегда на весь экран: .{} у него не бывает", m.name),
             ));
         }
-        apply(&vars.resolve_modifier(m)?, &mut root)?;
-        record(&mut root.origins, &m.name, from);
+        root.script
+            .push(Step::Mod(vars.resolve_modifier(m)?, from.clone()));
     }
+    for step in &root.script {
+        if let Step::Mod(m, _) = step {
+            check_states(m, &root)?;
+        }
+    }
+    replay(&mut root, DEFAULT_FONT, Color::WHITE, 0, &Env::default())?;
     let inner = Ctx {
         vars,
         font: root.font,
@@ -805,10 +1182,12 @@ pub fn screen(decl: &ScreenDecl, styles: &StyleSet, vars: &Vars) -> Result<Scree
         ancestors: vec![me],
         ..root_ctx
     };
+    let n = decl.children.len();
     root.children = decl
         .children
         .iter()
-        .map(|c| element(c, &inner))
+        .enumerate()
+        .map(|(i, c)| element(c, &inner, i, n))
         .collect::<Result<_, _>>()?;
     Ok(Screen {
         name: decl.name.clone(),
