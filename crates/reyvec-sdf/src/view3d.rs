@@ -12,13 +12,18 @@
 //!   проверяется «тень» объекта — капсула от него в сторону от света, толще на ширину
 //!   полутени, — и если она задевает пирамиду камеры, объект остаётся.
 //!
+//! - или его видно в отражении: в кадре есть блестящая поверхность (материал с блеском),
+//!   и объект достаёт до неё лучом отражения ([`Mirrors`]). У плоского зеркала-пола это
+//!   точная проверка (объект, отражённый в плоскости, попадает в пирамиду камеры), у
+//!   остальных — «не дальше длины луча отражения от блестящего предмета».
+//!
 //! Бесконечные объекты (пол) остаются всегда. Проверка только оставляет лишнее, но не
 //! выбрасывает нужное: тест `culling_keeps_the_picture` сравнивает лучи глаза и тени по
 //! полной и урезанной сцене и требует полного совпадения.
 
 use glam::{Mat4, Vec3, Vec4};
 
-use crate::shape3d::{Lamp3, SHADOW_LAMPS, Shape3};
+use crate::shape3d::{Lamp3, Material3, SHADOW_LAMPS, Shape3};
 use crate::space_file::SpaceFrame;
 
 /// Направление на солнце — как SUN в `include/space.slang`.
@@ -77,6 +82,110 @@ impl Frustum {
     }
 }
 
+/// Дальше этого луч отражения не идёт (`REFLECT_FAR` в `raymarch_reflect.slang`).
+pub const REFLECT_FAR: f32 = 80.0;
+
+/// Есть ли в форме блестящий материал (в нём что-то отражается).
+fn shiny(shape: &Shape3, outer: Option<u32>, materials: &[Material3]) -> bool {
+    match shape {
+        Shape3::Paint { material, shape } => shiny(shape, Some(*material), materials),
+        Shape3::Union { shapes, .. } | Shape3::Intersect { shapes, .. } => {
+            shapes.iter().any(|s| shiny(s, outer, materials))
+        }
+        Shape3::Subtract { base, cut, .. } => {
+            shiny(base, outer, materials) || cut.iter().any(|s| shiny(s, outer, materials))
+        }
+        Shape3::Move { shape, .. }
+        | Shape3::Animate { shape, .. }
+        | Shape3::Mirror { shape, .. }
+        | Shape3::Repeat { shape, .. } => shiny(shape, outer, materials),
+        _ => materials
+            .get(outer.unwrap_or(0) as usize)
+            .is_some_and(|m| m.shine > 0.0),
+    }
+}
+
+/// Блестящие поверхности в кадре: что в них может отразиться, отсеивать нельзя.
+#[derive(Default)]
+struct Mirrors {
+    /// Видимые блестящие предметы: шар-граница, раздутый на длину луча отражения и
+    /// длину тени (отражённая точка тоже затенена).
+    reach: Vec<(Vec3, f32)>,
+    /// Блестящие плоскости (пол): нормаль и сдвиг, `dot(n, p) + d = 0`.
+    planes: Vec<(Vec3, f32)>,
+    /// Блестит бесконечная форма сложнее плоскости: отразиться может что угодно.
+    all: bool,
+}
+
+impl Mirrors {
+    fn new(frame: &SpaceFrame, frustum: &Frustum, materials: &[Material3]) -> Self {
+        let mut out = Self::default();
+        if !materials.iter().any(|m| m.shine > 0.0) {
+            return out;
+        }
+        for s in &frame.shapes {
+            if !shiny(s, None, materials) {
+                continue;
+            }
+            match s.bounds() {
+                Some((c, r)) => {
+                    if frustum.sphere(c, r) {
+                        out.reach.push((c, r + REFLECT_FAR + SUN_FAR));
+                    }
+                }
+                None => match crate::shape3d::compile(s).ok().and_then(|p| p.plane()) {
+                    Some(plane) => out.planes.push(plane),
+                    None => out.all = true,
+                },
+            }
+        }
+        // Модели из треугольников: блестящая часть — зеркало по своим вершинам.
+        for m in &frame.meshes {
+            if !materials
+                .get(m.material as usize)
+                .is_some_and(|m| m.shine > 0.0)
+            {
+                continue;
+            }
+            let mut lo = Vec3::splat(f32::INFINITY);
+            let mut hi = Vec3::splat(f32::NEG_INFINITY);
+            for p in m.triangles.iter().flatten() {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+            if lo.x <= hi.x {
+                let (c, r) = ((lo + hi) * 0.5, (hi - lo).length() * 0.5);
+                if frustum.sphere(c, r) {
+                    out.reach.push((c, r + REFLECT_FAR + SUN_FAR));
+                }
+            }
+        }
+        out
+    }
+
+    /// Может ли объект с шаром (c, r) или его тень попасть в отражение.
+    fn shows(&self, frustum: &Frustum, sun: bool, c: Vec3, r: f32) -> bool {
+        self.all
+            || self
+                .reach
+                .iter()
+                .any(|&(m, reach)| c.distance_squared(m) <= (reach + r) * (reach + r))
+            || self.planes.iter().any(|&(n, d)| {
+                // Плоское зеркало показывает мир, отражённый в плоскости: объект виден,
+                // если его отражение в пирамиде камеры. Тень от солнца — та же капсула,
+                // что у прямого взгляда, тоже отражённая.
+                let flip = |p: Vec3| p - 2.0 * (n.dot(p) + d) * n;
+                frustum.sphere(flip(c), r + AO_MARGIN)
+                    || sun
+                        && frustum.capsule(
+                            flip(c),
+                            flip(c - SUN * SUN_FAR),
+                            r + SUN_FAR / SUN_HARDNESS,
+                        )
+            })
+    }
+}
+
 /// Что известно о сцене кадра для проверки теней.
 struct Shadows<'a> {
     lamps: &'a [Lamp3],
@@ -127,8 +236,17 @@ pub struct ViewCullStats {
 /// ламп. Раньше уровень отсеивался как сцена с солнцем, а в нём есть стена, и
 /// [`lowest_visible`] не знал нижней границы: каждый объект проверялся как заслонка
 /// солнца конусом в 30 м, и в кадр комнаты попадали десятки объектов коридора.
-pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4, sun: bool) -> ViewCullStats {
+///
+/// `materials` — материалы сцены: по блеску находятся зеркала, в которых видно то, что
+/// за спиной камеры (пустой список — отражений нет).
+pub fn cull_frame(
+    frame: &mut SpaceFrame,
+    view_proj: Mat4,
+    sun: bool,
+    materials: &[Material3],
+) -> ViewCullStats {
     let frustum = Frustum::new(view_proj);
+    let mirrors = Mirrors::new(frame, &frustum, materials);
     let floor = if sun { lowest_visible(frame) } else { None };
     let shadows = Shadows {
         lamps: &frame.lamps,
@@ -138,7 +256,11 @@ pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4, sun: bool) -> ViewCul
     let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
     let keep = |s: &Shape3| match s.bounds() {
         None => true,
-        Some((c, r)) => frustum.sphere(c, r + AO_MARGIN) || shadows.casts(&frustum, c, r),
+        Some((c, r)) => {
+            frustum.sphere(c, r + AO_MARGIN)
+                || shadows.casts(&frustum, c, r)
+                || mirrors.shows(&frustum, sun, c, r)
+        }
     };
     let shapes: Vec<bool> = frame.shapes.iter().map(keep).collect();
     // Заменители моделей невидимы: им важны только тени и углы.
@@ -155,9 +277,10 @@ pub fn cull_frame(frame: &mut SpaceFrame, view_proj: Mat4, sun: bool) -> ViewCul
     let mut kept = proxies.iter();
     frame.proxies.retain(|_| *kept.next().unwrap_or(&false));
     // Теней светящиеся не дают: нужны, только если их видно.
-    frame
-        .glows
-        .retain(|s| s.bounds().is_none_or(|(c, r)| frustum.sphere(c, r)));
+    frame.glows.retain(|s| {
+        s.bounds()
+            .is_none_or(|(c, r)| frustum.sphere(c, r) || mirrors.shows(&frustum, false, c, r))
+    });
     ViewCullStats {
         total,
         kept: frame.shapes.len() + frame.proxies.len() + frame.glows.len(),
@@ -212,6 +335,68 @@ mod tests {
         assert!(!f.sphere(Vec3::new(40.0, 1.0, 0.0), 1.0));
     }
 
+    /// Находка Романа 2026-11-26: у зеркала вплотную из отражения пропадали предметы за
+    /// спиной камеры. Предмет за спиной остаётся, пока в кадре есть блестящее: зеркало
+    /// (в пределах луча отражения) или блестящий пол (отражение предмета в кадре).
+    #[test]
+    fn things_behind_the_camera_stay_for_mirrors() {
+        let cam = Camera3D::looking_at(Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 1.0, -3.0));
+        let view_proj = cam.view_proj(16.0 / 9.0);
+        let material = |shine: f32| Material3 {
+            color: [0.5; 3],
+            glow: 0.0,
+            grid: false,
+            texture: 0,
+            shine,
+            rough: 0.0,
+            bulb: false,
+        };
+        let (dull, glossy) = (material(0.0), material(0.9));
+        let behind = Vec3::new(0.5, 1.0, 6.0);
+        let frame = |mirror: u32, floor: u32| SpaceFrame {
+            shapes: vec![
+                Shape3::Plane {
+                    normal: [0.0, 1.0, 0.0],
+                    offset: 0.0,
+                }
+                .paint(floor),
+                Shape3::Box {
+                    size: [4.0, 2.0, 0.1],
+                    round: 0.0,
+                }
+                .at([0.0, 1.0, -3.0])
+                .paint(mirror),
+                Shape3::Sphere { radius: 0.3 }.at(behind.to_array()),
+                // Далеко за спиной и высоко: ни в зеркале стены (дальше луча), ни в полу.
+                Shape3::Sphere { radius: 0.3 }.at([0.0, 400.0, 300.0]),
+            ],
+            lamps: Vec::new(),
+            meshes: Vec::new(),
+            proxies: Vec::new(),
+            glows: Vec::new(),
+            still: Vec::new(),
+        };
+        let materials = [dull, glossy];
+        let kept = |mirror, floor, materials: &[Material3]| {
+            let mut f = frame(mirror, floor);
+            cull_frame(&mut f, view_proj, false, materials).kept
+        };
+        assert_eq!(kept(0, 0, &materials), 2, "без блеска шар за спиной лишний");
+        assert_eq!(kept(1, 0, &materials), 3, "зеркало на стене его показывает");
+        assert_eq!(kept(1, 0, &[]), 2, "отражения выключены");
+        // Блестящий пол: отражение шара под полом камера, глядящая вперёд, не видит…
+        assert_eq!(kept(0, 1, &materials), 2);
+        // …а шар впереди над кадром, чьё отражение в полу в кадре, остаётся.
+        let mut f = frame(0, 1);
+        f.shapes[2] = Shape3::Sphere { radius: 0.3 }.at([0.0, 6.0, -3.0]);
+        let mut plain = frame(0, 0);
+        plain.shapes[2] = f.shapes[2].clone();
+        let down = Camera3D::looking_at(Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, -1.0));
+        let vp = down.view_proj(16.0 / 9.0);
+        assert_eq!(cull_frame(&mut plain, vp, false, &materials).kept, 2);
+        assert_eq!(cull_frame(&mut f, vp, false, &materials).kept, 3);
+    }
+
     /// Без солнца (2.5D-уровень) объект, который держался в кадре только как заслонка
     /// солнца, отсеивается; видимый остаётся.
     #[test]
@@ -239,13 +424,13 @@ mod tests {
         };
         let mut with_sun = frame();
         assert_eq!(
-            cull_frame(&mut with_sun, view_proj, true).kept,
+            cull_frame(&mut with_sun, view_proj, true, &[]).kept,
             3,
             "с солнцем заслонка нужна"
         );
         let mut no_sun = frame();
         assert_eq!(
-            cull_frame(&mut no_sun, view_proj, false).kept,
+            cull_frame(&mut no_sun, view_proj, false, &[]).kept,
             2,
             "без солнца она лишняя"
         );
@@ -279,7 +464,7 @@ mod tests {
         for (k, cam) in cameras.iter().enumerate() {
             let full = scene.frame(1.3);
             let mut part = scene.frame(1.3);
-            let stats = cull_frame(&mut part, cam.view_proj(aspect), true);
+            let stats = cull_frame(&mut part, cam.view_proj(aspect), true, &[]);
             culled_any |= stats.kept < stats.total;
             let progs = |f: &SpaceFrame| -> Vec<Program> {
                 f.shapes.iter().map(|s| compile(s).unwrap()).collect()

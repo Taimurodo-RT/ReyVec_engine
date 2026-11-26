@@ -4264,13 +4264,16 @@ impl Demo {
             let ray_extent = self.space_scale.apply(extent);
             let ray_aspect = ray_extent.width as f32 / ray_extent.height.max(1) as f32;
             let view_proj = space_camera.view_proj(ray_aspect);
+            let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             self.space_view_culled = level || !self.space.view_culling_off;
             if self.space_view_culled {
                 // У уровня солнца нет: его заслонки не держим, иначе в кадр комнаты
                 // тянулся бы коридор (разбор 2026-11-07).
-                self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj, !level);
+                // Без прохода отражений зеркал нет: блеск материалов отсеву не важен.
+                let mirrors: &[_] = if self.reflections { materials } else { &[] };
+                self.space_view =
+                    reyvec_sdf::view3d::cull_frame(&mut frame, view_proj, !level, mirrors);
             }
-            let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             space_reflect = self.reflections
                 && self.space_reflect != vk::Pipeline::null()
                 && materials.iter().any(|m| m.shine > 0.0);
