@@ -12,8 +12,9 @@ use reyvec_sdf::shape3d::{
     MAX_MATERIALS, MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_cached,
 };
 
-/// Сколько слов помещается в буфер сцены кадра (4 МБ: треугольники 2.5D-вида, 7.9б).
-pub(crate) const MAX_WORDS: usize = 1024 * 1024;
+/// Сколько слов помещается в буфер сцены кадра (8 МБ: треугольники 2.5D-вида, 7.9б; с
+/// 8.10б — ещё мелкая сетка отсева большого мира, с ней город занимает до 1 М слов).
+pub(crate) const MAX_WORDS: usize = 2 * 1024 * 1024;
 
 /// Предупреждения о пределах уже записаны в журнал (пишутся один раз, пока предел
 /// нарушен; панель показывает их каждый кадр, 7.18б).
@@ -266,6 +267,8 @@ pub struct GridStats {
     pub dims: [u32; 3],
     pub mean_list: f32,
     pub max_list: u32,
+    /// Мелкая сетка поверх тесной части (8.10б): размер клетки и число клеток.
+    pub fine: Option<(f32, [u32; 3])>,
 }
 
 /// Сетка отсева по словам сцены (раскладка — `Grid::write`); `None` — сетки нет.
@@ -293,6 +296,16 @@ pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
             sum as f32 / count as f32
         },
         max_list: max,
+        fine: words
+            .get(g + 19)
+            .map(|&h| h as usize)
+            .filter(|&h| h != 0 && h + 6 < words.len())
+            .map(|h| {
+                (
+                    f32::from_bits(words[h + 3]),
+                    [words[h + 4], words[h + 5], words[h + 6]],
+                )
+            }),
     })
 }
 

@@ -1672,11 +1672,19 @@ fn grid_text(info: &PanelInfo) -> String {
     let grid = match (info.space_culling, info.space_grid) {
         (false, _) => "сетка отсева выключена (culling: false)".to_string(),
         (true, None) => "сетка отсева включена".to_string(),
-        (true, Some(g)) => format!(
-            "сетка отсева: клетка {:.2} м, {}×{}×{}, в списке клетки в среднем {:.1}, \
-             не больше {}",
-            g.cell, g.dims[0], g.dims[1], g.dims[2], g.mean_list, g.max_list
-        ),
+        (true, Some(g)) => {
+            let fine = g.fine.map_or(String::new(), |(cell, d)| {
+                format!(
+                    "; мелкая сетка в тесной части: клетка {cell:.2} м, {}×{}×{}",
+                    d[0], d[1], d[2]
+                )
+            });
+            format!(
+                "сетка отсева: клетка {:.2} м, {}×{}×{}, в списке клетки в среднем {:.1}, \
+                 не больше {}{fine}",
+                g.cell, g.dims[0], g.dims[1], g.dims[2], g.mean_list, g.max_list
+            )
+        }
     };
     match info.space_in_view {
         Some((kept, total)) => format!("{grid}, в кадре {kept} из {total}"),
@@ -1847,7 +1855,7 @@ fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
     let share = (f64::from(s.objects) / max_objects as f64).max(s.words as f64 / max_words as f64);
     ui.label(
         mono(format!(
-            "Данные сцены 3D: объектов {} из {max_objects}, слов {} из {max_words} ({:.2} МБ из 4)",
+            "Данные сцены 3D: объектов {} из {max_objects}, слов {} из {max_words} ({:.2} МБ из 8)",
             s.objects,
             s.words,
             s.words as f64 * 4.0 / (1024.0 * 1024.0)
