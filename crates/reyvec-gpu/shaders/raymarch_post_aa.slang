@@ -45,8 +45,10 @@ float2 pixel_screen(int2 px, float2 size)
 // краёв для лучей (edge_reason в raymarch_edge_find.slang): у одного из четырёх соседей
 // небо против формы, другой материал, поворот нормали или сосед не лежит на плоскости
 // этой точки. Ровный пол под острым углом — не край, его линии не размываются.
-bool shape_edge(int2 p, int2 size, float4 g0)
+// `t` — глубина для порога дальних краёв: самого пикселя, а у неба — соседа за краем.
+bool shape_edge(int2 p, int2 size, float4 g0, out float t)
 {
+    t = g0.x;
     Ray r0 = screen_ray(pixel_screen(p, float2(size)));
     float3 n0 = oct_decode(g0.zw);
     float3 p0 = r0.origin + r0.dir * g0.x;
@@ -58,7 +60,10 @@ bool shape_edge(int2 p, int2 size, float4 g0)
             continue;
         float4 g1 = gbuffer_load(q);
         if ((g0.x < 0.0) != (g1.x < 0.0))
+        {
+            t = max(g0.x, g1.x);
             return true;
+        }
         if (g0.x < 0.0)
             continue;
         if (abs(g0.y - g1.y) > 0.5 || dot(n0, oct_decode(g1.zw)) < 0.9)
@@ -83,8 +88,20 @@ float4 fs_main(VertexOut input) : SV_Target
     float2 inv = 1.0 / float2(w, h);
     int2 p = int2(input.position.xy);
     float3 center = img.Load(int3(p, 0)).rgb;
-    if (!shape_edge(p, last + 1, gbuffer_load(p)))
+    float depth;
+    if (!shape_edge(p, last + 1, gbuffer_load(p), depth))
         return float4(center, 1.0);
+    // Только дальние края (8.10в): pc.flags — порог в метрах на пиксель (биты float; 0 —
+    // все края). Ближние уже сглажены лучами краёв, их цвет в картинке готов.
+    float far = asfloat(pc.flags);
+    if (far > 0.0)
+    {
+        float2 size = float2(last + 1);
+        Ray a = screen_ray(pixel_screen(p, size));
+        Ray b = screen_ray(pixel_screen(p + int2(1, 0), size));
+        if (length((b.origin + b.dir * depth) - (a.origin + a.dir * depth)) <= far)
+            return float4(center, 1.0);
+    }
 
     // Яркость пикселя и соседей крестом.
     float lc = luma(center);

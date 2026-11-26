@@ -585,6 +585,7 @@ fn render(
             demo.set_edge_creases(tests::EDGE_CREASES.get());
             demo.set_edge_shadow_reuse(tests::EDGE_SHADOW_REUSE.get());
             demo.set_edge_far_meters(tests::EDGE_FAR.get());
+            demo.set_edge_far_picture(tests::EDGE_FAR_PICTURE.get());
             demo.set_post_aa(tests::POST_AA.get());
             demo.set_space_triangles(tests::TRIANGLES.get());
             if tests::TRIANGLES.get() {
@@ -975,6 +976,8 @@ pub(crate) mod tests {
         /// Края: два луча вдали (8.11б), порог в метрах; как в песочнице, по умолчанию 0 —
         /// выключено.
         pub(super) static EDGE_FAR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+        /// Края: вдали по картинке (8.10в).
+        pub(super) static EDGE_FAR_PICTURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Сглаживание 3D по картинке вместо лучей краёв (8.12а); по умолчанию выключено.
         pub(super) static POST_AA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Режим «треугольники» для 3D (8.20б).
@@ -1381,6 +1384,83 @@ pub(crate) mod tests {
             jumps * 500 <= pixels,
             "даль мерцает: {jumps} пикселей из {pixels}"
         );
+    }
+
+    /// Края вдали по картинке (8.10в): в большом мире с холма почти все края дальние —
+    /// лучей краёв почти не остаётся, а кадр ближе к кадру с лучами, чем кадр вовсе без
+    /// сглаживания. В сцене, где почти всё близко, меняются только немногие дальние края.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn far_edges_go_to_picture_smoothing() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let world = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/world.ron").into()),
+                ..Default::default()
+            },
+        };
+        let shots = |scene: &HeadlessScene| {
+            let rays = render_headless(&options, scene).expect("кадр с лучами краёв");
+            EDGE_PROBE.set(crate::EdgeProbe::NoSubRays);
+            let rough = render_headless(&options, scene);
+            EDGE_PROBE.set(crate::EdgeProbe::Off);
+            EDGE_FAR_PICTURE.set(true);
+            let far = render_headless(&options, scene);
+            EDGE_FAR_PICTURE.set(false);
+            (
+                rays,
+                rough.expect("кадр без доп. лучей"),
+                far.expect("кадр с дальними краями по картинке"),
+            )
+        };
+        let edges = |f: &HeadlessImage| {
+            f.space_stats
+                .as_ref()
+                .and_then(|s| s.edge_pixels)
+                .expect("края посчитаны")
+        };
+
+        let (rays, rough, far) = shots(&world);
+        let (all, left) = (edges(&rays), edges(&far));
+        let (_, _, rough_mean) = image_diff(&rays.image, &rough.image);
+        let (changed, worst, far_mean) = image_diff(&rays.image, &far.image);
+        eprintln!(
+            "мир: краёв с лучами {all} → {left}; от кадра с лучами: без сглаживания средняя \
+             {rough_mean:.4}, вдали по картинке {far_mean:.4} (пикселей {changed}, худшая \
+             {worst})"
+        );
+        assert!(
+            left * 4 < all,
+            "дальние края остались с лучами: {left} из {all}"
+        );
+        assert!(far_mean < rough_mean, "{far_mean} против {rough_mean}");
+
+        // Вблизи (комната; дальних краёв — только даль пола у горизонта): почти все края
+        // остаются с лучами, а кадр меняется только на ушедших к картинке краях.
+        let near = hollow_side();
+        let (rays, _, far) = shots(&near);
+        let (all, left) = (edges(&rays), edges(&far));
+        let (changed, worst, _) = image_diff(&rays.image, &far.image);
+        eprintln!(
+            "вблизи: краёв с лучами {all} → {left}, отличается {changed} пикселей, худшая \
+             разница {worst}"
+        );
+        assert!(left <= all && left * 10 > all * 9, "{left} из {all}");
+        assert!(changed as u32 <= all - left, "{changed} > {}", all - left);
+        assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
     }
 
     /// Сцена «выставка» (итог этапа 8): всё, что умеет быстрый режим 3D, в одном кадре —
