@@ -7426,6 +7426,9 @@ mod tests {
                     PlayState::Playing => Item::Character("kuznec".into()),
                 };
                 ui.story.open(item, false);
+                if play == PlayState::Edit {
+                    ui.story.preview_play("kuznec.privet");
+                }
             }
             if ws == 5 {
                 // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.

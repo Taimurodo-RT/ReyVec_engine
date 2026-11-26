@@ -243,6 +243,10 @@ pub(crate) struct DialogGraph {
     /// Тянем новую стрелку: из какой карточки, из какого выхода, откуда.
     wire: Option<(String, Port, Pos2)>,
     pub(crate) selected: Option<String>,
+    /// Карточка, на которой сейчас проигрыватель (обводится оранжевым).
+    pub(crate) playing: Option<String>,
+    /// К какой карточке проигрывателя уже сдвигали вид.
+    shown_playing: Option<String>,
     undo: HashMap<String, Vec<Dialog>>,
     redo: HashMap<String, Vec<Dialog>>,
     /// Снимок до начала переноса карточки.
@@ -373,6 +377,18 @@ impl DialogGraph {
             .get(&d.id)
             .copied()
             .unwrap_or_else(|| fit(d, outer.size()));
+        // Проигрыватель перешёл на другую карточку — показать её, если она за краем.
+        // Места карточек берутся с прошлого кадра: пока их нет, ждём.
+        if self.playing != self.shown_playing
+            && (self.playing.is_none() || self.rects.len() == d.nodes.len())
+        {
+            self.shown_playing = self.playing.clone();
+            if let Some(r) = self.playing.as_ref().and_then(|p| self.rects.get(p))
+                && !view.contains_rect(*r)
+            {
+                view = view.translate(r.center() - view.center());
+            }
+        }
         let start = d.start_node().unwrap_or("").to_string();
         let mut drop_wire = None;
         let scene = egui::Scene::new()
@@ -412,7 +428,14 @@ impl DialogGraph {
             for i in 0..d.nodes.len() {
                 let id = d.nodes[i].id().to_string();
                 let on = self.selected.as_deref() == Some(id.as_str());
-                let out = node_card(ui, &mut d.nodes[i], around, &ids, on, start == id);
+                let ring = if self.playing.as_deref() == Some(id.as_str()) {
+                    Some(Stroke::new(3.0, ACCENT))
+                } else if on {
+                    Some(Stroke::new(2.0, SELECT))
+                } else {
+                    None
+                };
+                let out = node_card(ui, &mut d.nodes[i], around, &ids, ring, start == id);
                 changed |= out.changed;
                 if out.header.drag_started() {
                     self.moving = Some(d.clone());
@@ -551,7 +574,7 @@ fn node_card(
     n: &mut Node,
     around: &Around,
     ids: &[String],
-    selected: bool,
+    ring: Option<Stroke>,
     start: bool,
 ) -> CardOut {
     let kind = Kind::of(n);
@@ -568,11 +591,7 @@ fn node_card(
             .id_salt(("node", &id))
             .layout(Layout::top_down(Align::Min)),
         |ui| {
-            let stroke = if selected {
-                Stroke::new(2.0, SELECT)
-            } else {
-                Stroke::new(LINE, BORDER_STRONG)
-            };
+            let stroke = ring.unwrap_or(Stroke::new(LINE, BORDER_STRONG));
             Frame::NONE
                 .fill(CARD)
                 .stroke(stroke)
