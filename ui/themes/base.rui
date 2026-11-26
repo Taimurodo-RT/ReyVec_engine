@@ -1,0 +1,30 @@
+// Темы примера (шаг И.2а): каждая — набор переменных. В песочнице F4 меняет тему.
+// Переменная читается в стилях и экранах как var(имя).
+
+theme Forge {
+    panel     = #171A21E6     // фон окна
+    button    = #262B36       // фон кнопки
+    line      = #FFFFFF1A     // тонкая рамка
+    accent    = #F5A54A       // цвет раскалённого металла
+    text      = #E8ECF2
+    muted     = #9AA3B5
+    danger    = #E5484D
+    stamina   = #7FD36B
+    radius    = 10
+    gap       = 14
+    gap_big   = var(gap) * 2
+}
+
+theme Ice {
+    panel     = #0E1C2CE6
+    button    = #1B3550
+    line      = #BFE3FF33
+    accent    = #6BB8F5
+    text      = #EAF6FF
+    muted     = #8FB3CC
+    danger    = #FF6B8A
+    stamina   = #5FE0D0
+    radius    = 4
+    gap       = 10
+    gap_big   = var(gap) * 2
+}

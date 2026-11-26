@@ -1,13 +1,15 @@
 //! Что значат блоки и модификаторы: из разобранного файла ([`crate::syntax`]) — дерево
 //! элементов с готовыми размерами, отступами и оформлением.
 //!
-//! Шаг И.1 понимает блоки `Column`, `Row`, `Stack`, `Rect`, `Text`, `Spacer` и модификаторы
-//! раскладки и оформления. Незнакомое имя — ошибка с местом в файле и подсказкой
+//! Понимает блоки `Column`, `Row`, `Stack`, `Rect`, `Text`, `Spacer`, модификаторы
+//! раскладки и оформления (И.1), стили, классы, переменные и наследование текста (И.2а,
+//! [`crate::style`]). Незнакомое имя — ошибка с местом в файле и подсказкой
 //! («может, .padding?»), а не молчаливый пропуск: иначе опечатку не найти.
 
 use reyvec_vector::Color;
 
 use crate::UiError;
+use crate::style::{Info, StyleSet, Vars};
 use crate::syntax::{Arg, Modifier, Node, Pos, ScreenDecl, ScreenKind, Value};
 
 /// Длина: пиксели экрана 1920×1080 (на другом экране умножаются на высоту / 1080) или
@@ -124,8 +126,16 @@ pub struct Element {
     pub kind: Kind,
     pub placement: Placement,
     pub look: Look,
+    /// Размер и цвет текста этого элемента и (по наследству) его детей.
+    pub font: f32,
+    pub color: Color,
     pub children: Vec<Element>,
     pub pos: Pos,
+    /// Вид блока, как написан в файле (`Rect`, `Button`), и классы.
+    pub type_name: String,
+    pub classes: Vec<String>,
+    /// Откуда взялось каждое свойство: имя модификатора и источник, последний победил.
+    pub origins: Vec<(String, String)>,
 }
 
 /// Экран: корень — `Stack` на весь экран.
@@ -138,6 +148,9 @@ pub struct Screen {
 
 const KINDS: &[&str] = &["Column", "Row", "Stack", "Rect", "Text", "Spacer"];
 const MODIFIERS: &[&str] = &[
+    "class",
+    "var",
+    "spacing",
     "padding",
     "margin",
     "size",
@@ -166,7 +179,7 @@ fn meaning(pos: Pos, message: impl Into<String>) -> UiError {
 }
 
 /// Самое похожее имя из списка, если оно правда похоже: для подсказки при опечатке.
-fn suggest<'a>(word: &str, known: &[&'a str]) -> Option<&'a str> {
+pub(crate) fn suggest<'a>(word: &str, known: &[&'a str]) -> Option<&'a str> {
     let distance = |a: &str, b: &str| {
         let a: Vec<char> = a.to_lowercase().chars().collect();
         let b: Vec<char> = b.to_lowercase().chars().collect();
@@ -243,7 +256,7 @@ fn color(arg: &Arg, what: &str) -> Result<Color, UiError> {
                 "{what}: ждал цвет вида #F5A54A, а здесь {}{}",
                 v.kind(),
                 if matches!(v, Value::Name(n) if n.starts_with("theme.")) {
-                    " (темы — шаг И.2)"
+                    " (переменные темы пишутся var(имя))"
                 } else {
                     ""
                 }
@@ -312,7 +325,11 @@ fn align_word(arg: &Arg) -> Result<(Option<Edge>, Option<Edge>), UiError> {
 fn apply(m: &Modifier, el: &mut Element) -> Result<(), UiError> {
     let name = m.name.as_str();
     if STATES.contains(&name) {
-        // Состояния — шаг И.2: разбор уже есть, применять пока нечего.
+        // Состояния — шаг И.2б: разбор уже есть, применять пока нечего.
+        return Ok(());
+    }
+    if matches!(name, "class" | "var") {
+        // Разобраны раньше, до сопоставления стилей.
         return Ok(());
     }
     if !MODIFIERS.contains(&name) {
@@ -339,6 +356,16 @@ fn apply(m: &Modifier, el: &mut Element) -> Result<(), UiError> {
     };
     let p = &mut el.placement;
     match name {
+        "spacing" => {
+            if !matches!(el.kind, Kind::Column | Kind::Row) {
+                return Err(meaning(
+                    m.pos,
+                    format!("{what} бывает только у Column и Row"),
+                ));
+            }
+            count(1..=1)?;
+            p.spacing = number(&m.args[0], &what)?;
+        }
         "padding" => p.padding = sides(m)?,
         "margin" => p.margin = sides(m)?,
         "size" => {
@@ -396,15 +423,13 @@ fn apply(m: &Modifier, el: &mut Element) -> Result<(), UiError> {
             count(1..=1)?;
             el.look.opacity = number(&m.args[0], &what)?.clamp(0.0, 1.0);
         }
+        // У контейнера — для текстов внутри него (наследование, как в CSS).
         "font" | "color" => {
-            let Kind::Text(spec) = &mut el.kind else {
-                return Err(meaning(m.pos, format!("{what} бывает только у Text")));
-            };
             count(1..=1)?;
             if name == "font" {
-                spec.size = number(&m.args[0], &what)?.max(1.0);
+                el.font = number(&m.args[0], &what)?.max(1.0);
             } else {
-                spec.color = color(&m.args[0], &what)?;
+                el.color = color(&m.args[0], &what)?;
             }
         }
         _ => unreachable!("имя проверено выше"),
@@ -471,7 +496,112 @@ fn container_args(node: &Node, p: &mut Placement) -> Result<(), UiError> {
     Ok(())
 }
 
-fn element(node: &Node) -> Result<Element, UiError> {
+/// Что блок получает от предков: переменные, текст по наследству и цепочку предков для
+/// вложенных стилей.
+#[derive(Clone)]
+struct Ctx<'a> {
+    styles: &'a StyleSet,
+    vars: Vars,
+    font: f32,
+    color: Color,
+    ancestors: Vec<Info>,
+}
+
+/// Классы из `.class(a, b)` у самого блока.
+fn classes_of(modifiers: &[Modifier]) -> Result<Vec<String>, UiError> {
+    let mut out = Vec::new();
+    for m in modifiers.iter().filter(|m| m.name == "class") {
+        if m.args.is_empty() {
+            return Err(meaning(
+                m.pos,
+                ".class: имена классов, например .class(danger)",
+            ));
+        }
+        for a in &m.args {
+            match &a.value {
+                Value::Name(n)
+                    if a.name.is_none()
+                        && !n.contains('.')
+                        && !n.chars().next().is_some_and(char::is_uppercase) =>
+                {
+                    out.push(n.clone());
+                }
+                _ => {
+                    return Err(meaning(
+                        a.pos,
+                        ".class: имя класса с маленькой буквы без кавычек, .class(danger)",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Модификатор и откуда он: «style Button (styles/menu.rui, строка 3)» или «у блока».
+type Sourced<'m> = (&'m Modifier, String);
+
+/// Модификаторы блока по лестнице: стили (слабые первыми), потом свои. Вместе с
+/// источником для «откуда взялось». Переменные `.var` собираются в `vars`.
+fn styled<'m>(
+    ctx: &Ctx<'m>,
+    me: &Info,
+    own: &'m [Modifier],
+) -> Result<(Vec<Sourced<'m>>, Vec<Sourced<'m>>), UiError> {
+    let mut from_styles = Vec::new();
+    for r in ctx.styles.matching(me, &ctx.ancestors) {
+        for m in &r.modifiers {
+            if m.name == "class" {
+                return Err(meaning(
+                    m.pos,
+                    ".class пишется у блока, а не в стиле: стиль сам выбирает блоки по классам",
+                ));
+            }
+            from_styles.push((m, r.origin.clone()));
+        }
+    }
+    let own = own
+        .iter()
+        .map(|m| (m, format!("у блока (строка {})", m.pos.line)))
+        .collect();
+    Ok((from_styles, own))
+}
+
+/// Переменные блока: родительские и `.var(имя: значение)` из стилей и своих модификаторов
+/// по лестнице. Значения считаются от переменных родителя.
+fn own_vars(ctx: &Ctx<'_>, mods: &[&Sourced<'_>]) -> Result<Vars, UiError> {
+    let mut set: Vec<(String, Value)> = Vec::new();
+    for (m, _) in mods.iter().map(|x| (x.0, &x.1)) {
+        if m.name != "var" {
+            continue;
+        }
+        if m.args.is_empty() {
+            return Err(meaning(
+                m.pos,
+                ".var: имя и значение, .var(accent: #6BB8F5)",
+            ));
+        }
+        for a in &m.args {
+            let Some(name) = &a.name else {
+                return Err(meaning(
+                    a.pos,
+                    ".var: имя и значение, .var(accent: #6BB8F5)",
+                ));
+            };
+            let v = ctx.vars.resolve(&a.value, a.pos)?;
+            set.retain(|(n, _)| n != name);
+            set.push((name.clone(), v));
+        }
+    }
+    Ok(ctx.vars.with(set))
+}
+
+fn record(origins: &mut Vec<(String, String)>, name: &str, from: &str) {
+    origins.retain(|(n, _)| n != name);
+    origins.push((name.to_owned(), from.to_owned()));
+}
+
+fn element(node: &Node, ctx: &Ctx<'_>) -> Result<Element, UiError> {
     let kind_name = node.kind.as_str();
     if !KINDS.contains(&kind_name) {
         return Err(unknown(node.pos, "блок", kind_name, KINDS, ""));
@@ -479,7 +609,6 @@ fn element(node: &Node) -> Result<Element, UiError> {
     let mut placement = Placement::default();
     let kind = match kind_name {
         "Column" | "Row" => {
-            container_args(node, &mut placement)?;
             if kind_name == "Column" {
                 Kind::Column
             } else {
@@ -525,19 +654,63 @@ fn element(node: &Node) -> Result<Element, UiError> {
             };
             Kind::Text(TextSpec {
                 text,
-                size: DEFAULT_FONT,
-                color: Color::WHITE,
+                size: ctx.font,
+                color: ctx.color,
             })
         }
         _ => unreachable!("имя проверено выше"),
     };
+    let me = Info {
+        kind: kind_name.to_owned(),
+        classes: classes_of(&node.modifiers)?,
+    };
     let mut el = Element {
         kind,
-        placement,
+        placement: Placement::default(),
         look: Look::default(),
+        font: ctx.font,
+        color: ctx.color,
         children: Vec::new(),
         pos: node.pos,
+        type_name: me.kind.clone(),
+        classes: me.classes.clone(),
+        origins: Vec::new(),
     };
+    // Spacer растягивается, если стиль или сам блок не скажут иначе.
+    el.placement.grow = placement.grow;
+    let (from_styles, own) = styled(ctx, &me, &node.modifiers)?;
+    let vars = own_vars(
+        ctx,
+        &from_styles.iter().chain(own.iter()).collect::<Vec<_>>(),
+    )?;
+    // Лестница: стили, потом значения в скобках у Column/Row, потом свои модификаторы.
+    for (m, from) in &from_styles {
+        apply(&vars.resolve_modifier(m)?, &mut el)?;
+        record(&mut el.origins, &m.name, from);
+    }
+    if matches!(el.kind, Kind::Column | Kind::Row) {
+        let resolved = Node {
+            args: vars.resolve_args(&node.args)?,
+            ..node.clone()
+        };
+        container_args(&resolved, &mut el.placement)?;
+        for a in &node.args {
+            let name = a.name.as_deref().unwrap_or("spacing");
+            record(
+                &mut el.origins,
+                name,
+                &format!("у блока (строка {})", a.pos.line),
+            );
+        }
+    }
+    for (m, from) in &own {
+        apply(&vars.resolve_modifier(m)?, &mut el)?;
+        record(&mut el.origins, &m.name, from);
+    }
+    if let Kind::Text(spec) = &mut el.kind {
+        spec.size = el.font;
+        spec.color = el.color;
+    }
     if let Some(children) = &node.children {
         if matches!(el.kind, Kind::Text(_) | Kind::Spacer) {
             return Err(meaning(
@@ -545,30 +718,28 @@ fn element(node: &Node) -> Result<Element, UiError> {
                 format!("у {kind_name} не бывает вложенных блоков в {{ }}"),
             ));
         }
-        el.children = children.iter().map(element).collect::<Result<_, _>>()?;
-    }
-    for m in &node.modifiers {
-        apply(m, &mut el)?;
+        let mut inner = ctx.clone();
+        inner.vars = vars;
+        inner.font = el.font;
+        inner.color = el.color;
+        inner.ancestors.push(me);
+        el.children = children
+            .iter()
+            .map(|c| element(c, &inner))
+            .collect::<Result<_, _>>()?;
     }
     Ok(el)
 }
 
 /// Экран из объявления: корень — `Stack` на весь экран, модификаторы экрана — у корня.
-pub fn screen(decl: &ScreenDecl) -> Result<Screen, UiError> {
-    let mut root = Element {
-        kind: Kind::Stack,
-        placement: Placement {
-            width: Len::Percent(100.0),
-            height: Len::Percent(100.0),
-            ..Placement::default()
-        },
-        look: Look::default(),
-        children: decl
-            .children
-            .iter()
-            .map(element)
-            .collect::<Result<_, _>>()?,
-        pos: decl.pos,
+/// Корень сопоставляется со стилями по имени экрана: `style MainMenu { ... }`.
+pub fn screen(decl: &ScreenDecl, styles: &StyleSet, vars: &Vars) -> Result<Screen, UiError> {
+    let root_ctx = Ctx {
+        styles,
+        vars: vars.clone(),
+        font: DEFAULT_FONT,
+        color: Color::WHITE,
+        ancestors: Vec::new(),
     };
     for m in &decl.modifiers {
         if matches!(
@@ -580,8 +751,65 @@ pub fn screen(decl: &ScreenDecl) -> Result<Screen, UiError> {
                 format!("экран всегда на весь экран: .{} у него не бывает", m.name),
             ));
         }
-        apply(m, &mut root)?;
     }
+    // Корень — тот же Stack, только с видом «имя экрана» для стилей.
+    let node = Node {
+        kind: "Stack".into(),
+        args: Vec::new(),
+        children: Some(decl.children.clone()),
+        modifiers: decl.modifiers.clone(),
+        pos: decl.pos,
+    };
+    let me = Info {
+        kind: decl.name.clone(),
+        classes: classes_of(&decl.modifiers)?,
+    };
+    let mut root = Element {
+        kind: Kind::Stack,
+        placement: Placement {
+            width: Len::Percent(100.0),
+            height: Len::Percent(100.0),
+            ..Placement::default()
+        },
+        look: Look::default(),
+        font: DEFAULT_FONT,
+        color: Color::WHITE,
+        children: Vec::new(),
+        pos: decl.pos,
+        type_name: decl.name.clone(),
+        classes: me.classes.clone(),
+        origins: Vec::new(),
+    };
+    let (from_styles, own) = styled(&root_ctx, &me, &node.modifiers)?;
+    let vars = own_vars(
+        &root_ctx,
+        &from_styles.iter().chain(own.iter()).collect::<Vec<_>>(),
+    )?;
+    for (m, from) in from_styles.iter().chain(own.iter()) {
+        if matches!(
+            m.name.as_str(),
+            "size" | "width" | "height" | "align" | "anchor"
+        ) {
+            return Err(meaning(
+                m.pos,
+                format!("экран всегда на весь экран: .{} у него не бывает", m.name),
+            ));
+        }
+        apply(&vars.resolve_modifier(m)?, &mut root)?;
+        record(&mut root.origins, &m.name, from);
+    }
+    let inner = Ctx {
+        vars,
+        font: root.font,
+        color: root.color,
+        ancestors: vec![me],
+        ..root_ctx
+    };
+    root.children = decl
+        .children
+        .iter()
+        .map(|c| element(c, &inner))
+        .collect::<Result<_, _>>()?;
     Ok(Screen {
         name: decl.name.clone(),
         kind: decl.kind,
@@ -595,7 +823,12 @@ mod tests {
     use crate::syntax::parse;
 
     fn first(src: &str) -> Result<Screen, UiError> {
-        screen(&parse(src)?.screens[0])
+        let doc = parse(src)?;
+        let mut styles = StyleSet::default();
+        styles.add_rules(&doc.styles, "экран");
+        styles.themes = doc.themes.clone();
+        let vars = styles.theme_vars((!styles.themes.is_empty()).then_some(0))?;
+        screen(&doc.screens[0], &styles, &vars)
     }
 
     #[test]
@@ -647,14 +880,14 @@ mod tests {
             e.contains("строка 2") && e.contains("Может, Column?"),
             "{e}"
         );
-        let e = first("screen A { Rect().font(20) }")
+        let e = first("screen A { Rect().spacing(20) }")
             .unwrap_err()
             .to_string();
-        assert!(e.contains("только у Text"), "{e}");
+        assert!(e.contains("только у Column и Row"), "{e}");
         let e = first("screen A { Rect().background(theme.panel) }")
             .unwrap_err()
             .to_string();
-        assert!(e.contains("шаг И.2"), "{e}");
+        assert!(e.contains("var(имя)"), "{e}");
         let e = first("screen A { Text(\"a\") { Rect() } }")
             .unwrap_err()
             .to_string();

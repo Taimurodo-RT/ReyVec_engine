@@ -197,7 +197,7 @@ struct App {
     gamepads: crate::gamepad::Gamepads,
     /// Игровой интерфейс и настройка клавиш (6.10б).
     game_ui: crate::game_ui::GameUi,
-    /// Экран интерфейса игры из `ui/demo.rui` (И.1), F3.
+    /// Экран интерфейса игры из `ui/demo.rui` (И.1–И.2а): F3 — показать, F4 — тема.
     rui_demo: crate::rui_demo::RuiDemo,
     /// Звук (6.7): звуки событий игры и музыка.
     audio: reyvec_audio::Audio,
@@ -1422,7 +1422,24 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => self.rui_demo.toggle(),
+            } => {
+                // Shift+F3: «откуда взялось» каждое свойство экрана — в лог и консоль (~).
+                if self.modifiers.shift_key() {
+                    self.rui_demo.log_origins();
+                } else {
+                    self.rui_demo.toggle();
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F4),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => self.rui_demo.next_theme(),
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
