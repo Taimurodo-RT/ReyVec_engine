@@ -18,6 +18,7 @@ use reyvec_story::format::{self, Change, Choice, Goal, Stage, Value, VarsFile};
 use reyvec_story::{Character, Dialog, LineSettings, Node, Problem, Quest, Story, View};
 
 use super::dialog_graph::{Around, DialogGraph, KINDS as NODE_KINDS, Speaker};
+use super::story_play::Player;
 use super::theme::*;
 
 /// Через сколько секунд после последней правки заметка сохраняется сама.
@@ -28,6 +29,8 @@ const RIBBON: f32 = 44.0;
 const SIDEBAR: f32 = 260.0;
 /// Правая панель.
 const RIGHTBAR: f32 = 290.0;
+/// Правая панель с проигрывателем шире: в ней лента разговора.
+const PLAYBAR: f32 = 380.0;
 /// Ширина текста посередине (как «читаемая длина строки» Obsidian).
 const READABLE: f32 = 720.0;
 /// Заголовок заметки.
@@ -74,6 +77,7 @@ enum Side {
     Links,
     Outline,
     Problems,
+    Play,
 }
 
 /// Значки, нарисованные линиями.
@@ -117,6 +121,8 @@ pub(crate) struct StoryUi {
     out: Vec<StoryOut>,
     /// Схема карточек диалога (Сю.3).
     graph: DialogGraph,
+    /// Проигрыватель диалога (Сю.4).
+    player: Player,
     /// Диалог показан сценарием, а не схемой.
     script: bool,
 }
@@ -142,6 +148,7 @@ impl Default for StoryUi {
             new_var: (String::new(), 0),
             out: Vec::new(),
             graph: DialogGraph::default(),
+            player: Player::default(),
             script: false,
         }
     }
@@ -293,7 +300,12 @@ impl StoryUi {
             Pos2::new(ribbon.max.x, full.min.y),
             vec2(SIDEBAR, full.height()),
         );
-        let right = Rect::from_min_max(Pos2::new(full.max.x - RIGHTBAR, full.min.y), full.max);
+        let rw = if self.side == Side::Play {
+            PLAYBAR
+        } else {
+            RIGHTBAR
+        };
+        let right = Rect::from_min_max(Pos2::new(full.max.x - rw, full.min.y), full.max);
         let center = Rect::from_min_max(
             Pos2::new(left.max.x, full.min.y),
             Pos2::new(right.min.x, full.max.y),
@@ -747,12 +759,20 @@ impl StoryUi {
     /// Полоса над диалогом: «Схема / Сценарий» и, на схеме, кнопки новых карточек.
     fn dialog_bar(&mut self, ui: &mut Ui, id: &str, now: f64) {
         ui.add_space(GAP_S);
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             ui.add_space(GAP_L);
             for (script, name) in [(false, "Схема"), (true, "Сценарий")] {
                 if ui.selectable_label(self.script == script, name).clicked() {
                     self.script = script;
                 }
+            }
+            if ui
+                .button("▶ Проиграть")
+                .on_hover_text("Пройти диалог как в игре, справа")
+                .clicked()
+            {
+                self.side = Side::Play;
+                self.player.start(&mut self.story, id);
             }
             if self.script {
                 return;
@@ -766,7 +786,15 @@ impl StoryUi {
                 self.graph.arrange(d);
                 self.edited(&Item::Dialog(id.to_string()), now);
             }
-            ui.separator();
+        });
+        if self.script {
+            ui.add_space(GAP_S);
+            return;
+        }
+        ui.add_space(GAP_S);
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(GAP_L);
+            ui.label(RichText::new("Добавить:").color(MUTED).size(FONT_CHIP));
             ui.spacing_mut().button_padding = vec2(GAP_M, 2.0);
             ui.spacing_mut().item_spacing.x = GAP_S;
             let who = self
@@ -810,11 +838,24 @@ impl StoryUi {
         let Some(d) = self.story.dialogs.get_mut(id) else {
             return false;
         };
+        self.graph.playing = self
+            .player
+            .at()
+            .filter(|(dlg, _)| *dlg == id)
+            .map(|(_, n)| n.to_string());
         let around = Around {
             speakers: &speakers,
             dialogs: &dialogs,
         };
         self.graph.draw(ui, d, &around)
+    }
+
+    /// Для снимка вида: проигрыватель справа, разговор дошёл до вариантов.
+    #[cfg(test)]
+    pub(crate) fn preview_play(&mut self, dialog: &str) {
+        self.side = Side::Play;
+        self.player.start(&mut self.story, dialog);
+        self.player.go_on(&mut self.story);
     }
 
     fn tab_bar(&mut self, ui: &mut Ui) {
@@ -1353,6 +1394,7 @@ impl StoryUi {
             for (s, t) in [
                 (Side::Links, "Ссылки".to_string()),
                 (Side::Outline, "Структура".to_string()),
+                (Side::Play, "Проиграть".to_string()),
                 (
                     Side::Problems,
                     if self.problems.is_empty() {
@@ -1454,6 +1496,13 @@ impl StoryUi {
                             ui.label(RichText::new(kind).color(MUTED).size(FONT_SMALL));
                         });
                     }
+                }
+                Side::Play => {
+                    let dialog = match &item {
+                        Item::Dialog(id) => Some(id.as_str()),
+                        _ => None,
+                    };
+                    self.player.show(ui, &mut self.story, dialog);
                 }
                 Side::Problems => {
                     if self.problems.is_empty() {
@@ -1812,7 +1861,7 @@ fn title_or_id(title: &str, id: &str) -> String {
     }
 }
 
-fn lang_name(code: &str) -> String {
+pub(super) fn lang_name(code: &str) -> String {
     match code {
         "en" => "Английский".into(),
         "ru" => "Русский".into(),
@@ -1834,18 +1883,18 @@ fn change_text(c: &Change) -> String {
     }
 }
 
-fn value_text(v: &Value) -> String {
+pub(super) fn value_text(v: &Value) -> String {
     match v {
         Value::Text(t) => format!("\"{t}\""),
         other => other.show(),
     }
 }
 
-fn args_text(args: &[Value]) -> String {
+pub(super) fn args_text(args: &[Value]) -> String {
     args.iter().map(value_text).collect::<Vec<_>>().join(", ")
 }
 
-fn parse_hex(s: &str) -> Option<Color32> {
+pub(super) fn parse_hex(s: &str) -> Option<Color32> {
     let h = s.trim().strip_prefix('#')?;
     if h.len() != 6 {
         return None;
@@ -1880,7 +1929,7 @@ fn convert(v: &Value, kind: usize) -> Value {
 
 // ---- Кусочки вида.
 
-fn value_edit(ui: &mut Ui, v: &mut Value, salt: &str) -> bool {
+pub(super) fn value_edit(ui: &mut Ui, v: &mut Value, salt: &str) -> bool {
     match v {
         Value::Bool(b) => ui.checkbox(b, if *b { "да" } else { "нет" }).changed(),
         Value::Int(i) => ui.add(egui::DragValue::new(i).speed(0.2)).changed(),
@@ -1921,11 +1970,11 @@ fn h2(ui: &mut Ui, text: &str) -> egui::Response {
     ui.label(RichText::new(text).size(FONT_H2).color(TEXT).strong())
 }
 
-fn caption(ui: &mut Ui, text: &str) {
+pub(super) fn caption(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(FONT_SMALL).color(MUTED).strong());
 }
 
-fn muted(ui: &mut Ui, text: &str) {
+pub(super) fn muted(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).color(MUTED).size(FONT_BODY));
 }
 
