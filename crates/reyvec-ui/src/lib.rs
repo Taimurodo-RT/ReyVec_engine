@@ -28,6 +28,7 @@
 //! Единицы: пиксели экрана 1920×1080. На другом окне всё умножается на высоту / 1080,
 //! поэтому экран выглядит одинаково на любом размере.
 
+pub mod data;
 pub mod lang;
 pub mod model;
 pub mod style;
@@ -39,6 +40,7 @@ use reyvec_text::{GlyphAtlas, TextBlock, TextLibrary};
 use reyvec_vector::{Color, TextId};
 use taffy::prelude::*;
 
+pub use data::UiData;
 pub use lang::Texts;
 use model::{Edge, Element, Justify, Kind, Len};
 pub use syntax::Pos;
@@ -170,8 +172,11 @@ pub struct UiScreen {
     focus: Option<Vec<usize>>,
     /// Состояния поменялись: вид блоков пересчитать перед рисованием.
     restyle: bool,
-    /// Окно, язык и способ ввода для `.when(…)`.
+    /// Окно, язык, способ ввода и данные игры для `.when(…)` и живых значений.
     env: model::Env,
+    /// Ошибка последнего пересчёта по данным игры (нет такого пути, формула не
+    /// считается). Экран при этом показывает прежний вид.
+    problem: Option<UiError>,
 }
 
 impl UiScreen {
@@ -325,6 +330,7 @@ impl UiScreen {
             focus: None,
             restyle: false,
             env: model::Env::default(),
+            problem: None,
         };
         let first = (!ui.styles.themes.is_empty()).then_some(0);
         ui.rebuild(first)?;
@@ -545,13 +551,26 @@ impl UiScreen {
                 }
             }
         }
-        // Модификаторы проверены при сборке: ошибки здесь не бывает.
-        let _ = model::restyle(
+        // Модификаторы проверены при сборке; ошибка бывает только от данных игры.
+        let done = model::restyle(
             &mut screen.root,
             model::DEFAULT_FONT,
             Color::WHITE,
             0,
             &self.env,
+        );
+        self.problem = done.err();
+        // Живые тексты: раскладываются заново только поменявшиеся.
+        let first: usize = self.screens[..self.current]
+            .iter()
+            .map(|s| count_text(&s.root))
+            .sum();
+        let mut next = first;
+        sync_text(
+            &self.screens[self.current].root,
+            &mut self.text,
+            &self.text_ids,
+            &mut next,
         );
         self.fresh = false;
     }
@@ -594,7 +613,40 @@ impl UiScreen {
     /// Номер сборки: меняется, когда экраны собраны заново (другая тема) — тогда
     /// видеокарте нужен новый атлас букв.
     pub fn generation(&self) -> u64 {
-        self.generation
+        // Новые буквы живых текстов тоже попадают в атлас.
+        (self.generation << 32) ^ self.text.revision()
+    }
+
+    /// Число из игры по пути `game.…`: `Bar(game.hero.hp / game.hero.hp_max)`.
+    pub fn set_number(&mut self, path: &str, v: f64) {
+        if self.env.data.set_number(path, v) {
+            self.restyle = true;
+        }
+    }
+
+    /// Строка из игры по пути.
+    pub fn set_text(&mut self, path: &str, v: &str) {
+        if self.env.data.set_text(path, v) {
+            self.restyle = true;
+        }
+    }
+
+    /// Да или нет из игры по пути: `.when(game.hero.hurt) { … }`.
+    pub fn set_flag(&mut self, path: &str, v: bool) {
+        if self.env.data.set_flag(path, v) {
+            self.restyle = true;
+        }
+    }
+
+    /// Данные игры, которые видит экран.
+    pub fn data(&self) -> &UiData {
+        &self.env.data
+    }
+
+    /// Ошибка последнего пересчёта по данным игры: путь, которого игра не даёт, или
+    /// формула, которая не считается. `None` — всё хорошо.
+    pub fn problem(&self) -> Option<&UiError> {
+        self.problem.as_ref()
     }
 
     /// «Откуда взялось»: дерево текущего экрана, у каждого блока — его свойства и
@@ -734,6 +786,10 @@ impl UiScreen {
         path: &mut Vec<usize>,
         out: &mut UiDraw,
     ) {
+        if !el.placement.visible {
+            *next_text += count_text(el);
+            return;
+        }
         let Ok(layout) = tree.layout(node) else {
             return;
         };
@@ -761,6 +817,22 @@ impl UiScreen {
                     radius: el.look.radius * scale,
                     border: border.0,
                     border_color: border.1,
+                },
+            });
+        }
+        if let (Kind::Bar, Some(fill)) = (&el.kind, el.look.fill)
+            && el.look.value > 0.0
+            && w > 0.0
+            && h > 0.0
+        {
+            let r = [x, y, x + w * el.look.value, y + h];
+            out.quads.push(UiQuad {
+                rect: r.map(|v| v * scale),
+                color: faded(fill, opacity),
+                kind: QuadKind::Block {
+                    radius: el.look.radius.min(w * el.look.value * 0.5) * scale,
+                    border: 0.0,
+                    border_color: [0.0; 4],
                 },
             });
         }
@@ -855,12 +927,27 @@ fn faded(c: Color, opacity: f32) -> [f32; 4] {
     [c.r, c.g, c.b, c.a * opacity]
 }
 
+// Цвет букв берётся из элемента при рисовании, поэтому в блоке текста его нет: смена
+// цвета при наведении не раскладывает текст заново.
 fn collect_text(el: &Element, text: &mut TextLibrary, ids: &mut Vec<TextId>) {
     if let Kind::Text(spec) = &el.kind {
-        ids.push(text.add(TextBlock::new(spec.text.clone(), spec.size).color(spec.color)));
+        ids.push(text.add(TextBlock::new(spec.text.clone(), spec.size)));
     }
     for c in &el.children {
         collect_text(c, text, ids);
+    }
+}
+
+/// Отдаёт библиотеке поменявшиеся тексты (`TextLibrary::set` сам пропускает прежние).
+fn sync_text(el: &Element, text: &mut TextLibrary, ids: &[TextId], next: &mut usize) {
+    if let Kind::Text(spec) = &el.kind {
+        if let Some(id) = ids.get(*next) {
+            text.set(*id, TextBlock::new(spec.text.clone(), spec.size));
+        }
+        *next += 1;
+    }
+    for c in &el.children {
+        sync_text(c, text, ids, next);
     }
 }
 
@@ -982,10 +1069,16 @@ fn build(
         Kind::Text(_) => {
             let index = *next_text;
             *next_text += 1;
+            if !p.visible {
+                style.display = Display::None;
+            }
             return tree.new_leaf_with_context(style, index);
         }
-        Kind::Spacer => None,
+        Kind::Spacer | Kind::Bar => None,
     };
+    if !p.visible {
+        style.display = Display::None;
+    }
     let mut children = Vec::with_capacity(el.children.len());
     for c in &el.children {
         children.push(build(tree, c, me, next_text)?);
@@ -1643,5 +1736,57 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("с именем"), "{e}");
+    }
+
+    #[test]
+    fn bar_text_and_conditions_follow_game_data() {
+        let mut ui = UiScreen::parse(
+            r##"screen Hud {
+                Column(spacing: 4) {
+                    Bar(game.hero.hp / game.hero.hp_max)
+                        .size(200, 10).background(#101010).fill(#E04040)
+                        .when(game.hero.hp < 2) { .fill(#FF0000) }
+                    Text("Монеты: \(game.hero.coins)")
+                    Text(tr("coins", n: game.hero.coins * 2))
+                    Rect().size(10).background(#202020).visible(game.hero.hp > 0)
+                }.align(top_left)
+            }"##,
+        )
+        .unwrap();
+        ui.set_texts(texts()).unwrap();
+        ui.set_number("game.hero.hp", 3.0);
+        ui.set_number("game.hero.hp_max", 4.0);
+        ui.set_number("game.hero.coins", 7.0);
+        let fill = |ui: &mut UiScreen| {
+            let d = ui.draw([1920.0, 1080.0]);
+            let b = blocks(d);
+            (b[1].rect[2] - b[1].rect[0], b[1].color, b.len())
+        };
+        ui.draw([1920.0, 1080.0]);
+        assert!(ui.problem().is_none(), "{:?}", ui.problem());
+        let (w, c, n) = fill(&mut ui);
+        assert!((w - 150.0).abs() < 0.5, "{w}");
+        assert!(c[1] > 0.01, "обычный цвет: {c:?}");
+        assert_eq!(n, 3, "фон полоски, заполнение и квадрат");
+        assert_eq!(label(&ui, &[0, 1]), "Монеты: 7");
+        assert_eq!(label(&ui, &[0, 2]), "Монеты: 14");
+        let before = ui.generation();
+        ui.set_number("game.hero.hp", 1.0);
+        ui.set_number("game.hero.coins", 12.0);
+        let (w, c, _) = fill(&mut ui);
+        assert!((w - 50.0).abs() < 0.5, "{w}");
+        assert!(c[1] < 0.001, "мало здоровья — красная: {c:?}");
+        assert_eq!(label(&ui, &[0, 1]), "Монеты: 12");
+        assert_ne!(ui.generation(), before, "новые буквы — новый атлас");
+        ui.set_number("game.hero.hp", 0.0);
+        let n = blocks(ui.draw([1920.0, 1080.0])).len();
+        assert_eq!(n, 1, "пустая полоска без заполнения, квадрат спрятан");
+        assert!(ui.problem().is_none());
+        // Опечатка в пути видна, когда игра дала данные.
+        let mut bad = UiScreen::parse("screen S { Bar(game.hero.hpp) }").unwrap();
+        bad.set_number("game.hero.hp", 1.0);
+        bad.draw([1920.0, 1080.0]);
+        let e = bad.problem().unwrap().to_string();
+        assert!(e.contains("Может, game.hero.hp?"), "{e}");
     }
 }

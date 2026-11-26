@@ -49,8 +49,11 @@ pub enum Value {
     Name(String),
     /// Вызов: `tr("menu.title")`, `image("...")`, `var(accent)`.
     Call(String, Vec<Arg>),
-    /// Формула: `var(gap) * 2`, `100% - 32`. Знак: `+`, `-`, `*`, `/`.
+    /// Формула: `var(gap) * 2`, `100% - 32`. Знак: `+`, `-`, `*`, `/`; сравнения `<`,
+    /// `>`, `≤`, `≥`, `=` (`==`) и `≠` (`!=`).
     Op(Box<Value>, char, Box<Value>),
+    /// Выбор: `game.hero.hp < 2 ? var(danger) : var(accent)`.
+    If(Box<Value>, Box<Value>, Box<Value>),
 }
 
 impl Value {
@@ -64,6 +67,7 @@ impl Value {
             Value::Name(_) => "имя",
             Value::Call(..) => "вызов",
             Value::Op(..) => "формула",
+            Value::If(..) => "выбор ? :",
         }
     }
 }
@@ -207,6 +211,10 @@ enum Tok {
     Slash,
     /// Сравнение для `.when`: `<`, `>`, `≤` (`<=`), `≥` (`>=`).
     Cmp(char),
+    /// `?` в выборе `a ? b : c`.
+    Question,
+    /// Строка со вставками `"Монеты: \(game.hero.coins)"`: куски и значения.
+    Interp(Vec<Arg>),
     Eof,
 }
 
@@ -231,8 +239,49 @@ impl Tok {
             Tok::Star => "«*»".into(),
             Tok::Slash => "«/»".into(),
             Tok::Cmp(c) => format!("«{c}»"),
+            Tok::Question => "«?»".into(),
+            Tok::Interp(_) => "строка".into(),
             Tok::Eof => "конец файла".into(),
         }
+    }
+}
+
+/// Значение вставки `\(…)` в строке; места — от начала вставки в файле.
+fn inserted(src: &str, at: Pos, file: u16) -> Result<Value, UiError> {
+    let shift = |p: Pos| Pos {
+        line: at.line + p.line - 1,
+        column: if p.line == 1 {
+            at.column + 1 + p.column
+        } else {
+            p.column
+        },
+        file,
+    };
+    let toks = lex(src, file)
+        .map_err(|e| match e {
+            UiError::Syntax { pos, message } => UiError::Syntax {
+                pos: shift(pos),
+                message,
+            },
+            other => other,
+        })?
+        .into_iter()
+        .map(|(t, p)| (t, shift(p)))
+        .collect();
+    let mut p = Parser { toks, at: 0 };
+    if *p.peek() == Tok::Eof {
+        return Err(UiError::Syntax {
+            pos: at,
+            message: "пустая вставка \\(): внутри пишется значение, \\(game.hero.coins)".into(),
+        });
+    }
+    let v = p.value()?;
+    match p.next() {
+        (Tok::Eof, _) => Ok(v),
+        (t, pos) => Err(UiError::Syntax {
+            pos,
+            message: format!("во вставке \\(…) одно значение, а дальше {}", t.describe()),
+        }),
     }
 }
 
@@ -273,6 +322,14 @@ fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
                     i += 1;
                 }
             }
+            '=' | '!' if chars.get(i + 1) == Some(&'=') => {
+                out.push((Tok::Cmp(if c == '=' { '=' } else { '≠' }), pos));
+                step(2, &mut i, &mut col);
+            }
+            '?' => {
+                out.push((Tok::Question, pos));
+                step(1, &mut i, &mut col);
+            }
             '(' | ')' | '{' | '}' | ',' | ':' | '=' | '+' | '*' | '/' => {
                 out.push((
                     match c {
@@ -297,6 +354,8 @@ fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
             }
             '"' => {
                 let mut text = String::new();
+                // Вставки `\(…)`: куски строки и значения по порядку.
+                let mut parts: Vec<Arg> = Vec::new();
                 i += 1;
                 col += 1;
                 loop {
@@ -308,6 +367,49 @@ fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
                             i += 1;
                             col += 1;
                             break;
+                        }
+                        Some('\\') if chars.get(i + 1) == Some(&'(') => {
+                            let at = Pos {
+                                line,
+                                column: col,
+                                file,
+                            };
+                            let start = i + 2;
+                            let mut depth = 1;
+                            let mut end = start;
+                            while end < chars.len() && chars[end] != '\n' {
+                                match chars[end] {
+                                    '(' => depth += 1,
+                                    ')' => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                end += 1;
+                            }
+                            if depth != 0 {
+                                return Err(err(at, "вставка \\( в строке не закрыта «)»".into()));
+                            }
+                            let inner: String = chars[start..end].iter().collect();
+                            let value = inserted(&inner, at, file)?;
+                            if !text.is_empty() {
+                                parts.push(Arg {
+                                    name: None,
+                                    value: Value::Text(std::mem::take(&mut text)),
+                                    pos: at,
+                                });
+                            }
+                            parts.push(Arg {
+                                name: None,
+                                value,
+                                pos: at,
+                            });
+                            let n = end + 1 - i;
+                            i += n;
+                            col += n as u32;
                         }
                         Some('\\') => {
                             let e = chars.get(i + 1).copied();
@@ -322,7 +424,7 @@ fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
                                             column: col,
                                             file,
                                         },
-                                        "в строке после \\ бывает только n, \" или \\".into(),
+                                        "в строке после \\ бывает только n, \", \\ или вставка \\(…)".into(),
                                     ));
                                 }
                             });
@@ -336,7 +438,18 @@ fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
                         }
                     }
                 }
-                out.push((Tok::Text(text), pos));
+                if parts.is_empty() {
+                    out.push((Tok::Text(text), pos));
+                } else {
+                    if !text.is_empty() {
+                        parts.push(Arg {
+                            name: None,
+                            value: Value::Text(text),
+                            pos,
+                        });
+                    }
+                    out.push((Tok::Interp(parts), pos));
+                }
             }
             '#' => {
                 let start = i + 1;
@@ -847,11 +960,18 @@ impl Parser {
 
     /// Значение с формулой и, для `.when`, сравнением: `width < 1280`.
     fn value(&mut self) -> Result<Value, UiError> {
-        let left = self.sum()?;
+        let mut left = self.sum()?;
         if let Tok::Cmp(op) = *self.peek() {
             self.next();
             let right = self.sum()?;
-            return Ok(Value::Op(Box::new(left), op, Box::new(right)));
+            left = Value::Op(Box::new(left), op, Box::new(right));
+        }
+        if *self.peek() == Tok::Question {
+            self.next();
+            let yes = self.value()?;
+            self.expect(Tok::Colon, "«:» между вариантами выбора, a ? b : c")?;
+            let no = self.value()?;
+            return Ok(Value::If(Box::new(left), Box::new(yes), Box::new(no)));
         }
         Ok(left)
     }
@@ -890,6 +1010,7 @@ impl Parser {
             (Tok::Number(n), _) => Ok(Value::Number(n)),
             (Tok::Percent(n), _) => Ok(Value::Percent(n)),
             (Tok::Text(s), _) => Ok(Value::Text(s)),
+            (Tok::Interp(parts), _) => Ok(Value::Call("text".into(), parts)),
             (Tok::Color(c), _) => Ok(Value::Color(c)),
             (Tok::Ident(first), _) => {
                 let mut path = first;

@@ -789,6 +789,7 @@ impl App {
                 Vec::new()
             },
         };
+        self.game_ui.file_hud = self.rui_demo.hud_ready();
         let game_ui = &mut self.game_ui;
         let in_game = renderer.scene() == DemoScene::File;
         let ui = self.panel.as_mut().and_then(|panel| {
@@ -895,7 +896,21 @@ impl App {
         let ui_size = renderer
             .view_rect()
             .map_or([size.width, size.height], |r| [r[2], r[3]]);
-        let rui = self.rui_demo.frame([ui_size[0] as f32, ui_size[1] as f32]);
+        // Полоска здоровья (И.3а) читает героя из сцены, как старая на egui.
+        let hero =
+            game_view
+                .player
+                .as_ref()
+                .filter(|_| in_game)
+                .map(|p| crate::rui_demo::HeroData {
+                    hp: p.hp,
+                    hp_max: p.max_hp,
+                    coins: self.game_ui.coins(),
+                    hurt: p.invulnerable,
+                });
+        let rui = self
+            .rui_demo
+            .frame([ui_size[0] as f32, ui_size[1] as f32], hero);
         if let Err(e) = renderer.set_game_ui(rui) {
             tracing::warn!("интерфейс игры не загрузился на видеокарту: {e}");
         }

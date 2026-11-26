@@ -1,4 +1,4 @@
-// Темы примера (шаги И.2а–И.2б): каждая — набор переменных. В песочнице F4 меняет тему.
+// Темы примера (шаги И.2а–И.3а): каждая — набор переменных. В песочнице F4 меняет тему.
 // Переменная читается в стилях и экранах как var(имя).
 
 theme Forge {
@@ -12,6 +12,8 @@ theme Forge {
     muted     = #9AA3B5
     danger    = #E5484D
     stamina   = #7FD36B
+    health    = #E0473F       // полоска здоровья (ui/hud.rui)
+    coin      = #FFCD46
     radius    = 10
     gap       = 14
     gap_big   = var(gap) * 2
@@ -28,6 +30,8 @@ theme Ice {
     muted     = #8FB3CC
     danger    = #FF6B8A
     stamina   = #5FE0D0
+    health    = #FF6B8A
+    coin      = #FFE27A
     radius    = 4
     gap       = 10
     gap_big   = var(gap) * 2
