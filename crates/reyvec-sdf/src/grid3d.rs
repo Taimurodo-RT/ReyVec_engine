@@ -35,6 +35,16 @@ const TARGET_CELLS: f32 = 2048.0;
 pub const MAX_CELLS: usize = 131072;
 /// Предел клеток с шарами (как до 8.8а, для сравнения на панели).
 pub const SPHERE_MAX_CELLS: usize = 32768;
+/// Мелкая сетка ([`Grid::fine`]) — не больше стольких клеток…
+pub const FINE_MAX_CELLS: usize = 98304;
+/// …и её клетка мельче клетки крупной не больше чем во столько раз (мельче — шаг луча
+/// в пустоте между предметами короче, и шагов становится больше, чем экономит список).
+const FINE_MAX_SPLIT: f32 = 4.0;
+/// Клетка крупной сетки «тесная», если в её списке не меньше стольких неподвижных
+/// предметов: по тесным клеткам выбирается место мелкой сетки.
+const FINE_BUSY: u32 = 4;
+/// Мелкая сетка строится, если тесных клеток набралось на столько пар (клетка, предмет).
+const FINE_MIN_PAIRS: u32 = 256;
 /// Клетка не мельче 25 см: мельче — длинные списки соседей и лишняя память.
 const MIN_CELL: f32 = 0.25;
 
@@ -85,6 +95,14 @@ struct CacheKey {
     squared: bool,
 }
 
+/// Место мелкой сетки: угол, размер клетки и число клеток по осям.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FineBox {
+    origin: Vec3,
+    cell: f32,
+    dims: [u32; 3],
+}
+
 /// Сетка прошлых кадров для [`Grid::build_cached`] (8.8б): вклад объектов, которые не
 /// двигаются, — их пары (клетка, объект) и свободное расстояние от них.
 #[derive(Clone, Debug, Default)]
@@ -95,6 +113,10 @@ pub struct GridCache {
     base_bounds: Vec<Bound>,
     base_pairs: Vec<(u32, u32)>,
     base_free: Vec<f32>,
+    /// Где лежит мелкая сетка ([`Grid::fine`]): выбирается по неподвижному вместе с ним.
+    fine_box: Option<FineBox>,
+    /// Готовое для мелкой сетки (то же, что здесь, но в её клетках).
+    fine: Option<Box<GridCache>>,
     /// Сколько раз неподвижное пересчитывалось (для тестов и счётчиков).
     pub rebuilds: usize,
     /// Сколько объектов посчитано заново в последнем кадре.
@@ -255,6 +277,12 @@ pub struct Grid {
     pub field: Option<u32>,
     /// Отсеивать предметы и по коробке ([`GridOptions::object_boxes`]).
     pub object_boxes: bool,
+    /// Мелкая сетка поверх тесной части крупной (8.10б): точка внутри её коробки берёт
+    /// клетку и список из неё, остальные — из крупной. В городе на 800 м с холмами клетка
+    /// крупной сетки — 11 м, и у земли в её списках по 10–25 предметов; мелкая (клетка в
+    /// 2–4 раза меньше, только там, где тесно) оставляет в списке 2–4. Бесконечные
+    /// объекты и поле уровня у неё те же, что у крупной (свои пусты).
+    pub fine: Option<Box<Grid>>,
 }
 
 impl Grid {
@@ -292,6 +320,40 @@ impl Grid {
             cache.clear();
             return grid;
         }
+        let rebuilt = grid.fill_cached(&bounds, options, cache);
+        if rebuilt {
+            cache.fine_box = options
+                .boxes
+                .then(|| grid.dense_box(&cache.base_pairs, &cache.base_bounds))
+                .flatten();
+            cache.fine = None;
+        }
+        if let Some(place) = cache.fine_box {
+            let mut fine = Grid {
+                origin: place.origin,
+                cell: place.cell,
+                dims: place.dims,
+                margin: place.cell,
+                inner_lo: grid.inner_lo,
+                inner_hi: grid.inner_hi,
+                object_boxes: grid.object_boxes,
+                ..Grid::default()
+            };
+            fine.fill_cached(&bounds, options, cache.fine.get_or_insert_default());
+            grid.fine = Some(Box::new(fine));
+        }
+        grid
+    }
+
+    /// Списки и свободное расстояние клеток готовой по размерам сетки; вклад неподвижного
+    /// берётся из `cache` или считается и запоминается (тогда ответ `true`).
+    fn fill_cached(
+        &mut self,
+        bounds: &[Bound],
+        options: GridOptions,
+        cache: &mut GridCache,
+    ) -> bool {
+        let grid = self;
         // У коробок (радиус 0) свободное расстояние хранится квадратом: без корня в каждой
         // клетке, корень — в конце, один на клетку.
         let squared = bounds.iter().all(|b| b.r == 0.0);
@@ -307,7 +369,7 @@ impl Grid {
         let still = unchanged.iter().filter(|&&u| u).count();
         // Готовое подходит, если неподвижное то же (номера могли сдвинуться: отсев по
         // взгляду убрал или вернул объект перед ним).
-        let reuse = cache.key == Some(key) && still == cache.base.len() && cache.relocate(&bounds);
+        let reuse = cache.key == Some(key) && still == cache.base.len() && cache.relocate(bounds);
         if !reuse {
             // Неподвижное — то, что не изменилось с прошлого кадра; его вклад считается
             // сейчас и дальше берётся готовым, пока оно не сдвинется.
@@ -346,7 +408,66 @@ impl Grid {
         }
         cache.moved = rest.len();
         cache.key = Some(key);
-        grid
+        !reuse
+    }
+
+    /// Где строить мелкую сетку: коробка вокруг почти всех неподвижных предметов из
+    /// «тесных» клеток этой (крупной) — клеток, у которых в списке `pairs` не меньше
+    /// [`FINE_BUSY`] предметов. По каждой оси отбрасывается по сотой доле предметов с
+    /// краёв: одинокий тесный угол вдали не растягивает коробку. Клетка — чтобы клеток
+    /// вышло около [`FINE_MAX_CELLS`], но не мельче крупной в [`FINE_MAX_SPLIT`] раз.
+    /// `None` — тесных клеток мало или мелкая сетка не вышла бы заметно мельче.
+    fn dense_box(&self, pairs: &[(u32, u32)], bounds: &[Bound]) -> Option<FineBox> {
+        let mut counts = vec![0u32; self.cells_len()];
+        for &(k, _) in pairs {
+            counts[k as usize] += 1;
+        }
+        // Предметы тесных клеток (пары идут по порядку предметов, границы — тоже).
+        let mut busy: Vec<&Bound> = Vec::new();
+        let mut total = 0u32;
+        let mut b = 0;
+        for &(k, i) in pairs {
+            if counts[k as usize] < FINE_BUSY {
+                continue;
+            }
+            total += 1;
+            while bounds[b].index != i {
+                b += 1;
+            }
+            if busy.last().is_none_or(|last| last.index != i) {
+                busy.push(&bounds[b]);
+            }
+        }
+        if total < FINE_MIN_PAIRS || busy.len() < 16 {
+            return None;
+        }
+        let cut = busy.len() / 100;
+        let mut lo = Vec3::ZERO;
+        let mut hi = Vec3::ZERO;
+        let mut edge: Vec<f32> = Vec::with_capacity(busy.len());
+        for axis in 0..3 {
+            edge.clear();
+            edge.extend(busy.iter().map(|b| b.lo[axis] - b.r));
+            lo[axis] = *edge.select_nth_unstable_by(cut, f32::total_cmp).1;
+            edge.clear();
+            edge.extend(busy.iter().map(|b| b.hi[axis] + b.r));
+            let last = busy.len() - 1 - cut;
+            hi[axis] = *edge.select_nth_unstable_by(last, f32::total_cmp).1;
+        }
+        let size = (hi - lo).max(Vec3::splat(MIN_CELL));
+        let cell = ((size.x * size.y * size.z) / FINE_MAX_CELLS as f32)
+            .cbrt()
+            .max(self.cell / FINE_MAX_SPLIT)
+            .max(MIN_CELL);
+        if cell * 1.5 > self.cell {
+            return None;
+        }
+        let dims = (size / cell).ceil();
+        Some(FineBox {
+            origin: lo,
+            cell,
+            dims: [dims.x as u32, dims.y as u32, dims.z as u32],
+        })
     }
 
     /// Сетка без свободного расстояния: шаг в пустоте начинается с `margin`, как до
@@ -354,6 +475,9 @@ impl Grid {
     pub fn clear_free(&mut self) {
         for c in &mut self.cells {
             c.free_mm = 0;
+        }
+        if let Some(fine) = &mut self.fine {
+            fine.clear_free();
         }
     }
 
@@ -603,14 +727,20 @@ impl Grid {
 
     /// Слов в раскладке для видеокарты ([`Grid::write`]).
     pub fn words(&self) -> usize {
-        GRID_HEADER_WORDS + self.cells.len() * CELL_WORDS + self.items.len() + self.unbounded.len()
+        GRID_HEADER_WORDS
+            + self.cells.len() * CELL_WORDS
+            + self.items.len()
+            + self.unbounded.len()
+            + self.fine.as_ref().map_or(0, |f| f.words())
     }
 
     /// Раскладка для видеокарты, начиная со слова `at` буфера сцены:
     ///
     /// - заголовок, 20 слов: угол сетки (3 числа), размер клетки, клеток по осям
     ///   (3 целых), margin, коробка шаров (6 чисел), где клетки, где списки, где и
-    ///   сколько бесконечных объектов, сколько из них не плоскости, 1 запасное;
+    ///   сколько бесконечных объектов, сколько из них не плоскости, где заголовок мелкой
+    ///   сетки ([`Grid::fine`], 0 — нет; у неё раскладка та же, читаются из неё только
+    ///   угол, размер клетки, число клеток, margin и клетки);
     /// - клетки по 2 слова: начало списка (номер слова в буфере) и длина в младших
     ///   16 битах, свободное расстояние в миллиметрах ([`Cell::free_mm`]) в старших;
     ///   клетка (x, y, z) — номер (z · ny + y) · nx + x;
@@ -631,7 +761,10 @@ impl Grid {
             unbounded_at as u32,
             self.unbounded.len() as u32,
             self.unbounded_solid as u32,
-            0,
+            // Где заголовок мелкой сетки (0 — её нет): сразу за этой.
+            self.fine
+                .as_ref()
+                .map_or(0, |_| (unbounded_at + self.unbounded.len()) as u32),
         ]);
         for c in &self.cells {
             debug_assert!(c.count < 1 << 16);
@@ -642,6 +775,10 @@ impl Grid {
         }
         out.extend(&self.items);
         out.extend(&self.unbounded);
+        if let Some(fine) = &self.fine {
+            let at = out.len();
+            fine.write(at, out);
+        }
     }
 
     /// Клетка точки `p` или `None`, если точка вне сетки.
@@ -683,11 +820,16 @@ impl Grid {
                 list = one;
             }
         } else if !self.cells.is_empty() {
-            match self.cell_at(p) {
-                Some(c) => {
-                    let cell = self.cells[c];
-                    list = &self.items[cell.start as usize..(cell.start + cell.count) as usize];
-                    pick.distance = self.start(c);
+            // Как в шейдере: внутри коробки мелкой сетки клетка и список — её.
+            let fine = self
+                .fine
+                .as_deref()
+                .and_then(|f| f.cell_at(p).map(|c| (f, c)));
+            match fine.or_else(|| self.cell_at(p).map(|c| (self, c))) {
+                Some((grid, c)) => {
+                    let cell = grid.cells[c];
+                    list = &grid.items[cell.start as usize..(cell.start + cell.count) as usize];
+                    pick.distance = grid.start(c);
                 }
                 None => {
                     pick.distance = (p - p.clamp(self.inner_lo, self.inner_hi)).length();
@@ -1018,7 +1160,7 @@ mod tests {
             boxes.2,
             spheres.2
         );
-        // Сетка не съедает буфер кадра (MAX_WORDS = 1М слов).
+        // Сетка не съедает буфер кадра (MAX_WORDS = 2М слов).
         assert!(boxes.4 < 400_000, "сетка {} слов", boxes.4);
         check(&objects);
         for options in BOTH {
@@ -1088,6 +1230,144 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Предметы города «большой мир» — как на видеокарте, с флагами неподвижности.
+    fn world(time: f32) -> Vec<Program> {
+        let scene = crate::SpaceScene::parse(include_str!("../../../scenes/3d/world.ron")).unwrap();
+        let f = scene.frame(time);
+        f.shapes
+            .iter()
+            .zip(&f.still)
+            .map(|(s, &still)| Program {
+                still,
+                ..compile(s).unwrap()
+            })
+            .collect()
+    }
+
+    /// Мелкая сетка (8.10б): в городе на 800 м с холмами она ложится на город (а не на
+    /// холмы и небо), её клетка в разы мельче, списки у земли короче в разы, и ответ по
+    /// ней так же никогда не больше правды. Слова для видеокарты читаются так же, как
+    /// считает зеркало; сетка с готовым неподвижным та же, что посчитанная целиком.
+    #[test]
+    fn fine_grid_covers_the_town() {
+        let objects = world(1.0);
+        let grid = build(&objects, GridOptions::default());
+        let fine = grid.fine.as_deref().expect("у города есть мелкая сетка");
+        assert!(fine.cells.len() <= FINE_MAX_CELLS + FINE_MAX_CELLS / 8);
+        assert!(fine.cell * 3.0 < grid.cell, "{} и {}", fine.cell, grid.cell);
+        let size = fine.cell * Vec3::from(fine.dims.map(|d| d as f32));
+        assert!(
+            size.y < 20.0,
+            "мелкая сетка по высоте домов, а не холмов: {size}"
+        );
+        assert!(size.x > 300.0 && size.z > 300.0, "весь город: {size}");
+        // Точки у земли в городе: длина списка в мелкой сетке и в крупной.
+        let mut seed = 777u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let (mut coarse_sum, mut fine_sum) = (0u64, 0u64);
+        for _ in 0..20000 {
+            let p = fine.origin + Vec3::new(rnd(), rnd(), rnd()) * size;
+            let (Some(a), Some(b)) = (grid.cell_at(p), fine.cell_at(p)) else {
+                continue;
+            };
+            coarse_sum += u64::from(grid.cells[a].count);
+            fine_sum += u64::from(fine.cells[b].count);
+            let truth = exact(&objects, p);
+            let (d, m) = grid.near(&objects, p, 1e9);
+            assert!(d <= truth + 1e-4, "{p}: сетка {d}, правда {truth}");
+            if truth < 0.2 {
+                assert!((d - truth).abs() < 1e-4, "{p}: сетка {d}, правда {truth}");
+                assert!(m.is_some());
+            }
+        }
+        println!("в списке у земли: крупная {coarse_sum}, мелкая {fine_sum}");
+        assert!(fine_sum * 3 < coarse_sum, "{fine_sum} и {coarse_sum}");
+        // Свободное расстояние клеток мелкой сетки — по тем же правилам (на выборку).
+        let [nx, ny, _] = fine.dims.map(|d| d as usize);
+        for k in (0..fine.cells.len()).step_by(997) {
+            let c = fine.cells[k];
+            let (x, y, z) = (k % nx, (k / nx) % ny, k / (nx * ny));
+            let lo = fine.origin + Vec3::new(x as f32, y as f32, z as f32) * fine.cell;
+            let hi = lo + fine.cell;
+            let listed = &fine.items[c.start as usize..(c.start + c.count) as usize];
+            let brute = objects
+                .iter()
+                .enumerate()
+                .filter(|(i, o)| o.bounds.is_some() && !listed.contains(&(*i as u32)))
+                .filter_map(|(_, o)| o.bounds_box)
+                .map(|(blo, bhi)| (blo - hi).max(lo - bhi).max(Vec3::ZERO).length())
+                .fold(FREE_CAP, f32::min);
+            let free = f32::from(c.free_mm) * 0.001;
+            assert!(
+                free <= (brute - 0.0009).max(0.0),
+                "клетка {k}: {free} > {brute}"
+            );
+            assert!(free >= brute - 0.0021, "клетка {k}: {free} и {brute}");
+            // Всё, что не в списке, не ближе клетки.
+            assert!(
+                brute >= fine.margin.min(FREE_CAP) - 1e-3,
+                "клетка {k}: {brute}"
+            );
+        }
+        words_match_the_mirror(&objects);
+        // Кадр за кадром: место мелкой сетки не скачет, неподвижное считается один раз.
+        let mut cache = GridCache::default();
+        for k in 0..3 {
+            let objects = world(1.0 + k as f32 * 0.016);
+            let cached = Grid::build_cached(&objects, None, GridOptions::default(), &mut cache);
+            let full = Grid::build_with(&objects, None, GridOptions::default());
+            assert!(cached == full, "кадр {k}");
+            assert!(cached.fine.is_some());
+        }
+        assert_eq!(cache.rebuilds, 1);
+        assert_eq!(cache.fine.as_ref().map(|f| f.rebuilds), Some(1));
+    }
+
+    /// Сценам в комнатах мелкая сетка не нужна: клетка у них и так по предметам.
+    #[test]
+    fn small_scenes_have_no_fine_grid() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        for (name, text) in [
+            ("stress", include_str!("../../../scenes/3d/stress.ron")),
+            ("showroom", include_str!("../../../scenes/3d/showroom.ron")),
+            ("effects", include_str!("../../../scenes/3d/effects.ron")),
+            ("factory", include_str!("../../../scenes/3d/factory.ron")),
+            (
+                "warehouse",
+                include_str!("../../../scenes/3d/warehouse.ron"),
+            ),
+            ("lamps", include_str!("../../../scenes/3d/lamps.ron")),
+        ] {
+            let f = crate::SpaceScene::parse_in(text, Some(dir))
+                .unwrap()
+                .frame(1.0);
+            let objects: Vec<Program> = f
+                .shapes
+                .iter()
+                .chain(&f.proxies)
+                .zip(&f.still)
+                .flat_map(|(s, &still)| {
+                    crate::shape3d::compile_parts(s)
+                        .unwrap()
+                        .into_iter()
+                        .map(move |p| Program { still, ..p })
+                })
+                .collect();
+            let grid = build(&objects, GridOptions::default());
+            assert!(
+                grid.fine.is_none(),
+                "{name}: клетка {}, мелкая {:?}",
+                grid.cell,
+                grid.fine.as_ref().map(|f| (f.cell, f.dims))
+            );
         }
     }
 
@@ -1333,20 +1613,29 @@ mod tests {
         let f = |i: usize| f32::from_bits(w[i]);
         let g = 100;
         let from_words = |p: Vec3| -> (f32, Vec<u32>) {
-            let origin = Vec3::new(f(g), f(g + 1), f(g + 2));
-            let cell = f(g + 3);
-            let dims = [w[g + 4], w[g + 5], w[g + 6]].map(|d| d as i64);
-            let q = ((p - origin) / cell).floor();
-            let q = [q.x as i64, q.y as i64, q.z as i64];
+            // Клетка точки в сетке с заголовком `h` (как в шейдере): её номер и число клеток.
+            let cell_in = |h: usize| {
+                let origin = Vec3::new(f(h), f(h + 1), f(h + 2));
+                let dims = [w[h + 4], w[h + 5], w[h + 6]].map(|d| d as i64);
+                let q = ((p - origin) / f(h + 3)).floor();
+                let q = [q.x as i64, q.y as i64, q.z as i64];
+                (0..3)
+                    .all(|k| q[k] >= 0 && q[k] < dims[k])
+                    .then(|| ((q[2] * dims[1] + q[1]) * dims[0] + q[0]) as usize)
+            };
             let unbounded = w[g + 16] as usize;
             let mut list: Vec<u32> = w[unbounded..unbounded + w[g + 17] as usize].to_vec();
-            let inside = (0..3).all(|k| q[k] >= 0 && q[k] < dims[k]);
-            let best = if inside {
-                let c =
-                    w[g + 14] as usize + (((q[2] * dims[1] + q[1]) * dims[0] + q[0]) as usize) * 2;
+            // Сначала мелкая сетка (слово 19), потом крупная.
+            let fine = w[g + 19] as usize;
+            let found = (fine != 0)
+                .then(|| cell_in(fine).map(|c| (fine, c)))
+                .flatten()
+                .or_else(|| cell_in(g).map(|c| (g, c)));
+            let best = if let Some((h, c)) = found {
+                let c = w[h + 14] as usize + c * 2;
                 let (start, count) = (w[c] as usize, (w[c + 1] & 0xffff) as usize);
                 list.extend(&w[start..start + count]);
-                f(g + 7).max((w[c + 1] >> 16) as f32 * 0.001)
+                f(h + 7).max((w[c + 1] >> 16) as f32 * 0.001)
             } else {
                 let lo = Vec3::new(f(g + 8), f(g + 9), f(g + 10));
                 let hi = Vec3::new(f(g + 11), f(g + 12), f(g + 13));

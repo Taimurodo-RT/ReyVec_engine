@@ -226,19 +226,40 @@ float2 scene_walk<let PICK : int>(float3 p, float near, bool proxies, bool plane
         first = pc.scene[g + 16];
         // Плоскости — в конце списка бесконечных форм: без них список короче.
         first_count = min(pc.scene[g + (planes ? 17 : 18)], MAX_OBJECTS);
-        float3 origin = float3(asfloat(pc.scene[g]), asfloat(pc.scene[g + 1]), asfloat(pc.scene[g + 2]));
-        float cell = asfloat(pc.scene[g + 3]);
-        int3 dims = int3(pc.scene[g + 4], pc.scene[g + 5], pc.scene[g + 6]);
-        int3 q = int3(floor((p - origin) / cell));
-        if (all(q >= 0) && all(q < dims))
+        // Мелкая сетка поверх тесной части (8.10б, слово 19 заголовка — где её
+        // заголовок, 0 — нет): точка внутри её коробки берёт клетку из неё.
+        uint h = pc.scene[g + 19];
+        float3 origin;
+        float cell;
+        int3 dims;
+        int3 q;
+        bool inside = false;
+        if (h != 0)
         {
-            uint c = pc.scene[g + 14] + uint((q.z * dims.y + q.y) * dims.x + q.x) * 2;
+            origin = float3(asfloat(pc.scene[h]), asfloat(pc.scene[h + 1]), asfloat(pc.scene[h + 2]));
+            cell = asfloat(pc.scene[h + 3]);
+            dims = int3(pc.scene[h + 4], pc.scene[h + 5], pc.scene[h + 6]);
+            q = int3(floor((p - origin) / cell));
+            inside = all(q >= 0) && all(q < dims);
+        }
+        if (!inside)
+        {
+            h = g;
+            origin = float3(asfloat(pc.scene[g]), asfloat(pc.scene[g + 1]), asfloat(pc.scene[g + 2]));
+            cell = asfloat(pc.scene[g + 3]);
+            dims = int3(pc.scene[g + 4], pc.scene[g + 5], pc.scene[g + 6]);
+            q = int3(floor((p - origin) / cell));
+            inside = all(q >= 0) && all(q < dims);
+        }
+        if (inside)
+        {
+            uint c = pc.scene[h + 14] + uint((q.z * dims.y + q.y) * dims.x + q.x) * 2;
             second_list = pc.scene[c];
             // Длина списка — младшие 16 бит, свободное расстояние клетки в мм — старшие
             // (7.18д4): объекты не из списка не ближе большего из него и размера клетки.
             uint packed = pc.scene[c + 1];
             second_count = min(packed & 0xffffu, MAX_OBJECTS);
-            best = float2(max(asfloat(pc.scene[g + 7]), float(packed >> 16) * 0.001), -1.0);
+            best = float2(max(asfloat(pc.scene[h + 7]), float(packed >> 16) * 0.001), -1.0);
         }
         else
         {
