@@ -22,6 +22,7 @@ mod code;
 mod contour;
 mod convert;
 mod cost;
+mod dialog_graph;
 mod doc;
 mod endless;
 mod explorer;
