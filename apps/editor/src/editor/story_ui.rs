@@ -21,6 +21,7 @@ use super::dialog_graph::{Around, DialogGraph, KINDS as NODE_KINDS, Speaker, cha
 use super::story_play::Player;
 use super::story_refs::{self, Rename, RenameAnswer, Script};
 use super::theme::*;
+use reyvec_story::life::{Chat, Routine};
 use reyvec_story::rename::Kind;
 use reyvec_story::writer::Suggest;
 
@@ -775,6 +776,8 @@ impl StoryUi {
                         about: String::new(),
                         lines: LineSettings::default(),
                         relations: BTreeMap::new(),
+                        day: Vec::new(),
+                        chats: Vec::new(),
                     },
                 );
                 s.files
@@ -1364,6 +1367,7 @@ impl StoryUi {
             .filter(|o| o.id != id)
             .map(|o| (o.id.clone(), o.name.clone()))
             .collect();
+        let dialogs: Vec<String> = self.story.dialogs.keys().cloned().collect();
         let Some(c) = self.story.characters.get_mut(id) else {
             return false;
         };
@@ -1399,6 +1403,8 @@ impl StoryUi {
             )
             .changed();
         changed |= relations_edit(ui, &mut c.relations, &others);
+        changed |= day_edit(ui, &mut c.day);
+        changed |= chats_edit(ui, &mut c.chats, &others, &dialogs);
         ui.add_space(GAP_L);
         h2(ui, "Память");
         muted(
@@ -2430,6 +2436,21 @@ pub(crate) fn backlinks(s: &Story, item: &Item) -> Vec<(Item, String)> {
             out.push((Item::Dialog(d.id.clone()), text));
         }
     }
+    // Разговоры персонажей между собой (Сю.12).
+    for c in s.characters.values() {
+        let why: Vec<String> = c
+            .chats
+            .iter()
+            .filter_map(|ch| match item {
+                Item::Dialog(id) if ch.dialog == *id => Some("разговор".to_string()),
+                Item::Character(id) if ch.with == *id => Some(format!("разговор «{}»", ch.dialog)),
+                _ => None,
+            })
+            .collect();
+        if !why.is_empty() {
+            out.push((Item::Character(c.id.clone()), why.join(", ")));
+        }
+    }
     out
 }
 
@@ -2750,6 +2771,178 @@ fn relations_edit(
         }
     }
     changed
+}
+
+/// Распорядок дня (Сю.12): с какого часа где и чем занят.
+fn day_edit(ui: &mut Ui, day: &mut Vec<Routine>) -> bool {
+    let mut changed = false;
+    ui.add_space(GAP_L);
+    h2(ui, "Распорядок дня");
+    muted(
+        ui,
+        "С какого часа где персонаж и чем занят. День идёт по кругу: до первой строки \
+         действует последняя. Игра начинается в 8 утра, час игры — минута. Скрипты читают \
+         место так: npc.place(\"кто\").",
+    );
+    let mut remove = None;
+    for (i, r) in day.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("с").color(MUTED));
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut r.from)
+                        .range(0.0..=23.99)
+                        .speed(0.25)
+                        .custom_formatter(|h, _| {
+                            format!(
+                                "{:02}:{:02}",
+                                h.floor() as u32,
+                                ((h.fract() * 60.0).round() as u32).min(59)
+                            )
+                        }),
+                )
+                .changed();
+            for (text, hint, w) in [
+                (&mut r.place, "место: kuznya", 110.0),
+                (&mut r.doing, "занят: rabotaet", 110.0),
+            ] {
+                changed |= ui
+                    .add(
+                        TextEdit::singleline(text)
+                            .hint_text(hint)
+                            .font(FontId::monospace(FONT_MONO))
+                            .desired_width(w)
+                            .margin(PAD_FIELD),
+                    )
+                    .changed();
+            }
+            if glyph_button(ui, Glyph::Close, "Убрать", false).clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        day.remove(i);
+        changed = true;
+    }
+    if ui
+        .add(egui::Button::new(RichText::new("+ час распорядка").color(GOOD)).frame(false))
+        .clicked()
+    {
+        let from = day.iter().map(|r| r.from).fold(6.0f64, f64::max);
+        day.push(Routine {
+            from: if day.is_empty() {
+                7.0
+            } else {
+                (from + 2.0).min(23.0)
+            },
+            place: String::new(),
+            doing: String::new(),
+        });
+        changed = true;
+    }
+    if changed {
+        day.sort_by(|a, b| a.from.total_cmp(&b.from));
+    }
+    changed
+}
+
+/// Разговоры с другими персонажами (Сю.12).
+fn chats_edit(
+    ui: &mut Ui,
+    chats: &mut Vec<Chat>,
+    others: &[(String, String)],
+    dialogs: &[String],
+) -> bool {
+    let mut changed = false;
+    ui.add_space(GAP_L);
+    h2(ui, "Разговоры с другими");
+    muted(
+        ui,
+        "Когда оба в одном месте по распорядку, диалог идёт сам, без игрока. Его события \
+         меняют мир и память; если кто-то из двоих рядом с героем — реплики слышно.",
+    );
+    let mut remove = None;
+    for (i, ch) in chats.iter_mut().enumerate() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("с").color(MUTED));
+            let name = others
+                .iter()
+                .find(|(id, _)| *id == ch.with)
+                .map_or_else(|| (ch.with.clone(), BAD), |(_, n)| (n.clone(), TEXT));
+            egui::ComboBox::from_id_salt(("chat-with", i))
+                .selected_text(RichText::new(name.0).color(name.1))
+                .show_ui(ui, |ui| {
+                    for (id, n) in others {
+                        if ui.selectable_label(ch.with == *id, n.as_str()).clicked() {
+                            ch.with = id.clone();
+                            changed = true;
+                        }
+                    }
+                });
+            ui.label(RichText::new("диалог").color(MUTED));
+            egui::ComboBox::from_id_salt(("chat-dialog", i))
+                .selected_text(if ch.dialog.is_empty() {
+                    "выберите"
+                } else {
+                    ch.dialog.as_str()
+                })
+                .show_ui(ui, |ui| {
+                    for d in dialogs {
+                        if ui.selectable_label(ch.dialog == *d, d.as_str()).clicked() {
+                            ch.dialog = d.clone();
+                            changed = true;
+                        }
+                    }
+                });
+            ui.label(RichText::new("раз в").color(MUTED));
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut ch.every)
+                        .range(0.1..=240.0)
+                        .speed(0.1)
+                        .suffix(" ч"),
+                )
+                .changed();
+            if glyph_button(ui, Glyph::Close, "Убрать", false).clicked() {
+                remove = Some(i);
+            }
+        });
+        changed |= cond_line(ui, &mut ch.when, i);
+    }
+    if let Some(i) = remove {
+        chats.remove(i);
+        changed = true;
+    }
+    if !others.is_empty()
+        && ui
+            .add(egui::Button::new(RichText::new("+ разговор").color(GOOD)).frame(false))
+            .clicked()
+    {
+        chats.push(Chat {
+            with: others[0].0.clone(),
+            dialog: String::new(),
+            when: String::new(),
+            every: 1.0,
+        });
+        changed = true;
+    }
+    changed
+}
+
+/// Условие разговора одной строкой.
+fn cond_line(ui: &mut Ui, when: &mut String, i: usize) -> bool {
+    ui.push_id(("chat-when", i), |ui| {
+        ui.add(
+            TextEdit::singleline(when)
+                .hint_text("если (пусто — всегда): quest.mech.state == \"active\"")
+                .font(FontId::monospace(FONT_MONO))
+                .desired_width(f32::INFINITY)
+                .margin(PAD_FIELD),
+        )
+        .changed()
+    })
+    .inner
 }
 
 /// Маленькая кнопка «переименовать» рядом с именем в коде.
@@ -3212,7 +3405,15 @@ mod tests {
         let (s, problems) = Story::from_texts(reyvec_story::EXAMPLE);
         assert!(problems.is_empty());
         let smith = backlinks(&s, &Item::Character("kuznec".into()));
-        assert_eq!(smith.len(), 2, "{smith:?}");
+        assert_eq!(smith.len(), 3, "{smith:?}");
+        let boy = backlinks(&s, &Item::Character("uchenik".into()));
+        assert!(
+            boy.contains(&(
+                Item::Character("kuznec".into()),
+                "разговор «kuznec.uchenik»".into()
+            )),
+            "{boy:?}"
+        );
         let vars = backlinks(&s, &Item::Vars);
         assert!(
             vars[0].1.contains("меняет kuznec.znakom: #znakomstvo"),
