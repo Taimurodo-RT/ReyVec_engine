@@ -1,6 +1,7 @@
 //! Экран интерфейса игры из файла `ui/demo.rui` (шаги И.1–И.2а, решение 0022).
 //!
-//! F3 показывает и прячет его поверх любой сцены, F4 меняет тему, Shift+F3 пишет в лог и
+//! F3 показывает и прячет его поверх любой сцены, F4 меняет тему; кнопки отвечают мыши,
+//! Tab, стрелкам и Enter (нажатие — в лог и консоль, «Выход» прячет экран); Shift+F3 пишет в лог и
 //! консоль, откуда взялось каждое свойство. Экран читается вместе
 //! с темами и стилями из его `head`; любой из этих файлов перечитывается, когда меняется
 //! (проверка раз в четверть секунды), так что правка сразу видна в окне. Если в файле
@@ -11,7 +12,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use reyvec_text::GlyphAtlas;
-use reyvec_ui::{UiDraw, UiError, UiScreen};
+use reyvec_ui::{UiDraw, UiError, UiEvent, UiKey, UiScreen};
+use winit::event::{ElementState, MouseButton, WindowEvent};
+use winit::keyboard::{Key, NamedKey};
 
 /// Пример, если папки репозитория нет рядом (собранная программа на другом ПК).
 const BUILT_IN: &str = include_str!("../../../ui/demo.rui");
@@ -85,6 +88,61 @@ impl RuiDemo {
             }
             Err(e) => self.show_error(&e),
         }
+    }
+
+    /// Мышь и клавиатура для экрана (И.2б). `offset` — где в окне левый верхний угол
+    /// картинки, поверх которой нарисован интерфейс; `shift` — зажат ли Shift. `true` —
+    /// событие забрал интерфейс (наведение мыши не забирает, оно нужно и камере).
+    pub(crate) fn on_event(&mut self, event: &WindowEvent, offset: [f32; 2], shift: bool) -> bool {
+        if !self.shown || self.error.is_some() {
+            return false;
+        }
+        let Some(screen) = self.screen.as_mut() else {
+            return false;
+        };
+        let event = match event {
+            WindowEvent::CursorMoved { position, .. } => {
+                screen.pointer_move([position.x as f32 - offset[0], position.y as f32 - offset[1]]);
+                return false;
+            }
+            WindowEvent::CursorLeft { .. } => {
+                screen.pointer_leave();
+                return false;
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => return screen.pointer_down(),
+                ElementState::Released => match screen.pointer_up() {
+                    Some(e) => e,
+                    None => return false,
+                },
+            },
+            WindowEvent::KeyboardInput { event: key, .. } if key.state == ElementState::Pressed => {
+                let k = match &key.logical_key {
+                    Key::Named(NamedKey::Tab) if shift => UiKey::Prev,
+                    Key::Named(NamedKey::Tab | NamedKey::ArrowDown | NamedKey::ArrowRight) => {
+                        UiKey::Next
+                    }
+                    Key::Named(NamedKey::ArrowUp | NamedKey::ArrowLeft) => UiKey::Prev,
+                    Key::Named(NamedKey::Enter | NamedKey::Space) => UiKey::Activate,
+                    _ => return false,
+                };
+                match screen.key(k) {
+                    Some(e) => e,
+                    None => return true,
+                }
+            }
+            _ => return false,
+        };
+        let UiEvent::Click(name) = event;
+        tracing::info!("интерфейс: нажата кнопка «{name}»");
+        if name == "close" {
+            self.shown = false;
+        }
+        true
     }
 
     /// Shift+F3: откуда взялось каждое свойство экрана (стиль с файлом и строкой или сам

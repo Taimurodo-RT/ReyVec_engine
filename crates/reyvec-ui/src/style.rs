@@ -212,12 +212,20 @@ impl Vars {
         })
     }
 
-    /// Модификатор с подставленными переменными (вложенные — состояния — как есть).
+    /// Модификатор с подставленными переменными, вместе с вложенными (состояния).
     pub fn resolve_modifier(&self, m: &Modifier) -> Result<Modifier, UiError> {
         Ok(Modifier {
             name: m.name.clone(),
             args: self.resolve_args(&m.args)?,
-            inner: m.inner.clone(),
+            inner: match &m.inner {
+                Some(inner) => Some(
+                    inner
+                        .iter()
+                        .map(|i| self.resolve_modifier(i))
+                        .collect::<Result<_, _>>()?,
+                ),
+                None => None,
+            },
             pos: m.pos,
         })
     }
@@ -267,6 +275,10 @@ fn eval(
                 })
                 .collect::<Result<_, UiError>>()?;
             Ok(Value::Call(f.clone(), args))
+        }
+        Value::Op(a, op, b) if matches!(op, '<' | '>' | '≤' | '≥') => {
+            // Сравнение `.when(width < var(narrow))`: слева имя окна, справа число.
+            Ok(Value::Op(a.clone(), *op, Box::new(eval(b, pos, lookup)?)))
         }
         Value::Op(a, op, b) => {
             let a = eval(a, pos, lookup)?;
