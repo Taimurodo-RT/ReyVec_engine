@@ -11,6 +11,10 @@
 #include "include/space.slang"
 
 static const float CONE_TILE = 8.0; // как CONE_TILE в crates/reyvec-gpu/src/demo.rs
+// Средний уровень (8.10в2): тем же шейдером второй проход — точка на квадрат
+// CONE_MID_TILE пикселей (pc.flags — сторона квадрата, 0 — первый проход 8×8). Он
+// начинает с длины своего квадрата 8×8 (pc.cone — картинка первого прохода) и идёт
+// дальше, пока шар пустоты шире его узкого конуса.
 
 // Луч через точку кадра `c` (в пикселях кадра) размером `size`.
 Ray pixel_ray(float2 c, float2 size)
@@ -22,8 +26,10 @@ Ray pixel_ray(float2 c, float2 size)
 float fs_main(VertexOut input) : SV_Target
 {
     float2 size = float2(round(pc.aspect * pc.height), pc.height);
-    float2 corner = floor(input.position.xy) * CONE_TILE;
-    Ray axis = pixel_ray(corner + CONE_TILE * 0.5, size);
+    bool mid = pc.flags != 0;
+    float tile = mid ? float(pc.flags) : CONE_TILE;
+    float2 corner = floor(input.position.xy) * tile;
+    Ray axis = pixel_ray(corner + tile * 0.5, size);
     Ray edge = pixel_ray(corner, size);
     // Как далеко луч угла квадрата от оси в точке t: оба луча прямые, поэтому
     // расстояние меняется по прямой от `spread0` до `spread0 + spread1 · t` (для плоской
@@ -36,6 +42,13 @@ float fs_main(VertexOut input) : SV_Target
     float limit = min(axis.limit, plane_hit(axis.origin, axis.dir, plane_normal).x);
     count_ray();
     float t = 0.0;
+    // Запас остановки у узкого конуса вчетверо меньше: он подходит к формам ближе.
+    float slack = 1.0;
+    if (mid)
+    {
+        t = min(textures[pc.cone].Load(int3(int2(corner / CONE_TILE), 0)).x, limit);
+        slack = 0.25;
+    }
     for (int i = 0; i < 96; i++)
     {
         count_step();
@@ -43,7 +56,7 @@ float fs_main(VertexOut input) : SV_Target
         float d = scene_near(axis.origin + axis.dir * t, max(0.25, 2.0 * cone), false, false).x;
         // Пустота должна быть шире конуса с запасом: иначе дальше идут тонкие лучи.
         float free = d - cone;
-        if (free < 0.01 + 0.002 * t)
+        if (free < (0.01 + 0.002 * t) * slack)
             break;
         // Шаг меньше пустоты: за шаг конус чуть расширяется.
         t += free * 0.9;

@@ -60,6 +60,8 @@ pub(crate) enum PanelAction {
     EdgeFar(bool),
     /// Края: вдали по картинке (8.10в).
     EdgeFarPicture(bool),
+    /// Средний уровень грубых лучей (8.10в2).
+    ConeMid(bool),
     /// Тени моделей от кирпичей поля (8.15).
     BrickShadows(bool),
     /// Границы частей внутри моделей (М.1).
@@ -218,6 +220,8 @@ pub(crate) struct PanelInfo<'a> {
     pub edge_far: bool,
     /// Края: вдали по картинке (8.10в).
     pub edge_far_picture: bool,
+    /// Средний уровень грубых лучей (8.10в2).
+    pub cone_mid: bool,
     /// Тени моделей от кирпичей поля (8.15).
     pub brick_shadows: bool,
     /// Границы частей внутри моделей (М.1).
@@ -1357,6 +1361,19 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 {
                     actions.push(PanelAction::EdgeFarPicture(far_picture));
                 }
+                let mut cone_mid = info.cone_mid;
+                if ui
+                    .checkbox(&mut cone_mid, "Грубые лучи: средний уровень")
+                    .on_hover_text(
+                        "8.10в2: после грубых лучей (квадраты 8×8 пикселей) идёт второй \
+                     проход квадратами 2×2 — он подводит лучи пикселей ближе к формам, и им \
+                     остаётся меньше шагов. Картинка та же. Выключите, чтобы сравнить время \
+                     «реймарчинг» и «края 3D» с прежним (появится проход «лучи 3D средне»)",
+                    )
+                    .changed()
+                {
+                    actions.push(PanelAction::ConeMid(cone_mid));
+                }
                 let mut bricks = info.brick_shadows;
                 if ui
                     .checkbox(&mut bricks, "Тени моделей: кирпич поля")
@@ -2262,6 +2279,7 @@ mod tests {
             edge_shadow_reuse: true,
             edge_far: false,
             edge_far_picture: false,
+            cone_mid: true,
             brick_shadows: true,
             part_bounds: true,
             split_parts: true,
