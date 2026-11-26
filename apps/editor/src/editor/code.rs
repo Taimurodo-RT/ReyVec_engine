@@ -414,7 +414,7 @@ impl CodeEditor {
     }
 
     /// Перейти к строке: курсор в её начало.
-    fn go_line(&mut self, line: usize) {
+    pub(crate) fn go_line(&mut self, line: usize) {
         let at = line_start(&self.text, line);
         self.jump = Some((line, at..at));
     }

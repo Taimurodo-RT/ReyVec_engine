@@ -642,14 +642,26 @@ impl EditorUi {
             let project = self.explorer.project().map(Path::to_path_buf);
             self.story.sync(project.as_deref());
             let mut logs = Vec::new();
+            let mut open_script = None;
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 for out in self.story.draw(ui) {
                     match out {
                         super::story_ui::StoryOut::Log(c, t) => logs.push((c, t)),
+                        super::story_ui::StoryOut::OpenScript(path, line) => {
+                            open_script = Some((path, line));
+                        }
                     }
                 }
             });
             self.push_log(logs);
+            // Ссылка «в скриптах» (Сю.8): скрипт в редакторе кода «Ассетов», на строке.
+            if let Some((path, line)) = open_script {
+                self.open_code(&path);
+                if let Some(c) = self.code.as_mut() {
+                    c.go_line(line);
+                }
+                self.open_workspace(ASSETS_WORKSPACE);
+            }
             if info.frameless && !info.maximized {
                 self.window_edges(&ctx);
             }
