@@ -140,3 +140,44 @@ fn generate_card_is_checked() {
         assert!(all.contains(want), "{want}: {all}");
     }
 }
+
+/// Сю.11: модель предлагает автору варианты реплики и ответов игрока.
+#[test]
+fn suggestions_for_the_author() {
+    use reyvec_story::writer::Suggest;
+    let mut s = example();
+    assert_eq!(
+        s.suggest("kuznec.privet", "vopros", Suggest::Line, 3),
+        Err("модель не подключена".into())
+    );
+    let asked = Arc::new(Mutex::new(None));
+    s.writer = Some(Box::new(Canned {
+        reply: Ok(Reply {
+            text: "Чего тебе, чужак?".into(),
+            events: Vec::new(),
+        }),
+        asked: Arc::clone(&asked),
+    }));
+    // Заглушка отвечает одно и то же — повтор не предлагается дважды.
+    let v = s
+        .suggest("kuznec.privet", "vopros", Suggest::Line, 3)
+        .unwrap();
+    assert_eq!(v, ["Чего тебе, чужак?"]);
+    let req = asked.lock().unwrap().clone().unwrap();
+    assert_eq!(req.who, "kuznec");
+    assert!(!req.before.is_empty(), "модель видит, что было перед этим");
+    let p = prompt(&req);
+    assert!(
+        p.contains("Не повторяй") && p.contains("Чего тебе, чужак?"),
+        "{p}"
+    );
+    s.suggest("kuznec.privet", "vopros", Suggest::Answers, 2)
+        .unwrap();
+    let req = asked.lock().unwrap().clone().unwrap();
+    assert_eq!(req.name, "игрок");
+    assert!(req.task.contains("Кузнец Борис"), "{}", req.task);
+    assert!(
+        s.suggest("kuznec.privet", "konec", Suggest::Line, 1)
+            .is_err()
+    );
+}
