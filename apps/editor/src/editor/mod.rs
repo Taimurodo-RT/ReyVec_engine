@@ -40,6 +40,7 @@ mod ron_edit;
 mod shape_edit;
 mod shapes;
 mod space_edit;
+mod story_ui;
 mod theme;
 mod thumbs;
 mod ui;

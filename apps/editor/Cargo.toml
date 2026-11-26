@@ -30,6 +30,8 @@ reyvec-gpu.workspace = true
 reyvec-scene.workspace = true
 reyvec-script.workspace = true
 reyvec-sdf.workspace = true
+# Сюжет (Сю.2): персонажи, диалоги, задания из папки story/ проекта.
+reyvec-story.workspace = true
 png.workspace = true
 ron.workspace = true
 serde.workspace = true

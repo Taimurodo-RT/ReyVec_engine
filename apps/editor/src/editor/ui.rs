@@ -22,7 +22,9 @@ use super::contour;
 use super::doc::{Change, Edit};
 use super::explorer::{self, Explorer};
 use super::geom;
-use super::layout::{ASSETS_WORKSPACE, START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
+use super::layout::{
+    ASSETS_WORKSPACE, START_WORKSPACE, STORY_WORKSPACE, Side, Tab, WORKSPACES, Workspace,
+};
 use super::model_params;
 use super::outline::{self, Kind};
 use super::overlay::{self, Overlay, ViewMode};
@@ -403,6 +405,8 @@ pub(crate) struct EditorUi {
     space: space::SceneUi,
     /// Лепка глины (М.9б).
     clay: clay::ClayUi,
+    /// Пространство «Сюжет» (Сю.2).
+    story: super::story_ui::StoryUi,
 }
 
 /// Фильтр консоли.
@@ -479,6 +483,7 @@ impl EditorUi {
             shape_menu: None,
             space: space::SceneUi::default(),
             clay: clay::ClayUi::default(),
+            story: super::story_ui::StoryUi::default(),
         }
     }
 
@@ -629,6 +634,33 @@ impl EditorUi {
             self.open_workspace("Мир");
         }
         let ws = &WORKSPACES[self.workspace];
+        if ws.name == STORY_WORKSPACE {
+            // «Сюжет» (Сю.2) — своё окно на всё место, как у Obsidian: сцены и панелей нет.
+            self.files_shown = true;
+            self.viewport = None;
+            self.viewport_hovered = false;
+            let project = self.explorer.project().map(Path::to_path_buf);
+            self.story.sync(project.as_deref());
+            let mut logs = Vec::new();
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                for out in self.story.draw(ui) {
+                    match out {
+                        super::story_ui::StoryOut::Log(c, t) => logs.push((c, t)),
+                    }
+                }
+            });
+            self.push_log(logs);
+            if info.frameless && !info.maximized {
+                self.window_edges(&ctx);
+            }
+            if self.asking_close {
+                self.close_dialog(&ctx, info);
+            }
+            self.projects_dialog(&ctx, info);
+            self.open_dialog(&ctx, info);
+            return;
+        }
+        self.story.save_dirty();
         self.files_shown = self.files_mode(info);
         if self.files_shown {
             // Проводник на всё место между верхней и нижней полосами: сцены и панелей нет.
@@ -6136,8 +6168,9 @@ mod tests {
                 frame(&ctx, &mut ui, &info(Some(&file), play), Vec::new());
                 frame(&ctx, &mut ui, &info(None, play), Vec::new());
             }
-            if space.name == ASSETS_WORKSPACE {
-                // Во «Ассетах» без открытого ассета — проводник вместо сцены.
+            if space.name == ASSETS_WORKSPACE || space.name == STORY_WORKSPACE {
+                // Во «Ассетах» без открытого ассета — проводник вместо сцены, в «Сюжете» —
+                // заметки сюжета (Сю.2).
                 assert!(ui.viewport().is_none() && ui.scene_hidden());
                 continue;
             }
@@ -7328,6 +7361,9 @@ mod tests {
             (START_WORKSPACE, PlayState::Playing, false, false),
             (1, PlayState::Edit, false, false),
             (0, PlayState::Edit, false, false),
+            // «Сюжет» ещё дважды: задание и персонаж (вид заметок, Сю.2).
+            (0, PlayState::Paused, false, false),
+            (0, PlayState::Playing, false, false),
             (3, PlayState::Edit, false, false),
             (5, PlayState::Edit, false, false),
             // Пауза в «Мире» снимается с профайлером внизу: широкая панель, много колонок.
@@ -7380,6 +7416,16 @@ mod tests {
                 ui.explorer.go(dir.clone());
                 ui.explorer.view = explorer::ViewKind::Tiles;
                 ui.explorer.selected = vec![dir.join("конвейер.shape.ron")];
+            }
+            if ws == 0 {
+                use crate::editor::story_ui::Item;
+                ui.story.sync(Some(&root));
+                let item = match play {
+                    PlayState::Edit => Item::Dialog("kuznec.privet".into()),
+                    PlayState::Paused => Item::Quest("mech".into()),
+                    PlayState::Playing => Item::Character("kuznec".into()),
+                };
+                ui.story.open(item, false);
             }
             if ws == 5 {
                 // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.
@@ -7543,6 +7589,13 @@ mod tests {
             let menu = if menu { "-меню" } else { "" };
             let name = if shape {
                 "Формы-стеллаж.png".to_owned()
+            } else if ws == 0 {
+                let what = match play {
+                    PlayState::Edit => "диалог",
+                    PlayState::Paused => "задание",
+                    PlayState::Playing => "персонаж",
+                };
+                format!("Сюжет-{what}.png")
             } else {
                 format!("{}-{:?}{menu}.png", WORKSPACES[ws].name, play)
             };

@@ -3436,6 +3436,7 @@ dependencies = [
  "reyvec-scene",
  "reyvec-script",
  "reyvec-sdf",
+ "reyvec-story",
  "reyvec-vector",
  "ron",
  "serde",
