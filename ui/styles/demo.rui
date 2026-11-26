@@ -1,0 +1,32 @@
+// Стили примера (шаг И.2а). Имя с большой буквы — вид блока или экран,
+// с маленькой — класс (блоку его дают .class(имя)). Вложенный стиль значит «внутри».
+
+// Все столбцы и тексты.
+style Column { .spacing(var(gap)) }
+
+// Окно: класс panel.
+style panel {
+    .padding(36)
+    .background(var(panel))
+    .radius(var(radius) * 2)
+    .border(var(line), 1)
+    .color(var(text))             // тексты внутри окна наследуют цвет
+}
+
+// Кнопки — пока просто Stack с классом button.
+style button {
+    .padding(12, var(gap_big))
+    .background(var(button))
+    .radius(var(radius))
+    .font(26)
+}
+
+style danger { .border(var(danger), 2).color(var(danger)) }
+
+style title { .font(56).color(var(accent)) }
+style hint { .font(20).color(var(muted)) }
+
+// Внутри экрана Demo столбцы шире и просторнее.
+style Demo {
+    Column.menu { .width(420) }
+}

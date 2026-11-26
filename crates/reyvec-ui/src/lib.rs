@@ -29,7 +29,10 @@
 //! поэтому экран выглядит одинаково на любом размере.
 
 pub mod model;
+pub mod style;
 pub mod syntax;
+
+use std::path::{Path, PathBuf};
 
 use reyvec_text::{GlyphAtlas, TextBlock, TextLibrary};
 use reyvec_vector::{Color, TextId};
@@ -53,6 +56,22 @@ pub enum UiError {
     /// В файле нет ни одного экрана.
     #[error("в файле нет ни одного экрана: начните с «screen Имя {{ ... }}»")]
     Empty,
+    /// Ошибка в подключённом файле темы или стилей.
+    #[error("{file}: {source}")]
+    File {
+        file: String,
+        #[source]
+        source: Box<UiError>,
+    },
+}
+
+impl UiError {
+    fn pos(&self) -> Option<Pos> {
+        match self {
+            UiError::Syntax { pos, .. } | UiError::Meaning { pos, .. } => Some(*pos),
+            _ => None,
+        }
+    }
 }
 
 /// Что рисовать: прямоугольник со скруглением и обводкой или букву из атласа.
@@ -92,6 +111,13 @@ pub struct UiDraw {
 
 /// Экран из файла `.rui`, готовый к рисованию.
 pub struct UiScreen {
+    decls: Vec<syntax::ScreenDecl>,
+    styles: style::StyleSet,
+    /// Имена файлов по номерам [`Pos::file`]: 0 — сам экран.
+    names: Vec<String>,
+    /// Пути прочитанных файлов (для слежки за правкой); пусто, если файл дан текстом.
+    files: Vec<PathBuf>,
+    theme: Option<usize>,
     screens: Vec<model::Screen>,
     current: usize,
     text: TextLibrary,
@@ -100,34 +126,232 @@ pub struct UiScreen {
     draw: UiDraw,
     /// Разложен ли экран под `draw.viewport` после последней правки.
     fresh: bool,
+    /// Растёт при каждой сборке экранов: тогда меняется и атлас букв.
+    generation: u64,
 }
 
 impl UiScreen {
     /// Разбирает файл. Ошибка — с местом в файле; прежний экран при этом не трогается
-    /// (его хранит тот, кто вызывает).
+    /// (его хранит тот, кто вызывает). Файлы из `head` здесь подключить нельзя — для них
+    /// [`Self::load`].
     pub fn parse(src: &str) -> Result<Self, UiError> {
-        let doc = syntax::parse(src)?;
+        Self::parse_with(src, "экран", &mut |path| {
+            Err(format!(
+                "файл «{path}» не подключить: экран дан текстом, а не из папки ui/"
+            ))
+        })
+    }
+
+    /// Читает экран `file` из папки `dir` (обычно `ui/`) вместе с темами и стилями из его
+    /// `head`. Пути в `head` — от `dir`, `.rui` можно не писать.
+    pub fn load(dir: &Path, file: &str) -> Result<Self, UiError> {
+        let main = dir.join(file);
+        let src = std::fs::read_to_string(&main).map_err(|e| UiError::File {
+            file: file.to_owned(),
+            source: Box::new(UiError::Meaning {
+                pos: Pos::default(),
+                message: format!("файл не прочитать: {e}"),
+            }),
+        })?;
+        let mut read = Vec::new();
+        let mut screen = Self::parse_with(&src, file, &mut |path| {
+            let p = rui_path(dir, path);
+            let text =
+                std::fs::read_to_string(&p).map_err(|e| format!("файл не прочитать: {e}"))?;
+            read.push(p);
+            Ok(text)
+        })?;
+        screen.files.push(main);
+        screen.files.extend(read);
+        Ok(screen)
+    }
+
+    /// Разбирает экран `src` (его имя для ошибок — `name`); файлы из `head` даёт `read`
+    /// по пути, как он написан.
+    pub fn parse_with(
+        src: &str,
+        name: &str,
+        read: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Result<Self, UiError> {
+        let mut names = vec![name.to_owned()];
+        let result = Self::assemble(src, &mut names, read);
+        result.map_err(|e| match e.pos() {
+            Some(pos) if pos.file > 0 => UiError::File {
+                file: names
+                    .get(usize::from(pos.file))
+                    .cloned()
+                    .unwrap_or_default(),
+                source: Box::new(e),
+            },
+            _ => e,
+        })
+    }
+
+    fn assemble(
+        src: &str,
+        names: &mut Vec<String>,
+        read: &mut dyn FnMut(&str) -> Result<String, String>,
+    ) -> Result<Self, UiError> {
+        let doc = syntax::parse_file(src, 0)?;
         if doc.screens.is_empty() {
             return Err(UiError::Empty);
         }
-        let screens = doc
-            .screens
+        let mut styles = style::StyleSet::default();
+        for inc in &doc.head {
+            let file = with_rui(&inc.path);
+            if names.contains(&file) {
+                return Err(UiError::Meaning {
+                    pos: inc.pos,
+                    message: format!("«{}» уже подключён выше", inc.path),
+                });
+            }
+            let text = read(&inc.path).map_err(|message| UiError::Meaning {
+                pos: inc.pos,
+                message: format!("{}: {message}", file),
+            })?;
+            let id = u16::try_from(names.len()).unwrap_or(u16::MAX);
+            names.push(file.clone());
+            let part = syntax::parse_file(&text, id)?;
+            let bad = |pos: Pos, what: &str| UiError::Meaning {
+                pos,
+                message: format!("{what} пишется в файле экрана, а это подключённый файл"),
+            };
+            if let Some(s) = part.screens.first() {
+                return Err(bad(s.pos, "screen"));
+            }
+            if let Some(h) = part.head.first() {
+                return Err(bad(h.pos, "head"));
+            }
+            match inc.kind {
+                syntax::IncludeKind::Theme => {
+                    if let Some(r) = part.styles.first() {
+                        return Err(UiError::Meaning {
+                            pos: r.pos,
+                            message: "в файле темы только theme { }; стили — в файле, подключённом через styles(...)".into(),
+                        });
+                    }
+                }
+                syntax::IncludeKind::Styles => {
+                    if let Some(t) = part.themes.first() {
+                        return Err(UiError::Meaning {
+                            pos: t.pos,
+                            message: "в файле стилей только style { }; темы — в файле, подключённом через theme(...)".into(),
+                        });
+                    }
+                }
+            }
+            for t in part.themes {
+                if styles.themes.iter().any(|o| o.name == t.name) {
+                    return Err(UiError::Meaning {
+                        pos: t.pos,
+                        message: format!("тема «{}» уже есть в другом подключённом файле", t.name),
+                    });
+                }
+                styles.themes.push(t);
+            }
+            styles.add_rules(&part.styles, &file);
+        }
+        // Темы и стили самого экрана — последними: при равенстве они сильнее.
+        for t in &doc.themes {
+            if styles.themes.iter().any(|o| o.name == t.name) {
+                return Err(UiError::Meaning {
+                    pos: t.pos,
+                    message: format!("тема «{}» уже есть в подключённом файле", t.name),
+                });
+            }
+            styles.themes.push(t.clone());
+        }
+        styles.add_rules(&doc.styles, &names[0]);
+        let mut ui = Self {
+            decls: doc.screens,
+            styles,
+            names: names.clone(),
+            files: Vec::new(),
+            theme: None,
+            screens: Vec::new(),
+            current: 0,
+            text: TextLibrary::new(),
+            text_ids: Vec::new(),
+            draw: UiDraw::default(),
+            fresh: false,
+            generation: 0,
+        };
+        let first = (!ui.styles.themes.is_empty()).then_some(0);
+        ui.rebuild(first)?;
+        Ok(ui)
+    }
+
+    /// Строит экраны с темой `theme`. При ошибке прежние экраны остаются.
+    fn rebuild(&mut self, theme: Option<usize>) -> Result<(), UiError> {
+        let vars = self.styles.theme_vars(theme)?;
+        let screens = self
+            .decls
             .iter()
-            .map(model::screen)
+            .map(|d| model::screen(d, &self.styles, &vars))
             .collect::<Result<Vec<_>, _>>()?;
         let mut text = TextLibrary::new();
         let mut text_ids = Vec::new();
         for s in &screens {
             collect_text(&s.root, &mut text, &mut text_ids);
         }
-        Ok(Self {
-            screens,
-            current: 0,
-            text,
-            text_ids,
-            draw: UiDraw::default(),
-            fresh: false,
-        })
+        self.screens = screens;
+        self.text = text;
+        self.text_ids = text_ids;
+        self.theme = theme;
+        self.fresh = false;
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Файлы, из которых собран экран: сам экран и подключённые. Правка любого —
+    /// повод перечитать.
+    pub fn files(&self) -> &[PathBuf] {
+        &self.files
+    }
+
+    /// Имена тем из подключённых файлов по порядку.
+    pub fn themes(&self) -> Vec<&str> {
+        self.styles.theme_names().collect()
+    }
+
+    /// Активная тема (по умолчанию — первая подключённая).
+    pub fn theme(&self) -> Option<&str> {
+        self.theme.map(|i| self.styles.themes[i].name.as_str())
+    }
+
+    /// Включает тему по имени. `Ok(false)` — такой темы нет; ошибка — в теме что-то не так
+    /// (тогда остаётся прежняя).
+    pub fn set_theme(&mut self, name: &str) -> Result<bool, UiError> {
+        let Some(i) = self.styles.themes.iter().position(|t| t.name == name) else {
+            return Ok(false);
+        };
+        if Some(i) != self.theme {
+            let names = self.names.clone();
+            self.rebuild(Some(i)).map_err(|e| match e.pos() {
+                Some(pos) if pos.file > 0 => UiError::File {
+                    file: names[usize::from(pos.file)].clone(),
+                    source: Box::new(e),
+                },
+                _ => e,
+            })?;
+        }
+        Ok(true)
+    }
+
+    /// Номер сборки: меняется, когда экраны собраны заново (другая тема) — тогда
+    /// видеокарте нужен новый атлас букв.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// «Откуда взялось»: дерево текущего экрана, у каждого блока — его свойства и
+    /// источник каждого (стиль с файлом и строкой или сам блок).
+    pub fn explain(&self) -> String {
+        let mut out = String::new();
+        if let Some(s) = self.screens.get(self.current) {
+            explain(&s.root, 0, &mut out);
+        }
+        out
     }
 
     /// Имена экранов файла по порядку.
@@ -296,6 +520,35 @@ impl UiScreen {
         for (child, el) in children.into_iter().zip(&el.children) {
             self.paint(tree, child, el, [x, y], opacity, scale, next_text, out);
         }
+    }
+}
+
+fn rui_path(dir: &Path, path: &str) -> PathBuf {
+    dir.join(with_rui(path))
+}
+
+fn with_rui(path: &str) -> String {
+    if path.ends_with(".rui") {
+        path.to_owned()
+    } else {
+        format!("{path}.rui")
+    }
+}
+
+fn explain(el: &Element, depth: usize, out: &mut String) {
+    use std::fmt::Write;
+    let pad = "  ".repeat(depth);
+    let classes: String = el.classes.iter().map(|c| format!(".{c}")).collect();
+    let _ = writeln!(
+        out,
+        "{pad}{}{classes} (строка {})",
+        el.type_name, el.pos.line
+    );
+    for (name, from) in &el.origins {
+        let _ = writeln!(out, "{pad}  .{name} ← {from}");
+    }
+    for c in &el.children {
+        explain(c, depth + 1, out);
     }
 }
 
@@ -583,5 +836,270 @@ mod tests {
     #[test]
     fn empty_file_is_an_error() {
         assert_eq!(UiScreen::parse("// пусто").err(), Some(UiError::Empty));
+    }
+
+    /// Экран с подключёнными файлами из памяти: путь → текст.
+    fn with_files(src: &str, files: &[(&str, &str)]) -> Result<UiScreen, UiError> {
+        UiScreen::parse_with(src, "экран.rui", &mut |path| {
+            files
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, t)| (*t).to_owned())
+                .ok_or_else(|| "нет такого файла".to_owned())
+        })
+    }
+
+    fn el<'a>(ui: &'a UiScreen, path: &[usize]) -> &'a Element {
+        let mut e = &ui.screens[ui.current].root;
+        for i in path {
+            e = &e.children[*i];
+        }
+        e
+    }
+
+    fn bg(e: &Element) -> [u8; 3] {
+        let c = e.look.background.expect("есть фон");
+        let to = |v: f32| {
+            let s = if v <= 0.003_130_8 {
+                v * 12.92
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            };
+            (s * 255.0).round() as u8
+        };
+        [to(c.r), to(c.g), to(c.b)]
+    }
+
+    const THEMES: &str = r##"
+        theme Forge {
+            panel = #111111
+            accent = #F5A54A
+            gap = 12
+            gap_big = var(gap) * 2
+        }
+        theme Ice {
+            panel = #0A1A2A
+            accent = #6BB8F5
+            gap = 8
+            gap_big = var(gap) * 2
+        }
+    "##;
+
+    #[test]
+    fn ladder_kind_class_nested_own() {
+        let styles = r##"
+            style Rect { .background(#010101).radius(4) }
+            style big { .background(#020202) }
+            style Menu {
+                Rect { .background(#030303) }
+            }
+            style Rect { .radius(9) }
+        "##;
+        let ui = with_files(
+            r##"
+            head { styles("styles/a") }
+            screen Menu {
+                Column {
+                    Rect().size(10)
+                    Rect().class(big).size(10)
+                    Rect().class(big).background(#040404)
+                }
+            }
+            "##,
+            &[("styles/a", styles)],
+        )
+        .unwrap();
+        // Вложенный «Menu Rect» сильнее и класса, и вида.
+        assert_eq!(bg(el(&ui, &[0, 0])), [3, 3, 3]);
+        assert_eq!(bg(el(&ui, &[0, 1])), [3, 3, 3]);
+        // Модификатор у самого блока сильнее всех.
+        assert_eq!(bg(el(&ui, &[0, 2])), [4, 4, 4]);
+        // На одной ступени побеждает записанное позже.
+        assert_eq!(el(&ui, &[0, 0]).look.radius, 9.0);
+        // «Откуда взялось».
+        let why = ui.explain();
+        assert!(
+            why.contains(".background ← style Menu Rect (styles/a.rui, строка 5)"),
+            "{why}"
+        );
+        assert!(why.contains(".background ← у блока (строка 7)"), "{why}");
+    }
+
+    #[test]
+    fn class_beats_kind_and_later_file_wins() {
+        let a = "style Rect { .background(#010101) } style big { .background(#020202) }";
+        let b = "style Rect { .background(#050505) }";
+        let ui = with_files(
+            r#"head { styles("a") styles("b") }
+            screen S { Rect().size(4) Rect().class(big).size(4) }"#,
+            &[("a", a), ("b", b)],
+        )
+        .unwrap();
+        assert_eq!(bg(el(&ui, &[0])), [5, 5, 5]);
+        assert_eq!(bg(el(&ui, &[1])), [2, 2, 2]);
+    }
+
+    #[test]
+    fn nested_styles_reach_any_depth_but_only_inside() {
+        let styles = r##"
+            style Menu { Button { .background(#0A0A0A) } }
+            style Menu.wide { Rect { .width(500) } }
+        "##;
+        // Button — пока просто имя вида блока: в стилях это любое слово с большой буквы.
+        let ui = with_files(
+            r#"head { styles("s") }
+            screen S {
+                Column { Rect().size(4) }
+                Stack { Column { Rect().size(4) } }.class(menu)
+            }"#,
+            &[("s", styles)],
+        )
+        .unwrap();
+        // Экран не Menu — вложенные стили не действуют.
+        assert!(el(&ui, &[0, 0]).look.background.is_none());
+        let ui = with_files(
+            r#"head { styles("s") }
+            screen Menu { Stack { Column { Rect().size(4) } } }"#,
+            &[("s", "style Menu { Rect { .background(#0B0B0B) } }")],
+        )
+        .unwrap();
+        assert_eq!(bg(el(&ui, &[0, 0, 0])), [11, 11, 11]);
+    }
+
+    #[test]
+    fn variables_come_from_theme_and_can_be_overridden_inside() {
+        let styles = r##"
+            style Rect { .background(var(accent)).radius(var(gap_big)) }
+            style ice { .var(accent: #6BB8F5) }
+        "##;
+        let mut ui = with_files(
+            r#"head { theme("themes/base") styles("styles/s") }
+            screen S {
+                Column(spacing: var(gap)) { Rect().size(4) }
+                Column { Stack { Rect().size(4) } }.class(ice)
+            }"#,
+            &[("themes/base", THEMES), ("styles/s", styles)],
+        )
+        .unwrap();
+        assert_eq!(ui.themes(), ["Forge", "Ice"]);
+        assert_eq!(ui.theme(), Some("Forge"));
+        assert_eq!(bg(el(&ui, &[0, 0])), [0xF5, 0xA5, 0x4A]);
+        assert_eq!(el(&ui, &[0, 0]).look.radius, 24.0);
+        assert_eq!(el(&ui, &[0]).placement.spacing, 12.0);
+        // Переопределение действует на всё внутри, на любой глубине.
+        assert_eq!(bg(el(&ui, &[1, 0, 0])), [0x6B, 0xB8, 0xF5]);
+        // Смена темы — другие значения, новая сборка (и атлас букв).
+        let g = ui.generation();
+        assert!(ui.set_theme("Ice").unwrap());
+        assert!(ui.generation() > g);
+        assert_eq!(bg(el(&ui, &[0, 0])), [0x6B, 0xB8, 0xF5]);
+        assert_eq!(el(&ui, &[0]).placement.spacing, 8.0);
+        assert!(!ui.set_theme("Нет").unwrap());
+    }
+
+    #[test]
+    fn text_inherits_font_and_color() {
+        let ui = UiScreen::parse(
+            r##"screen S {
+                Column { Text("a") Text("b").color(#FF0000) Stack { Text("c") } }
+                    .font(40).color(#00FF00)
+            }"##,
+        )
+        .unwrap();
+        let spec = |e: &Element| match &e.kind {
+            Kind::Text(t) => (t.size, t.color.g > 0.9, t.color.r > 0.9),
+            _ => panic!("ждали текст"),
+        };
+        assert_eq!(spec(el(&ui, &[0, 0])), (40.0, true, false));
+        assert_eq!(spec(el(&ui, &[0, 1])), (40.0, false, true));
+        assert_eq!(spec(el(&ui, &[0, 2, 0])), (40.0, true, false));
+    }
+
+    #[test]
+    fn style_errors_name_the_file_and_line() {
+        let e = with_files(
+            r#"head { styles("s") }
+            screen S { Rect() }"#,
+            &[("s", "style Rect {\n  .backgrond(#000000)\n}")],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.starts_with("s.rui: строка 2"), "{e}");
+        assert!(e.contains("Может, .background?"), "{e}");
+        let e = with_files(r#"head { styles("нет") } screen S { }"#, &[])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("нет.rui: нет такого файла"), "{e}");
+        let e = with_files(
+            r#"head { theme("t") } screen S { Rect().background(var(acent)) }"#,
+            &[("t", THEMES)],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("Может, var(accent)?"), "{e}");
+        let e = with_files(
+            r#"head { theme("t") } screen S { }"#,
+            &[("t", "theme A { a = var(b) b = var(a) }")],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("по кругу: a → b → a"), "{e}");
+        let e = with_files(
+            r#"head { styles("s") } screen S { }"#,
+            &[("s", "screen X { }")],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains("пишется в файле экрана"), "{e}");
+        let e = with_files(
+            r#"head { styles("s") } screen S { Rect() }"#,
+            &[("s", "style Rect { .class(big) }")],
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(e.contains(".class пишется у блока"), "{e}");
+        let e = UiScreen::parse(r#"head { styles("s") } screen S { }"#)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("экран дан текстом"), "{e}");
+    }
+
+    #[test]
+    fn load_reads_files_from_the_folder() {
+        let dir = std::env::temp_dir().join(format!("reyvec-ui-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("styles")).unwrap();
+        std::fs::write(
+            dir.join("a.rui"),
+            r#"head { styles("styles/s") } screen A { Rect().size(4) }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("styles/s.rui"),
+            "style Rect { .background(#070707) }",
+        )
+        .unwrap();
+        let ui = UiScreen::load(&dir, "a.rui").unwrap();
+        assert_eq!(bg(el(&ui, &[0])), [7, 7, 7]);
+        assert_eq!(ui.files().len(), 2);
+        assert!(ui.files()[1].ends_with("styles/s.rui"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_demo_file_works() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ui");
+        let mut ui = UiScreen::load(&dir, "demo.rui").unwrap();
+        assert!(ui.themes().len() >= 2, "{:?}", ui.themes());
+        assert!(!ui.draw([1920.0, 1080.0]).quads.is_empty());
+        let other = ui.themes()[1].to_owned();
+        assert!(ui.set_theme(&other).unwrap());
+        assert!(!ui.draw([1920.0, 1080.0]).quads.is_empty());
     }
 }

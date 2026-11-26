@@ -24,6 +24,8 @@ use crate::UiError;
 pub struct Pos {
     pub line: u32,
     pub column: u32,
+    /// Какой файл: 0 — сам экран, дальше — подключённые в `head` по порядку чтения.
+    pub file: u16,
 }
 
 impl std::fmt::Display for Pos {
@@ -45,8 +47,10 @@ pub enum Value {
     Color([u8; 4]),
     /// Имя или путь через точку: `center`, `theme.accent`, `game.hero.stamina`.
     Name(String),
-    /// Вызов: `tr("menu.title")`, `image("...")`.
+    /// Вызов: `tr("menu.title")`, `image("...")`, `var(accent)`.
     Call(String, Vec<Arg>),
+    /// Формула: `var(gap) * 2`, `100% - 32`. Знак: `+`, `-`, `*`, `/`.
+    Op(Box<Value>, char, Box<Value>),
 }
 
 impl Value {
@@ -59,6 +63,7 @@ impl Value {
             Value::Color(_) => "цвет",
             Value::Name(_) => "имя",
             Value::Call(..) => "вызов",
+            Value::Op(..) => "формула",
         }
     }
 }
@@ -109,10 +114,76 @@ pub struct ScreenDecl {
     pub pos: Pos,
 }
 
+/// Что подключает строка блока `head`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncludeKind {
+    /// `theme("themes/forge")`: файл с темами (наборами переменных).
+    Theme,
+    /// `styles("styles/menu")`: файл со стилями.
+    Styles,
+}
+
+/// Строка блока `head`: что и откуда подключить. Путь — от папки `ui/`, без `.rui`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Include {
+    pub kind: IncludeKind,
+    pub path: String,
+    pub pos: Pos,
+}
+
+/// Звено селектора стиля: вид блока или экран (с большой буквы) и классы (с маленькой).
+/// `Button`, `danger`, `Button.big.red`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Selector {
+    pub kind: Option<String>,
+    pub classes: Vec<String>,
+    pub pos: Pos,
+}
+
+impl std::fmt::Display for Selector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        if let Some(k) = &self.kind {
+            f.write_str(k)?;
+            first = false;
+        }
+        for c in &self.classes {
+            if !first {
+                f.write_str(".")?;
+            }
+            f.write_str(c)?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
+/// Стиль: `style Селектор { модификаторы и вложенные стили }`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleRule {
+    pub selector: Selector,
+    pub modifiers: Vec<Modifier>,
+    /// Вложенные стили: действуют на блоки внутри блока этого селектора.
+    pub nested: Vec<StyleRule>,
+    pub pos: Pos,
+}
+
+/// Тема: `theme Имя { имя = значение ... }` — набор переменных.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ThemeDecl {
+    pub name: String,
+    pub vars: Vec<(String, Value, Pos)>,
+    pub pos: Pos,
+}
+
 /// Разобранный файл.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Document {
+    /// Подключения из блока `head` по порядку.
+    pub head: Vec<Include>,
     pub screens: Vec<ScreenDecl>,
+    pub themes: Vec<ThemeDecl>,
+    pub styles: Vec<StyleRule>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,6 +200,11 @@ enum Tok {
     Comma,
     Colon,
     Dot,
+    Eq,
+    Plus,
+    Minus,
+    Star,
+    Slash,
     Eof,
 }
 
@@ -147,19 +223,37 @@ impl Tok {
             Tok::Comma => "запятая".into(),
             Tok::Colon => "двоеточие".into(),
             Tok::Dot => "точка".into(),
+            Tok::Eq => "«=»".into(),
+            Tok::Plus => "«+»".into(),
+            Tok::Minus => "«-»".into(),
+            Tok::Star => "«*»".into(),
+            Tok::Slash => "«/»".into(),
             Tok::Eof => "конец файла".into(),
         }
     }
 }
 
-fn lex(src: &str) -> Result<Vec<(Tok, Pos)>, UiError> {
+fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
     let mut out = Vec::new();
     let chars: Vec<char> = src.chars().collect();
     let (mut i, mut line, mut col) = (0usize, 1u32, 1u32);
     let err = |pos: Pos, message: String| UiError::Syntax { pos, message };
     while i < chars.len() {
         let c = chars[i];
-        let pos = Pos { line, column: col };
+        let pos = Pos {
+            line,
+            column: col,
+            file,
+        };
+        // Минус перед числом — знак числа, если перед ним не стоит значение: `-4`, но
+        // `100% - 4` и `var(a)-4` — вычитание.
+        let after_value = matches!(
+            out.last(),
+            Some((
+                Tok::Number(_) | Tok::Percent(_) | Tok::Ident(_) | Tok::RParen | Tok::Color(_),
+                _
+            ))
+        );
         let step = |n: usize, i: &mut usize, col: &mut u32| {
             *i += n;
             *col += n as u32;
@@ -176,7 +270,7 @@ fn lex(src: &str) -> Result<Vec<(Tok, Pos)>, UiError> {
                     i += 1;
                 }
             }
-            '(' | ')' | '{' | '}' | ',' | ':' => {
+            '(' | ')' | '{' | '}' | ',' | ':' | '=' | '+' | '*' | '/' => {
                 out.push((
                     match c {
                         '(' => Tok::LParen,
@@ -184,6 +278,10 @@ fn lex(src: &str) -> Result<Vec<(Tok, Pos)>, UiError> {
                         '{' => Tok::LBrace,
                         '}' => Tok::RBrace,
                         ',' => Tok::Comma,
+                        '=' => Tok::Eq,
+                        '+' => Tok::Plus,
+                        '*' => Tok::Star,
+                        '/' => Tok::Slash,
                         _ => Tok::Colon,
                     },
                     pos,
@@ -216,7 +314,11 @@ fn lex(src: &str) -> Result<Vec<(Tok, Pos)>, UiError> {
                                 Some('\\') => '\\',
                                 _ => {
                                     return Err(err(
-                                        Pos { line, column: col },
+                                        Pos {
+                                            line,
+                                            column: col,
+                                            file,
+                                        },
                                         "в строке после \\ бывает только n, \" или \\".into(),
                                     ));
                                 }
@@ -249,6 +351,14 @@ fn lex(src: &str) -> Result<Vec<(Tok, Pos)>, UiError> {
                 out.push((Tok::Color(color), pos));
                 let n = end - i;
                 step(n, &mut i, &mut col);
+            }
+            '-' if after_value
+                || !chars
+                    .get(i + 1)
+                    .is_some_and(|n| n.is_ascii_digit() || *n == '.') =>
+            {
+                out.push((Tok::Minus, pos));
+                step(1, &mut i, &mut col);
             }
             c if c.is_ascii_digit() || c == '-' || c == '.' => {
                 let start = i;
@@ -285,7 +395,14 @@ fn lex(src: &str) -> Result<Vec<(Tok, Pos)>, UiError> {
             other => return Err(err(pos, format!("непонятный знак «{other}»"))),
         }
     }
-    out.push((Tok::Eof, Pos { line, column: col }));
+    out.push((
+        Tok::Eof,
+        Pos {
+            line,
+            column: col,
+            file,
+        },
+    ));
     Ok(out)
 }
 
@@ -378,9 +495,206 @@ impl Parser {
                         pos,
                     });
                 }
+                Tok::Ident(word) if word == "head" => {
+                    let pos = self.next().1;
+                    if !doc.head.is_empty()
+                        || !doc.screens.is_empty()
+                        || !doc.themes.is_empty()
+                        || !doc.styles.is_empty()
+                    {
+                        return Err(UiError::Syntax {
+                            pos,
+                            message: "head пишется один раз, в самом начале файла".into(),
+                        });
+                    }
+                    doc.head = self.head()?;
+                }
+                Tok::Ident(word) if word == "theme" => {
+                    let pos = self.next().1;
+                    let (name, _) = self.ident("имя темы после «theme»")?;
+                    if doc.themes.iter().any(|t| t.name == name) {
+                        return Err(UiError::Syntax {
+                            pos,
+                            message: format!("тема «{name}» уже есть в этом файле"),
+                        });
+                    }
+                    let vars = self.theme_vars()?;
+                    doc.themes.push(ThemeDecl { name, vars, pos });
+                }
+                Tok::Ident(word) if word == "style" => {
+                    self.next();
+                    let rule = self.style_rule()?;
+                    doc.styles.push(rule);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "файл состоит из «screen Имя {{ ... }}» и «layer Имя {{ ... }}», а здесь {}",
+                        "файл состоит из head {{ ... }}, «screen Имя {{ ... }}», «layer Имя {{ ... }}», «theme Имя {{ ... }}» и «style Имя {{ ... }}», а здесь {}",
+                        other.describe()
+                    )));
+                }
+            }
+        }
+    }
+
+    /// `{ theme("путь") styles("путь") }`
+    fn head(&mut self) -> Result<Vec<Include>, UiError> {
+        self.expect(Tok::LBrace, "«{» после head")?;
+        let mut out = Vec::new();
+        loop {
+            match self.next() {
+                (Tok::RBrace, _) => return Ok(out),
+                (Tok::Ident(word), pos) => {
+                    let kind = match word.as_str() {
+                        "theme" => IncludeKind::Theme,
+                        "styles" => IncludeKind::Styles,
+                        "import" => {
+                            return Err(UiError::Meaning {
+                                pos,
+                                message: "import (свои блоки из других файлов) появится вместе с компонентами, позже".into(),
+                            });
+                        }
+                        other => {
+                            return Err(UiError::Syntax {
+                                pos,
+                                message: format!(
+                                    "в head бывают theme(\"путь\") и styles(\"путь\"), а здесь «{other}»"
+                                ),
+                            });
+                        }
+                    };
+                    let args = self.args()?;
+                    let path = match &args[..] {
+                        [
+                            Arg {
+                                name: None,
+                                value: Value::Text(t),
+                                ..
+                            },
+                        ] => t.clone(),
+                        _ => {
+                            return Err(UiError::Syntax {
+                                pos,
+                                message: format!(
+                                    "{word}: один путь в кавычках от папки ui/, например {word}(\"styles/menu\")"
+                                ),
+                            });
+                        }
+                    };
+                    out.push(Include { kind, path, pos });
+                }
+                (Tok::Eof, pos) => {
+                    return Err(UiError::Syntax {
+                        pos,
+                        message: "не хватает «}»: head не закрыт".into(),
+                    });
+                }
+                (t, pos) => {
+                    return Err(UiError::Syntax {
+                        pos,
+                        message: format!(
+                            "в head бывают theme(\"путь\") и styles(\"путь\"), а здесь {}",
+                            t.describe()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    /// `{ имя = значение ... }`
+    fn theme_vars(&mut self) -> Result<Vec<(String, Value, Pos)>, UiError> {
+        self.expect(Tok::LBrace, "«{» после имени темы")?;
+        let mut vars: Vec<(String, Value, Pos)> = Vec::new();
+        loop {
+            match self.next() {
+                (Tok::RBrace, _) => return Ok(vars),
+                (Tok::Ident(name), pos) => {
+                    self.expect(Tok::Eq, &format!("«=» после «{name}»: {name} = значение"))?;
+                    let value = self.value()?;
+                    if vars.iter().any(|(n, ..)| *n == name) {
+                        return Err(UiError::Syntax {
+                            pos,
+                            message: format!("переменная «{name}» уже есть в этой теме"),
+                        });
+                    }
+                    vars.push((name, value, pos));
+                }
+                (Tok::Eof, pos) => {
+                    return Err(UiError::Syntax {
+                        pos,
+                        message: "не хватает «}»: тема не закрыта".into(),
+                    });
+                }
+                (t, pos) => {
+                    return Err(UiError::Syntax {
+                        pos,
+                        message: format!(
+                            "в теме пишутся переменные «имя = значение», а здесь {}",
+                            t.describe()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    /// `Button.big`, `danger`, `MainMenu`.
+    fn selector(&mut self) -> Result<Selector, UiError> {
+        let (first, pos) = self.ident("имя вида блока (Button) или класса (danger)")?;
+        let mut sel = Selector {
+            kind: None,
+            classes: Vec::new(),
+            pos,
+        };
+        if first.chars().next().is_some_and(char::is_uppercase) {
+            sel.kind = Some(first);
+        } else {
+            sel.classes.push(first);
+        }
+        while *self.peek() == Tok::Dot {
+            self.next();
+            let (class, pos) = self.ident("имя класса после точки")?;
+            if class.chars().next().is_some_and(char::is_uppercase) {
+                return Err(UiError::Syntax {
+                    pos,
+                    message: format!(
+                        "после точки в стиле — класс с маленькой буквы, а «{class}» с большой: вид блока пишется первым, Button.big"
+                    ),
+                });
+            }
+            sel.classes.push(class);
+        }
+        Ok(sel)
+    }
+
+    /// `Селектор { модификаторы и вложенные стили }` (слово `style` уже прочитано).
+    fn style_rule(&mut self) -> Result<StyleRule, UiError> {
+        let selector = self.selector()?;
+        let pos = selector.pos;
+        self.expect(Tok::LBrace, &format!("«{{» после «{selector}»"))?;
+        let mut modifiers = Vec::new();
+        let mut nested = Vec::new();
+        loop {
+            match self.peek() {
+                Tok::RBrace => {
+                    self.next();
+                    return Ok(StyleRule {
+                        selector,
+                        modifiers,
+                        nested,
+                        pos,
+                    });
+                }
+                Tok::Dot => modifiers.extend(self.modifiers()?),
+                Tok::Ident(_) => nested.push(self.style_rule()?),
+                Tok::Eof => {
+                    return Err(
+                        self.error(format!("не хватает «}}»: стиль «{selector}» не закрыт"))
+                    );
+                }
+                other => {
+                    return Err(self.error(format!(
+                        "в стиле пишутся модификаторы (.background(#262B36)) и вложенные стили (Button {{ ... }}), а здесь {}",
                         other.describe()
                     )));
                 }
@@ -500,7 +814,36 @@ impl Parser {
         }
     }
 
+    /// Значение с формулой: `+` и `-` слабее `*` и `/`, как в школе.
     fn value(&mut self) -> Result<Value, UiError> {
+        let mut left = self.term()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Plus => '+',
+                Tok::Minus => '-',
+                _ => return Ok(left),
+            };
+            self.next();
+            let right = self.term()?;
+            left = Value::Op(Box::new(left), op, Box::new(right));
+        }
+    }
+
+    fn term(&mut self) -> Result<Value, UiError> {
+        let mut left = self.atom()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Star => '*',
+                Tok::Slash => '/',
+                _ => return Ok(left),
+            };
+            self.next();
+            let right = self.atom()?;
+            left = Value::Op(Box::new(left), op, Box::new(right));
+        }
+    }
+
+    fn atom(&mut self) -> Result<Value, UiError> {
         match self.next() {
             (Tok::Number(n), _) => Ok(Value::Number(n)),
             (Tok::Percent(n), _) => Ok(Value::Percent(n)),
@@ -521,6 +864,11 @@ impl Parser {
                     Ok(Value::Name(path))
                 }
             }
+            (Tok::LParen, _) => {
+                let v = self.value()?;
+                self.expect(Tok::RParen, "«)» после формулы")?;
+                Ok(v)
+            }
             (t, pos) => Err(UiError::Syntax {
                 pos,
                 message: format!("ждал значение, а здесь {}", t.describe()),
@@ -531,7 +879,12 @@ impl Parser {
 
 /// Разбирает текст файла `.rui`.
 pub fn parse(src: &str) -> Result<Document, UiError> {
-    let toks = lex(src)?;
+    parse_file(src, 0)
+}
+
+/// Разбирает текст файла `.rui`; `file` попадает в места ошибок ([`Pos::file`]).
+pub fn parse_file(src: &str, file: u16) -> Result<Document, UiError> {
+    let toks = lex(src, file)?;
     Parser { toks, at: 0 }.document()
 }
 
@@ -595,7 +948,8 @@ mod tests {
                     value: Value::Text("menu.title".into()),
                     pos: Pos {
                         line: 1,
-                        column: 20
+                        column: 20,
+                        file: 0,
                     }
                 }]
             )
