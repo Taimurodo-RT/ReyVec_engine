@@ -67,6 +67,8 @@ pub(crate) struct GameUi {
     floats: Vec<Float>,
     banner: f32,
     coins: u32,
+    /// Полоска здоровья из файла `ui/hud.rui` (И.3а) готова: свою не рисовать.
+    pub file_hud: bool,
     /// Строка под настройками: куда сохранено или что не так.
     note: Option<(String, bool)>,
     quit: bool,
@@ -88,11 +90,17 @@ impl GameUi {
             floats: Vec::new(),
             banner: 0.0,
             coins: 0,
+            file_hud: false,
             note: None,
             quit: false,
             last: Instant::now(),
             console: Console::new(),
         }
+    }
+
+    /// Сколько монет подобрано в этой сцене.
+    pub(crate) fn coins(&self) -> u32 {
+        self.coins
     }
 
     /// Привязки и поведение управления.
@@ -264,7 +272,9 @@ impl GameUi {
 
         let screen = ctx.content_rect();
         let painter = ctx.layer_painter(LayerId::background());
-        if let Some(p) = &view.player {
+        if let Some(p) = &view.player
+            && !self.file_hud
+        {
             hud(&painter, screen, p, self.coins);
         }
         let project = |at: [f32; 2]| {
@@ -546,6 +556,7 @@ mod tests {
             floats: Vec::new(),
             banner: 0.0,
             coins: 0,
+            file_hud: false,
             note: None,
             quit: false,
             last: Instant::now(),

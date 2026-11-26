@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::UiError;
+use crate::data::is_live;
 use crate::syntax::{Arg, Modifier, Pos, Selector, StyleRule, ThemeDecl, Value};
 
 /// Ступень лестницы силы стиля.
@@ -276,13 +277,37 @@ fn eval(
                 .collect::<Result<_, UiError>>()?;
             Ok(Value::Call(f.clone(), args))
         }
-        Value::Op(a, op, b) if matches!(op, '<' | '>' | '≤' | '≥') => {
-            // Сравнение `.when(width < var(narrow))`: слева имя окна, справа число.
-            Ok(Value::Op(a.clone(), *op, Box::new(eval(b, pos, lookup)?)))
+        Value::Op(a, op, b) if matches!(op, '<' | '>' | '≤' | '≥' | '=' | '≠') => {
+            // Сравнение `.when(width < var(narrow))`: слева имя окна или данные игры,
+            // посчитает его `.when` или [`crate::data::compute`].
+            let a = match a.as_ref() {
+                Value::Name(_) => a.as_ref().clone(),
+                other => eval(other, pos, lookup)?,
+            };
+            Ok(Value::Op(Box::new(a), *op, Box::new(eval(b, pos, lookup)?)))
+        }
+        Value::If(c, yes, no) => {
+            let c = eval(c, pos, lookup)?;
+            if is_live(&c) {
+                return Ok(Value::If(
+                    Box::new(c),
+                    Box::new(eval(yes, pos, lookup)?),
+                    Box::new(eval(no, pos, lookup)?),
+                ));
+            }
+            if crate::data::truth(&c, pos)? {
+                eval(yes, pos, lookup)
+            } else {
+                eval(no, pos, lookup)
+            }
         }
         Value::Op(a, op, b) => {
             let a = eval(a, pos, lookup)?;
             let b = eval(b, pos, lookup)?;
+            if is_live(&a) || is_live(&b) {
+                // Данные игры: досчитается, когда они придут.
+                return Ok(Value::Op(Box::new(a), *op, Box::new(b)));
+            }
             arith(&a, *op, &b).ok_or_else(|| UiError::Meaning {
                 pos,
                 message: format!(

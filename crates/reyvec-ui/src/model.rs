@@ -9,6 +9,7 @@
 use reyvec_vector::Color;
 
 use crate::UiError;
+use crate::data::{UiData, compute, is_live, show, truth};
 use crate::lang::Texts;
 use crate::style::{Info, StyleSet, Vars};
 use crate::syntax::{Arg, Modifier, Node, Pos, ScreenDecl, ScreenKind, Value};
@@ -61,6 +62,8 @@ pub struct Placement {
     /// Как ряд или столбец ставит детей поперёк себя.
     pub cross: Edge,
     pub justify: Justify,
+    /// `.visible(false)`: блока нет ни на экране, ни в раскладке.
+    pub visible: bool,
 }
 
 impl Default for Placement {
@@ -75,6 +78,7 @@ impl Default for Placement {
             spacing: 0.0,
             cross: Edge::Start,
             justify: Justify::Start,
+            visible: true,
         }
     }
 }
@@ -88,6 +92,9 @@ pub struct Look {
     pub border: Option<(Color, f32)>,
     /// Прозрачность элемента и всего внутри него.
     pub opacity: f32,
+    /// У `Bar`: цвет заполненной части и сколько заполнено, от 0 до 1.
+    pub fill: Option<Color>,
+    pub value: f32,
 }
 
 impl Default for Look {
@@ -97,6 +104,8 @@ impl Default for Look {
             radius: 0.0,
             border: None,
             opacity: 1.0,
+            fill: None,
+            value: 0.0,
         }
     }
 }
@@ -105,6 +114,9 @@ impl Default for Look {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextSpec {
     pub text: String,
+    /// Текст с данными игры (`"Монеты: \(game.hero.coins)"`): куски и значения, из
+    /// которых `text` собирается заново, когда данные меняются.
+    pub parts: Option<Vec<Arg>>,
     /// Высота буквы (em) в пикселях экрана 1920×1080.
     pub size: f32,
     pub color: Color,
@@ -119,6 +131,8 @@ pub enum Kind {
     Stack,
     Text(TextSpec),
     Spacer,
+    /// Полоска: фон — пустая часть, `.fill` — заполненная слева на `look.value`.
+    Bar,
 }
 
 /// Элемент экрана.
@@ -179,7 +193,9 @@ pub struct Screen {
     pub root: Element,
 }
 
-const KINDS: &[&str] = &["Column", "Row", "Stack", "Rect", "Text", "Spacer", "Button"];
+const KINDS: &[&str] = &[
+    "Column", "Row", "Stack", "Rect", "Text", "Spacer", "Button", "Bar",
+];
 const MODIFIERS: &[&str] = &[
     "class",
     "var",
@@ -196,6 +212,9 @@ const MODIFIERS: &[&str] = &[
     "radius",
     "border",
     "opacity",
+    "visible",
+    "value",
+    "fill",
     "font",
     "color",
     "id",
@@ -468,6 +487,21 @@ fn apply(m: &Modifier, el: &mut Element) -> Result<(), UiError> {
             count(1..=1)?;
             el.look.opacity = number(&m.args[0], &what)?.clamp(0.0, 1.0);
         }
+        "visible" => {
+            count(1..=1)?;
+            p.visible = truth(&m.args[0].value, m.args[0].pos)?;
+        }
+        "value" | "fill" => {
+            if el.kind != Kind::Bar {
+                return Err(meaning(m.pos, format!("{what} бывает только у Bar")));
+            }
+            count(1..=1)?;
+            if name == "value" {
+                el.look.value = number(&m.args[0], &what)?.clamp(0.0, 1.0);
+            } else {
+                el.look.fill = Some(color(&m.args[0], &what)?);
+            }
+        }
         // У контейнера — для текстов внутри него (наследование, как в CSS).
         "font" | "color" => {
             count(1..=1)?;
@@ -689,6 +723,8 @@ pub struct Env {
     pub lang: String,
     /// Чем игрок пользуется сейчас: `mouse`, `keyboard`, `gamepad`.
     pub input: String,
+    /// Данные игры: `game.hero.hp` и другие.
+    pub data: UiData,
 }
 
 impl Default for Env {
@@ -698,6 +734,7 @@ impl Default for Env {
             height: 1080.0,
             lang: "ru".into(),
             input: "mouse".into(),
+            data: UiData::default(),
         }
     }
 }
@@ -707,7 +744,7 @@ fn when(m: &Modifier, env: &Env) -> Result<bool, UiError> {
     let bad = |pos| {
         meaning(
             pos,
-            ".when: width < 1280, height >= 900, lang: en, input: gamepad — через запятую",
+            ".when: width < 1280, height >= 900, lang: en, input: gamepad, game.hero.hp < 2 — через запятую",
         )
     };
     if m.args.is_empty() {
@@ -716,6 +753,7 @@ fn when(m: &Modifier, env: &Env) -> Result<bool, UiError> {
     let mut all = true;
     for a in &m.args {
         let ok = match (&a.name, &a.value) {
+            (None, v) if is_live(v) => truth(&compute(v, a.pos, &env.data)?, a.pos)?,
             (Some(k), Value::Name(v)) if k == "lang" => env.lang == *v,
             (Some(k), Value::Name(v)) if k == "input" => {
                 if !matches!(v.as_str(), "mouse" | "keyboard" | "gamepad") {
@@ -778,7 +816,15 @@ fn run(
         }
         return Ok(());
     }
-    apply(m, el)?;
+    if m.args.iter().any(|a| is_live(&a.value)) {
+        let mut m = m.clone();
+        for a in &mut m.args {
+            a.value = compute(&a.value, a.pos, &env.data)?;
+        }
+        apply(&m, el)?;
+    } else {
+        apply(m, el)?;
+    }
     if origins {
         record(&mut el.origins, &m.name, from);
     }
@@ -823,8 +869,20 @@ fn replay(el: &mut Element, font: f32, color: Color, states: u8, env: &Env) -> R
     if let Kind::Text(spec) = &mut el.kind {
         spec.size = el.font;
         spec.color = el.color;
+        if let Some(parts) = &spec.parts {
+            spec.text = joined(parts, &env.data)?;
+        }
     }
     Ok(())
+}
+
+/// Текст из кусков и значений по данным игры.
+fn joined(parts: &[Arg], data: &UiData) -> Result<String, UiError> {
+    let mut out = String::new();
+    for p in parts {
+        out.push_str(&show(&compute(&p.value, p.pos, data)?));
+    }
+    Ok(out)
 }
 
 /// Состояния блока при состояниях родителя `inherited`: свои флаги и то, что сейчас с ним
@@ -947,24 +1005,54 @@ fn flag(modifiers: &[Modifier], name: &str) -> Result<bool, UiError> {
     Ok(on)
 }
 
-/// Надпись: строка в кавычках или `tr("ключ", имя: значение)`.
+/// Надпись: строка в кавычках (можно со вставками `\(…)`) или `tr("ключ", имя: значение)`.
 fn is_words(a: &Arg) -> bool {
     a.name.is_none()
         && match &a.value {
             Value::Text(_) => true,
-            Value::Call(f, _) => f == "tr",
+            Value::Call(f, _) => f == "tr" || f == "text",
             _ => false,
         }
 }
 
-/// Текст надписи. У `tr` слова берутся из файла языка, а `{имя}` в них заменяется
-/// значением `имя:` из скобок: `tr("hud.coins", n: 5)` и «Монеты: {n}».
-fn words(a: &Arg, ctx: &Ctx<'_>) -> Result<String, UiError> {
-    let Value::Call(_, args) = &a.value else {
-        let Value::Text(t) = &a.value else {
-            unreachable!("проверено в is_words")
-        };
-        return Ok(t.clone());
+/// Надпись кусками: строки и значения. У `tr` слова берутся из файла языка, а `{имя}`
+/// в них — место для значения `имя:` из скобок: `tr("hud.coins", n: 5)` и «Монеты: {n}».
+/// Значения с данными игры остаются живыми и считаются при каждом пересчёте.
+fn words(a: &Arg, ctx: &Ctx<'_>) -> Result<Vec<Arg>, UiError> {
+    let lit = |t: String, pos: Pos| Arg {
+        name: None,
+        value: Value::Text(t),
+        pos,
+    };
+    let checked = |r: &Arg| -> Result<Arg, UiError> {
+        let value = ctx.vars.resolve(&r.value, r.pos)?;
+        if !is_live(&value)
+            && !matches!(
+                value,
+                Value::Number(_) | Value::Percent(_) | Value::Text(_) | Value::Name(_)
+            )
+        {
+            return Err(meaning(
+                r.pos,
+                format!(
+                    "в текст вставляется число или строка, а здесь {}",
+                    value.kind()
+                ),
+            ));
+        }
+        Ok(Arg {
+            name: None,
+            value,
+            pos: r.pos,
+        })
+    };
+    let args = match &a.value {
+        Value::Text(t) => return Ok(vec![lit(t.clone(), a.pos)]),
+        Value::Call(f, parts) if f == "text" => {
+            return parts.iter().map(checked).collect();
+        }
+        Value::Call(_, args) => args,
+        _ => unreachable!("проверено в is_words"),
     };
     let (key, rest) = match &args[..] {
         [
@@ -982,7 +1070,8 @@ fn words(a: &Arg, ctx: &Ctx<'_>) -> Result<String, UiError> {
             ));
         }
     };
-    let mut text = ctx.texts.get(ctx.lang, key.0, key.1)?;
+    let template = ctx.texts.get(ctx.lang, key.0, key.1)?;
+    let mut values = Vec::new();
     for r in rest {
         let Some(name) = &r.name else {
             return Err(meaning(
@@ -990,23 +1079,41 @@ fn words(a: &Arg, ctx: &Ctx<'_>) -> Result<String, UiError> {
                 "tr: подстановка пишется с именем, tr(\"hud.coins\", n: 5), а в тексте — {n}",
             ));
         };
-        let value = match ctx.vars.resolve(&r.value, r.pos)? {
-            Value::Number(n) if n.fract() == 0.0 && n.abs() < 1e9 => format!("{}", n as i64),
-            Value::Number(n) => format!("{n}"),
-            Value::Text(t) | Value::Name(t) => t,
-            other => {
-                return Err(meaning(
-                    r.pos,
-                    format!(
-                        "tr: подставить можно число или строку, а здесь {}",
-                        other.kind()
-                    ),
-                ));
-            }
-        };
-        text = text.replace(&format!("{{{name}}}"), &value);
+        values.push((name.as_str(), checked(r)?));
     }
-    Ok(text)
+    // «Монеты: {n}» → «Монеты: », n.
+    let mut out = Vec::new();
+    let mut rest = template.as_str();
+    let mut text = String::new();
+    while let Some(open) = rest.find('{') {
+        let after = &rest[open + 1..];
+        let found = after.find('}').and_then(|close| {
+            let name = &after[..close];
+            values
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| (close, v.clone()))
+        });
+        match found {
+            Some((close, v)) => {
+                text.push_str(&rest[..open]);
+                if !text.is_empty() {
+                    out.push(lit(std::mem::take(&mut text), key.1));
+                }
+                out.push(v);
+                rest = &after[close + 1..];
+            }
+            None => {
+                text.push_str(&rest[..=open]);
+                rest = after;
+            }
+        }
+    }
+    text.push_str(rest);
+    if !text.is_empty() || out.is_empty() {
+        out.push(lit(text, key.1));
+    }
+    Ok(out)
 }
 
 fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<Element, UiError> {
@@ -1015,6 +1122,7 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
         return Err(unknown(node.pos, "блок", kind_name, KINDS, ""));
     }
     let mut initial = Placement::default();
+    let mut patched: Option<Node> = None;
     // `Button("Играть")` — короткая запись `Button { Text("Играть") }`.
     let mut kids = node.children.clone();
     let kind = match kind_name {
@@ -1069,14 +1177,51 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
                     ));
                 }
             };
+            let live = text.iter().any(|p| is_live(&p.value));
             Kind::Text(TextSpec {
-                text,
+                text: joined(&text, &UiData::default())?,
+                parts: live.then_some(text),
                 size: ctx.font,
                 color: ctx.color,
             })
         }
+        "Bar" => {
+            if kids.is_some() {
+                return Err(meaning(node.pos, "у Bar не бывает вложенных блоков в { }"));
+            }
+            match &node.args[..] {
+                [] => {}
+                [a] if a.name.is_none() => {
+                    // `Bar(x)` — то же, что `.value(x)` у самого блока, первым.
+                    let mut mods = vec![Modifier {
+                        name: "value".into(),
+                        args: vec![a.clone()],
+                        inner: None,
+                        pos: a.pos,
+                    }];
+                    mods.extend(node.modifiers.iter().cloned());
+                    patched = Some(Node {
+                        kind: node.kind.clone(),
+                        args: Vec::new(),
+                        children: None,
+                        modifiers: mods,
+                        pos: node.pos,
+                    });
+                }
+                _ => {
+                    return Err(meaning(
+                        node.pos,
+                        "Bar: одно значение от 0 до 1, Bar(game.hero.hp / game.hero.hp_max)",
+                    ));
+                }
+            }
+            initial.width = Len::Px(200.0);
+            initial.height = Len::Px(12.0);
+            Kind::Bar
+        }
         _ => unreachable!("имя проверено выше"),
     };
+    let node = patched.as_ref().unwrap_or(node);
     let me = Info {
         kind: kind_name.to_owned(),
         classes: classes_of(&node.modifiers)?,

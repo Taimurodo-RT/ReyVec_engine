@@ -14,5 +14,6 @@
         "menu.quit": "Выход",
         "hud.stamina": "Выносливость",
         "hud.coins": "Монеты: {n}",
+        "hud.health": "Здоровье",
     },
 )

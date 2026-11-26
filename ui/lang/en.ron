@@ -12,5 +12,6 @@
         "menu.quit": "Quit",
         "hud.stamina": "Stamina",
         "hud.coins": "Coins: {n}",
+        "hud.health": "Health",
     },
 )
