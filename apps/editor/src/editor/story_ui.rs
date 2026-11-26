@@ -17,7 +17,7 @@ use egui::{
 use reyvec_story::format::{self, Change, Choice, Goal, Stage, Value, VarsFile};
 use reyvec_story::{Character, Dialog, LineSettings, Node, Problem, Quest, Story, View};
 
-use super::dialog_graph::{Around, DialogGraph, KINDS as NODE_KINDS, Speaker};
+use super::dialog_graph::{Around, DialogGraph, KINDS as NODE_KINDS, Speaker, change_row};
 use super::story_play::Player;
 use super::theme::*;
 
@@ -678,12 +678,10 @@ impl StoryUi {
                         version: format::VERSION,
                         id: id.clone(),
                         title: "Новое задание".into(),
-                        stages: vec![Stage {
-                            id: "nachalo".into(),
-                            journal: "Что нужно сделать.".into(),
-                            goals: Vec::new(),
-                            next: String::new(),
-                        }],
+                        description: String::new(),
+                        stages: vec![new_stage("nachalo")],
+                        rewards: Vec::new(),
+                        fail_when: String::new(),
                     },
                 );
                 s.files
@@ -1302,21 +1300,118 @@ impl StoryUi {
             prop(ui, "Имя в коде", |ui| {
                 ui.label(RichText::new(&q.id).monospace().color(TEXT_DIM));
             });
-            prop(ui, "Стадий", |ui| {
-                ui.label(RichText::new(q.stages.len().to_string()).color(TEXT_DIM));
+            prop(ui, "Описание", |ui| {
+                changed |= ui
+                    .add(
+                        TextEdit::multiline(&mut q.description)
+                            .frame(Frame::NONE)
+                            .desired_rows(1)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("О чём задание — видно в журнале"),
+                    )
+                    .changed();
+            });
+            prop(ui, "Провал, если", |ui| {
+                changed |= ui
+                    .add(
+                        TextEdit::singleline(&mut q.fail_when)
+                            .frame(Frame::NONE)
+                            .font(FontId::monospace(FONT_MONO))
+                            .desired_width(f32::INFINITY)
+                            .hint_text("условие Luau, например kuznec.zloy"),
+                    )
+                    .on_hover_text("Стало верным, пока задание идёт, — задание провалено")
+                    .changed();
             });
         });
-        let mut jump_to = None;
+
+        ui.add_space(GAP_M);
+        h2(ui, "Награда");
+        muted(ui, "Что меняется в мире, когда задание выполнено");
+        let mut drop = None;
+        for (i, c) in q.rewards.iter_mut().enumerate() {
+            let (ch, del) = change_row(ui, c, ("reward", i), 180.0);
+            changed |= ch;
+            if del {
+                drop = Some(i);
+            }
+        }
+        if let Some(i) = drop {
+            q.rewards.remove(i);
+            changed = true;
+        }
+        if add_button(ui, "+ награда") {
+            q.rewards.push(format::Change {
+                var: String::new(),
+                to: Some(Value::Bool(true)),
+                add: None,
+            });
+            changed = true;
+        }
+
+        ui.add_space(GAP_M);
+        h2(ui, "Стадии");
+        let ids: Vec<String> = q.stages.iter().map(|s| s.id.clone()).collect();
+        let n = q.stages.len();
+        let mut action = None;
+        let mut rename = None;
         for (i, s) in q.stages.iter_mut().enumerate() {
-            ui.add_space(GAP_M);
-            let r = h2(ui, &format!("{}. {}", i + 1, s.id));
+            ui.add_space(GAP_S);
+            let r = ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{}.", i + 1))
+                        .size(FONT_H2)
+                        .color(TEXT)
+                        .strong(),
+                );
+                let mut sid = s.id.clone();
+                if ui
+                    .add(
+                        TextEdit::singleline(&mut sid)
+                            .id_salt(("stage-id", i))
+                            .frame(Frame::NONE)
+                            .font(FontId::monospace(FONT_H2 - 2.0))
+                            .desired_width(180.0),
+                    )
+                    .on_hover_text("Имя стадии в коде: quest.stage(\"задание\") его вернёт")
+                    .changed()
+                {
+                    rename = Some((s.id.clone(), sid.clone()));
+                    s.id = sid;
+                    changed = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("×").color(MUTED)).frame(false))
+                        .on_hover_text("Удалить стадию")
+                        .clicked()
+                    {
+                        action = Some(StageAction::Remove(i));
+                    }
+                    if ui
+                        .add_enabled(i + 1 < n, egui::Button::new("↓").frame(false))
+                        .on_hover_text("Ниже")
+                        .clicked()
+                    {
+                        action = Some(StageAction::Swap(i, i + 1));
+                    }
+                    if ui
+                        .add_enabled(i > 0, egui::Button::new("↑").frame(false))
+                        .on_hover_text("Выше")
+                        .clicked()
+                    {
+                        action = Some(StageAction::Swap(i - 1, i));
+                    }
+                });
+            });
             if self.scroll_to.as_deref() == Some(s.id.as_str()) {
-                r.scroll_to_me(Some(Align::Min));
+                r.response.scroll_to_me(Some(Align::Min));
                 self.scroll_to = None;
             }
             changed |= ui
                 .add(
                     TextEdit::multiline(&mut s.journal)
+                        .id_salt(("stage-journal", i))
                         .frame(Frame::NONE)
                         .font(FontId::proportional(FONT_NOTE))
                         .desired_width(f32::INFINITY)
@@ -1324,18 +1419,118 @@ impl StoryUi {
                         .hint_text("Запись в журнале игрока"),
                 )
                 .changed();
-            for g in &mut s.goals {
-                changed |= goal_row(ui, g);
+            let mut drop = None;
+            for (gi, g) in s.goals.iter_mut().enumerate() {
+                let (ch, del) = goal_row(ui, g);
+                changed |= ch;
+                if del {
+                    drop = Some(gi);
+                }
             }
-            if s.next.is_empty() {
-                muted(ui, "■ после этой стадии задание выполнено");
-            } else {
-                arrow(ui, "дальше", &s.next, &mut jump_to);
+            if let Some(gi) = drop {
+                s.goals.remove(gi);
+                changed = true;
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(GAP_L);
+                if add_button(ui, "+ цель") {
+                    let gid = (1..)
+                        .map(|k| format!("cel_{k}"))
+                        .find(|g| !s.goals.iter().any(|x| x.id == *g))
+                        .unwrap_or_default();
+                    s.goals.push(format::Goal {
+                        id: gid,
+                        text: String::new(),
+                        count: 1,
+                    });
+                    changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(GAP_L);
+                muted(ui, "и если");
+                changed |= ui
+                    .add(
+                        TextEdit::singleline(&mut s.done_when)
+                            .id_salt(("stage-when", i))
+                            .font(FontId::monospace(FONT_MONO))
+                            .desired_width(260.0)
+                            .margin(PAD_FIELD)
+                            .hint_text("условие Luau (можно пусто)"),
+                    )
+                    .on_hover_text(
+                        "Стадия закончится, когда выполнены цели и это условие верно. \
+                         Без целей и условия стадию заканчивает скрипт или событие \
+                         quest.stage / quest.complete",
+                    )
+                    .changed();
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(GAP_L);
+                muted(ui, "↓ дальше");
+                let shown = if s.next.is_empty() {
+                    "■ задание выполнено".to_string()
+                } else {
+                    s.next.clone()
+                };
+                egui::ComboBox::from_id_salt(("stage-next", i))
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(s.next.is_empty(), "■ задание выполнено")
+                            .clicked()
+                        {
+                            s.next.clear();
+                            changed = true;
+                        }
+                        for other in ids.iter().filter(|o| **o != ids[i]) {
+                            if ui.selectable_label(s.next == *other, other).clicked() {
+                                s.next = other.clone();
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+        }
+        if let Some((old, new)) = rename {
+            for s in &mut q.stages {
+                if s.next == old {
+                    s.next = new.clone();
+                }
             }
         }
-        if let Some(n) = jump_to {
-            self.scroll_to = Some(n);
+        match action {
+            Some(StageAction::Remove(i)) => {
+                let gone = q.stages.remove(i).id;
+                for s in &mut q.stages {
+                    if s.next == gone {
+                        s.next.clear();
+                    }
+                }
+                changed = true;
+            }
+            Some(StageAction::Swap(a, b)) => {
+                q.stages.swap(a, b);
+                changed = true;
+            }
+            None => {}
         }
+        if add_button(ui, "+ стадия") {
+            let sid = (1..)
+                .map(|k| format!("stadiya_{k}"))
+                .find(|x| q.stage(x).is_none())
+                .unwrap_or_default();
+            // Новая стадия встаёт в конец цепочки: последняя теперь ведёт в неё.
+            if let Some(last) = q.stages.iter_mut().find(|s| s.next.is_empty()) {
+                last.next = sid.clone();
+            }
+            q.stages.push(new_stage(&sid));
+            changed = true;
+        }
+
+        ui.add_space(GAP_L);
+        h2(ui, "Как увидит игрок");
+        journal_preview(ui, q);
         changed
     }
 
@@ -2161,8 +2356,9 @@ fn choice_row(
     changed
 }
 
-fn goal_row(ui: &mut Ui, g: &mut Goal) -> bool {
+fn goal_row(ui: &mut Ui, g: &mut Goal) -> (bool, bool) {
     let mut changed = false;
+    let mut drop = false;
     ui.horizontal(|ui| {
         ui.add_space(GAP_L);
         let (r, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
@@ -2178,21 +2374,100 @@ fn goal_row(ui: &mut Ui, g: &mut Goal) -> bool {
                     .id_salt(("goal", &g.id))
                     .frame(Frame::NONE)
                     .font(FontId::proportional(FONT_NOTE))
-                    .desired_width(220.0),
+                    .hint_text("что сделать")
+                    .desired_width(200.0),
             )
             .changed();
         muted(ui, "нужно");
         changed |= ui
             .add(egui::DragValue::new(&mut g.count).range(1..=9999))
             .changed();
-        ui.label(
-            RichText::new(format!("#{}", g.id))
-                .monospace()
-                .size(FONT_SMALL)
-                .color(MUTED),
-        );
+        changed |= ui
+            .add(
+                TextEdit::singleline(&mut g.id)
+                    .id_salt(("goal-id", &g.text))
+                    .font(FontId::monospace(FONT_SMALL))
+                    .desired_width(70.0),
+            )
+            .on_hover_text("Имя цели в коде: quest.add(\"задание\", \"цель\", 1)")
+            .changed();
+        if ui
+            .add(egui::Button::new(RichText::new("×").color(MUTED)).frame(false))
+            .on_hover_text("Убрать цель")
+            .clicked()
+        {
+            drop = true;
+        }
     });
-    changed
+    (changed, drop)
+}
+
+/// Что делать со стадией после рисования списка.
+enum StageAction {
+    Remove(usize),
+    Swap(usize, usize),
+}
+
+fn new_stage(id: &str) -> Stage {
+    Stage {
+        id: id.into(),
+        journal: "Что нужно сделать.".into(),
+        goals: Vec::new(),
+        next: String::new(),
+        done_when: String::new(),
+    }
+}
+
+/// Кнопка-ссылка «+ …» зелёным.
+fn add_button(ui: &mut Ui, text: &str) -> bool {
+    ui.add(egui::Button::new(RichText::new(text).color(GOOD)).frame(false))
+        .clicked()
+}
+
+/// Журнал так, как его увидит игрок: задание по стадиям, цели с «0 из N», награда.
+fn journal_preview(ui: &mut Ui, q: &Quest) {
+    Frame::NONE
+        .fill(CARD)
+        .stroke(Stroke::new(LINE, BORDER))
+        .corner_radius(RADIUS_M)
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(&q.title).size(FONT_H2).color(TEXT).strong());
+            if !q.description.is_empty() {
+                ui.label(RichText::new(&q.description).color(TEXT_DIM));
+            }
+            ui.add_space(GAP_S);
+            for (i, s) in q.stages.iter().enumerate() {
+                let first = i == 0;
+                let color = if first { TEXT } else { MUTED };
+                ui.label(
+                    RichText::new(format!("{}  {}", if first { "▶" } else { "·" }, s.journal))
+                        .color(color),
+                );
+                for g in &s.goals {
+                    ui.label(
+                        RichText::new(format!("      ☐ {} — 0 из {}", g.text, g.count))
+                            .color(color)
+                            .size(FONT_SMALL + 1.0),
+                    );
+                }
+            }
+            if !q.rewards.is_empty() {
+                ui.add_space(GAP_S);
+                let list: Vec<String> = q.rewards.iter().map(change_text).collect();
+                ui.label(
+                    RichText::new(format!("Награда: {}", list.join(", ")))
+                        .color(GOOD)
+                        .size(FONT_SMALL + 1.0),
+                );
+            }
+            ui.label(
+                RichText::new("Сначала видна только первая стадия; следующие открываются по ходу.")
+                    .color(MUTED)
+                    .size(FONT_SMALL),
+            );
+        });
 }
 
 fn folder_row(ui: &mut Ui, name: &str, count: usize, open: bool) -> egui::Response {

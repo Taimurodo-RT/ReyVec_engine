@@ -85,7 +85,8 @@ impl Story {
             .goals
             .iter()
             .all(|g| s.progress.get(&g.id).copied().unwrap_or(0) >= g.count);
-        if all {
+        // Есть условие стадии — её закончит `quest_tick`, когда оно станет верным.
+        if all && stage.done_when.trim().is_empty() {
             let next = stage.next.clone();
             self.quest_stage(state, id, &next)?;
         }
@@ -104,6 +105,9 @@ impl Story {
         }
         if stage.is_empty() {
             s.status = Status::Done;
+            for c in &q.rewards {
+                crate::play::apply(state, c).map_err(|e| format!("награда за «{id}»: {e}"))?;
+            }
         } else {
             s.status = Status::Active;
             s.stage = stage.to_string();
@@ -129,6 +133,44 @@ impl Story {
         Ok(())
     }
 
+    /// Условия заданий: провал (`fail_when`) и конец стадии по условию (`done_when`).
+    /// Игра зовёт это после изменений мира (и проигрыватель — на каждом шаге).
+    pub fn quest_tick(&mut self, state: &mut State) -> Result<(), String> {
+        let active: Vec<String> = state
+            .quests
+            .iter()
+            .filter(|(_, s)| s.status == Status::Active)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in active {
+            let Some(q) = self.quests.get(&id) else {
+                continue;
+            };
+            let fail = q.fail_when.clone();
+            if !fail.trim().is_empty() && self.conds.eval(&fail, state)? {
+                self.quest_fail(state, &id)?;
+                continue;
+            }
+            let s = self.quest_state(state, &id);
+            let Some(stage) = q.stage(&s.stage) else {
+                continue;
+            };
+            let when = stage.done_when.clone();
+            if when.trim().is_empty() {
+                continue;
+            }
+            let goals_done = stage
+                .goals
+                .iter()
+                .all(|g| s.progress.get(&g.id).copied().unwrap_or(0) >= g.count);
+            if goals_done && self.conds.eval(&when, state)? {
+                let next = stage.next.clone();
+                self.quest_stage(state, &id, &next)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Записи журнала: (задание, запись текущей стадии, цели «текст, сделано, нужно»)
     /// для начатых заданий.
     pub fn journal(&self, state: &State) -> Vec<JournalEntry> {
@@ -144,6 +186,7 @@ impl Story {
             out.push(JournalEntry {
                 quest: id.clone(),
                 title: q.title.clone(),
+                description: q.description.clone(),
                 status: s.status,
                 text: stage.map(|st| st.journal.clone()).unwrap_or_default(),
                 goals: stage
@@ -171,6 +214,7 @@ impl Story {
 pub struct JournalEntry {
     pub quest: String,
     pub title: String,
+    pub description: String,
     pub status: Status,
     pub text: String,
     /// Цели: текст, сделано, нужно.

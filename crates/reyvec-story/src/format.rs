@@ -359,6 +359,10 @@ pub struct Stage {
     /// Следующая стадия. Пусто — задание выполнено.
     #[serde(default)]
     pub next: String,
+    /// Условие Luau, без которого стадия не закончится (вместе с целями, если они есть):
+    /// `hero.ruda >= 3`. Пусто — хватает целей.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub done_when: String,
 }
 
 /// Задание: `story/quests/<id>.ron`.
@@ -370,7 +374,16 @@ pub struct Quest {
     pub version: u32,
     pub id: String,
     pub title: String,
+    /// Описание для журнала: о чём задание в целом.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     pub stages: Vec<Stage>,
+    /// Награда: что меняется в мире, когда задание выполнено.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rewards: Vec<Change>,
+    /// Условие Luau провала: стало верным, пока задание идёт, — задание провалено.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fail_when: String,
 }
 
 impl Quest {

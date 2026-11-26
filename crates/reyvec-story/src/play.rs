@@ -117,8 +117,17 @@ impl Story {
         })
     }
 
-    /// Ведёт разговор до следующей реплики, события, паузы или конца.
+    /// Ведёт разговор до следующей реплики, события, паузы или конца. После шага
+    /// проверяет условия заданий ([`Story::quest_tick`]): разговор мог поменять мир.
     pub fn step(&mut self, talk: &mut Talk, state: &mut State) -> Step {
+        let step = self.step_talk(talk, state);
+        if let Err(e) = self.quest_tick(state) {
+            tracing::warn!("условия заданий: {e}");
+        }
+        step
+    }
+
+    fn step_talk(&mut self, talk: &mut Talk, state: &mut State) -> Step {
         match std::mem::replace(&mut talk.pending, Pending::Ended) {
             Pending::Ended => return Step::End,
             Pending::Choices(c) => {
