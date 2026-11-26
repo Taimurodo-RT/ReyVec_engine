@@ -81,12 +81,81 @@ pub fn check(story: &mut Story) -> Vec<Problem> {
             ));
         }
     }
+    check_life(story, &mut out);
     let ids: Vec<String> = story.dialogs.keys().cloned().collect();
     for id in ids {
         check_dialog(story, &id, &mut out);
     }
     check_quests(story, &mut out);
     out
+}
+
+/// Распорядок и разговоры персонажей (Сю.12).
+fn check_life(story: &mut Story, out: &mut Vec<Problem>) {
+    let state = story.new_state();
+    let chars: Vec<_> = story.characters.values().cloned().collect();
+    for c in chars {
+        let file = story
+            .files
+            .get(&format!("c:{}", c.id))
+            .cloned()
+            .unwrap_or_default();
+        for r in &c.day {
+            if !(0.0..24.0).contains(&r.from) {
+                out.push(Problem::error(
+                    &file,
+                    "day",
+                    format!("час {} — нужен от 0 до 24", r.from),
+                ));
+            }
+            if !valid_id(&r.place) {
+                out.push(Problem::error(&file, "day", bad_id(&r.place)));
+            }
+        }
+        for ch in &c.chats {
+            if !story.characters.contains_key(&ch.with) {
+                out.push(Problem::error(
+                    &file,
+                    "chats",
+                    format!("разговор с «{}», а такого персонажа нет", ch.with),
+                ));
+            } else if story.characters[&ch.with].day.is_empty() || c.day.is_empty() {
+                out.push(Problem::warning(
+                    &file,
+                    "chats",
+                    format!(
+                        "разговор с «{}» не начнётся: у обоих должен быть распорядок дня",
+                        ch.with
+                    ),
+                ));
+            }
+            if !story.dialogs.contains_key(&ch.dialog) {
+                out.push(Problem::error(
+                    &file,
+                    "chats",
+                    format!("нет диалога «{}»", ch.dialog),
+                ));
+            }
+            if ch.every <= 0.0 {
+                out.push(Problem::error(
+                    &file,
+                    "chats",
+                    "«every» — сколько часов между разговорами, больше нуля",
+                ));
+            }
+            if !ch.when.trim().is_empty() {
+                if let Err(e) = story.conds.compile(&ch.when) {
+                    out.push(Problem::error(
+                        &file,
+                        "chats",
+                        format!("условие «{}»: {e}", ch.when),
+                    ));
+                } else if let Err(e) = story.conds.eval(&ch.when, &state) {
+                    out.push(Problem::error(&file, "chats", e));
+                }
+            }
+        }
+    }
 }
 
 fn bad_id(id: &str) -> String {

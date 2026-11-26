@@ -9,4 +9,15 @@
     lines: (view: Window, mood: "spokoiny"),
     // Отношения в начале игры (Сю.9): к незнакомцу кузнец относится настороженно.
     relations: {"hero": -1},
+    // Распорядок дня (Сю.12): игра начинается в 8 утра, час игры — минута.
+    day: [
+        (from: 6, place: "kuznya", doing: "rabotaet"),
+        (from: 12, place: "ploshad", doing: "obedaet"),
+        (from: 13, place: "kuznya", doing: "rabotaet"),
+        (from: 22, place: "dom", doing: "spit"),
+    ],
+    // Разговоры с другими (Сю.12): когда оба в одном месте, не чаще раза в час игры.
+    chats: [
+        (with: "uchenik", dialog: "kuznec.uchenik", every: 1),
+    ],
 )

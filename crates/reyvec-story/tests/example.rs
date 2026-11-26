@@ -20,8 +20,21 @@ fn example_folder_matches_embedded() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../story");
     let (story, problems) = Story::load_dir(&dir);
     assert!(problems.is_empty(), "{problems:#?}");
-    assert_eq!(story.dialogs.len(), 2);
-    assert_eq!(story.characters.len(), 2);
+    assert_eq!(
+        story.dialogs.len(),
+        EXAMPLE
+            .iter()
+            .filter(|(p, _)| p.starts_with("dialogs/"))
+            .count()
+    );
+    assert_eq!(
+        story.characters.len(),
+        EXAMPLE
+            .iter()
+            .filter(|(p, _)| p.starts_with("characters/"))
+            .count()
+    );
+    assert_eq!(story.dialogs.len(), 3);
     assert_eq!(story.quests.len(), 1);
     assert!(story.lang.contains_key("en"));
 }

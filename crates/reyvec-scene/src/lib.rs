@@ -2189,7 +2189,7 @@ pub use logic::{STEP, SceneLogic, TIME_SCALE};
 /// Игровые системы (этап 6): ввод и контроллер персонажа.
 pub use reyvec_game as game;
 /// Сюжет (Сю.7): общий сюжет мира, реплика на экране и ответы игрока.
-pub use reyvec_script::{Answer, Screen, SharedStory, StoryHost, lock_story};
+pub use reyvec_script::{Answer, Heard, Screen, SharedStory, StoryHost, lock_story};
 /// Сюжет данными (решение 0023): журнал заданий, сохранение.
 pub use reyvec_story as story;
 pub use tiles::TilesDesc;

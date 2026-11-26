@@ -2477,3 +2477,36 @@ fn smith_and_ore_example_plays_through_in_the_first_room() {
     assert!(h.problems.is_empty(), "{:?}", h.problems);
     assert!(w.snapshot().scripts.errors.is_empty());
 }
+
+/// Сю.12: рядом с кузнецом слышно, как он переговаривается с учеником.
+#[test]
+fn hero_near_the_smith_overhears_the_apprentice_talk() {
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let story = w.story().expect("папка story/ в корне репозитория");
+    let mut b = w.player_body().unwrap();
+    b.pos = [6.5, -0.62];
+    b.vel = [0.0, 0.0];
+    w.set_player_body(b);
+    let mut heard = Vec::new();
+    let mut t = 0;
+    for _ in 0..8 * 60 {
+        t = steps(&mut w, t, 1);
+        let h = story.lock().unwrap();
+        for l in &h.heard {
+            if !heard.contains(&l.text) {
+                heard.push(l.text.clone());
+            }
+        }
+    }
+    assert!(
+        heard.iter().any(|t| t.contains("мехи")) && heard.iter().any(|t| t.contains("Руды")),
+        "{heard:?}"
+    );
+    assert!(
+        !story.lock().unwrap().busy(),
+        "игрока в разговор не втянули"
+    );
+    assert!(w.snapshot().scripts.errors.is_empty());
+}
