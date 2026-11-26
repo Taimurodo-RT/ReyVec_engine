@@ -16,7 +16,9 @@ use egui::{
     Stroke, Ui, pos2, vec2,
 };
 
-use super::luau_text::{self, HERO, Hint, ME, Problem, Tok, Warning};
+use super::luau_text::{
+    self, Func, HERO, Hint, ME, Problem, QUEST_FUNCS, STORY_FUNCS, Tok, Warning,
+};
 use super::project_files as pf;
 use super::theme::*;
 
@@ -65,6 +67,8 @@ pub(crate) struct CodeEditor {
     problem: Option<Problem>,
     /// Похоже на опечатку (С.2).
     warnings: Vec<Warning>,
+    /// Имена диалогов, заданий и переменных сюжета проекта (Сю.5).
+    story: luau_text::StoryNames,
     find: Option<Find>,
     /// Окошко «Перейти к строке» (Ctrl+G) и что в нём набрано.
     goto_input: Option<String>,
@@ -94,6 +98,9 @@ impl CodeEditor {
             text,
             problem: None,
             warnings: Vec::new(),
+            story: project
+                .map(luau_text::StoryNames::of_project)
+                .unwrap_or_default(),
             find: None,
             goto_input: None,
             jump: None,
@@ -176,6 +183,9 @@ impl CodeEditor {
             p
         });
         self.warnings = luau_text::warnings(&self.text);
+        self.warnings
+            .extend(luau_text::story_warnings(&self.text, &self.story));
+        self.warnings.sort_by_key(|w| w.range.start);
         self.checked = Some(self.text.clone());
     }
 
@@ -355,6 +365,17 @@ impl CodeEditor {
         hint_list(ui, "hero — герой", HERO, false);
         ui.add_space(GAP_L);
         ui.label(RichText::new("dt — шаг игры, секунды").color(TEXT));
+        ui.add_space(GAP_L);
+        func_list(ui, "story — сюжет", "story", STORY_FUNCS);
+        ui.add_space(GAP_L);
+        func_list(ui, "quest — задания", "quest", QUEST_FUNCS);
+        if !self.story.dialogs.is_empty() {
+            ui.label(
+                RichText::new("Имена диалогов и заданий подсказываются прямо в кавычках")
+                    .small()
+                    .color(MUTED),
+            );
+        }
         ui.add_space(GAP_XL);
         ui.label(RichText::new("Где используется").color(TEXT).strong());
         ui.add_space(GAP_S);
@@ -780,11 +801,9 @@ impl CodeEditor {
             let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
             self.at = (line, col);
             if edited {
-                self.popup = luau_text::complete(&self.text, at).map(|(at, _, items)| Popup {
-                    at,
-                    items,
-                    pick: 0,
-                });
+                self.popup = luau_text::complete(&self.text, at)
+                    .or_else(|| luau_text::story_complete(&self.text, at, &self.story))
+                    .map(|(at, _, items)| Popup { at, items, pick: 0 });
             } else if range.primary.index.0 != range.secondary.index.0 {
                 self.popup = None;
             }
@@ -962,7 +981,15 @@ impl CodeEditor {
                                 .iter()
                                 .chain(HERO.iter())
                                 .find(|h| h.name == name.as_str())
-                                .map_or("", |h| h.about);
+                                .map(|h| h.about)
+                                .or_else(|| {
+                                    STORY_FUNCS
+                                        .iter()
+                                        .chain(QUEST_FUNCS.iter())
+                                        .find(|f| f.name == name.as_str())
+                                        .map(|f| f.about)
+                                })
+                                .unwrap_or("");
                             let picked = i == popup.pick;
                             let text = RichText::new(name.as_str()).monospace().color(if picked {
                                 Color32::WHITE
@@ -1083,6 +1110,20 @@ fn hint_list(ui: &mut Ui, title: &str, hints: &[Hint], legend: bool) {
                 .small()
                 .color(MUTED),
         );
+    }
+}
+
+fn func_list(ui: &mut Ui, title: &str, table: &str, funcs: &[Func]) {
+    ui.label(RichText::new(title).color(TEXT).strong());
+    ui.add_space(GAP_XS);
+    for f in funcs {
+        ui.label(
+            RichText::new(format!("{table}.{}{}", f.name, f.args))
+                .monospace()
+                .size(FONT_MONO)
+                .color(SELECT),
+        );
+        ui.add(egui::Label::new(RichText::new(f.about).small().color(TEXT_DIM)).wrap());
     }
 }
 

@@ -34,9 +34,9 @@ const KEYWORDS: [&str; 19] = [
 ];
 
 /// Имена, которые есть у скрипта и без объявления.
-const KNOWN: [&str; 17] = [
+const KNOWN: [&str; 19] = [
     "me", "hero", "dt", "update", "math", "string", "table", "print", "pairs", "ipairs",
-    "tostring", "tonumber", "type", "select", "error", "pcall", "bit32",
+    "tostring", "tonumber", "type", "select", "error", "pcall", "bit32", "story", "quest",
 ];
 
 /// Разбить текст на куски (байтовые границы); куски идут подряд и покрывают весь текст.
@@ -205,6 +205,139 @@ fn has_update(text: &str) -> bool {
 /// Поля `me` и `hero` описаны в движке (`reyvec-script`) рядом с кодом, который их
 /// заполняет: новое поле движка редактор подсказывает сам.
 pub(crate) use reyvec_script::{Field as Hint, HERO_FIELDS as HERO, ME_FIELDS as ME};
+/// Функции сюжета (Сю.5) тоже описаны в движке.
+pub(crate) use reyvec_script::{Func, QUEST_FUNCS, STORY_FUNCS};
+
+/// Функции таблицы `story` или `quest`.
+pub(crate) fn funcs_of(table: &str) -> Option<&'static [Func]> {
+    match table {
+        "story" => Some(STORY_FUNCS),
+        "quest" => Some(QUEST_FUNCS),
+        _ => None,
+    }
+}
+
+/// Имена из сюжета проекта: на них ссылаются `story.talk("…")`, `quest.add("…")`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct StoryNames {
+    pub dialogs: Vec<String>,
+    pub quests: Vec<String>,
+    pub vars: Vec<String>,
+}
+
+impl StoryNames {
+    /// Из папки `story/` проекта (нет папки — пусто, и имена не проверяются).
+    pub(crate) fn of_project(project: &std::path::Path) -> Self {
+        let (s, _) = reyvec_story::Story::load_dir(&project.join("story"));
+        Self {
+            dialogs: s.dialogs.into_keys().collect(),
+            quests: s.quests.into_keys().collect(),
+            vars: s.vars.into_keys().collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.dialogs.is_empty() && self.quests.is_empty() && self.vars.is_empty()
+    }
+}
+
+/// Что за имя стоит в кавычках первым аргументом функции сюжета.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoryArg {
+    Dialog,
+    Quest,
+    Var,
+}
+
+impl StoryArg {
+    fn list(self, n: &StoryNames) -> &[String] {
+        match self {
+            StoryArg::Dialog => &n.dialogs,
+            StoryArg::Quest => &n.quests,
+            StoryArg::Var => &n.vars,
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            StoryArg::Dialog => "диалога",
+            StoryArg::Quest => "задания",
+            StoryArg::Var => "переменной",
+        }
+    }
+}
+
+/// Строки-имена в вызовах сюжета: `story.talk("kuznec.privet")` → (место строки, вид,
+/// имя без кавычек).
+pub(crate) fn story_args(text: &str) -> Vec<(Range<usize>, StoryArg, String)> {
+    let w = words(text);
+    let mut out = Vec::new();
+    for i in 0..w.len().saturating_sub(4) {
+        let (table, dot, f, open, arg) = (&w[i], &w[i + 1], &w[i + 2], &w[i + 3], &w[i + 4]);
+        if dot.2 != "." || open.2 != "(" || arg.1 != Tok::Str {
+            continue;
+        }
+        let kind = match (table.2, f.2) {
+            ("story", "talk" | "seen") => StoryArg::Dialog,
+            ("story", "get" | "set") => StoryArg::Var,
+            ("quest", _) => StoryArg::Quest,
+            _ => continue,
+        };
+        let inner = arg.2.trim_matches(|c| c == '"' || c == '\'');
+        out.push((arg.0.clone(), kind, inner.to_owned()));
+    }
+    out
+}
+
+/// Подсказка в кавычках: имена диалогов, заданий или переменных из сюжета проекта.
+pub(crate) fn story_complete(
+    text: &str,
+    cursor: usize,
+    names: &StoryNames,
+) -> Option<(usize, String, Vec<String>)> {
+    let (r, kind, _) = story_args(text)
+        .into_iter()
+        .find(|(r, _, _)| r.start < cursor && cursor <= r.end)?;
+    let start = r.start + 1;
+    let typed = text.get(start..cursor)?;
+    if typed.contains(['"', '\'']) {
+        return None;
+    }
+    let found: Vec<String> = kind
+        .list(names)
+        .iter()
+        .filter(|n| n.starts_with(typed) && n.as_str() != typed)
+        .cloned()
+        .collect();
+    (!found.is_empty()).then(|| (start, typed.to_owned(), found))
+}
+
+/// Опечатки в именах сюжета: нет такого диалога, задания или переменной.
+pub(crate) fn story_warnings(text: &str, names: &StoryNames) -> Vec<Warning> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (r, kind, name) in story_args(text) {
+        let list = kind.list(names);
+        if list.contains(&name) {
+            continue;
+        }
+        let near = list
+            .iter()
+            .map(|n| (distance(n, &name), n))
+            .filter(|(d, _)| *d <= 3)
+            .min_by_key(|(d, _)| *d)
+            .map(|(_, n)| format!(" Может, {n}?"))
+            .unwrap_or_default();
+        out.push(Warning {
+            line: text[..r.start].matches('\n').count() + 1,
+            range: r,
+            text: format!("В сюжете нет {} «{name}».{near}", kind.what()),
+        });
+    }
+    out
+}
 
 /// Самое нужное из `math`.
 const MATH: [&str; 16] = [
@@ -324,6 +457,11 @@ pub(crate) fn complete(text: &str, cursor: usize) -> Option<(usize, String, Vec<
                     .collect(),
                 "hero" => HERO.iter().map(|h| h.name.to_owned()).collect(),
                 "math" => MATH.iter().map(|n| (*n).to_owned()).collect(),
+                t if funcs_of(t).is_some() => funcs_of(t)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|f| f.name.to_owned())
+                    .collect(),
                 _ => return None,
             }
         }
@@ -523,6 +661,18 @@ pub(crate) fn warnings(text: &str) -> Vec<Warning> {
                     text: format!("me.{name} {what}.{}", near(known)),
                 });
             }
+            t if funcs_of(t).is_some_and(|fs| !fs.iter().any(|f| f.name == name)) => {
+                let known = funcs_of(t)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|f| f.name.to_owned())
+                    .collect();
+                out.push(Warning {
+                    range: w[i].0.clone(),
+                    line,
+                    text: format!("У {t} нет функции {name}.{}", near(known)),
+                });
+            }
             "hero" if !HERO.iter().any(|f| f.name == name) => {
                 let known = HERO.iter().map(|f| f.name.to_owned()).collect();
                 out.push(Warning {
@@ -576,6 +726,11 @@ pub(crate) fn hover(text: &str, at: usize) -> Option<String> {
                 .then(|| format!("me.{name}: своё поле скрипта, живёт, пока жив мир"))
         }),
         (Tok::Field, Some("hero")) => field(HERO, "hero"),
+        (Tok::Field, Some(t)) if funcs_of(t).is_some() => funcs_of(t)
+            .unwrap_or_default()
+            .iter()
+            .find(|f| f.name == *name)
+            .map(|f| format!("{t}.{}{}: {}", f.name, f.args, f.about)),
         (Tok::Known, _) => Some(
             match *name {
                 "me" => "me: этот предмет. Движок пишет в него, где предмет и что с ним; скрипт — что делать",
@@ -586,6 +741,8 @@ pub(crate) fn hover(text: &str, at: usize) -> Option<String> {
                 "string" => "string: работа с текстом",
                 "table" => "table: работа со списками (insert, remove, sort…)",
                 "print" => "print(…): строка в консоль редактора",
+                "story" => "story: сюжет — разговоры и переменные мира (story.talk, story.get…)",
+                "quest" => "quest: задания (quest.start, quest.add, quest.state…)",
                 _ => return None,
             }
             .to_owned(),
@@ -896,5 +1053,59 @@ mod tests {
         assert_eq!(next_indent("function update(me, hero, dt)"), "    ");
         assert_eq!(next_indent("    me.x = 1 -- then"), "    ");
         assert_eq!(next_indent("\tx = 1"), "\t");
+    }
+
+    #[test]
+    fn story_names_complete_and_typos_are_flagged() {
+        let names = StoryNames {
+            dialogs: vec!["kuznec.privet".into(), "kuznec.ruda".into()],
+            quests: vec!["mech".into()],
+            vars: vec!["hero.money".into()],
+        };
+        // После «story.» и «quest.» — функции движка.
+        let t = "function update(me) story.ta";
+        let (_, typed, items) = complete(t, t.len()).unwrap();
+        assert_eq!((typed.as_str(), items), ("ta", vec!["talk".to_owned()]));
+        let t = "quest.";
+        let items = complete(t, t.len()).unwrap().2;
+        assert!(items.contains(&"add".to_owned()) && items.contains(&"state".to_owned()));
+        // В кавычках — имена из сюжета проекта.
+        let t = "story.talk(\"kuznec.";
+        let (at, typed, items) = story_complete(t, t.len(), &names).unwrap();
+        assert_eq!((at, typed.as_str()), (12, "kuznec."));
+        assert_eq!(
+            items,
+            vec!["kuznec.privet".to_owned(), "kuznec.ruda".to_owned()]
+        );
+        let t = "quest.add(\"m";
+        assert_eq!(
+            story_complete(t, t.len(), &names).unwrap().2,
+            vec!["mech".to_owned()]
+        );
+        // Опечатки: имя не из сюжета и функция, которой нет.
+        let t = "story.talk(\"kuznec.privt\")\nquest.add(\"mech\", \"ruda\")\nstory.get('hero.mony')\nquest.strat(\"mech\")";
+        let w = story_warnings(t, &names);
+        let texts: Vec<&str> = w.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "В сюжете нет диалога «kuznec.privt». Может, kuznec.privet?",
+                "В сюжете нет переменной «hero.mony». Может, hero.money?",
+            ]
+        );
+        assert_eq!(w[1].line, 3);
+        let w = warnings(t);
+        assert!(
+            w.iter()
+                .any(|w| w.text == "У quest нет функции strat. Может, start?"),
+            "{w:?}"
+        );
+        // Без сюжета в проекте имена не проверяются.
+        assert!(story_warnings(t, &StoryNames::default()).is_empty());
+        assert!(
+            hover("story.talk(x)", 7)
+                .unwrap()
+                .starts_with("story.talk(диалог): ")
+        );
     }
 }
