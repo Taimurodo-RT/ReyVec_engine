@@ -325,6 +325,13 @@ impl Story {
                         }
                         k
                     }
+                    (Kind::Character, Node::Generate { who, .. }) if who == old => {
+                        *who = new.into();
+                        1
+                    }
+                    (Kind::Var, Node::Generate { fallback, .. }) => {
+                        rename_in_placeholders(fallback, old, new)
+                    }
                     (Kind::Character, Node::Check { when, .. }) => {
                         rename_npc_in_expr(when, old, new)
                     }

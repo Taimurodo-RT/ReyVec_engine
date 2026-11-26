@@ -160,6 +160,10 @@ pub struct Change {
     pub add: Option<f64>,
 }
 
+fn words() -> u32 {
+    40
+}
+
 /// Место карточки на схеме редактора.
 pub type At = (f32, f32);
 
@@ -181,6 +185,32 @@ pub enum Node {
         #[serde(default)]
         next: String,
         /// Ключ перевода. Пусто — `<диалог>.<карточка>`.
+        #[serde(default)]
+        key: String,
+    },
+    /// Реплика, которую пишет модель (Сю.10): задача, рамки и запасной текст. Модели нет,
+    /// она молчит или ответила не по правилам — звучит запасной текст.
+    Generate {
+        id: String,
+        #[serde(default)]
+        at: At,
+        who: String,
+        /// Что сказать — задача для модели («пожаловаться на погоду и намекнуть про руду»).
+        task: String,
+        /// Запасной текст (с подстановками `{hero.name}`), его же переводят.
+        fallback: String,
+        /// Не длиннее стольких слов.
+        #[serde(default = "words")]
+        words: u32,
+        /// Что модель может сделать, кроме слов: имена событий (`relation.add`,
+        /// `memory.add`, `quest.start`). Остальное отбрасывается.
+        #[serde(default)]
+        allowed: Vec<String>,
+        #[serde(default)]
+        settings: LineSettings,
+        #[serde(default)]
+        next: String,
+        /// Ключ перевода запасного текста. Пусто — `<диалог>.<карточка>`.
         #[serde(default)]
         key: String,
     },
@@ -268,6 +298,7 @@ impl Node {
     pub fn id(&self) -> &str {
         match self {
             Node::Line { id, .. }
+            | Node::Generate { id, .. }
             | Node::Check { id, .. }
             | Node::Set { id, .. }
             | Node::Event { id, .. }
@@ -291,6 +322,13 @@ impl Node {
                 v
             }
             Node::Check { yes, no, .. } | Node::Chance { yes, no, .. } => vec![yes, no],
+            Node::Generate { next, .. } => {
+                if next.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![next]
+                }
+            }
             Node::Set { next, .. }
             | Node::Event { next, .. }
             | Node::Run { next, .. }

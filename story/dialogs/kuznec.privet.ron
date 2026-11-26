@@ -21,7 +21,9 @@
         Line(id: "pro_mech", at: (1560, -330), who: "kuznec", text: "Меч? Принеси три куска руды — выкую.", settings: (camera: true), next: "vzyat"),
         Event(id: "vzyat", at: (1950, -330), name: "quest.start", args: ["mech"], next: "konec"),
         Jump(id: "k_rude", at: (1560, -100), dialog: "kuznec.ruda"),
-        Line(id: "proshchai", at: (1560, 60), who: "kuznec", text: "Смотри, только руками не трогай.", next: "konec"),
+        // Сю.10: эту реплику может написать модель (по характеру и памяти кузнеца). Модели
+        // нет или она ответила не по правилам — звучит запасной текст.
+        Generate(id: "proshchai", at: (1560, 60), who: "kuznec", task: "Проворчи, что смотреть можно, но руками ничего не трогать. Можно намекнуть, что тебе не хватает руды.", fallback: "Смотри, только руками не трогай.", words: 20, allowed: ["relation.add"], next: "konec"),
         End(id: "konec", at: (1950, 40)),
     ],
 )
