@@ -23,6 +23,7 @@ use super::story_refs::{self, Rename, RenameAnswer, Script};
 use super::theme::*;
 use reyvec_story::life::{Chat, Routine};
 use reyvec_story::rename::Kind;
+use reyvec_story::text::{TextError, from_text, to_text};
 use reyvec_story::writer::Suggest;
 
 /// Варианты от модели (Сю.11): для какой реплики, что просили, что пришло.
@@ -31,6 +32,68 @@ pub(crate) struct Suggested {
     node: String,
     what: Suggest,
     got: Result<Vec<String>, String>,
+}
+
+/// Диалог текстом (Сю.13): что набрано и почему оно пока не стало диалогом.
+pub(crate) struct Typed {
+    dialog: String,
+    text: String,
+    errors: Vec<TextError>,
+}
+
+/// Поле «диалог текстом». Правка без ошибок сразу становится диалогом; с ошибками —
+/// диалог не меняется, ошибки видны под полем. `true` — диалог поменялся.
+fn typed_dialog(ui: &mut Ui, d: &mut Dialog, typed: &mut Option<Typed>) -> bool {
+    let mut changed = false;
+    let t = typed.get_or_insert_with(|| Typed {
+        dialog: d.id.clone(),
+        text: to_text(d),
+        errors: Vec::new(),
+    });
+    if t.dialog != d.id {
+        *t = Typed {
+            dialog: d.id.clone(),
+            text: to_text(d),
+            errors: Vec::new(),
+        };
+    }
+    callout(
+        ui,
+        "Диалог как пьеса. Карточка начинается строкой «== имя». Реплика — «кто: текст», \
+         варианты — «* текст [если условие] -> куда», стрелка дальше — «-> куда», развилка — \
+         «если условие -> куда» и «иначе -> куда», переменная — «имя = значение» или \
+         «имя += 1», ещё: «событие quest.start(\"mech\")», «выполнить имя(…)», «пауза 2», \
+         «наугад -> a, b», «процент 30 -> a | b», «перейти диалог», «конец». Места на \
+         схеме и настройки реплик сохраняются.",
+    );
+    let r = ui.add(
+        TextEdit::multiline(&mut t.text)
+            .font(FontId::monospace(FONT_MONO + 1.0))
+            .code_editor()
+            .desired_width(f32::INFINITY)
+            .desired_rows(24)
+            .margin(PAD_FIELD),
+    );
+    if r.changed() {
+        match from_text(&t.text, d) {
+            Ok(nd) => {
+                *d = nd;
+                t.errors.clear();
+                changed = true;
+            }
+            Err(e) => t.errors = e,
+        }
+    } else if !r.has_focus() && t.errors.is_empty() {
+        // Диалог поменяли на схеме или отменой — текст вслед за ним.
+        let now = to_text(d);
+        if now != t.text {
+            t.text = now;
+        }
+    }
+    for e in &t.errors {
+        ui.label(RichText::new(e.to_string()).color(BAD).size(FONT_SMALL));
+    }
+    changed
 }
 
 /// Сколько вариантов просить у модели за раз.
@@ -151,6 +214,10 @@ pub(crate) struct StoryUi {
     renaming: Option<Rename>,
     /// Строка поиска по тексту (вкладка «Поиск»).
     search: String,
+    /// Диалог открыт текстом, как пьеса (Сю.13).
+    text_view: bool,
+    /// Набранный текст диалога и его ошибки.
+    typed: Option<Typed>,
     /// Что предложила модель для выбранной реплики (Сю.11).
     suggested: Option<Suggested>,
 }
@@ -182,6 +249,8 @@ impl Default for StoryUi {
             scripts_at: f64::NEG_INFINITY,
             renaming: None,
             search: String::new(),
+            text_view: false,
+            typed: None,
             suggested: None,
         }
     }
@@ -918,9 +987,29 @@ impl StoryUi {
         ui.add_space(GAP_S);
         ui.horizontal(|ui| {
             ui.add_space(GAP_L);
-            for (script, name) in [(false, "Схема"), (true, "Сценарий")] {
-                if ui.selectable_label(self.script == script, name).clicked() {
+            for (script, text, name, hint) in [
+                (false, false, "Схема", "Карточки и стрелки"),
+                (
+                    true,
+                    false,
+                    "Сценарий",
+                    "Реплики по порядку, тексты правятся",
+                ),
+                (
+                    true,
+                    true,
+                    "Текст",
+                    "Весь диалог текстом, как пьеса: правится целиком (Сю.13)",
+                ),
+            ] {
+                if ui
+                    .selectable_label(self.script == script && self.text_view == text, name)
+                    .on_hover_text(hint)
+                    .clicked()
+                {
                     self.script = script;
+                    self.text_view = text;
+                    self.typed = None;
                 }
             }
             if ui
@@ -1483,14 +1572,19 @@ impl StoryUi {
             });
             changed |= line_settings(ui, &mut d.lines, "dialog");
         });
-        callout(
-            ui,
-            "Сценарий — тот же диалог текстом: реплики и варианты можно править здесь. \
-             Новые карточки и стрелки — на схеме.",
-        );
+        let text_view = self.text_view;
+        if text_view {
+            changed |= typed_dialog(ui, d, &mut self.typed);
+        } else {
+            callout(
+                ui,
+                "Сценарий — тот же диалог текстом: реплики и варианты можно править здесь. \
+                 Новые карточки и стрелки — на схеме.",
+            );
+        }
         let mut jump_to = None;
         let mut open = None;
-        for node in &mut d.nodes {
+        for node in d.nodes.iter_mut().filter(|_| !text_view) {
             let nid = node.id().to_string();
             let anchor = ui.label(
                 RichText::new(format!("#{nid}"))
@@ -3496,6 +3590,39 @@ mod tests {
 
     /// Сю.8: переименовали диалог — поправились переход в другом диалоге, перевод, файл и
     /// скрипт кузнеца; перечитанный сюжет без ошибок.
+    #[test]
+    fn dialog_as_text_is_drawn_and_kept_in_step() {
+        let mut ui = StoryUi::default();
+        ui.story = Story::from_texts(reyvec_story::EXAMPLE).0;
+        ui.open(Item::Dialog("kuznec.privet".into()), false);
+        ui.script = true;
+        ui.text_view = true;
+        let ctx = egui::Context::default();
+        let frame = |ui: &mut StoryUi| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |u| {
+                ui.draw(u);
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut ui);
+        let text = |ui: &StoryUi| ui.typed.as_ref().unwrap().text.clone();
+        assert!(text(&ui).contains("== vopros\nkuznec: Что тебе нужно?"));
+        // Поменяли на схеме — текст следом.
+        if let Some(Node::Line { text, .. }) = ui
+            .story
+            .dialogs
+            .get_mut("kuznec.privet")
+            .unwrap()
+            .nodes
+            .iter_mut()
+            .find(|n| n.id() == "vopros")
+        {
+            *text = "Ну?".into();
+        }
+        frame(&mut ui);
+        assert!(text(&ui).contains("kuznec: Ну?"), "{}", text(&ui));
+    }
+
     #[test]
     fn model_suggestions_replace_the_line_and_add_answers() {
         use reyvec_story::writer::{Canned, Reply};
