@@ -3535,6 +3535,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reyvec-story"
+version = "0.1.0"
+dependencies = [
+ "mlua",
+ "ron",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "reyvec-svg"
 version = "0.1.0"
 dependencies = [

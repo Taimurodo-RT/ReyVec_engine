@@ -1,0 +1,17 @@
+// Пример «кузнец и руда»: герой принёс руду.
+(
+    format: "reyvec-dialog",
+    version: 1,
+    id: "kuznec.ruda",
+    title: "Кузнец: руда принесена",
+    with: ["kuznec"],
+    nodes: [
+        Line(id: "nachalo", at: (0, 0), who: "kuznec", text: "Ого, три куска! Хорошая руда.", settings: (mood: "dobryi"), next: "otdat"),
+        Set(id: "otdat", at: (240, 0), changes: [(var: "hero.ruda", add: -3), (var: "kuznec.nastroenie", add: 1)], next: "etap"),
+        Event(id: "etap", at: (480, 0), name: "quest.stage", args: ["mech", "zhdat"], next: "kogda"),
+        Random(id: "kogda", at: (720, 0), next: ["zavtra", "den"]),
+        Line(id: "zavtra", at: (960, -80), who: "kuznec", text: "Приходи завтра, меч будет готов.", next: "konec"),
+        Line(id: "den", at: (960, 80), who: "kuznec", text: "Дай мне день, и меч будет твоим.", next: "konec"),
+        End(id: "konec", at: (1200, 0)),
+    ],
+)

@@ -25,6 +25,7 @@ reyvec-game = { path = "crates/reyvec-game" }
 reyvec-audio = { path = "crates/reyvec-audio" }
 reyvec-script = { path = "crates/reyvec-script" }
 reyvec-ui = { path = "crates/reyvec-ui" }
+reyvec-story = { path = "crates/reyvec-story" }
 # Математика 3D (этап 7): векторы, матрицы камеры.
 glam = "0.30"
 # Модели из файлов glTF (8.14): только разбор файла, без картинок и встроенных data:-данных.
