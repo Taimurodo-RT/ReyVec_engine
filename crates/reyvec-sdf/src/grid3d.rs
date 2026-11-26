@@ -405,7 +405,9 @@ impl Grid {
             // объекта не меньше клетки, и луч снаружи подходит к ней большими шагами.
             let d = ((extent + 2.0 * cell) / cell).ceil();
             let dims = [d.x as u32, d.y as u32, d.z as u32];
-            if dims.iter().map(|&d| d as usize).product::<usize>() <= max_cells {
+            // Счёт в f64: у сцены с огромным предметом (ошибка в файле) число клеток
+            // на первых кругах не влезает в целое.
+            if dims.iter().map(|&d| d as f64).product::<f64>() <= max_cells as f64 {
                 break dims;
             }
             cell *= 1.25;
