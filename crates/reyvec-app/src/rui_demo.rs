@@ -1,9 +1,10 @@
-//! Экран интерфейса игры из файла `ui/demo.rui` (шаги И.1–И.2а, решение 0022).
+//! Экран интерфейса игры из файла `ui/demo.rui` (шаги И.1–И.2в, решение 0022).
 //!
 //! F3 показывает и прячет его поверх любой сцены, F4 меняет тему; кнопки отвечают мыши,
-//! Tab, стрелкам и Enter (нажатие — в лог и консоль, «Выход» прячет экран); Shift+F3 пишет в лог и
-//! консоль, откуда взялось каждое свойство. Экран читается вместе
-//! с темами и стилями из его `head`; любой из этих файлов перечитывается, когда меняется
+//! Tab, стрелкам и Enter (нажатие — в лог и консоль, «Язык» переключает русский и
+//! английский, «Выход» прячет экран); Shift+F3 пишет в лог и консоль, откуда взялось
+//! каждое свойство. Экран читается вместе с темами и стилями из его `head` и с языками из
+//! `ui/lang`; любой из этих файлов перечитывается, когда меняется
 //! (проверка раз в четверть секунды), так что правка сразу видна в окне. Если в файле
 //! ошибка, вместо экрана видна плашка с текстом ошибки и местом в файле, а прежний
 //! разобранный экран ждёт: после исправления вернётся новый.
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use reyvec_text::GlyphAtlas;
-use reyvec_ui::{UiDraw, UiError, UiEvent, UiKey, UiScreen};
+use reyvec_ui::{Texts, UiDraw, UiError, UiEvent, UiKey, UiScreen};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
 
@@ -22,6 +23,13 @@ const BUILT_IN_FILES: &[(&str, &str)] = &[
     ("themes/base", include_str!("../../../ui/themes/base.rui")),
     ("styles/demo", include_str!("../../../ui/styles/demo.rui")),
 ];
+const BUILT_IN_LANGS: &[(&str, &str)] = &[
+    ("ru", include_str!("../../../ui/lang/ru.ron")),
+    ("en", include_str!("../../../ui/lang/en.ron")),
+];
+
+/// Главный язык: его слова видны, если в другом языке ключа нет.
+const MAIN_LANG: &str = "ru";
 
 /// Как часто смотреть, не поменялся ли файл.
 const POLL: Duration = Duration::from_millis(250);
@@ -40,6 +48,8 @@ pub(crate) struct RuiDemo {
     checked: Instant,
     /// Тема, выбранная F4: сохраняется, когда файлы перечитываются.
     theme: Option<String>,
+    /// Язык, выбранный кнопкой «Язык»: тоже сохраняется.
+    lang: String,
 }
 
 impl RuiDemo {
@@ -54,6 +64,7 @@ impl RuiDemo {
             watched: Vec::new(),
             checked: Instant::now(),
             theme: None,
+            lang: MAIN_LANG.to_owned(),
         };
         demo.load();
         demo
@@ -85,6 +96,25 @@ impl RuiDemo {
             Ok(_) => {
                 tracing::info!("интерфейс: тема {next}");
                 self.theme = Some(next);
+            }
+            Err(e) => self.show_error(&e),
+        }
+    }
+
+    /// Кнопка «Язык»: следующий язык из `ui/lang`.
+    fn next_lang(&mut self) {
+        let Some(screen) = self.screen.as_mut() else {
+            return;
+        };
+        let langs: Vec<String> = screen.languages().map(|(c, _)| c.to_owned()).collect();
+        let Some(now) = langs.iter().position(|c| *c == self.lang) else {
+            return;
+        };
+        let next = langs[(now + 1) % langs.len()].clone();
+        match screen.set_lang(&next) {
+            Ok(()) => {
+                tracing::info!("интерфейс: язык {next}");
+                self.lang = next;
             }
             Err(e) => self.show_error(&e),
         }
@@ -139,8 +169,10 @@ impl RuiDemo {
         };
         let UiEvent::Click(name) = event;
         tracing::info!("интерфейс: нажата кнопка «{name}»");
-        if name == "close" {
-            self.shown = false;
+        match name.as_str() {
+            "close" => self.shown = false,
+            "language" => self.next_lang(),
+            _ => {}
         }
         true
     }
@@ -209,14 +241,27 @@ impl RuiDemo {
         };
         match loaded {
             Ok(mut screen) => {
-                if let Some(t) = &self.theme
-                    && let Err(e) = screen.set_theme(t)
-                {
-                    self.watch(&screen);
+                let texts = self.texts();
+                let files: Vec<PathBuf> = match &texts {
+                    Ok(t) => t.files().to_vec(),
+                    Err(_) => self.lang_files(),
+                };
+                let applied = texts.and_then(|texts| {
+                    for gap in texts.gaps() {
+                        tracing::warn!("интерфейс: {gap}");
+                    }
+                    screen.set_texts(texts)?;
+                    screen.set_lang(&self.lang)?;
+                    match &self.theme {
+                        Some(t) => screen.set_theme(t).map(|_| ()),
+                        None => Ok(()),
+                    }
+                });
+                self.watch(&screen, files);
+                if let Err(e) = applied {
                     return self.show_error(&e);
                 }
                 tracing::info!("интерфейс: прочитан ui/demo.rui");
-                self.watch(&screen);
                 self.screen = Some(screen);
                 self.error = None;
             }
@@ -233,11 +278,40 @@ impl RuiDemo {
         }
     }
 
-    fn watch(&mut self, screen: &UiScreen) {
+    /// Языки из `ui/lang`, а если папки нет — вшитые в программу.
+    fn texts(&self) -> Result<Texts, UiError> {
+        let dir = self.dir.join("lang");
+        if dir.is_dir() {
+            return Texts::load(&dir, MAIN_LANG);
+        }
+        let mut texts = Texts::default();
+        for (code, src) in BUILT_IN_LANGS {
+            texts.add(code, src, &format!("lang/{code}.ron"))?;
+        }
+        Ok(texts)
+    }
+
+    /// Файлы языков в папке, даже если какой-то не читается: исправят — перечитаем.
+    fn lang_files(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(self.dir.join("lang"))
+            .map(|d| {
+                d.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.extension().is_some_and(|x| x == "ron"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn watch(&mut self, screen: &UiScreen, langs: Vec<PathBuf>) {
         self.watched = screen
             .files()
             .iter()
-            .map(|p| (p.clone(), modified(p)))
+            .cloned()
+            .chain(langs)
+            .map(|p| {
+                let at = modified(&p);
+                (p, at)
+            })
             .collect();
     }
 
@@ -291,6 +365,16 @@ mod tests {
         .expect("пример разбирается");
         assert!(!s.draw([1920.0, 1080.0]).quads.is_empty());
         assert!(s.themes().len() >= 2);
+        let mut texts = Texts::default();
+        for (code, src) in BUILT_IN_LANGS {
+            texts
+                .add(code, src, &format!("lang/{code}.ron"))
+                .expect("язык читается");
+        }
+        assert!(texts.gaps().is_empty(), "{:?}", texts.gaps());
+        s.set_texts(texts).expect("все ключи на месте");
+        s.set_lang("en").expect("английский");
+        assert!(!s.draw([1920.0, 1080.0]).quads.is_empty());
     }
 
     #[test]

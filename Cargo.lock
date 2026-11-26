@@ -3574,6 +3574,8 @@ version = "0.1.0"
 dependencies = [
  "reyvec-text",
  "reyvec-vector",
+ "ron",
+ "serde",
  "taffy",
  "thiserror 2.0.21",
 ]

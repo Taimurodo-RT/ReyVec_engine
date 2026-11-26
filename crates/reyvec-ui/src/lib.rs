@@ -28,6 +28,7 @@
 //! Единицы: пиксели экрана 1920×1080. На другом окне всё умножается на высоту / 1080,
 //! поэтому экран выглядит одинаково на любом размере.
 
+pub mod lang;
 pub mod model;
 pub mod style;
 pub mod syntax;
@@ -38,6 +39,7 @@ use reyvec_text::{GlyphAtlas, TextBlock, TextLibrary};
 use reyvec_vector::{Color, TextId};
 use taffy::prelude::*;
 
+pub use lang::Texts;
 use model::{Edge, Element, Justify, Kind, Len};
 pub use syntax::Pos;
 
@@ -150,6 +152,8 @@ pub struct UiScreen {
     /// Пути прочитанных файлов (для слежки за правкой); пусто, если файл дан текстом.
     files: Vec<PathBuf>,
     theme: Option<usize>,
+    /// Слова для `tr("ключ")`; язык — в `env.lang`.
+    texts: Texts,
     screens: Vec<model::Screen>,
     current: usize,
     text: TextLibrary,
@@ -308,6 +312,7 @@ impl UiScreen {
             names: names.clone(),
             files: Vec::new(),
             theme: None,
+            texts: Texts::default(),
             screens: Vec::new(),
             current: 0,
             text: TextLibrary::new(),
@@ -332,7 +337,7 @@ impl UiScreen {
         let screens = self
             .decls
             .iter()
-            .map(|d| model::screen(d, &self.styles, &vars))
+            .map(|d| model::screen(d, &self.styles, &vars, &self.texts, &self.env.lang))
             .collect::<Result<Vec<_>, _>>()?;
         let mut text = TextLibrary::new();
         let mut text_ids = Vec::new();
@@ -345,21 +350,57 @@ impl UiScreen {
         self.theme = theme;
         self.fresh = false;
         self.generation += 1;
-        // Пути в новом дереве могут вести к другим блокам: состояния — заново.
-        self.hover = None;
-        self.pressed = None;
-        self.focus = None;
+        // Дерево то же (другие тема или язык), поэтому наведение и фокус остаются:
+        // язык можно сменить кнопкой, не теряя её.
         // Условия `.when` при сборке считались для окна 1920×1080: пересчитать под своё.
         self.restyle = true;
         Ok(())
     }
 
-    /// Язык игры для `.when(lang: en)`.
-    pub fn set_lang(&mut self, lang: &str) {
-        if self.env.lang != lang {
-            lang.clone_into(&mut self.env.lang);
-            self.restyle = true;
+    /// Язык игры: слова для `tr("ключ")` и `.when(lang: en)`. Экраны собираются заново
+    /// (у текста другая длина). При ошибке остаются прежние язык и экраны.
+    pub fn set_lang(&mut self, lang: &str) -> Result<(), UiError> {
+        if self.env.lang == lang {
+            return Ok(());
         }
+        let old = std::mem::replace(&mut self.env.lang, lang.to_owned());
+        if let Err(e) = self.rebuild_keep_theme() {
+            self.env.lang = old;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Язык игры (`ru` по умолчанию).
+    pub fn lang(&self) -> &str {
+        &self.env.lang
+    }
+
+    /// Слова на языках для `tr("ключ")`. Без них `tr` показывает сам ключ. При ошибке
+    /// (ключа нет в главном языке) остаются прежние слова.
+    pub fn set_texts(&mut self, texts: Texts) -> Result<(), UiError> {
+        let old = std::mem::replace(&mut self.texts, texts);
+        if let Err(e) = self.rebuild_keep_theme() {
+            self.texts = old;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Языки из [`Self::set_texts`]: код и имя для игрока.
+    pub fn languages(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.texts.languages()
+    }
+
+    fn rebuild_keep_theme(&mut self) -> Result<(), UiError> {
+        let names = self.names.clone();
+        self.rebuild(self.theme).map_err(|e| match e.pos() {
+            Some(pos) if pos.file > 0 => UiError::File {
+                file: names[usize::from(pos.file)].clone(),
+                source: Box::new(e),
+            },
+            _ => e,
+        })
     }
 
     /// Чем игрок пользуется сейчас, для `.when(input: keyboard)`: `mouse`, `keyboard`,
@@ -1514,7 +1555,7 @@ mod tests {
         ui.draw([1920.0, 1080.0]);
         assert_eq!(bg(el(&ui, &[0])), [1, 1, 1]);
         assert_eq!(bg(el(&ui, &[1])), [1, 1, 1]);
-        ui.set_lang("en");
+        ui.set_lang("en").unwrap();
         ui.draw([1920.0, 1080.0]);
         assert_eq!(bg(el(&ui, &[1])), [3, 3, 3]);
         // Клавиша интерфейса — значит, игрок на клавиатуре.
@@ -1529,5 +1570,78 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains(".when: width < 1280"), "{e}");
+    }
+
+    fn texts() -> Texts {
+        let mut t = Texts::default();
+        t.add(
+            "ru",
+            r#"(name: "Русский", texts: { "play": "Играть", "coins": "Монеты: {n}", "quit": "Выход" })"#,
+            "lang/ru.ron",
+        )
+        .unwrap();
+        t.add(
+            "en",
+            r#"(name: "English", texts: { "play": "Play", "coins": "Coins: {n}" })"#,
+            "lang/en.ron",
+        )
+        .unwrap();
+        t
+    }
+
+    fn label(ui: &UiScreen, path: &[usize]) -> String {
+        first_text(el(ui, path)).unwrap()
+    }
+
+    #[test]
+    fn tr_takes_words_from_the_language_and_keeps_focus() {
+        let mut ui = UiScreen::parse(
+            r#"screen S {
+                Column {
+                    Button(tr("play")).size(200, 40)
+                    Button(tr("quit")).size(200, 40)
+                    Text(tr("coins", n: 12))
+                }
+            }"#,
+        )
+        .unwrap();
+        // Без файлов языков виден сам ключ.
+        assert_eq!(label(&ui, &[0, 0]), "play");
+        ui.set_texts(texts()).unwrap();
+        assert_eq!(label(&ui, &[0, 0]), "Играть");
+        assert_eq!(label(&ui, &[0, 2]), "Монеты: 12");
+        ui.draw([1920.0, 1080.0]);
+        ui.key(UiKey::Next);
+        assert_eq!(ui.focused().as_deref(), Some("Играть"));
+        let before = ui.draw([1920.0, 1080.0]).targets[0].rect;
+        ui.set_lang("en").unwrap();
+        assert_eq!(ui.lang(), "en");
+        assert_eq!(label(&ui, &[0, 0]), "Play");
+        assert_eq!(label(&ui, &[0, 2]), "Coins: 12");
+        // В английском нет «quit»: слово главного языка.
+        assert_eq!(label(&ui, &[0, 1]), "Выход");
+        assert_eq!(ui.draw([1920.0, 1080.0]).targets[0].rect, before);
+        // Фокус остался на той же кнопке, у которой теперь другое имя.
+        assert_eq!(ui.focused().as_deref(), Some("Play"));
+        assert_eq!(
+            ui.languages().collect::<Vec<_>>(),
+            [("ru", "Русский"), ("en", "English")]
+        );
+    }
+
+    #[test]
+    fn missing_key_is_an_error_and_keeps_the_old_words() {
+        let mut ui = UiScreen::parse("screen S {\n Text(tr(\"pley\"))\n}").unwrap();
+        let e = ui.set_texts(texts()).unwrap_err().to_string();
+        assert!(
+            e.starts_with("строка 2") && e.contains("tr(\"play\")"),
+            "{e}"
+        );
+        assert_eq!(label(&ui, &[0]), "pley");
+        let e = UiScreen::parse("screen S { Text(tr(\"a\", 5)) }")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("с именем"), "{e}");
     }
 }
