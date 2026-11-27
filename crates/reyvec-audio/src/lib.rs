@@ -48,6 +48,8 @@ pub struct AudioStats {
     pub played: u64,
     pub skipped: u64,
     pub music: bool,
+    /// Общая громкость от 0 до 1 (И.3в: ползунок в настройках).
+    pub volume: f32,
 }
 
 /// Громкость музыки, дБ: тише звуков игры.
@@ -77,6 +79,7 @@ impl Audio {
             bank: None,
             stats: AudioStats {
                 music,
+                volume: 1.0,
                 ..AudioStats::default()
             },
             next_id: MUSIC_ID + 1,
@@ -178,6 +181,19 @@ impl Audio {
             self.start_music();
         } else if let Some(commands) = &self.commands {
             let _ = commands.send(Command::Stop { id: MUSIC_ID });
+        }
+    }
+
+    /// Общая громкость: 0 — тишина, 1 — как есть. Громкость слышится по квадрату
+    /// ползунка, поэтому середина ползунка — заметно тише, как привычно уху.
+    pub fn set_volume(&mut self, volume: f32) {
+        let volume = volume.clamp(0.0, 1.0);
+        if volume == self.stats.volume {
+            return;
+        }
+        self.stats.volume = volume;
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Volume(volume * volume));
         }
     }
 

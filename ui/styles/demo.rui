@@ -33,6 +33,22 @@ style Button.danger {
     .focus { .border(var(danger), 3) }
 }
 
+// Ползунок и переключатель: дорожка, заполненная часть (fill) и кружок (knob).
+style Slider {
+    .background(var(button))
+    .fill(var(accent))
+    .radius(4)
+    .hover { .knob(var(accent)) }
+    .focus { .knob(var(accent)) }
+}
+style Toggle {
+    .background(var(button))
+    .fill(var(accent))
+    .radius(14)
+    .focus { .border(var(accent), 2) }
+}
+style Row { .font(26) }
+
 style title { .font(56).color(var(accent)) }
 style hint { .font(20).color(var(muted)) }
 
@@ -41,5 +57,5 @@ style Demo {
     Column.menu { .width(420) }
 }
 style Settings {
-    Column.menu { .width(420) }
+    Column.menu { .width(480) }   // строкам с ползунком нужно место
 }

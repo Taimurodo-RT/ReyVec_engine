@@ -13,6 +13,8 @@
         "settings.title": "Настройки",
         "settings.language": "Язык: {name}",
         "settings.theme": "Тема: {name}",
+        "settings.volume": "Громкость: {n}%",
+        "settings.music": "Музыка",
         "settings.back": "Назад",
         "menu.quit": "Выход",
         "hud.stamina": "Выносливость",

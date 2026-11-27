@@ -22,6 +22,8 @@ pub enum Command {
     },
     /// Плавно выключить звук `id` (музыку).
     Stop { id: u64 },
+    /// Общая громкость: 0 — тишина, 1 — как есть.
+    Volume(f32),
 }
 
 struct Voice {
@@ -40,6 +42,7 @@ const FADE: u32 = 9_600;
 pub struct Mixer {
     commands: Receiver<Command>,
     voices: Vec<Voice>,
+    master: f32,
 }
 
 impl Mixer {
@@ -47,6 +50,7 @@ impl Mixer {
         Self {
             commands,
             voices: Vec::with_capacity(VOICES),
+            master: 1.0,
         }
     }
 
@@ -81,6 +85,7 @@ impl Mixer {
                         v.fade = FADE;
                     }
                 }
+                Command::Volume(v) => self.master = v.clamp(0.0, 1.0),
             }
         }
     }
@@ -115,7 +120,7 @@ impl Mixer {
                 }
             }
             // Мягкое ограничение: много звуков разом не хрипят, а чуть сжимаются.
-            let (l, r) = (soft_clip(l), soft_clip(r));
+            let (l, r) = (soft_clip(l * self.master), soft_clip(r * self.master));
             match frame.len() {
                 1 => frame[0] = 0.5 * (l + r),
                 _ => {
@@ -179,6 +184,26 @@ mod tests {
         assert_eq!(&out[..2], &[0.5, 0.25]);
         assert_eq!(&out[8..], &[0.0, 0.0, 0.0, 0.0], "доиграли — тишина");
         assert_eq!(m.playing(), 0);
+    }
+
+    #[test]
+    fn master_volume_scales_the_whole_mix() {
+        let (tx, rx) = channel();
+        let mut m = Mixer::new(rx);
+        tx.send(Command::Volume(0.5)).unwrap();
+        tx.send(Command::Play {
+            id: 1,
+            samples: vec![0.5; 2].into(),
+            gain: [1.0, 1.0],
+            looped: false,
+        })
+        .unwrap();
+        let mut out = [0.0f32; 2];
+        m.fill(&mut out, 2);
+        assert_eq!(out, [0.25, 0.25]);
+        tx.send(Command::Volume(0.0)).unwrap();
+        m.fill(&mut out, 2);
+        assert_eq!(out, [0.0, 0.0], "тишина");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-// Пример экрана интерфейса игры (шаги И.1–И.3б, решение 0022).
+// Пример экрана интерфейса игры (шаги И.1–И.3в, решение 0022).
 // В песочнице: F3 показывает и прячет, F4 меняет тему.
 // Правка этого файла, темы, стилей, языков (ui/lang) или ui/demo.luau сразу видна в окне.
 // Что делает кнопка, пишется в её фигурных скобках с маленькой буквы:
@@ -62,6 +62,19 @@ screen Settings {
         // settings.lang и settings.theme — имя языка и темы: их даёт песочница.
         Button(tr("settings.language", name: settings.lang)) { next_lang() }
         Button(tr("settings.theme", name: settings.theme)) { next_theme() }
+        // Знак $ — связь в обе стороны: ползунок показывает громкость игры и сам её
+        // меняет. Мышь тянет, стрелки влево и вправо двигают выбранный ползунок.
+        Row(spacing: 16, align: center) {
+            Text(tr("settings.volume", n: settings.audio.volume * 100))
+            Spacer()
+            Slider($settings.audio.volume, from: 0, to: 1, step: 0.05).width(160)
+        }
+        // Музыку можно включить и клавишей O: переключатель сдвинется сам.
+        Row(spacing: 16, align: center) {
+            Text(tr("settings.music"))
+            Spacer()
+            Toggle($settings.audio.music)
+        }
         Button(tr("settings.back")) { back() }
     }
     .class(menu, panel)
