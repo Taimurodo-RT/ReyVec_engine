@@ -171,7 +171,12 @@ struct ScriptFile {
     /// Глобальные имена файла: здесь карточка «Скрипт» сюжета ищет свою функцию.
     env: Option<Table>,
     error: Option<String>,
+    /// Набор функций без `update` (например, действия кнопок интерфейса, И.3б).
+    module: bool,
 }
+
+/// Куда команды из Luau (`ui.close()`) складываются для игры: имя и значения.
+pub type CommandSink = Arc<std::sync::Mutex<Vec<(String, Vec<Value>)>>>;
 
 /// Все скрипты мира.
 pub struct Scripts {
@@ -267,15 +272,47 @@ impl Scripts {
 
     /// Зовёт функцию `func` из первого скрипта, где она есть (карточка «Скрипт» сюжета).
     pub fn call_story(&mut self, func: &str, args: &[Value]) -> Result<(), String> {
+        if !self.has_function(func) {
+            return Err(format!(
+                "карточка «Скрипт»: ни в одном скрипте нет функции {func}()"
+            ));
+        }
+        self.call(func, args)
+    }
+
+    /// Есть ли функция `func` в каком-нибудь скрипте.
+    pub fn has_function(&self, func: &str) -> bool {
+        self.files.iter().any(|f| {
+            f.env
+                .as_ref()
+                .and_then(|env| env.raw_get::<Option<Function>>(func).ok().flatten())
+                .is_some()
+        })
+    }
+
+    /// Имена функций всех скриптов (для подсказок в ошибках).
+    pub fn functions(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for env in self.files.iter().filter_map(|f| f.env.as_ref()) {
+            for (k, v) in env.pairs::<String, mlua::Value>().flatten() {
+                if v.is_function() && !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Зовёт функцию `func` из первого скрипта, где она есть, с пределом работы.
+    pub fn call(&mut self, func: &str, args: &[Value]) -> Result<(), String> {
         let found = self.files.iter().find_map(|f| {
             let env = f.env.as_ref()?;
             let fun = env.raw_get::<Option<Function>>(func).ok().flatten()?;
             Some((f.name.clone(), fun))
         });
         let Some((name, fun)) = found else {
-            return Err(format!(
-                "карточка «Скрипт»: ни в одном скрипте нет функции {func}()"
-            ));
+            return Err(format!("ни в одном скрипте нет функции {func}()"));
         };
         let args = args
             .iter()
@@ -305,10 +342,94 @@ impl Scripts {
             update: None,
             env: None,
             error: None,
+            module: false,
         });
         let i = self.files.len() - 1;
         self.compile(i);
         ScriptId(i)
+    }
+
+    /// Загружает набор функций без `update` (действия кнопок интерфейса, И.3б); правка
+    /// файла видна после [`Self::reload_changed`].
+    pub fn load_module(&mut self, path: &Path) -> ScriptId {
+        if let Some(i) = self.files.iter().position(|f| f.path == path) {
+            return ScriptId(i);
+        }
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into(),
+        );
+        self.files.push(ScriptFile {
+            path: path.to_path_buf(),
+            name,
+            modified: None,
+            update: None,
+            env: None,
+            error: None,
+            module: true,
+        });
+        let i = self.files.len() - 1;
+        self.compile(i);
+        ScriptId(i)
+    }
+
+    /// Набор функций из текста (встроенный пример, тесты).
+    pub fn load_module_text(&mut self, name: &str, source: &str) -> ScriptId {
+        self.files.push(ScriptFile {
+            path: PathBuf::new(),
+            name: name.into(),
+            modified: None,
+            update: None,
+            env: None,
+            error: None,
+            module: true,
+        });
+        let i = self.files.len() - 1;
+        self.compile_source(i, source);
+        ScriptId(i)
+    }
+
+    /// Таблица `table` с функциями `names`: вызов `table.name(значения)` в Luau кладёт
+    /// полное имя (`ui.close`) и значения в `sink`, а выполняет их игра (как команды консоли). Значения —
+    /// да/нет, числа и строки.
+    pub fn add_commands(&mut self, table: &str, names: &[&str], sink: &CommandSink) {
+        let made = (|| -> mlua::Result<()> {
+            let t = self.lua.create_table()?;
+            for name in names {
+                let sink = Arc::clone(sink);
+                let full = format!("{table}.{name}");
+                t.set(
+                    *name,
+                    self.lua
+                        .create_function(move |_, args: mlua::MultiValue| {
+                            let mut vals = Vec::new();
+                            for a in args {
+                                vals.push(match a {
+                                    mlua::Value::Boolean(b) => Value::Bool(b),
+                                    mlua::Value::Integer(i) => Value::Int(i),
+                                    mlua::Value::Number(n) => Value::Float(n),
+                                    mlua::Value::String(s) => Value::Text(s.to_string_lossy()),
+                                    other => {
+                                        return Err(mlua::Error::runtime(format!(
+                                            "{full}: можно передать да/нет, число или строку, а здесь {}",
+                                            other.type_name()
+                                        )));
+                                    }
+                                });
+                            }
+                            if let Ok(mut q) = sink.lock() {
+                                q.push((full.clone(), vals));
+                            }
+                            Ok(())
+                        })?,
+                )?;
+            }
+            t.set_readonly(true);
+            self.lua.globals().raw_set(table, t)
+        })();
+        if let Err(e) = made {
+            tracing::warn!("команды {table} для скриптов: {e}");
+        }
     }
 
     /// Загружает скрипт из текста (для тестов и встроенных скриптов): без файла, без
@@ -321,6 +442,7 @@ impl Scripts {
             update: None,
             env: None,
             error: None,
+            module: false,
         });
         let i = self.files.len() - 1;
         self.compile_source(i, source);
@@ -340,7 +462,8 @@ impl Scripts {
 
     fn compile_source(&mut self, i: usize, source: &str) {
         let name = self.files[i].name.clone();
-        let result = (|| -> mlua::Result<(Function, Table)> {
+        let module = self.files[i].module;
+        let result = (|| -> mlua::Result<(Option<Function>, Table)> {
             let env = self.lua.create_table()?;
             let meta = self.lua.create_table()?;
             meta.raw_set("__index", self.lua.globals())?;
@@ -354,15 +477,16 @@ impl Scripts {
                 .exec();
             self.disarm();
             run?;
-            let update = env
-                .get::<Option<Function>>("update")?
-                .ok_or_else(|| mlua::Error::runtime("нет функции update(me, hero, dt)"))?;
+            let update = env.get::<Option<Function>>("update")?;
+            if update.is_none() && !module {
+                return Err(mlua::Error::runtime("нет функции update(me, hero, dt)"));
+            }
             Ok((update, env))
         })();
         let f = &mut self.files[i];
         match result {
             Ok((update, env)) => {
-                f.update = Some(update);
+                f.update = update;
                 f.env = Some(env);
                 f.error = None;
             }
@@ -747,5 +871,36 @@ mod tests {
         );
         assert_eq!(s.reloads, 2);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn modules_call_functions_and_send_commands() {
+        let mut s = Scripts::new();
+        let sink = CommandSink::default();
+        s.add_commands("ui", &["close", "log"], &sink);
+        s.load_module_text(
+            "demo.luau",
+            "function new_game(n)\n ui.log(\"новая\", n + 1)\n ui.close()\nend",
+        );
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+        assert!(s.has_function("new_game"));
+        assert_eq!(s.functions(), ["new_game"]);
+        s.call("new_game", &[Value::Int(2)]).unwrap();
+        let got = std::mem::take(&mut *sink.lock().unwrap());
+        assert_eq!(
+            got,
+            [
+                (
+                    "ui.log".to_owned(),
+                    vec![Value::Text("новая".into()), Value::Int(3)]
+                ),
+                ("ui.close".to_owned(), vec![])
+            ]
+        );
+        let e = s.call("old_game", &[]).unwrap_err();
+        assert!(e.contains("old_game"), "{e}");
+        s.load_module_text("bad.luau", "function f() ui.nope() end");
+        let e = s.call("f", &[]).unwrap_err();
+        assert!(e.contains("bad.luau"), "{e}");
     }
 }

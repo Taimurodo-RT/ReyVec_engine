@@ -115,13 +115,36 @@ pub struct UiTarget {
     pub disabled: bool,
     /// `.id(…)` блока или, если его нет, первая надпись внутри.
     pub name: String,
+    /// Действия кнопки; значения ещё не посчитаны по данным игры.
+    pub actions: Vec<model::Action>,
 }
 
 /// Что случилось с интерфейсом от мыши или клавиатуры.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiEvent {
-    /// Нажата кнопка: её `.id` (или надпись, если `.id` нет).
-    Click(String),
+    /// Нажата кнопка: её `.id` (или надпись, если `.id` нет) и её действия по порядку,
+    /// со значениями, посчитанными в момент нажатия. `open` и `back` экран уже сделал
+    /// сам; остальное (`close`, `quit`, функции Luau) — дело игры.
+    Click {
+        name: String,
+        actions: Vec<UiAction>,
+    },
+}
+
+/// Действие нажатой кнопки: `close()`, `log("…")`, `new_game(3)`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiAction {
+    pub name: String,
+    pub args: Vec<syntax::Value>,
+    /// Где действие записано (для ошибок функций Luau).
+    pub pos: Pos,
+}
+
+impl UiAction {
+    /// Команда движка (`model::COMMANDS`), а не функция Luau.
+    pub fn is_command(&self) -> bool {
+        model::COMMANDS.iter().any(|(n, ..)| *n == self.name)
+    }
 }
 
 /// Клавиши, которые понимает интерфейс.
@@ -177,6 +200,8 @@ pub struct UiScreen {
     /// Ошибка последнего пересчёта по данным игры (нет такого пути, формула не
     /// считается). Экран при этом показывает прежний вид.
     problem: Option<UiError>,
+    /// Экраны, с которых ушли через `open(…)`: `back()` возвращает на последний.
+    history: Vec<usize>,
 }
 
 impl UiScreen {
@@ -331,6 +356,7 @@ impl UiScreen {
             restyle: false,
             env: model::Env::default(),
             problem: None,
+            history: Vec::new(),
         };
         let first = (!ui.styles.themes.is_empty()).then_some(0);
         ui.rebuild(first)?;
@@ -340,10 +366,11 @@ impl UiScreen {
     /// Строит экраны с темой `theme`. При ошибке прежние экраны остаются.
     fn rebuild(&mut self, theme: Option<usize>) -> Result<(), UiError> {
         let vars = self.styles.theme_vars(theme)?;
+        let names: Vec<String> = self.decls.iter().map(|d| d.name.clone()).collect();
         let screens = self
             .decls
             .iter()
-            .map(|d| model::screen(d, &self.styles, &vars, &self.texts, &self.env.lang))
+            .map(|d| model::screen(d, &self.styles, &vars, &self.texts, &self.env.lang, &names))
             .collect::<Result<Vec<_>, _>>()?;
         let mut text = TextLibrary::new();
         let mut text_ids = Vec::new();
@@ -466,10 +493,48 @@ impl UiScreen {
     pub fn pointer_up(&mut self) -> Option<UiEvent> {
         let pressed = self.pressed.take()?;
         self.restyle = true;
-        (self.hover.as_ref() == Some(&pressed))
-            .then(|| self.target_name(&pressed))
-            .flatten()
-            .map(UiEvent::Click)
+        if self.hover.as_ref() != Some(&pressed) {
+            return None;
+        }
+        let i = self.draw.targets.iter().position(|t| t.path == pressed)?;
+        self.click(i)
+    }
+
+    /// Нажатие кнопки `i` из `draw.targets`: значения действий считаются по данным
+    /// игры, `open` и `back` выполняются здесь же.
+    fn click(&mut self, i: usize) -> Option<UiEvent> {
+        let t = self.draw.targets.get(i)?;
+        let name = t.name.clone();
+        let mut actions = Vec::new();
+        for a in &t.actions {
+            let mut args = Vec::new();
+            for arg in &a.args {
+                match data::compute(&arg.value, arg.pos, &self.env.data) {
+                    Ok(v) => args.push(v),
+                    Err(e) => {
+                        self.problem = Some(e);
+                        return None;
+                    }
+                }
+            }
+            actions.push(UiAction {
+                name: a.name.clone(),
+                args,
+                pos: a.pos,
+            });
+        }
+        for a in &actions {
+            match (a.name.as_str(), a.args.first()) {
+                ("open", Some(syntax::Value::Name(to))) => {
+                    self.open(to);
+                }
+                ("back", _) => {
+                    self.back();
+                }
+                _ => {}
+            }
+        }
+        Some(UiEvent::Click { name, actions })
     }
 
     /// Клавиша. `None` — ничего не нажато (фокус мог сдвинуться).
@@ -504,10 +569,47 @@ impl UiScreen {
                 None
             }
             UiKey::Activate => {
-                let i = now?;
-                Some(UiEvent::Click(order[i].name.clone()))
+                let path = order[now?].path.clone();
+                let i = self.draw.targets.iter().position(|t| t.path == path)?;
+                self.click(i)
             }
         }
+    }
+
+    /// Открывает экран `name` этого файла так, что `back()` вернёт на текущий.
+    /// `false` — такого экрана нет.
+    pub fn open(&mut self, name: &str) -> bool {
+        let from = self.current;
+        if !self.show(name) {
+            return false;
+        }
+        if self.current != from {
+            self.history.push(from);
+        }
+        true
+    }
+
+    /// Назад на экран, с которого ушли через `open`. `false` — уходить некуда.
+    pub fn back(&mut self) -> bool {
+        match self.history.pop() {
+            Some(i) => {
+                self.switch(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Имя экрана, который сейчас рисуется.
+    pub fn current(&self) -> &str {
+        self.screens
+            .get(self.current)
+            .map_or("", |s| s.name.as_str())
+    }
+
+    /// Можно ли вернуться назад (`back()`): экраны, открытые через `open`.
+    pub fn can_go_back(&self) -> bool {
+        !self.history.is_empty()
     }
 
     /// Какая кнопка сейчас выбрана (её имя, как в [`UiEvent::Click`]).
@@ -668,14 +770,26 @@ impl UiScreen {
     pub fn show(&mut self, name: &str) -> bool {
         match self.screens.iter().position(|s| s.name == name) {
             Some(i) => {
-                if i != self.current {
-                    self.current = i;
-                    self.fresh = false;
-                }
+                self.switch(i);
                 true
             }
             None => false,
         }
+    }
+
+    fn switch(&mut self, i: usize) {
+        if i == self.current {
+            return;
+        }
+        self.current = i;
+        self.fresh = false;
+        // Пути наведения и фокуса вели в дерево прежнего экрана.
+        self.hover = None;
+        self.pressed = None;
+        self.focus = None;
+        self.restyle = true;
+        // Новый экран: кнопки найдутся после раскладки.
+        self.draw.targets.clear();
     }
 
     /// Атлас букв всех текстов файла: его загружает видеокарта. Меняется только при
@@ -804,6 +918,7 @@ impl UiScreen {
                 rect,
                 disabled: el.disabled,
                 name: el.id.clone().or_else(|| first_text(el)).unwrap_or_default(),
+                actions: el.actions.clone(),
             });
         }
         let border = el.look.border.map_or((0.0, [0.0; 4]), |(c, width)| {
@@ -1513,6 +1628,13 @@ mod tests {
         }
     "##;
 
+    fn click(name: &str) -> UiEvent {
+        UiEvent::Click {
+            name: name.into(),
+            actions: Vec::new(),
+        }
+    }
+
     fn center(ui: &UiScreen, i: usize) -> [f32; 2] {
         let r = ui.draw.targets[i].rect;
         [(r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0]
@@ -1545,7 +1667,7 @@ mod tests {
         assert!(ui.pointer_down());
         ui.draw([1920.0, 1080.0]);
         assert_eq!(bg(el(&ui, &[0, 0])), [48, 48, 48]);
-        assert_eq!(ui.pointer_up(), Some(UiEvent::Click("play".into())));
+        assert_eq!(ui.pointer_up(), Some(click("play")));
         ui.draw([1920.0, 1080.0]);
         assert_eq!(bg(el(&ui, &[0, 0])), [32, 32, 32]);
         // Нажал и увёл мышь — не нажатие.
@@ -1575,10 +1697,7 @@ mod tests {
         ui.key(UiKey::Next);
         assert_eq!(ui.focused().as_deref(), Some("play"));
         ui.key(UiKey::Prev);
-        assert_eq!(
-            ui.key(UiKey::Activate),
-            Some(UiEvent::Click("Мой цвет".into()))
-        );
+        assert_eq!(ui.key(UiKey::Activate), Some(click("Мой цвет")));
         ui.draw([1920.0, 1080.0]);
         assert!(el(&ui, &[0, 3]).look.border.is_some());
         assert!(el(&ui, &[0, 0]).look.border.is_none());
@@ -1788,5 +1907,56 @@ mod tests {
         bad.draw([1920.0, 1080.0]);
         let e = bad.problem().unwrap().to_string();
         assert!(e.contains("Может, game.hero.hp?"), "{e}");
+    }
+
+    #[test]
+    fn buttons_run_actions_and_switch_screens() {
+        let mut ui = UiScreen::parse(
+            r#"screen Menu {
+                Column {
+                    Button("Настройки") { open(Settings) log("ушли") }.size(200, 40)
+                    Button("Монеты") { give(game.hero.coins + 1, "x") }.size(200, 40)
+                }.align(top_left)
+            }
+            screen Settings {
+                Button("Назад") { back() }.size(200, 40).align(top_left)
+            }"#,
+        )
+        .unwrap();
+        ui.set_number("game.hero.coins", 4.0);
+        ui.draw([1920.0, 1080.0]);
+        ui.key(UiKey::Next);
+        ui.key(UiKey::Next);
+        let Some(UiEvent::Click { name, actions }) = ui.key(UiKey::Activate) else {
+            panic!("нажатие");
+        };
+        assert_eq!(name, "Монеты");
+        assert_eq!(actions[0].name, "give");
+        assert!(!actions[0].is_command());
+        assert_eq!(
+            actions[0].args,
+            [syntax::Value::Number(5.0), syntax::Value::Text("x".into())]
+        );
+        ui.key(UiKey::Prev);
+        let Some(UiEvent::Click { actions, .. }) = ui.key(UiKey::Activate) else {
+            panic!("нажатие");
+        };
+        assert_eq!(actions.len(), 2);
+        assert!(actions[1].is_command());
+        assert!(ui.can_go_back());
+        assert_eq!(ui.screens[ui.current].name, "Settings");
+        ui.draw([1920.0, 1080.0]);
+        ui.key(UiKey::Next);
+        assert_eq!(ui.focused().as_deref(), Some("Назад"));
+        ui.key(UiKey::Activate);
+        assert_eq!(ui.screens[ui.current].name, "Menu");
+        assert!(!ui.can_go_back());
+        let e = |src: &str| UiScreen::parse(src).err().unwrap().to_string();
+        let bad = e("screen M { Button(\"a\") { open(Setings) } }\nscreen Settings { }");
+        assert!(bad.contains("Может, Settings?"), "{bad}");
+        let bad = e("screen M { Column { quit() } }");
+        assert!(bad.contains("в скобках кнопки"), "{bad}");
+        let bad = e("screen M { Button(\"a\") { close(1) } }");
+        assert!(bad.contains("close: спрятать"), "{bad}");
     }
 }
