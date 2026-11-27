@@ -1,9 +1,10 @@
 //! Экраны интерфейса игры из файлов `ui/` (шаги И.1–И.3а, решение 0022).
 //!
-//! - `ui/demo.rui` — пример меню. F3 показывает и прячет его поверх любой сцены, F4
-//!   меняет тему; кнопки отвечают мыши, Tab, стрелкам и Enter (нажатие — в лог и
-//!   консоль, «Язык» переключает русский и английский, «Выход» прячет экран); Shift+F3
-//!   пишет в лог и консоль, откуда взялось каждое свойство.
+//! - `ui/demo.rui` — пример меню и экрана «Настройки». F3 показывает и прячет его поверх
+//!   любой сцены, F4 меняет тему; кнопки отвечают мыши, Tab, стрелкам и Enter и делают
+//!   то, что написано в их скобках (И.3б): команды движка (`close()`, `open(Settings)`)
+//!   выполняются здесь, свои функции — из `ui/demo.luau`; Shift+F3 пишет в лог и
+//!   консоль, откуда взялось каждое свойство.
 //! - `ui/hud.rui` — полоска здоровья и монеты в сцене с героем (И.3а): экран читает
 //!   `game.hero.hp`, `game.hero.hp_max`, `game.hero.coins`, `game.hero.hurt`. Пока он
 //!   читается без ошибок, старые сердечки на egui не рисуются.
@@ -17,8 +18,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
+use reyvec_scene::DebugCommand;
+use reyvec_script::{CommandSink, Scripts};
+use reyvec_story::Value as ScriptValue;
 use reyvec_text::GlyphAtlas;
-use reyvec_ui::{Texts, UiDraw, UiError, UiEvent, UiKey, UiScreen};
+use reyvec_ui::syntax::Value;
+use reyvec_ui::{Texts, UiAction, UiDraw, UiError, UiEvent, UiKey, UiScreen};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{Key, NamedKey};
 
@@ -33,6 +38,7 @@ const BUILT_IN_FILES: &[(&str, &str)] = &[
     ("styles/demo", include_str!("../../../ui/styles/demo.rui")),
     ("styles/hud", include_str!("../../../ui/styles/hud.rui")),
 ];
+const BUILT_IN_SCRIPT: &str = include_str!("../../../ui/demo.luau");
 const BUILT_IN_LANGS: &[(&str, &str)] = &[
     ("ru", include_str!("../../../ui/lang/ru.ron")),
     ("en", include_str!("../../../ui/lang/en.ron")),
@@ -178,8 +184,12 @@ impl Page {
             UiError::File { .. } => e.to_string(),
             _ => format!("{}: {e}", self.file),
         };
+        self.show_text(&message);
+    }
+
+    fn show_text(&mut self, message: &str) {
         tracing::warn!("интерфейс: ошибка в {message}");
-        self.error = UiScreen::parse(&error_screen(&message)).ok();
+        self.error = UiScreen::parse(&error_screen(message)).ok();
     }
 
     /// Экран прочитан без ошибок.
@@ -230,12 +240,36 @@ struct Choice {
     lang: String,
 }
 
+/// Что интерфейс просит у игры: команды миру сцены и выход.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Request {
+    World(DebugCommand),
+    Quit,
+}
+
+/// Команды для функций `ui/demo.luau`: `ui.close()`, `game.respawn()`.
+const UI_COMMANDS: &[&str] = &[
+    "open",
+    "back",
+    "close",
+    "quit",
+    "log",
+    "next_lang",
+    "next_theme",
+];
+const GAME_COMMANDS: &[&str] = &["respawn", "heal"];
+
 pub(crate) struct RuiDemo {
     dir: PathBuf,
     shown: bool,
     demo: Page,
     hud: Page,
     choice: Choice,
+    /// Функции кнопок из `ui/demo.luau` (И.3б) и куда они складывают команды.
+    scripts: Scripts,
+    sink: CommandSink,
+    scripts_checked: Instant,
+    requests: Vec<Request>,
 }
 
 impl RuiDemo {
@@ -250,10 +284,114 @@ impl RuiDemo {
                 theme: None,
                 lang: MAIN_LANG.to_owned(),
             },
+            scripts: Scripts::new(),
+            sink: CommandSink::default(),
+            scripts_checked: Instant::now(),
+            requests: Vec::new(),
         };
+        demo.scripts.add_commands("ui", UI_COMMANDS, &demo.sink);
+        demo.scripts.add_commands("game", GAME_COMMANDS, &demo.sink);
+        let script = demo.dir.join("demo.luau");
+        if script.exists() {
+            demo.scripts.load_module(&script);
+        } else {
+            demo.scripts.load_module_text("demo.luau", BUILT_IN_SCRIPT);
+        }
+        for e in demo.scripts.errors() {
+            tracing::warn!("интерфейс: {e}");
+        }
         demo.demo.load(&demo.dir, &demo.choice);
         demo.hud.load(&demo.dir, &demo.choice);
         demo
+    }
+
+    /// Что интерфейс попросил у игры с прошлого кадра.
+    pub(crate) fn take_requests(&mut self) -> Vec<Request> {
+        std::mem::take(&mut self.requests)
+    }
+
+    /// Действия нажатой кнопки по порядку: команды движка — здесь, остальное — функции
+    /// Luau. `open` и `back` экран уже сделал сам.
+    fn run(&mut self, actions: &[UiAction]) {
+        for a in actions {
+            if a.is_command() {
+                if !matches!(a.name.as_str(), "open" | "back") {
+                    self.command(&a.name, &a.args.iter().map(to_script).collect::<Vec<_>>());
+                }
+                continue;
+            }
+            let args: Vec<ScriptValue> = a.args.iter().map(to_script).collect();
+            if let Err(e) = self.scripts.call(&a.name, &args) {
+                let known = self.scripts.functions();
+                let hint = if known.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Есть: {}.", known.join(", "))
+                };
+                self.demo
+                    .show_text(&format!("demo.rui, {}: {e}.{hint}", a.pos));
+            }
+            self.drain();
+        }
+    }
+
+    /// Команды, которые функции Luau сложили в `sink`.
+    fn drain(&mut self) {
+        let got = match self.sink.lock() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => return,
+        };
+        for (name, args) in got {
+            match name.split_once('.') {
+                Some(("ui", n)) => {
+                    let n = n.to_owned();
+                    if let ("open" | "back", Some(screen)) = (n.as_str(), self.demo.screen.as_mut())
+                    {
+                        let ok = if n == "open" {
+                            match args.first() {
+                                Some(ScriptValue::Text(to)) => screen.open(to),
+                                _ => false,
+                            }
+                        } else {
+                            screen.back()
+                        };
+                        if !ok {
+                            tracing::warn!("интерфейс: ui.{n}: такого экрана нет или назад некуда");
+                        }
+                    } else {
+                        self.command(&n, &args);
+                    }
+                }
+                Some(("game", n)) => self.command(n, &args),
+                _ => {}
+            }
+        }
+    }
+
+    /// Команда движка: из скобок кнопки или из Luau (`ui.close()`, `game.respawn()`).
+    fn command(&mut self, name: &str, args: &[ScriptValue]) {
+        match name {
+            "close" => self.shown = false,
+            "quit" => self.requests.push(Request::Quit),
+            "log" => {
+                let text: Vec<String> = args.iter().map(script_text).collect();
+                tracing::info!("интерфейс: {}", text.join(" "));
+            }
+            "next_lang" => self.next_lang(),
+            "next_theme" => self.cycle_theme(),
+            "respawn" => self.requests.push(Request::World(DebugCommand::Respawn)),
+            "heal" => {
+                let n = match args.first() {
+                    Some(ScriptValue::Int(i)) => *i,
+                    Some(ScriptValue::Float(f)) => *f as i64,
+                    _ => 0,
+                };
+                self.requests.push(Request::World(
+                    DebugCommand::Health(n.clamp(1, 1000) as u32),
+                ));
+            }
+            other => tracing::warn!("интерфейс: неизвестная команда {other}"),
+        }
     }
 
     /// F3: показать или спрятать.
@@ -272,7 +410,13 @@ impl RuiDemo {
 
     /// F4: следующая тема из подключённых. Ничего не делает, пока экран спрятан.
     pub(crate) fn next_theme(&mut self) {
-        let Some(screen) = self.demo.screen.as_mut().filter(|_| self.shown) else {
+        if self.shown {
+            self.cycle_theme();
+        }
+    }
+
+    fn cycle_theme(&mut self) {
+        let Some(screen) = self.demo.screen.as_mut() else {
             return;
         };
         let themes: Vec<String> = screen.themes().iter().map(|t| (*t).to_owned()).collect();
@@ -297,7 +441,7 @@ impl RuiDemo {
         }
     }
 
-    /// Кнопка «Язык»: следующий язык из `ui/lang`, для всех экранов.
+    /// `next_lang()`: следующий язык из `ui/lang`, для всех экранов.
     fn next_lang(&mut self) {
         let Some(screen) = self.demo.screen.as_ref() else {
             return;
@@ -365,13 +509,9 @@ impl RuiDemo {
             }
             _ => return false,
         };
-        let UiEvent::Click(name) = event;
+        let UiEvent::Click { name, actions } = event;
         tracing::info!("интерфейс: нажата кнопка «{name}»");
-        match name.as_str() {
-            "close" => self.shown = false,
-            "language" => self.next_lang(),
-            _ => {}
-        }
+        self.run(&actions);
         true
     }
 
@@ -393,7 +533,25 @@ impl RuiDemo {
     /// `hero` — данные героя, если в сцене он есть. Меню F3 закрывает полоску здоровья:
     /// стопка из нескольких экранов — шаг И.4.
     pub(crate) fn frame(&mut self, viewport: [f32; 2], hero: Option<HeroData>) -> Draw<'_> {
+        if self.scripts_checked.elapsed() >= POLL {
+            self.scripts_checked = Instant::now();
+            if self.scripts.reload_changed() > 0 {
+                for e in self.scripts.errors() {
+                    self.demo.show_text(&e);
+                }
+            }
+        }
         if self.shown {
+            if let Some(s) = self.demo.screen.as_mut() {
+                // Имена языка и темы для экрана «Настройки»: settings.lang, settings.theme.
+                let lang = s
+                    .languages()
+                    .find(|(c, _)| *c == self.choice.lang)
+                    .map_or_else(|| self.choice.lang.clone(), |(_, n)| n.to_owned());
+                let theme = s.theme().unwrap_or("—").to_owned();
+                s.set_text("settings.lang", &lang);
+                s.set_text("settings.theme", &theme);
+            }
             return self.demo.frame(&self.dir, viewport, &self.choice);
         }
         let hero = hero?;
@@ -404,6 +562,27 @@ impl RuiDemo {
             s.set_flag("game.hero.hurt", hero.hurt);
         }
         self.hud.frame(&self.dir, viewport, &self.choice)
+    }
+}
+
+/// Значение из скобок кнопки для Luau: числа, строки, да/нет.
+fn to_script(v: &Value) -> ScriptValue {
+    match v {
+        Value::Number(n) if n.fract() == 0.0 && n.abs() < 1e15 => ScriptValue::Int(*n as i64),
+        Value::Number(n) | Value::Percent(n) => ScriptValue::Float(f64::from(*n)),
+        Value::Name(n) if n == "true" => ScriptValue::Bool(true),
+        Value::Name(n) if n == "false" => ScriptValue::Bool(false),
+        Value::Text(t) | Value::Name(t) => ScriptValue::Text(t.clone()),
+        other => ScriptValue::Text(other.kind().to_owned()),
+    }
+}
+
+fn script_text(v: &ScriptValue) -> String {
+    match v {
+        ScriptValue::Bool(b) => b.to_string(),
+        ScriptValue::Int(i) => i.to_string(),
+        ScriptValue::Float(f) => f.to_string(),
+        ScriptValue::Text(t) => t.clone(),
     }
 }
 
@@ -525,6 +704,49 @@ mod tests {
         {
             s.set_theme(&t).expect("тема подходит полоске");
         }
+    }
+
+    #[test]
+    fn built_in_settings_open_and_go_back() {
+        let mut s = built_in("demo.rui");
+        assert_eq!(s.current(), "Demo");
+        assert!(s.open("Settings"));
+        assert!(!s.draw([1920.0, 1080.0]).quads.is_empty());
+        assert!(s.problem().is_none(), "{:?}", s.problem());
+        assert!(s.back());
+        assert_eq!(s.current(), "Demo");
+    }
+
+    #[test]
+    fn new_game_button_respawns_the_hero_and_closes_the_menu() {
+        let mut demo = RuiDemo::new();
+        assert!(
+            demo.scripts.errors().is_empty(),
+            "{:?}",
+            demo.scripts.errors()
+        );
+        assert!(demo.scripts.has_function("new_game"));
+        // Встроенная копия тоже знает new_game.
+        let mut copy = Scripts::new();
+        copy.add_commands("ui", UI_COMMANDS, &CommandSink::default());
+        copy.add_commands("game", GAME_COMMANDS, &CommandSink::default());
+        copy.load_module_text("demo.luau", BUILT_IN_SCRIPT);
+        assert!(copy.has_function("new_game"), "{:?}", copy.errors());
+
+        demo.shown = true;
+        let action = |name: &str, args: Vec<Value>| UiAction {
+            name: name.into(),
+            args,
+            pos: Default::default(),
+        };
+        demo.run(&[action("new_game", Vec::new())]);
+        assert_eq!(
+            demo.take_requests(),
+            vec![Request::World(DebugCommand::Respawn)]
+        );
+        assert!(!demo.shown, "меню закрылось");
+        demo.run(&[action("quit", Vec::new())]);
+        assert_eq!(demo.take_requests(), vec![Request::Quit]);
     }
 
     #[test]

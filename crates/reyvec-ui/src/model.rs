@@ -168,7 +168,30 @@ pub struct Element {
     pub id: Option<String>,
     /// Сейчас: наведена мышь, нажат, выбран клавиатурой ([`HOVER`], [`PRESSED`], [`FOCUS`]).
     pub dynamic: u8,
+    /// Что делает кнопка при нажатии, по порядку.
+    pub actions: Vec<Action>,
 }
+
+/// Действие кнопки: команда движка (`open(Settings)`, `close()`) или функция Luau
+/// рядом с экраном (`new_game()`). Значения посчитаются в момент нажатия: в них могут
+/// быть данные игры.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Action {
+    pub name: String,
+    pub args: Vec<Arg>,
+    pub pos: Pos,
+}
+
+/// Команды движка: имя и сколько значений в скобках. Другие имена — функции Luau.
+pub const COMMANDS: &[(&str, usize, &str)] = &[
+    ("open", 1, "открыть экран этого файла: open(Settings)"),
+    ("back", 0, "вернуться на прошлый экран: back()"),
+    ("close", 0, "спрятать интерфейс: close()"),
+    ("quit", 0, "выйти из игры: quit()"),
+    ("next_lang", 0, "следующий язык: next_lang()"),
+    ("next_theme", 0, "следующая тема: next_theme()"),
+    ("log", 1, "написать в консоль: log(\"текст\")"),
+];
 
 /// Шаг пересчёта вида блока: модификатор (с источником) или значения в скобках у
 /// `Column` и `Row`.
@@ -580,6 +603,8 @@ fn container_args(node: &Node, p: &mut Placement) -> Result<(), UiError> {
 #[derive(Clone)]
 struct Ctx<'a> {
     styles: &'a StyleSet,
+    /// Имена экранов файла: для `open(Имя)`.
+    screens: &'a [String],
     /// Слова для `tr("ключ")` и язык, на котором их брать.
     texts: &'a Texts,
     lang: &'a str,
@@ -1116,6 +1141,42 @@ fn words(a: &Arg, ctx: &Ctx<'_>) -> Result<Vec<Arg>, UiError> {
     Ok(out)
 }
 
+/// Действие кнопки из записи `имя(значения)` в её фигурных скобках.
+fn action(c: &Node, vars: &Vars, screens: &[String]) -> Result<Action, UiError> {
+    if c.children.is_some() || !c.modifiers.is_empty() {
+        return Err(meaning(
+            c.pos,
+            format!(
+                "{}(): у действия нет своих скобок {{ }} и модификаторов",
+                c.kind
+            ),
+        ));
+    }
+    let args = vars.resolve_args(&c.args)?;
+    if let Some((_, n, help)) = COMMANDS.iter().find(|(name, ..)| *name == c.kind) {
+        if args.len() != *n || args.iter().any(|a| a.name.is_some()) {
+            return Err(meaning(c.pos, format!("{}: {help}", c.kind)));
+        }
+        if c.kind == "open" {
+            let Value::Name(to) = &args[0].value else {
+                return Err(meaning(
+                    args[0].pos,
+                    "open: имя экрана без кавычек, open(Settings)",
+                ));
+            };
+            if !screens.contains(to) {
+                let known: Vec<&str> = screens.iter().map(String::as_str).collect();
+                return Err(unknown(args[0].pos, "экран", to, &known, ""));
+            }
+        }
+    }
+    Ok(Action {
+        name: c.kind.clone(),
+        args,
+        pos: c.pos,
+    })
+}
+
 fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<Element, UiError> {
     let kind_name = node.kind.as_str();
     if !KINDS.contains(&kind_name) {
@@ -1123,8 +1184,31 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
     }
     let mut initial = Placement::default();
     let mut patched: Option<Node> = None;
+    // В фигурных скобках блоки пишутся с большой буквы, действия кнопки — с маленькой:
+    // `Button("Настройки") { open(Settings) }`.
+    let (mut kids, calls) = match &node.children {
+        None => (None, Vec::new()),
+        Some(all) => {
+            let (calls, blocks): (Vec<&Node>, Vec<&Node>) = all
+                .iter()
+                .partition(|n| n.kind.starts_with(|c: char| c.is_lowercase()));
+            let blocks: Vec<Node> = blocks.into_iter().cloned().collect();
+            let kids = (!blocks.is_empty() || calls.is_empty()).then_some(blocks);
+            (kids, calls)
+        }
+    };
+    if let Some(c) = calls.first()
+        && kind_name != "Button"
+    {
+        return Err(meaning(
+            c.pos,
+            format!(
+                "{}(): действие пишется в скобках кнопки, Button(\"…\") {{ {}() }}; блоки — с большой буквы",
+                c.kind, c.kind
+            ),
+        ));
+    }
     // `Button("Играть")` — короткая запись `Button { Text("Играть") }`.
-    let mut kids = node.children.clone();
     let kind = match kind_name {
         "Column" | "Row" => {
             if kind_name == "Column" {
@@ -1148,7 +1232,7 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
                 _ => {
                     return Err(meaning(
                         node.pos,
-                        "Button: надпись в кавычках или по ключу, Button(\"Играть\") или Button(tr(\"menu.play\")), или блоки в { }",
+                        "Button: надпись в кавычках или по ключу, Button(\"Играть\") или Button(tr(\"menu.play\")), или блоки в { }; надпись и блоки сразу не пишутся",
                     ));
                 }
             }
@@ -1246,6 +1330,7 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
         checked: flag(&node.modifiers, "checked")?,
         id: id_of(&node.modifiers)?,
         dynamic: 0,
+        actions: Vec::new(),
     };
     let (from_styles, own) = styled(ctx, &me, &node.modifiers)?;
     let vars = own_vars(
@@ -1274,6 +1359,10 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
     }
     let states = states_of(&el, ctx.states);
     replay(&mut el, ctx.font, ctx.color, states, &Env::default())?;
+    el.actions = calls
+        .iter()
+        .map(|c| action(c, &vars, ctx.screens))
+        .collect::<Result<_, _>>()?;
     if let Some(children) = &kids {
         if matches!(el.kind, Kind::Text(_) | Kind::Spacer) {
             return Err(meaning(
@@ -1305,9 +1394,11 @@ pub fn screen(
     vars: &Vars,
     texts: &Texts,
     lang: &str,
+    screens: &[String],
 ) -> Result<Screen, UiError> {
     let root_ctx = Ctx {
         styles,
+        screens,
         texts,
         lang,
         vars: vars.clone(),
@@ -1345,6 +1436,7 @@ pub fn screen(
         checked: false,
         id: None,
         dynamic: 0,
+        actions: Vec::new(),
     };
     let (from_styles, own) = styled(&root_ctx, &me, &decl.modifiers)?;
     let vars = own_vars(
@@ -1402,7 +1494,15 @@ mod tests {
         styles.add_rules(&doc.styles, "экран");
         styles.themes = doc.themes.clone();
         let vars = styles.theme_vars((!styles.themes.is_empty()).then_some(0))?;
-        screen(&doc.screens[0], &styles, &vars, &Texts::default(), "ru")
+        let names: Vec<String> = doc.screens.iter().map(|s| s.name.clone()).collect();
+        screen(
+            &doc.screens[0],
+            &styles,
+            &vars,
+            &Texts::default(),
+            "ru",
+            &names,
+        )
     }
 
     #[test]

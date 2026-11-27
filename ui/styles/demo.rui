@@ -36,7 +36,10 @@ style Button.danger {
 style title { .font(56).color(var(accent)) }
 style hint { .font(20).color(var(muted)) }
 
-// Внутри экрана Demo столбцы шире и просторнее.
+// Внутри экранов Demo и Settings столбцы шире и просторнее.
 style Demo {
+    Column.menu { .width(420) }
+}
+style Settings {
     Column.menu { .width(420) }
 }
