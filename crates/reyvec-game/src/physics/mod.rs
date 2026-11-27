@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use rapier2d::prelude::*;
 
+use crate::space::Surface;
 use crate::{Aabb, Collider};
 
 mod joints;
@@ -172,6 +173,8 @@ pub struct Physics {
     movers: HashMap<u64, Mover>,
     /// Где были тела на прошлом шаге (для платформ: на сколько сдвинулись).
     last: HashMap<RigidBodyHandle, [f64; 2]>,
+    /// Поворот тел на прошлом шаге, радианы (вращающаяся опора везёт стоящего).
+    last_angle: HashMap<RigidBodyHandle, f64>,
     /// Неподвижное тело в начале координат: к нему крепятся сочленения «к миру».
     ground: Option<RigidBodyHandle>,
     /// Наши надстройки над сочленениями: моторы туда-обратно, разрыв.
@@ -209,6 +212,7 @@ impl Physics {
             gravity: Vector::new(0.0, -gravity as f32),
             movers: HashMap::new(),
             last: HashMap::new(),
+            last_angle: HashMap::new(),
             ground: None,
             joint_extras: Vec::new(),
             breaks: Vec::new(),
@@ -248,12 +252,14 @@ impl Physics {
             .build();
         self.colliders.insert_with_parent(c, h, &mut self.bodies);
         self.last.insert(h, at);
+        self.last_angle.insert(h, angle.to_radians());
         BodyId(h)
     }
 
     /// Убирает тело.
     pub fn remove(&mut self, id: BodyId) {
         self.last.remove(&id.0);
+        self.last_angle.remove(&id.0);
         if matches!(self.grip, Some((Grip::Body { body, .. }, _)) if body == id.0) {
             self.grip = None;
         }
@@ -385,6 +391,7 @@ impl Physics {
         for (h, at) in self.last.iter_mut() {
             if let Some(b) = self.bodies.get(*h) {
                 *at = p(b.translation());
+                self.last_angle.insert(*h, f64::from(b.rotation().angle()));
             }
         }
         self.params.dt = dt.clamp(1e-4, 0.05) as f32;
@@ -618,22 +625,64 @@ impl Physics {
         }
     }
 
-    /// Тела как платформы для контроллера героя: на них встают сверху, сдвиг за шаг
-    /// везёт стоящего. Номер платформы — `base` плюс номер тела по порядку.
-    pub fn platforms(&self, ids: &[BodyId], base: u64) -> Vec<Collider> {
-        ids.iter()
-            .enumerate()
-            .filter_map(|(i, id)| {
-                let aabb = self.bounds(*id)?;
-                let now = p(self.bodies.get(id.0)?.translation());
-                let was = self.last.get(&id.0).copied().unwrap_or(now);
-                Some(Collider {
-                    id: base + i as u64,
-                    moved: [now[0] - was[0], now[1] - was[1]],
-                    ..Collider::oneway(aabb)
-                })
-            })
-            .collect()
+    /// Тела как поверхности мира столкновений героя и врагов (9.2): настоящие формы на
+    /// своих местах, со сдвигом и поворотом за прошлый шаг физики (опора везёт стоящего).
+    /// Подвижные тела можно толкать. Номер поверхности — `base` плюс номер тела по
+    /// порядку в `ids`.
+    pub fn surfaces(&self, ids: &[BodyId], base: u64) -> Vec<Surface> {
+        let mut out = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let Some(b) = self.bodies.get(id.0) else {
+                continue;
+            };
+            let now = p(b.translation());
+            let was = self.last.get(&id.0).copied().unwrap_or(now);
+            let angle = f64::from(b.rotation().angle());
+            let was_angle = self.last_angle.get(&id.0).copied().unwrap_or(angle);
+            let mut turned = angle - was_angle;
+            // Через ±180° — короткой дорогой.
+            if turned > std::f64::consts::PI {
+                turned -= std::f64::consts::TAU;
+            } else if turned < -std::f64::consts::PI {
+                turned += std::f64::consts::TAU;
+            }
+            for &c in b.colliders() {
+                let Some(col) = self.colliders.get(c) else {
+                    continue;
+                };
+                let mut s =
+                    Surface::of_shape(base + i as u64, col.shared_shape().clone(), *col.position());
+                s.moved = [now[0] - was[0], now[1] - was[1]];
+                s.turned = turned;
+                s.center = now;
+                s.pushable = b.is_dynamic();
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    /// Персонаж толкает тело сбоку, желая идти со скоростью `speed` (со знаком): тело
+    /// разгоняется к ней тем медленнее, чем оно тяжелее персонажа массой `pusher`.
+    pub fn push(&mut self, id: BodyId, speed: f64, pusher: f64, dt: f64) {
+        let Some(b) = self.bodies.get_mut(id.0) else {
+            return;
+        };
+        if !b.is_dynamic() {
+            return;
+        }
+        let mass = f64::from(b.mass()).max(1e-6);
+        // Лёгкое тело идёт почти со скоростью персонажа, тяжёлое — медленно.
+        let target = speed * (pusher / (pusher + mass)).clamp(0.05, 0.95) * 1.6;
+        let target = target.clamp(-speed.abs(), speed.abs());
+        let mut vel = b.linvel();
+        let cur = f64::from(vel.x);
+        let accel = 12.0 * pusher / (pusher + mass);
+        let dv = (target - cur).clamp(-accel * dt, accel * dt);
+        if (target > 0.0 && cur < target) || (target < 0.0 && cur > target) {
+            vel.x = (cur + dv) as f32;
+            b.set_linvel(vel, true);
+        }
     }
 }
 
