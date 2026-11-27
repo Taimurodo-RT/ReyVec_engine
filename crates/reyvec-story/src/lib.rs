@@ -24,6 +24,7 @@ pub mod memory;
 pub mod play;
 pub mod quest;
 pub mod rename;
+pub mod text;
 pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
