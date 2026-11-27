@@ -893,6 +893,16 @@ impl App {
                     coins: self.game_ui.coins(),
                     hurt: p.invulnerable,
                 });
+        // Кнопки интерфейса (И.3б) просят мир о командах, как консоль.
+        for r in self.rui_demo.take_requests() {
+            match r {
+                crate::rui_demo::Request::World(c) => match renderer.scene_logic() {
+                    Some(l) => l.debug(c),
+                    None => tracing::warn!("интерфейс: команды игры работают в сцене с героем (N)"),
+                },
+                crate::rui_demo::Request::Quit => return self.close(event_loop),
+            }
+        }
         let rui = self
             .rui_demo
             .frame([ui_size[0] as f32, ui_size[1] as f32], hero);

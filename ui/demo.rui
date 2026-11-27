@@ -1,6 +1,11 @@
-// Пример экрана интерфейса игры (шаги И.1–И.2в, решение 0022).
-// В песочнице: F3 показывает и прячет, F4 меняет тему, кнопка «Язык» — язык.
-// Правка этого файла, темы, стилей или языков (ui/lang) сразу видна в окне.
+// Пример экрана интерфейса игры (шаги И.1–И.3б, решение 0022).
+// В песочнице: F3 показывает и прячет, F4 меняет тему.
+// Правка этого файла, темы, стилей, языков (ui/lang) или ui/demo.luau сразу видна в окне.
+// Что делает кнопка, пишется в её фигурных скобках с маленькой буквы:
+//   open(Settings) — открыть экран этого файла, back() — вернуться,
+//   close() — спрятать интерфейс, quit() — выйти из игры, log("…") — в консоль,
+//   next_lang() и next_theme() — следующий язык и тема,
+//   другое имя — функция из ui/demo.luau, например new_game().
 // Тексты пишутся ключами: tr("menu.save"), а слова — в ui/lang/ru.ron и en.ron.
 // Размеры — в пикселях экрана 1920×1080, на другом окне всё растягивается.
 
@@ -22,13 +27,13 @@ screen Demo {
         Rect().height(8)
 
         // Мышь подсвечивает кнопку, Tab и стрелки выбирают, Enter нажимает.
-        // Что нажато — видно в консоли (~); «Язык» меняет язык, «Выход» прячет экран.
-        Button(tr("menu.continue")).id(continue)
-        Button(tr("menu.new_game")).id(new_game)
-        Button(tr("menu.save")).id(save).disabled()
-        Button(tr("menu.settings")).id(settings)
-        Button(tr("menu.language")).id(language)
-        Button(tr("menu.quit")).id(close).class(danger)
+        // Что нажато — видно в консоли (~).
+        Button(tr("menu.continue")) { close() }
+        Button(tr("menu.new_game")) { new_game() }     // функция из ui/demo.luau
+        Button(tr("menu.save")).disabled()
+        Button(tr("menu.settings")) { open(Settings) }
+        // В песочнице «Выйти» только прячет меню; в игре здесь будет quit().
+        Button(tr("menu.quit")) { close() }.class(danger)
     }
     .class(menu, panel)
 
@@ -47,4 +52,17 @@ screen Demo {
     }
     .var(muted: #C8D0DC)
     .anchor(bottom_left, margin: 32)
+}
+
+// Второй экран файла: его открывает кнопка «Настройки», «Назад» возвращает в меню.
+screen Settings {
+    Column(align: stretch) {
+        Text(tr("settings.title")).class(title)
+        Rect().height(8)
+        // settings.lang и settings.theme — имя языка и темы: их даёт песочница.
+        Button(tr("settings.language", name: settings.lang)) { next_lang() }
+        Button(tr("settings.theme", name: settings.theme)) { next_theme() }
+        Button(tr("settings.back")) { back() }
+    }
+    .class(menu, panel)
 }
