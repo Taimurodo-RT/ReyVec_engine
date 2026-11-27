@@ -596,6 +596,7 @@ impl StoryUi {
                             Node::Line { text, choices, .. } => {
                                 has(text) || choices.iter().any(|c| has(&c.text))
                             }
+                            Node::Generate { task, fallback, .. } => has(task) || has(fallback),
                             _ => false,
                         })
                     })
@@ -1378,6 +1379,38 @@ impl StoryUi {
                     for (i, c) in choices.iter_mut().enumerate() {
                         changed |= choice_row(ui, c, i, &nid, &mut jump_to);
                     }
+                    if !next.is_empty() {
+                        arrow(ui, "дальше", next, &mut jump_to);
+                    }
+                }
+                Node::Generate {
+                    who,
+                    task,
+                    fallback,
+                    next,
+                    ..
+                } => {
+                    let (name, color) = names
+                        .get(who.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| (who.clone(), BAD));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(name).color(color).strong().size(FONT_NOTE));
+                        muted(ui, "✦ скажет своими словами:");
+                        ui.label(RichText::new(task.as_str()).italics().color(TEXT_DIM));
+                    });
+                    ui.horizontal(|ui| {
+                        muted(ui, "без модели:");
+                        changed |= ui
+                            .add(
+                                TextEdit::multiline(fallback)
+                                    .frame(Frame::NONE)
+                                    .font(FontId::proportional(FONT_NOTE))
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(1),
+                            )
+                            .changed();
+                    });
                     if !next.is_empty() {
                         arrow(ui, "дальше", next, &mut jump_to);
                     }
@@ -2176,7 +2209,9 @@ pub(crate) fn backlinks(s: &Story, item: &Item) -> Vec<(Item, String)> {
         let mut why = Vec::new();
         for n in &d.nodes {
             match (item, n) {
-                (Item::Character(id), Node::Line { who, .. }) if who == id => {
+                (Item::Character(id), Node::Line { who, .. } | Node::Generate { who, .. })
+                    if who == id =>
+                {
                     why.push(format!("говорит в #{}", n.id()));
                 }
                 (Item::Quest(id), Node::Event { name, args, .. })
@@ -2267,7 +2302,7 @@ fn outlinks(s: &Story, item: &Item) -> Vec<Item> {
         }
         for n in &d.nodes {
             match n {
-                Node::Line { who, .. } => {
+                Node::Line { who, .. } | Node::Generate { who, .. } => {
                     out.insert(Item::Character(who.clone()));
                 }
                 Node::Jump { dialog, .. } => {
@@ -2322,6 +2357,17 @@ fn dialog_keys(d: &Dialog) -> Vec<(String, String)> {
             }
             out.insert(out.len() - choices.len(), (k, text.clone()));
         }
+        if let Node::Generate {
+            id, fallback, key, ..
+        } = n
+        {
+            let k = if key.is_empty() {
+                format!("{}.{id}", d.id)
+            } else {
+                key.clone()
+            };
+            out.push((k, fallback.clone()));
+        }
     }
     out
 }
@@ -2329,6 +2375,7 @@ fn dialog_keys(d: &Dialog) -> Vec<(String, String)> {
 fn node_kind(n: &Node) -> &'static str {
     match n {
         Node::Line { .. } => "реплика",
+        Node::Generate { .. } => "живая реплика",
         Node::Check { .. } => "развилка",
         Node::Set { .. } => "изменить мир",
         Node::Event { .. } => "событие",

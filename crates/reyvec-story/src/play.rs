@@ -60,6 +60,17 @@ pub struct Shown {
     /// Настройки: реплика поверх диалога поверх персонажа.
     pub settings: LineSettings,
     pub choices: Vec<ShownChoice>,
+    /// Откуда текст у карточки «Сгенерировать» (Сю.10): `None` — обычная реплика.
+    pub generated: Option<Generated>,
+}
+
+/// Чей текст у карточки «Сгенерировать».
+#[derive(Clone, Debug, PartialEq)]
+pub enum Generated {
+    /// Написала модель (её имя).
+    Model(String),
+    /// Запасной текст: модели нет или почему её ответ не подошёл.
+    Fallback(Option<String>),
 }
 
 /// Вариант ответа на экране.
@@ -228,6 +239,7 @@ impl Story {
                         .over(&ch.map(|c| c.lines.clone()).unwrap_or_default()),
                     choices: shown_choices,
                     who,
+                    generated: None,
                 };
                 if options.is_empty() {
                     talk.pending = Pending::Then(next);
@@ -235,6 +247,73 @@ impl Story {
                     talk.pending = Pending::Choices(options);
                     talk.shown = Some(shown.clone());
                 }
+                Some(Step::Line(shown))
+            }
+            Node::Generate {
+                id,
+                who,
+                task,
+                fallback,
+                words,
+                allowed,
+                settings,
+                next,
+                key,
+                ..
+            } => {
+                let line_key = if key.is_empty() {
+                    format!("{}.{id}", talk.dialog)
+                } else {
+                    key
+                };
+                let lines = dialog.lines.clone();
+                let req = self.request(state, &who, &task, words, &allowed);
+                let answer = self.writer.as_mut().map(|w| {
+                    let name = w.name().to_string();
+                    (
+                        name,
+                        w.write(&req).and_then(|r| crate::writer::accept(&req, r)),
+                    )
+                });
+                let (text, generated) = match answer {
+                    Some((name, Ok(reply))) => {
+                        for (event, args) in &reply.events {
+                            let done = match event.strip_prefix("quest.") {
+                                Some(op) => self.quest_event(state, op, args),
+                                None => self.memory_event(state, event, args),
+                            };
+                            if let Err(e) = done {
+                                tracing::warn!("действие модели {event}: {e}");
+                            }
+                        }
+                        (reply.text, Generated::Model(name))
+                    }
+                    Some((_, Err(e))) => {
+                        tracing::warn!("модель: {e}; звучит запасной текст");
+                        (
+                            fill(self.text(&line_key, &fallback, state), state),
+                            Generated::Fallback(Some(e)),
+                        )
+                    }
+                    None => (
+                        fill(self.text(&line_key, &fallback, state), state),
+                        Generated::Fallback(None),
+                    ),
+                };
+                let ch = self.characters.get(&who);
+                let shown = Shown {
+                    name: ch.map_or_else(|| who.clone(), |c| c.name.clone()),
+                    color: ch.map(|c| c.color.clone()).unwrap_or_default(),
+                    text,
+                    key: line_key,
+                    settings: settings
+                        .over(&lines)
+                        .over(&ch.map(|c| c.lines.clone()).unwrap_or_default()),
+                    choices: Vec::new(),
+                    who,
+                    generated: Some(generated),
+                };
+                talk.pending = Pending::Then(next);
                 Some(Step::Line(shown))
             }
             Node::Check { when, yes, no, .. } => {

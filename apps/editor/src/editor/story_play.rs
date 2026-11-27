@@ -4,7 +4,7 @@
 //! выполняются, только записываются в ленту.
 
 use egui::{Color32, Frame, Margin, RichText, Ui, vec2};
-use reyvec_story::{QuestState, State, Status, Step, Story, Talk};
+use reyvec_story::{Generated, QuestState, State, Status, Step, Story, Talk};
 
 use super::story_ui::{args_text, caption, lang_name, muted, parse_hex, value_edit, value_text};
 use super::theme::*;
@@ -124,6 +124,18 @@ impl Player {
                     let color = parse_hex(&s.color).unwrap_or(TEXT);
                     let name = if s.name.is_empty() { s.who } else { s.name };
                     self.log.push(Entry::Line(name, color, s.text));
+                    match &s.generated {
+                        Some(Generated::Model(m)) => self
+                            .log
+                            .push(Entry::Note(format!("Реплику написала модель «{m}»"))),
+                        Some(Generated::Fallback(None)) => self.log.push(Entry::Note(
+                            "Живая реплика: модель не подключена, звучит запасной текст".into(),
+                        )),
+                        Some(Generated::Fallback(Some(e))) => self.log.push(Entry::Note(format!(
+                            "Живая реплика: {e} — звучит запасной текст"
+                        ))),
+                        None => {}
+                    }
                     if s.choices.is_empty() {
                         self.next = true;
                     } else {
@@ -498,5 +510,25 @@ mod tests {
         assert_eq!(p.at(), Some(("kuznec.privet", "chuzhak")));
         p.go_on(&mut s);
         assert_eq!(p.at(), Some(("kuznec.privet", "vopros")));
+    }
+
+    #[test]
+    fn live_line_without_a_model_says_the_fallback() {
+        let mut s = story();
+        let mut p = Player::default();
+        p.start(&mut s, "kuznec.privet");
+        p.go_on(&mut s);
+        let last = p.choices.len() - 1;
+        p.choose(&mut s, last);
+        assert!(
+            lines(&p).last().unwrap().contains("руками не трогай"),
+            "{:?}",
+            p.log
+        );
+        assert!(
+            p.log
+                .iter()
+                .any(|e| matches!(e, Entry::Note(n) if n.contains("модель не подключена")))
+        );
     }
 }

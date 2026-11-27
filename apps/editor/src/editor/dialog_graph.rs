@@ -86,6 +86,7 @@ enum Port {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Kind {
     Line,
+    Generate,
     Run,
     Wait,
     Check,
@@ -97,8 +98,9 @@ pub(crate) enum Kind {
     End,
 }
 
-pub(crate) const KINDS: [Kind; 10] = [
+pub(crate) const KINDS: [Kind; 11] = [
     Kind::Line,
+    Kind::Generate,
     Kind::Run,
     Kind::Wait,
     Kind::Check,
@@ -114,6 +116,7 @@ impl Kind {
     fn of(n: &Node) -> Kind {
         match n {
             Node::Line { .. } => Kind::Line,
+            Node::Generate { .. } => Kind::Generate,
             Node::Run { .. } => Kind::Run,
             Node::Wait { .. } => Kind::Wait,
             Node::Check { .. } => Kind::Check,
@@ -129,6 +132,7 @@ impl Kind {
     pub(crate) fn title(self) -> &'static str {
         match self {
             Kind::Line => "Реплика",
+            Kind::Generate => "Сгенерировать",
             Kind::Run => "Выполнить",
             Kind::Wait => "Пауза",
             Kind::Check => "Развилка",
@@ -144,6 +148,9 @@ impl Kind {
     pub(crate) fn hint(self) -> &'static str {
         match self {
             Kind::Line => "Персонаж говорит; у реплики могут быть варианты ответа игрока",
+            Kind::Generate => {
+                "Реплику пишет модель по задаче и памяти персонажа; без модели — запасной текст"
+            }
             Kind::Run => "Позвать функцию скрипта Luau",
             Kind::Wait => "Подождать секунды или нажатия",
             Kind::Check => "Развилка по условию: да или нет",
@@ -158,7 +165,7 @@ impl Kind {
 
     pub(crate) fn color(self) -> Color32 {
         match self {
-            Kind::Line | Kind::Run | Kind::Wait => RED,
+            Kind::Line | Kind::Generate | Kind::Run | Kind::Wait => RED,
             Kind::Check | Kind::Random | Kind::Chance | Kind::Jump => GREEN,
             Kind::Set => BLUE,
             Kind::Event => PURPLE,
@@ -169,6 +176,7 @@ impl Kind {
     fn base_id(self) -> &'static str {
         match self {
             Kind::Line => "replika",
+            Kind::Generate => "zhivaya",
             Kind::Run => "vypolnit",
             Kind::Wait => "pauza",
             Kind::Check => "razvilka",
@@ -191,6 +199,18 @@ impl Kind {
                 text: String::new(),
                 settings: LineSettings::default(),
                 choices: Vec::new(),
+                next: String::new(),
+                key: String::new(),
+            },
+            Kind::Generate => Node::Generate {
+                id,
+                at,
+                who: who.to_string(),
+                task: String::new(),
+                fallback: String::new(),
+                words: 30,
+                allowed: Vec::new(),
+                settings: LineSettings::default(),
                 next: String::new(),
                 key: String::new(),
             },
@@ -603,7 +623,11 @@ fn node_card(
     start: bool,
 ) -> CardOut {
     let kind = Kind::of(n);
-    let w = if kind == Kind::Line { LINE_W } else { NODE_W };
+    let w = if matches!(kind, Kind::Line | Kind::Generate) {
+        LINE_W
+    } else {
+        NODE_W
+    };
     let at = Pos2::new(at_mut(n).0, at_mut(n).1);
     let id = n.id().to_string();
     let mut ports = Vec::new();
@@ -713,6 +737,31 @@ fn node_card(
     }
 }
 
+/// Кто говорит: список персонажей диалога.
+fn who_combo(ui: &mut Ui, who: &mut String, around: &Around) -> bool {
+    let mut changed = false;
+    let shown = around
+        .speakers
+        .iter()
+        .find(|s| s.id == *who)
+        .map_or_else(|| (who.clone(), BAD), |s| (s.name.clone(), s.color));
+    egui::ComboBox::from_id_salt("who")
+        .width(150.0)
+        .selected_text(RichText::new(shown.0).color(shown.1))
+        .show_ui(ui, |ui| {
+            for s in around.speakers {
+                if ui
+                    .selectable_label(*who == s.id, RichText::new(&s.name).color(s.color))
+                    .clicked()
+                {
+                    *who = s.id.clone();
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
 /// Тело карточки. В `ports` — выходы и высота их строки.
 fn card_body(
     ui: &mut Ui,
@@ -733,28 +782,7 @@ fn card_body(
             ..
         } => {
             ui.horizontal(|ui| {
-                let shown = around
-                    .speakers
-                    .iter()
-                    .find(|s| s.id == *who)
-                    .map_or_else(|| (who.clone(), BAD), |s| (s.name.clone(), s.color));
-                egui::ComboBox::from_id_salt("who")
-                    .width(150.0)
-                    .selected_text(RichText::new(shown.0).color(shown.1))
-                    .show_ui(ui, |ui| {
-                        for s in around.speakers {
-                            if ui
-                                .selectable_label(
-                                    *who == s.id,
-                                    RichText::new(&s.name).color(s.color),
-                                )
-                                .clicked()
-                            {
-                                *who = s.id.clone();
-                                changed = true;
-                            }
-                        }
-                    });
+                changed |= who_combo(ui, who, around);
                 let names = |v: Option<View>| match v {
                     None => "вид —",
                     Some(View::Window) => "окно",
@@ -838,6 +866,60 @@ fn card_body(
                 next.clear();
                 changed = true;
             }
+        }
+        Node::Generate {
+            who,
+            task,
+            fallback,
+            words,
+            allowed,
+            ..
+        } => {
+            ui.horizontal(|ui| {
+                changed |= who_combo(ui, who, around);
+                ui.label(RichText::new("слов ≤").color(TEXT_DIM));
+                changed |= ui
+                    .add(egui::DragValue::new(words).range(1..=200).speed(1.0))
+                    .changed();
+            });
+            changed |= ui
+                .add(
+                    TextEdit::multiline(task)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Задача для модели: о чём сказать")
+                        .margin(PAD_FIELD),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    TextEdit::multiline(fallback)
+                        .desired_rows(1)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Запасной текст: звучит, если модели нет")
+                        .margin(PAD_FIELD),
+                )
+                .changed();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("модель может:").color(TEXT_DIM));
+                for (e, _, about) in EVENTS {
+                    let mut on = allowed.iter().any(|a| a == e);
+                    if ui
+                        .checkbox(&mut on, RichText::new(*e).size(FONT_SMALL))
+                        .on_hover_text(*about)
+                        .changed()
+                    {
+                        if on {
+                            allowed.push((*e).to_string());
+                        } else {
+                            allowed.retain(|a| a != e);
+                        }
+                        changed = true;
+                    }
+                }
+            });
+            let r = out_row(ui, "дальше");
+            ports.push((Port::Next, row_y(&r)));
         }
         Node::Check { when, .. } => {
             changed |= cond_field(ui, when, "kuznec.znakom and hero.money >= 10");
@@ -1234,6 +1316,7 @@ fn free_id(d: &Dialog, base: &str) -> String {
 fn node_at(n: &Node) -> (f32, f32) {
     match n {
         Node::Line { at, .. }
+        | Node::Generate { at, .. }
         | Node::Check { at, .. }
         | Node::Set { at, .. }
         | Node::Event { at, .. }
@@ -1249,6 +1332,7 @@ fn node_at(n: &Node) -> (f32, f32) {
 fn at_mut(n: &mut Node) -> &mut (f32, f32) {
     match n {
         Node::Line { at, .. }
+        | Node::Generate { at, .. }
         | Node::Check { at, .. }
         | Node::Set { at, .. }
         | Node::Event { at, .. }
@@ -1268,6 +1352,7 @@ fn ports(n: &Node) -> Vec<Port> {
             (0..choices.len()).map(Port::Choice).collect()
         }
         Node::Line { .. }
+        | Node::Generate { .. }
         | Node::Set { .. }
         | Node::Event { .. }
         | Node::Run { .. }
@@ -1283,6 +1368,7 @@ fn target(n: &Node, p: Port) -> &str {
         (Node::Line { choices, .. }, Port::Choice(i)) => choices.get(i).map_or("", |c| &c.next),
         (
             Node::Line { next, .. }
+            | Node::Generate { next, .. }
             | Node::Set { next, .. }
             | Node::Event { next, .. }
             | Node::Run { next, .. }
@@ -1305,6 +1391,7 @@ fn set_target(n: &mut Node, p: Port, to: String) {
         }
         (
             Node::Line { next, .. }
+            | Node::Generate { next, .. }
             | Node::Set { next, .. }
             | Node::Event { next, .. }
             | Node::Run { next, .. }

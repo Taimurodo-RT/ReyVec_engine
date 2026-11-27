@@ -215,6 +215,57 @@ fn check_dialog(story: &mut Story, id: &str, out: &mut Vec<Problem>) {
                     cond(story, place, &c.when, out);
                 }
             }
+            Node::Generate {
+                who,
+                task,
+                fallback,
+                words,
+                allowed,
+                ..
+            } => {
+                if !story.characters.contains_key(who) {
+                    out.push(Problem::error(
+                        &file,
+                        place,
+                        format!("нет персонажа «{who}»"),
+                    ));
+                }
+                if fallback.trim().is_empty() {
+                    out.push(Problem::error(
+                        &file,
+                        place,
+                        "нет запасного текста: он звучит, когда модели нет или она ошиблась",
+                    ));
+                }
+                if task.trim().is_empty() {
+                    out.push(Problem::warning(
+                        &file,
+                        place,
+                        "нет задачи для модели: она не поймёт, что сказать",
+                    ));
+                }
+                if *words == 0 {
+                    out.push(Problem::error(&file, place, "предел слов 0"));
+                }
+                for a in allowed {
+                    if !crate::writer::allowed_event(a) {
+                        out.push(Problem::error(
+                            &file,
+                            place,
+                            format!("модели нельзя разрешить «{a}»: только quest.*, memory.*, relation.*"),
+                        ));
+                    }
+                }
+                for p in placeholders(fallback) {
+                    if !story.vars.contains_key(p) {
+                        out.push(Problem::error(
+                            &file,
+                            place,
+                            format!("в тексте {{{p}}}, а такой переменной нет"),
+                        ));
+                    }
+                }
+            }
             Node::Check { when, .. } => {
                 if when.trim().is_empty() {
                     out.push(Problem::error(&file, place, "у развилки нет условия"));

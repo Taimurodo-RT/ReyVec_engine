@@ -23,13 +23,14 @@ pub mod memory;
 pub mod play;
 pub mod quest;
 pub mod rename;
+pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 pub use check::Problem;
 pub use format::{Character, Dialog, LineSettings, Node, Quest, Value, VarsFile, View};
-pub use play::{Shown, ShownChoice, Step, Talk};
+pub use play::{Generated, Shown, ShownChoice, Step, Talk};
 pub use quest::{QuestState, Status};
 
 /// Пример сюжета «кузнец и руда» (папка `story/` в корне репозитория), для тестов.
@@ -70,6 +71,8 @@ pub struct Story {
     /// Из какого файла пришёл персонаж, диалог или задание (для сообщений).
     pub files: HashMap<String, String>,
     pub(crate) conds: cond::Conditions,
+    /// Модель для карточек «Сгенерировать» (Сю.10). Нет — звучит запасной текст.
+    pub writer: Option<Box<dyn writer::Writer>>,
 }
 
 /// Состояние сюжета в игре — часть сохранения ([`Story::save`], [`Story::restore`]).
