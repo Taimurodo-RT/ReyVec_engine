@@ -901,11 +901,21 @@ impl App {
                     None => tracing::warn!("интерфейс: команды игры работают в сцене с героем (N)"),
                 },
                 crate::rui_demo::Request::Quit => return self.close(event_loop),
+                crate::rui_demo::Request::Volume(v) => self.audio.set_volume(v),
+                crate::rui_demo::Request::Music(on) => {
+                    self.audio.set_music(on);
+                    tracing::info!("Музыка: {}", if on { "вкл" } else { "выкл" });
+                }
             }
         }
+        let stats = self.audio.stats();
+        let sound = crate::rui_demo::SoundSettings {
+            volume: stats.volume,
+            music: stats.music,
+        };
         let rui = self
             .rui_demo
-            .frame([ui_size[0] as f32, ui_size[1] as f32], hero);
+            .frame([ui_size[0] as f32, ui_size[1] as f32], hero, sound);
         if let Err(e) = renderer.set_game_ui(rui) {
             tracing::warn!("интерфейс игры не загрузился на видеокарту: {e}");
         }

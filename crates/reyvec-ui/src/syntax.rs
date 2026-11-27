@@ -54,6 +54,9 @@ pub enum Value {
     Op(Box<Value>, char, Box<Value>),
     /// Выбор: `game.hero.hp < 2 ? var(danger) : var(accent)`.
     If(Box<Value>, Box<Value>, Box<Value>),
+    /// Связь в обе стороны: `$settings.audio.volume`. Ползунок показывает значение по
+    /// пути и сам пишет туда новое.
+    Bind(String),
 }
 
 impl Value {
@@ -68,6 +71,7 @@ impl Value {
             Value::Call(..) => "вызов",
             Value::Op(..) => "формула",
             Value::If(..) => "выбор ? :",
+            Value::Bind(_) => "связь $",
         }
     }
 }
@@ -213,6 +217,8 @@ enum Tok {
     Cmp(char),
     /// `?` в выборе `a ? b : c`.
     Question,
+    /// `$` перед путём: связь в обе стороны.
+    Dollar,
     /// Строка со вставками `"Монеты: \(game.hero.coins)"`: куски и значения.
     Interp(Vec<Arg>),
     Eof,
@@ -240,6 +246,7 @@ impl Tok {
             Tok::Slash => "«/»".into(),
             Tok::Cmp(c) => format!("«{c}»"),
             Tok::Question => "«?»".into(),
+            Tok::Dollar => "«$»".into(),
             Tok::Interp(_) => "строка".into(),
             Tok::Eof => "конец файла".into(),
         }
@@ -328,6 +335,10 @@ fn lex(src: &str, file: u16) -> Result<Vec<(Tok, Pos)>, UiError> {
             }
             '?' => {
                 out.push((Tok::Question, pos));
+                step(1, &mut i, &mut col);
+            }
+            '$' => {
+                out.push((Tok::Dollar, pos));
                 step(1, &mut i, &mut col);
             }
             '(' | ')' | '{' | '}' | ',' | ':' | '=' | '+' | '*' | '/' => {
@@ -1026,6 +1037,17 @@ impl Parser {
                 } else {
                     Ok(Value::Name(path))
                 }
+            }
+            (Tok::Dollar, _) => {
+                let (first, _) = self.ident("путь после $, например $settings.audio.volume")?;
+                let mut path = first;
+                while *self.peek() == Tok::Dot {
+                    self.next();
+                    let (part, _) = self.ident("имя после точки")?;
+                    path.push('.');
+                    path.push_str(&part);
+                }
+                Ok(Value::Bind(path))
             }
             (Tok::LParen, _) => {
                 let v = self.value()?;

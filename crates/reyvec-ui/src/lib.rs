@@ -117,6 +117,17 @@ pub struct UiTarget {
     pub name: String,
     /// Действия кнопки; значения ещё не посчитаны по данным игры.
     pub actions: Vec<model::Action>,
+    /// У ползунка и переключателя: связь с данными.
+    pub bind: Option<model::Bind>,
+}
+
+/// Ползунок или переключатель поменял значение по связи (`$settings.audio.volume`):
+/// экран уже записал его в свои данные, игре — применить у себя.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiChange {
+    pub path: String,
+    /// Число у ползунка, `true`/`false` (имя) у переключателя.
+    pub value: syntax::Value,
 }
 
 /// Что случилось с интерфейсом от мыши или клавиатуры.
@@ -152,8 +163,11 @@ impl UiAction {
 pub enum UiKey {
     /// Tab, стрелки вниз и вправо: следующая кнопка.
     Next,
-    /// Shift+Tab, стрелки вверх и влево: прежняя.
+    /// Shift+Tab, стрелка вверх: прежняя.
     Prev,
+    /// Стрелки влево и вправо: у ползунка — значение на шаг, иначе как `Prev` и `Next`.
+    Left,
+    Right,
     /// Enter или пробел: нажать выбранную.
     Activate,
 }
@@ -202,6 +216,11 @@ pub struct UiScreen {
     problem: Option<UiError>,
     /// Экраны, с которых ушли через `open(…)`: `back()` возвращает на последний.
     history: Vec<usize>,
+    /// Где мышь (пиксели окна) и какой ползунок она тянет.
+    pointer: [f32; 2],
+    drag: Option<Vec<usize>>,
+    /// Что ползунки и переключатели поменяли с прошлого [`Self::take_changes`].
+    changes: Vec<UiChange>,
 }
 
 impl UiScreen {
@@ -357,6 +376,9 @@ impl UiScreen {
             env: model::Env::default(),
             problem: None,
             history: Vec::new(),
+            pointer: [0.0; 2],
+            drag: None,
+            changes: Vec::new(),
         };
         let first = (!ui.styles.themes.is_empty()).then_some(0);
         ui.rebuild(first)?;
@@ -448,6 +470,11 @@ impl UiScreen {
     /// Мышь в точке окна `p` (пиксели, как у [`Self::draw`]). `true` — она над кнопкой.
     pub fn pointer_move(&mut self, p: [f32; 2]) -> bool {
         self.set_input("mouse");
+        self.pointer = p;
+        if let Some(path) = self.drag.clone() {
+            self.slide_to(&path, p[0]);
+            return true;
+        }
         let hit = self
             .draw
             .targets
@@ -474,6 +501,7 @@ impl UiScreen {
 
     /// Мышь ушла из окна.
     pub fn pointer_leave(&mut self) {
+        self.drag = None;
         if self.hover.take().is_some() || self.pressed.take().is_some() {
             self.restyle = true;
         }
@@ -486,6 +514,13 @@ impl UiScreen {
         }
         self.pressed.clone_from(&self.hover);
         self.restyle = true;
+        // Ползунок: значение сразу под мышью, дальше он тянется за ней.
+        if let Some(path) = self.hover.clone()
+            && self.slider(&path).is_some()
+        {
+            self.slide_to(&path, self.pointer[0]);
+            self.drag = Some(path);
+        }
         true
     }
 
@@ -493,6 +528,9 @@ impl UiScreen {
     pub fn pointer_up(&mut self) -> Option<UiEvent> {
         let pressed = self.pressed.take()?;
         self.restyle = true;
+        if self.drag.take().is_some() {
+            return None;
+        }
         if self.hover.as_ref() != Some(&pressed) {
             return None;
         }
@@ -504,6 +542,16 @@ impl UiScreen {
     /// игры, `open` и `back` выполняются здесь же.
     fn click(&mut self, i: usize) -> Option<UiEvent> {
         let t = self.draw.targets.get(i)?;
+        if let Some(b) = &t.bind {
+            // Переключатель нажатием меняется на обратный; ползунок нажатием не меняется.
+            if b.control == model::Control::Toggle {
+                let path = b.path.clone();
+                let on =
+                    matches!(self.env.data.get(&path), Some(syntax::Value::Name(n)) if n == "true");
+                self.set_bound(&path, syntax::Value::Name((!on).to_string()));
+            }
+            return None;
+        }
         let name = t.name.clone();
         let mut actions = Vec::new();
         for a in &t.actions {
@@ -559,9 +607,28 @@ impl UiScreen {
             Some(i) if forward => (i + 1) % order.len(),
             Some(i) => (i + order.len() - 1) % order.len(),
         };
+        // Стрелки вбок двигают выбранный ползунок.
+        if matches!(key, UiKey::Left | UiKey::Right)
+            && let Some(path) = now.map(|i| order[i].path.clone())
+            && let Some((from, to, step)) = self.slider(&path)
+        {
+            let bind = self.bind_at(&path)?.path.clone();
+            let at = match self.env.data.get(&bind) {
+                Some(syntax::Value::Number(n)) => *n,
+                _ => from,
+            };
+            let by = if step > 0.0 { step } else { (to - from) / 20.0 };
+            let v = if key == UiKey::Right {
+                at + by
+            } else {
+                at - by
+            };
+            self.set_bound(&bind, syntax::Value::Number(snap(v, from, to, step)));
+            return None;
+        }
         match key {
-            UiKey::Next | UiKey::Prev => {
-                let i = step(key == UiKey::Next);
+            UiKey::Next | UiKey::Prev | UiKey::Left | UiKey::Right => {
+                let i = step(matches!(key, UiKey::Next | UiKey::Right));
                 self.focus = Some(order[i].path.clone());
                 // Подсветка одна: выбранная клавиатурой, а не та, где осталась мышь.
                 self.hover = None;
@@ -574,6 +641,66 @@ impl UiScreen {
                 self.click(i)
             }
         }
+    }
+
+    /// Связь блока по пути в дереве (из последней раскладки).
+    fn bind_at(&self, path: &[usize]) -> Option<&model::Bind> {
+        self.draw
+            .targets
+            .iter()
+            .find(|t| t.path == path)
+            .and_then(|t| t.bind.as_ref())
+    }
+
+    /// Пределы и шаг ползунка по пути; `None` — там не ползунок.
+    fn slider(&self, path: &[usize]) -> Option<(f32, f32, f32)> {
+        match self.bind_at(path)?.control {
+            model::Control::Slider { from, to, step } => Some((from, to, step)),
+            model::Control::Toggle => None,
+        }
+    }
+
+    /// Ставит ползунок по пути туда, где мышь по горизонтали.
+    fn slide_to(&mut self, path: &[usize], x: f32) {
+        let Some(t) = self.draw.targets.iter().find(|t| t.path == path) else {
+            return;
+        };
+        let Some(b) = &t.bind else {
+            return;
+        };
+        let model::Control::Slider { from, to, step } = b.control else {
+            return;
+        };
+        let w = (t.rect[2] - t.rect[0]).max(1.0);
+        let part = ((x - t.rect[0]) / w).clamp(0.0, 1.0);
+        let path = b.path.clone();
+        self.set_bound(
+            &path,
+            syntax::Value::Number(snap(from + part * (to - from), from, to, step)),
+        );
+    }
+
+    /// Записывает значение по связи в данные экрана и в список перемен для игры.
+    fn set_bound(&mut self, path: &str, value: syntax::Value) {
+        let changed = match &value {
+            syntax::Value::Number(n) => self.env.data.set_number(path, f64::from(*n)),
+            syntax::Value::Name(n) => self.env.data.set_flag(path, n == "true"),
+            _ => false,
+        };
+        if changed {
+            self.restyle = true;
+            self.changes.push(UiChange {
+                path: path.to_owned(),
+                value,
+            });
+        }
+    }
+
+    /// Что ползунки и переключатели поменяли с прошлого раза, по порядку. Экран уже
+    /// показывает новые значения; игра применяет их у себя (громкость, музыка). Когда
+    /// игра сама поменяет значение, она пишет его, как любые данные: `set_number`.
+    pub fn take_changes(&mut self) -> Vec<UiChange> {
+        std::mem::take(&mut self.changes)
     }
 
     /// Открывает экран `name` этого файла так, что `back()` вернёт на текущий.
@@ -787,6 +914,7 @@ impl UiScreen {
         self.hover = None;
         self.pressed = None;
         self.focus = None;
+        self.drag = None;
         self.restyle = true;
         // Новый экран: кнопки найдутся после раскладки.
         self.draw.targets.clear();
@@ -913,21 +1041,41 @@ impl UiScreen {
         let opacity = opacity * el.look.opacity;
         let rect = [x * scale, y * scale, (x + w) * scale, (y + h) * scale];
         if el.interactive {
+            // Тонкий ползунок ловит мышь и чуть выше и ниже себя.
+            let grab = if el.bind.is_some() && h < 32.0 {
+                let mid = y + h * 0.5;
+                [
+                    x * scale,
+                    (mid - 16.0) * scale,
+                    (x + w) * scale,
+                    (mid + 16.0) * scale,
+                ]
+            } else {
+                rect
+            };
             out.targets.push(UiTarget {
                 path: path.clone(),
-                rect,
+                rect: grab,
                 disabled: el.disabled,
                 name: el.id.clone().or_else(|| first_text(el)).unwrap_or_default(),
                 actions: el.actions.clone(),
+                bind: el.bind.clone(),
             });
         }
+        // Ползунок и переключатель без своих цветов всё равно видны.
+        let bound = el.bind.as_ref().map(|b| b.control);
+        let background = el
+            .look
+            .background
+            .or(bound.map(|_| Color::WHITE.with_alpha(0.2)));
+        let fill = el.look.fill.or(bound.map(|_| Color::WHITE.with_alpha(0.8)));
         let border = el.look.border.map_or((0.0, [0.0; 4]), |(c, width)| {
             (width * scale, faded(c, opacity))
         });
-        if (el.look.background.is_some() || border.0 > 0.0) && w > 0.0 && h > 0.0 {
+        if (background.is_some() || border.0 > 0.0) && w > 0.0 && h > 0.0 {
             out.quads.push(UiQuad {
                 rect,
-                color: el.look.background.map_or([0.0; 4], |c| faded(c, opacity)),
+                color: background.map_or([0.0; 4], |c| faded(c, opacity)),
                 kind: QuadKind::Block {
                     radius: el.look.radius * scale,
                     border: border.0,
@@ -935,7 +1083,7 @@ impl UiScreen {
                 },
             });
         }
-        if let (Kind::Bar, Some(fill)) = (&el.kind, el.look.fill)
+        if let (Kind::Bar, Some(fill)) = (&el.kind, fill)
             && el.look.value > 0.0
             && w > 0.0
             && h > 0.0
@@ -946,6 +1094,32 @@ impl UiScreen {
                 color: faded(fill, opacity),
                 kind: QuadKind::Block {
                     radius: el.look.radius.min(w * el.look.value * 0.5) * scale,
+                    border: 0.0,
+                    border_color: [0.0; 4],
+                },
+            });
+        }
+        if let Some(control) = bound
+            && w > 0.0
+            && h > 0.0
+        {
+            let v = el.look.value;
+            // Кружок переключателя — внутри дорожки, ползунка — больше её, на конце
+            // заполнения.
+            let (d, cx) = match control {
+                model::Control::Toggle => {
+                    let d = (h - 6.0).max(2.0);
+                    (d, x + 3.0 + d * 0.5 + v * (w - 6.0 - d).max(0.0))
+                }
+                model::Control::Slider { .. } => ((h * 2.5).max(20.0), x + v * w),
+            };
+            let cy = y + h * 0.5;
+            let knob = el.look.knob.unwrap_or(Color::WHITE);
+            out.quads.push(UiQuad {
+                rect: [cx - d * 0.5, cy - d * 0.5, cx + d * 0.5, cy + d * 0.5].map(|v| v * scale),
+                color: faded(knob, opacity),
+                kind: QuadKind::Block {
+                    radius: d * 0.5 * scale,
                     border: 0.0,
                     border_color: [0.0; 4],
                 },
@@ -1036,6 +1210,17 @@ fn explain(el: &Element, depth: usize, out: &mut String) {
     for c in &el.children {
         explain(c, depth + 1, out);
     }
+}
+
+/// Значение ползунка: в пределах и на шаге (`step` 0 — без шагов).
+fn snap(v: f32, from: f32, to: f32, step: f32) -> f32 {
+    let v = if step > 0.0 {
+        from + ((v - from) / step).round() * step
+    } else {
+        v
+    };
+    // Шаг 0.1 в числах с плавающей точкой даёт 0.30000001: округляем до миллионных.
+    ((v.clamp(from, to)) * 1e6).round() / 1e6
 }
 
 fn faded(c: Color, opacity: f32) -> [f32; 4] {
@@ -1907,6 +2092,68 @@ mod tests {
         bad.draw([1920.0, 1080.0]);
         let e = bad.problem().unwrap().to_string();
         assert!(e.contains("Может, game.hero.hp?"), "{e}");
+    }
+
+    #[test]
+    fn sliders_and_toggles_write_back_through_dollar() {
+        let mut ui = UiScreen::parse(
+            r#"screen S {
+                Column(spacing: 20) {
+                    Slider($settings.audio.volume, from: 0, to: 1, step: 0.05).width(400)
+                    Toggle($settings.audio.music).knob(#FFCC00)
+                }.align(top_left).padding(0)
+            }"#,
+        )
+        .unwrap();
+        ui.set_number("settings.audio.volume", 0.5);
+        ui.set_flag("settings.audio.music", false);
+        let slider = ui.draw([1920.0, 1080.0]).targets[0].rect;
+        assert!(ui.problem().is_none(), "{:?}", ui.problem());
+        // Мышь на трёх четвертях ползунка: громкость 0.75, и ползунок тянется дальше.
+        let mid = (slider[1] + slider[3]) / 2.0;
+        assert!(ui.pointer_move([slider[0] + 0.75 * (slider[2] - slider[0]), mid]));
+        assert!(ui.pointer_down());
+        ui.pointer_move([slider[0] + 0.21 * (slider[2] - slider[0]), mid + 100.0]);
+        assert_eq!(ui.pointer_up(), None);
+        let changes = ui.take_changes();
+        assert_eq!(
+            changes.iter().map(|c| c.value.clone()).collect::<Vec<_>>(),
+            [syntax::Value::Number(0.75), syntax::Value::Number(0.2)]
+        );
+        assert_eq!(changes[0].path, "settings.audio.volume");
+        // Стрелка вправо у выбранного ползунка — шаг вверх.
+        ui.key(UiKey::Right);
+        assert_eq!(ui.take_changes()[0].value, syntax::Value::Number(0.25));
+        // Переключатель: Tab к нему, Enter меняет; игра пишет обратно — кружок на месте.
+        ui.key(UiKey::Next);
+        assert_eq!(ui.key(UiKey::Activate), None);
+        assert_eq!(
+            ui.take_changes()[0].value,
+            syntax::Value::Name("true".into())
+        );
+        let knob = |ui: &mut UiScreen| {
+            ui.draw([1920.0, 1080.0])
+                .quads
+                .iter()
+                .rev()
+                .find(|q| q.color[2] < 0.1)
+                .map(|q| q.rect[0])
+                .unwrap()
+        };
+        let on = knob(&mut ui);
+        ui.set_flag("settings.audio.music", false);
+        assert!(knob(&mut ui) < on, "кружок ушёл влево");
+        assert!(
+            ui.take_changes().is_empty(),
+            "игра поменяла сама — это не перемена"
+        );
+        let e = |src: &str| UiScreen::parse(src).err().unwrap().to_string();
+        let bad = e("screen M { Slider(settings.audio.volume) }");
+        assert!(bad.contains("Slider:"), "{bad}");
+        let bad = e("screen M { Toggle($music) }");
+        assert!(bad.contains("путь в данных"), "{bad}");
+        let bad = e("screen M { Rect().knob(#FFFFFF) }");
+        assert!(bad.contains("Slider и Toggle"), "{bad}");
     }
 
     #[test]
