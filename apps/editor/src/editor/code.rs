@@ -17,7 +17,7 @@ use egui::{
 };
 
 use super::luau_text::{
-    self, Func, HERO, Hint, ME, Problem, QUEST_FUNCS, STORY_FUNCS, Tok, Warning,
+    self, Func, HERO, Hint, ME, NPC_FUNCS, Problem, QUEST_FUNCS, STORY_FUNCS, Tok, Warning,
 };
 use super::project_files as pf;
 use super::theme::*;
@@ -369,6 +369,8 @@ impl CodeEditor {
         func_list(ui, "story — сюжет", "story", STORY_FUNCS);
         ui.add_space(GAP_L);
         func_list(ui, "quest — задания", "quest", QUEST_FUNCS);
+        ui.add_space(GAP_L);
+        func_list(ui, "npc — память и отношения", "npc", NPC_FUNCS);
         if !self.story.dialogs.is_empty() {
             ui.label(
                 RichText::new("Имена диалогов и заданий подсказываются прямо в кавычках")
@@ -986,6 +988,7 @@ impl CodeEditor {
                                     STORY_FUNCS
                                         .iter()
                                         .chain(QUEST_FUNCS.iter())
+                                        .chain(NPC_FUNCS.iter())
                                         .find(|f| f.name == name.as_str())
                                         .map(|f| f.about)
                                 })

@@ -393,6 +393,38 @@ fn world_notes(story: &Story, before: &State, after: &State) -> Vec<Entry> {
             out.push(Entry::Note(format!("Задание «{title}»: {}", quest_text(q))));
         }
     }
+    // Память и отношения (Сю.9).
+    let empty = reyvec_story::memory::Memory::default();
+    for (npc, m) in &after.memory {
+        let was = before.memory.get(npc).unwrap_or(&empty);
+        let name = story
+            .characters
+            .get(npc)
+            .map_or(npc.as_str(), |c| c.name.as_str());
+        for f in &m.facts {
+            if was.facts.iter().all(|w| w.key != f.key) {
+                out.push(Entry::Note(format!(
+                    "{name} запомнил: {} ({}, важность {})",
+                    if f.text.is_empty() { &f.key } else { &f.text },
+                    f.key,
+                    f.importance
+                )));
+            }
+        }
+        for f in &was.facts {
+            if !m.knows(&f.key) {
+                out.push(Entry::Note(format!("{name} забыл: {}", f.key)));
+            }
+        }
+        for (whom, n) in &m.relations {
+            let before = was.relation(whom);
+            if before != *n {
+                out.push(Entry::Note(format!(
+                    "{name} → {whom}: отношение {before} → {n}"
+                )));
+            }
+        }
+    }
     out
 }
 

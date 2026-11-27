@@ -130,6 +130,9 @@ pub struct Character {
     /// Настройки реплик этого персонажа по умолчанию.
     #[serde(default)]
     pub lines: LineSettings,
+    /// Отношения в начале игры (Сю.9): к кому (`hero`) → число, больше — лучше.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub relations: BTreeMap<String, i64>,
 }
 
 /// Вариант ответа игрока у реплики.

@@ -3,6 +3,7 @@
 {
     "kuznec.privet.chuzhak": "What do you want, stranger? I'm the smith, by the way.",
     "kuznec.privet.po_imeni": "Ah, {hero.name}! Come in.",
+    "kuznec.privet.spasibo": "{hero.name}! Thanks again for the ore. The sword will be ready soon.",
     "kuznec.privet.vopros": "What do you need?",
     "kuznec.privet.vopros.1": "I need a sword.",
     "kuznec.privet.vopros.2": "I brought the ore.",

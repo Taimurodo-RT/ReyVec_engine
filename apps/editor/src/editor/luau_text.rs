@@ -34,9 +34,9 @@ const KEYWORDS: [&str; 19] = [
 ];
 
 /// Имена, которые есть у скрипта и без объявления.
-const KNOWN: [&str; 19] = [
+const KNOWN: [&str; 20] = [
     "me", "hero", "dt", "update", "math", "string", "table", "print", "pairs", "ipairs",
-    "tostring", "tonumber", "type", "select", "error", "pcall", "bit32", "story", "quest",
+    "tostring", "tonumber", "type", "select", "error", "pcall", "bit32", "story", "quest", "npc",
 ];
 
 /// Разбить текст на куски (байтовые границы); куски идут подряд и покрывают весь текст.
@@ -206,13 +206,14 @@ fn has_update(text: &str) -> bool {
 /// заполняет: новое поле движка редактор подсказывает сам.
 pub(crate) use reyvec_script::{Field as Hint, HERO_FIELDS as HERO, ME_FIELDS as ME};
 /// Функции сюжета (Сю.5) тоже описаны в движке.
-pub(crate) use reyvec_script::{Func, QUEST_FUNCS, STORY_FUNCS};
+pub(crate) use reyvec_script::{Func, NPC_FUNCS, QUEST_FUNCS, STORY_FUNCS};
 
 /// Функции таблицы `story` или `quest`.
 pub(crate) fn funcs_of(table: &str) -> Option<&'static [Func]> {
     match table {
         "story" => Some(STORY_FUNCS),
         "quest" => Some(QUEST_FUNCS),
+        "npc" => Some(NPC_FUNCS),
         _ => None,
     }
 }
@@ -223,6 +224,8 @@ pub(crate) struct StoryNames {
     pub dialogs: Vec<String>,
     pub quests: Vec<String>,
     pub vars: Vec<String>,
+    /// Персонажи (первый аргумент `npc.*`, Сю.9).
+    pub characters: Vec<String>,
 }
 
 impl StoryNames {
@@ -233,11 +236,15 @@ impl StoryNames {
             dialogs: s.dialogs.into_keys().collect(),
             quests: s.quests.into_keys().collect(),
             vars: s.vars.into_keys().collect(),
+            characters: s.characters.into_keys().collect(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.dialogs.is_empty() && self.quests.is_empty() && self.vars.is_empty()
+        self.dialogs.is_empty()
+            && self.quests.is_empty()
+            && self.vars.is_empty()
+            && self.characters.is_empty()
     }
 }
 
@@ -247,6 +254,7 @@ pub(crate) enum StoryArg {
     Dialog,
     Quest,
     Var,
+    Character,
 }
 
 impl StoryArg {
@@ -255,6 +263,7 @@ impl StoryArg {
             StoryArg::Dialog => &n.dialogs,
             StoryArg::Quest => &n.quests,
             StoryArg::Var => &n.vars,
+            StoryArg::Character => &n.characters,
         }
     }
 
@@ -263,6 +272,7 @@ impl StoryArg {
             StoryArg::Dialog => "диалога",
             StoryArg::Quest => "задания",
             StoryArg::Var => "переменной",
+            StoryArg::Character => "персонажа",
         }
     }
 }
@@ -281,6 +291,7 @@ pub(crate) fn story_args(text: &str) -> Vec<(Range<usize>, StoryArg, String)> {
             ("story", "talk" | "seen") => StoryArg::Dialog,
             ("story", "get" | "set") => StoryArg::Var,
             ("quest", _) => StoryArg::Quest,
+            ("npc", _) => StoryArg::Character,
             _ => continue,
         };
         let inner = arg.2.trim_matches(|c| c == '"' || c == '\'');
@@ -743,6 +754,7 @@ pub(crate) fn hover(text: &str, at: usize) -> Option<String> {
                 "print" => "print(…): строка в консоль редактора",
                 "story" => "story: сюжет — разговоры и переменные мира (story.talk, story.get…)",
                 "quest" => "quest: задания (quest.start, quest.add, quest.state…)",
+                "npc" => "npc: память и отношения персонажей (npc.remember, npc.knows…)",
                 _ => return None,
             }
             .to_owned(),
@@ -1061,6 +1073,7 @@ mod tests {
             dialogs: vec!["kuznec.privet".into(), "kuznec.ruda".into()],
             quests: vec!["mech".into()],
             vars: vec!["hero.money".into()],
+            characters: vec!["kuznec".into()],
         };
         // После «story.» и «quest.» — функции движка.
         let t = "function update(me) story.ta";
