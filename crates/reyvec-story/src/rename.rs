@@ -385,6 +385,51 @@ impl Story {
             }
         }
 
+        // Разговоры персонажей между собой (Сю.12).
+        if matches!(kind, Kind::Character | Kind::Dialog) {
+            for c in self.characters.values_mut() {
+                let mut n = 0;
+                for ch in &mut c.chats {
+                    let name = if kind == Kind::Character {
+                        &mut ch.with
+                    } else {
+                        &mut ch.dialog
+                    };
+                    if name == old {
+                        *name = new.into();
+                        n += 1;
+                    }
+                    n += match kind {
+                        Kind::Character => rename_npc_in_expr(&mut ch.when, old, new),
+                        _ => 0,
+                    };
+                }
+                if n > 0 {
+                    r.places += n;
+                    if !r.characters.contains(&c.id) {
+                        r.characters.push(c.id.clone());
+                    }
+                }
+            }
+        }
+        if matches!(kind, Kind::Var | Kind::Quest) {
+            for c in self.characters.values_mut() {
+                let mut n = 0;
+                for ch in &mut c.chats {
+                    n += if kind == Kind::Var {
+                        rename_in_expr(&mut ch.when, old, new)
+                    } else {
+                        rename_in_expr(&mut ch.when, &quest_ref.0, &quest_ref.1)
+                    };
+                }
+                if n > 0 {
+                    r.places += n;
+                    if !r.characters.contains(&c.id) {
+                        r.characters.push(c.id.clone());
+                    }
+                }
+            }
+        }
         // Отношения в начале игры у других персонажей.
         if kind == Kind::Character {
             for c in self.characters.values_mut() {

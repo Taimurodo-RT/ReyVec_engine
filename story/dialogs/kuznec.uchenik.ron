@@ -1,0 +1,18 @@
+// Разговор кузнеца с учеником (Сю.12): идёт сам, когда оба в кузне.
+// Герой слышит его, если стоит рядом с кузнецом.
+(
+    format: "reyvec-dialog",
+    version: 1,
+    id: "kuznec.uchenik",
+    title: "Кузнец и Петька в кузне",
+    with: ["kuznec", "uchenik"],
+    nodes: [
+        Check(id: "nachalo", at: (0, 0), when: "quest.mech.state == \"done\"", yes: "gotovo", no: "meha"),
+        Line(id: "meha", at: (390, 80), who: "kuznec", text: "Петька, мехи раздувай!", next: "otvet"),
+        Line(id: "otvet", at: (780, 80), who: "uchenik", text: "Раздуваю, дядя Борис. Руды-то всё нет…", next: "ruda"),
+        Line(id: "ruda", at: (1170, 80), who: "kuznec", text: "Будет руда — будет и меч.", next: "konec"),
+        Line(id: "gotovo", at: (390, -120), who: "uchenik", text: "Дядя Борис, а мне такой же меч скуёте?", next: "podrasti"),
+        Line(id: "podrasti", at: (780, -120), who: "kuznec", text: "Подрасти сперва.", next: "konec"),
+        End(id: "konec", at: (1560, 0)),
+    ],
+)

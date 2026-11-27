@@ -133,6 +133,12 @@ pub struct Character {
     /// Отношения в начале игры (Сю.9): к кому (`hero`) → число, больше — лучше.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub relations: BTreeMap<String, i64>,
+    /// Распорядок дня (Сю.12): с какого часа где и чем занят.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub day: Vec<crate::life::Routine>,
+    /// Разговоры с другими персонажами, когда оба в одном месте (Сю.12).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chats: Vec<crate::life::Chat>,
 }
 
 /// Вариант ответа игрока у реплики.

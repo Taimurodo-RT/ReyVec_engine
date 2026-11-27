@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use egui::{Align2, Color32, RichText, Stroke};
 use reyvec_scene::story::Status;
-use reyvec_scene::{Answer, Screen, SharedStory, lock_story};
+use reyvec_scene::{Answer, Heard, Screen, SharedStory, lock_story};
 use winit::keyboard::KeyCode;
 
 use crate::controls::{Input, controls_path};
@@ -110,15 +110,19 @@ impl StoryWindow {
 
     /// Рисует окно диалога и журнал.
     pub(crate) fn draw(&mut self, ctx: &egui::Context, story: &SharedStory) {
-        let (screen, problem, journal) = {
+        let (screen, problem, journal, heard) = {
             let h = lock_story(story);
             let journal = self.journal.then(|| h.story.journal(&h.state));
             (
                 h.screen.clone().filter(|_| h.busy()),
                 h.problems.last().cloned(),
                 journal,
+                h.heard.clone(),
             )
         };
+        if !heard.is_empty() {
+            overheard(ctx, &heard, screen.is_some());
+        }
         if let Some(screen) = screen
             && let Some(answer) = dialog_window(ctx, &screen, problem.as_deref())
         {
@@ -163,6 +167,33 @@ impl StoryWindow {
             }
         }
     }
+}
+
+/// Что говорят персонажи между собой (Сю.12): строки слева внизу, над окном диалога.
+fn overheard(ctx: &egui::Context, heard: &[Heard], talking: bool) {
+    let lift = if talking { -210.0 } else { -24.0 };
+    egui::Area::new(egui::Id::unique("story-heard"))
+        .anchor(Align2::LEFT_BOTTOM, [24.0, lift])
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(18, 20, 26, 170))
+                .corner_radius(6.0)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    for h in heard {
+                        let color = parse_hex(&h.color).unwrap_or(Color32::from_rgb(230, 200, 120));
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("{}:", h.name)).strong().color(color));
+                            ui.label(
+                                RichText::new(&h.text)
+                                    .italics()
+                                    .color(Color32::from_gray(225)),
+                            );
+                        });
+                    }
+                });
+        });
 }
 
 /// Окно реплики внизу экрана. Возвращает ответ, если игрок нажал мышью.

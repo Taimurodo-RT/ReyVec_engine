@@ -1,0 +1,15 @@
+(
+    format: "reyvec-character",
+    version: 1,
+    id: "uchenik",
+    name: "Петька",
+    color: "#81B29A",
+    about: "Ученик кузнеца, лет четырнадцати. Болтливый, вечно голодный, мечтает о собственном мече.",
+    // Распорядок дня (Сю.12): с какого часа где и чем занят. По кругу: после 21 — до 7.
+    day: [
+        (from: 7, place: "kuznya", doing: "pomogaet"),
+        (from: 13, place: "ploshad", doing: "obedaet"),
+        (from: 14, place: "kuznya", doing: "pomogaet"),
+        (from: 21, place: "dom", doing: "spit"),
+    ],
+)

@@ -19,6 +19,7 @@
 pub mod check;
 pub mod cond;
 pub mod format;
+pub mod life;
 pub mod memory;
 pub mod play;
 pub mod quest;
@@ -45,12 +46,20 @@ pub const EXAMPLE: &[(&str, &str)] = &[
         include_str!("../../../story/characters/kuznec.ron"),
     ),
     (
+        "characters/uchenik.ron",
+        include_str!("../../../story/characters/uchenik.ron"),
+    ),
+    (
         "dialogs/kuznec.privet.ron",
         include_str!("../../../story/dialogs/kuznec.privet.ron"),
     ),
     (
         "dialogs/kuznec.ruda.ron",
         include_str!("../../../story/dialogs/kuznec.ruda.ron"),
+    ),
+    (
+        "dialogs/kuznec.uchenik.ron",
+        include_str!("../../../story/dialogs/kuznec.uchenik.ron"),
     ),
     (
         "quests/mech.ron",
@@ -91,8 +100,10 @@ pub struct State {
     pub talked: BTreeSet<String>,
     /// Память и отношения персонажей (Сю.9): имя персонажа → что помнит.
     pub memory: BTreeMap<String, memory::Memory>,
-    /// Сколько секунд идёт игра (по этому времени забываются факты).
+    /// Сколько секунд идёт игра (по этому времени забываются факты и идут часы).
     pub time: f64,
+    /// Жизнь персонажей (Сю.12): где каждый, с кем говорил, что ещё скажет.
+    pub life: BTreeMap<String, life::Life>,
 }
 
 impl Story {
@@ -263,6 +274,11 @@ impl Story {
             }
         }
         state.time = saved.time;
+        for (npc, l) in saved.life {
+            if self.characters.contains_key(&npc) {
+                state.life.insert(npc, l);
+            }
+        }
         Ok(state)
     }
 

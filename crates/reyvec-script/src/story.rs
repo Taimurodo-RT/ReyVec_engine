@@ -12,9 +12,11 @@
 //! (окно диалога, Сю.7) ведёт начатый разговор и сохраняет состояние. Неизвестное имя
 //! (диалог, задание, переменная) — понятная ошибка Luau со строкой скрипта, а не падение.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mlua::{Lua, Table, Value as Lv};
+use reyvec_story::life::LifeEvent;
 use reyvec_story::{Shown, State, Step, Story, Talk, Value};
 
 /// Функция сюжета для скриптов: имя, аргументы, что делает. Редактор кода показывает эти
@@ -42,6 +44,11 @@ pub const STORY_FUNCS: &[Func] = &[
     func("get", "(переменная)", "значение переменной мира"),
     func("set", "(переменная, значение)", "записать переменную мира"),
     func("seen", "(диалог)", "был ли уже этот разговор"),
+    func(
+        "hour",
+        "()",
+        "час игры, 0–24 (с долями): день идёт 24 минуты",
+    ),
 ];
 
 /// `quest.*`.
@@ -80,7 +87,33 @@ pub const NPC_FUNCS: &[Func] = &[
         "(персонаж, к кому [, прибавить])",
         "отношение (число); с третьим аргументом — сначала прибавить",
     ),
+    func(
+        "place",
+        "(персонаж)",
+        "где персонаж сейчас по распорядку дня (имя места) или nil",
+    ),
+    func(
+        "doing",
+        "(персонаж)",
+        "чем занят по распорядку (\"rabotaet\", \"spit\"…) или nil",
+    ),
+    func(
+        "near",
+        "(персонаж, метры)",
+        "сказать сюжету, как далеко персонаж от героя: ближних считают чаще и слышат",
+    ),
 ];
+
+/// Подслушанная реплика (Сю.12): персонажи говорят между собой рядом с героем.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Heard {
+    pub who: String,
+    pub name: String,
+    pub color: String,
+    pub text: String,
+    /// До какого времени игры показывать.
+    pub until: f64,
+}
 
 /// Сюжет игры, его состояние и идущий разговор.
 #[derive(Default)]
@@ -99,6 +132,10 @@ pub struct StoryHost {
     pub events: Vec<String>,
     /// Ошибки разговоров и функций сюжета (последние [`KEEP`]) — для консоли и окна диалога.
     pub problems: Vec<String>,
+    /// Как далеко персонажи от героя, метры (пишут скрипты через `npc.near`).
+    pub distances: HashMap<String, f64>,
+    /// Что герой сейчас слышит от персонажей, говорящих между собой (Сю.12).
+    pub heard: Vec<Heard>,
 }
 
 /// Сколько последних событий и ошибок сюжета хранить.
@@ -193,9 +230,32 @@ impl StoryHost {
             wait,
             events,
             problems,
+            distances,
+            heard,
         } = self;
         // Время игры идёт и без разговора: слабые факты памяти забываются.
         story.memory_tick(state, f64::from(dt));
+        // Жизнь персонажей: распорядок и разговоры между собой (Сю.12).
+        let far = |id: &str| distances.get(id).copied().unwrap_or(f64::INFINITY);
+        for e in story.life_tick(state, f64::from(dt), &far) {
+            if let LifeEvent::Said {
+                who,
+                name,
+                color,
+                text,
+            } = e
+            {
+                heard.retain(|h| h.who != who);
+                heard.push(Heard {
+                    who,
+                    name,
+                    color,
+                    text,
+                    until: state.time + reyvec_story::life::LINE_SECONDS,
+                });
+            }
+        }
+        heard.retain(|h| h.until > state.time);
         let Some(t) = talk.as_mut() else {
             *screen = None;
             return None;
@@ -512,6 +572,49 @@ pub(crate) fn install(lua: &Lua, host: &SharedStory) -> mlua::Result<()> {
                 Ok(r)
             },
         )?,
+    )?;
+    // Жизнь персонажей (Сю.12).
+    let h = Arc::clone(host);
+    npc.set(
+        "place",
+        lua.create_function(move |lua, who: String| {
+            let g = lock(&h);
+            if !g.story.characters.contains_key(&who) {
+                return Err(err(lua, format!("npc.place: нет персонажа «{who}»")));
+            }
+            Ok(g.story.now_of(&g.state, &who).map(|r| r.place.clone()))
+        })?,
+    )?;
+    let h = Arc::clone(host);
+    npc.set(
+        "doing",
+        lua.create_function(move |lua, who: String| {
+            let g = lock(&h);
+            if !g.story.characters.contains_key(&who) {
+                return Err(err(lua, format!("npc.doing: нет персонажа «{who}»")));
+            }
+            Ok(g.story.now_of(&g.state, &who).map(|r| r.doing.clone()))
+        })?,
+    )?;
+    let h = Arc::clone(host);
+    npc.set(
+        "near",
+        lua.create_function(move |lua, (who, m): (String, f64)| {
+            let mut g = lock(&h);
+            if !g.story.characters.contains_key(&who) {
+                return Err(err(lua, format!("npc.near: нет персонажа «{who}»")));
+            }
+            g.distances.insert(who, m.max(0.0));
+            Ok(())
+        })?,
+    )?;
+    let h = Arc::clone(host);
+    story.set(
+        "hour",
+        lua.create_function(move |_, ()| {
+            let g = lock(&h);
+            Ok(reyvec_story::life::hour(g.state.time))
+        })?,
     )?;
     story.set_readonly(true);
     quest.set_readonly(true);
