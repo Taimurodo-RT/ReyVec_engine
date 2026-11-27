@@ -1,0 +1,14 @@
+// Пример «кузнец и руда»: задание. Руду считает скрипт: quest.add("mech", "ruda", 1).
+(
+    format: "reyvec-quest",
+    version: 1,
+    id: "mech",
+    title: "Меч для героя",
+    description: "Кузнец Борис выкует герою меч, если тот принесёт руду.",
+    stages: [
+        (id: "ruda", journal: "Кузнец выкует меч, если принести три куска руды.", goals: [(id: "ruda", text: "Руда", count: 3)], next: "otnesti"),
+        (id: "otnesti", journal: "Руда собрана. Отнести её кузнецу.", next: "zhdat"),
+        (id: "zhdat", journal: "Кузнец куёт меч. Зайти к нему завтра."),
+    ],
+    rewards: [(var: "hero.mech", to: true), (var: "kuznec.nastroenie", add: 1)],
+)

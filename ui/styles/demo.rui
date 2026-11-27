@@ -1,0 +1,42 @@
+// Стили примера (шаги И.2а–И.2б). Имя с большой буквы — вид блока или экран,
+// с маленькой — класс (блоку его дают .class(имя)). Вложенный стиль значит «внутри».
+
+// Все столбцы и тексты.
+style Column { .spacing(var(gap)) }
+
+// Окно: класс panel.
+style panel {
+    .padding(36)
+    .background(var(panel))
+    .radius(var(radius) * 2)
+    .border(var(line), 1)
+    .color(var(text))             // тексты внутри окна наследуют цвет
+    when(width < 1280) { .padding(20) }   // в маленьком окне отступы меньше
+}
+
+// Кнопки. В фигурных скобках — как кнопка выглядит в состоянии: под мышью (hover),
+// нажатая (pressed), выбранная клавиатурой (focus), выключенная (disabled).
+style Button {
+    .padding(12, var(gap_big))
+    .background(var(button))
+    .radius(var(radius))
+    .font(26)
+    .hover    { .background(var(button_hover)).color(var(accent)) }
+    .pressed  { .background(var(button_down)) }
+    .focus    { .border(var(accent), 2) }
+    .disabled { .opacity(0.4) }
+}
+
+style Button.danger {
+    .color(var(danger))
+    .border(var(danger), 2)
+    .focus { .border(var(danger), 3) }
+}
+
+style title { .font(56).color(var(accent)) }
+style hint { .font(20).color(var(muted)) }
+
+// Внутри экрана Demo столбцы шире и просторнее.
+style Demo {
+    Column.menu { .width(420) }
+}

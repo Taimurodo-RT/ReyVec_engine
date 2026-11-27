@@ -61,8 +61,6 @@ pub struct HeadlessScene {
     pub zoom: bool,
     /// Свои файлы для сцен «SVG» и «Motif»; без них там примеры.
     pub files: crate::UserFiles,
-    /// Опыт 4.6: свет каскадами лучей вместо лучей к источникам.
-    pub cascades: bool,
 }
 
 /// Сценарий игры для кадра без окна (проверка в движении, 6.4): где герой сцены «из
@@ -184,6 +182,8 @@ struct Resources<'a> {
     demo: Option<Demo>,
     transients: TransientPool,
     timer: Option<GpuTimer>,
+    /// Интерфейс игры поверх кадра (только в тестах, И.1).
+    game_ui: Option<crate::game_ui::GameUiRenderer>,
 }
 
 impl Drop for Resources<'_> {
@@ -194,6 +194,9 @@ impl Drop for Resources<'_> {
             let _ = d.device_wait_idle();
             if let Some(demo) = self.demo.take() {
                 demo.destroy(self.ctx);
+            }
+            if let Some(ui) = self.game_ui.take() {
+                ui.destroy(self.ctx);
             }
             self.transients.destroy(self.ctx);
             if let Some(mut timer) = self.timer.take() {
@@ -232,7 +235,6 @@ pub fn render_triangle_headless(
             fill: crate::FillMode::PerShape,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         },
     )
 }
@@ -373,6 +375,7 @@ fn render(
         demo: None,
         transients: TransientPool::new(),
         timer: None,
+        game_ui: None,
     };
     let extent = vk::Extent2D { width, height };
     let size = u64::from(width) * u64::from(height) * 4;
@@ -478,7 +481,6 @@ fn render(
             // Шум против полос случайно сдвигает пиксели на ступень: эталоны сравниваются без
             // него.
             demo.set_dither(false);
-            demo.set_cascades(scene.cascades);
             // Тесты поля сравнивают кадры с полем и без него и с «углами из поля» и без них.
             #[cfg(test)]
             demo.set_space_field(!tests::FIELD_OFF.get());
@@ -556,6 +558,22 @@ fn render(
                 demo.set_level_edit(tests::LEVEL_EDIT.get());
             }
         }
+        // Интерфейс игры из файла .rui поверх кадра (И.1).
+        #[cfg(test)]
+        if let Some(src) = tests::GAME_UI.get() {
+            let gpu = r.gpu.as_mut().expect("ресурсы созданы выше");
+            let mut ui = crate::game_ui::GameUiRenderer::new(
+                ctx,
+                gpu,
+                &ShaderLibrary::new(false),
+                FORMAT,
+                1,
+            )?;
+            let mut screen = reyvec_ui::UiScreen::parse(src).expect("экран разбирается");
+            let (draw, atlas) = screen.draw_with_atlas([width as f32, height as f32]);
+            ui.set(ctx, gpu, Some((draw, atlas, 1)))?;
+            r.game_ui = Some(ui);
+        }
         // Проверка на чтение незаполненной памяти (8.0).
         #[cfg(test)]
         r.transients
@@ -578,6 +596,11 @@ fn render(
             demo.set_shadow_reuse(tests::SHADOW_REUSE.get());
             demo.set_tensor_bench(tests::TENSOR_BENCH.get(), 0);
             demo.set_reflections(tests::REFLECTIONS.get());
+            // Тесты 3D сверяют кадры пиксель в пиксель, а ореол разносит любое отличие
+            // по соседям: в 3D свечение включает только свой тест.
+            if scene.scene == DemoScene::Space {
+                demo.set_glow(tests::GLOW.get());
+            }
             demo.set_glossy(tests::GLOSSY.get());
             demo.set_path_ref(tests::PATH_FRAMES.get() > 0);
             demo.set_path_live(tests::LIVE_FRAMES.get() > 0);
@@ -691,6 +714,10 @@ fn render(
             );
         }
         let particles = demo.particle_stats();
+        let game_ui_data = match r.game_ui.as_mut() {
+            Some(ui) => ui.prepare(ctx, gpu, 0, extent)?,
+            None => None,
+        };
         let gpu = &*gpu;
         let mut graph = RenderGraph::new();
         let target = graph.import(
@@ -703,6 +730,9 @@ fn render(
             None,
         );
         demo.add_passes(&mut graph, &gpu.bindless, data, target);
+        if let (Some(d), Some(ui)) = (game_ui_data, r.game_ui.as_ref()) {
+            ui.add_pass(&mut graph, &gpu.bindless, d, target);
+        }
         let buffer = r.buffer;
         // Последний проход копирует готовую картинку в буфер, который читает процессор.
         graph.add_pass("чтение", &[(target, Access::TransferSrc)], move |p| {
@@ -850,7 +880,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::default(),
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let errors = validation_error_count();
         let img = render_headless(&options, &scene).expect("кадр без окна");
@@ -890,6 +919,9 @@ pub(crate) mod tests {
 
     thread_local! {
         /// Кадр без запечённого поля (для сравнения с кадром с полем).
+        /// Экран интерфейса игры (.rui) поверх кадра (И.1).
+        pub(super) static GAME_UI: std::cell::Cell<Option<&'static str>> =
+            const { std::cell::Cell::new(None) };
         pub(super) static FIELD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Кадр с «углами из поля» (7.10г).
         pub(super) static AO_FROM_FIELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -957,6 +989,8 @@ pub(crate) mod tests {
         /// Тени из прошлого кадра (опыт Р3): снимаемому кадру предшествует кадр с той же
         /// камерой на 1/20 секунды раньше.
         pub(super) static SHADOW_REUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Свечение и переход к белому в сцене «3D» (8.16); в тестах по умолчанию выключено.
+        pub(super) static GLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Отражения у блестящих материалов (Л1).
         pub(super) static REFLECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
         /// Эталон 3D: сколько кадров копить (снимается последний); 0 — эталон выключен.
@@ -1051,7 +1085,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let level = |render| HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -1120,7 +1153,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let level = |render| HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -1221,7 +1253,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         for (name, scale, no_ms) in [
             ("обычно", crate::SpaceScale::Full, false),
@@ -1270,6 +1301,145 @@ pub(crate) mod tests {
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
+    /// Сцена «большой мир» (8.9–8.11): город 400 м помещается в пределы шейдера, кадр
+    /// рисуется без ошибок Vulkan, а сдвиг камеры на 2 см почти не меняет далёкое
+    /// (нет мерцания тонких вещей вдали).
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn world_scene_is_steady() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let text = include_str!("../../../scenes/3d/world.ron");
+        let shot = |text: &str| {
+            let scene = HeadlessScene {
+                width: 640,
+                height: 360,
+                time: 1.0,
+                shader_error: false,
+                scene: DemoScene::Space,
+                msaa: Msaa::X4,
+                perceptual_edges: false,
+                fill: crate::FillMode::default(),
+                zoom: false,
+                files: crate::UserFiles {
+                    space: Some(text.into()),
+                    ..Default::default()
+                },
+            };
+            render_headless(&options, &scene).expect("кадр")
+        };
+        let frame = shot(text);
+        let eye = "eye: (-30.0, 38.0,";
+        assert!(text.contains(eye), "камера сцены на своём месте");
+        let moved = shot(&text.replace(eye, "eye: (-29.98, 38.0,"));
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        let stats = frame.space_stats.as_ref().expect("числа сцены 3D");
+        eprintln!(
+            "мир: в кадре объектов {}, слов {}, {:?}, движется {}, процессор {:.2} + {:.2} мс, краёв {:?}",
+            stats.objects,
+            stats.words,
+            stats.frame,
+            stats.moving,
+            stats.build_ms,
+            stats.pack_ms,
+            stats.edge_pixels
+        );
+        if let Some(t) = &frame.gpu_timings {
+            eprintln!("мир: {}", t.describe());
+        }
+        // Сколько работы у лучей (события, на любой видеокарте те же).
+        SPACE_COUNTERS.set(true);
+        let counted = shot(text);
+        SPACE_COUNTERS.set(false);
+        let rays = counted.space_stats.expect("счётчики").rays.expect("лучи");
+        for (c, name) in rays.iter().zip(crate::counters::RAY_PASS_NAMES) {
+            eprintln!(
+                "мир, {name}: шагов {}, расчётов сцены {}, предметов {}, форм {}, примитивов {}",
+                c.steps, c.scene, c.objects, c.forms, c.prims
+            );
+        }
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/world.rgba"), &frame.image.rgba);
+            let _ = std::fs::write(format!("{dir}/world-moved.rgba"), &moved.image.rgba);
+        }
+        assert_eq!(stats.dropped, 0);
+        assert!(stats.overflow.is_none());
+        let pixels = (frame.image.width * frame.image.height) as usize;
+        let jumps = frame
+            .image
+            .rgba
+            .chunks_exact(4)
+            .zip(moved.image.rgba.chunks_exact(4))
+            .filter(|(x, y)| x[..3].iter().zip(&y[..3]).any(|(p, q)| p.abs_diff(*q) > 48))
+            .count();
+        eprintln!("мир: при сдвиге камеры на 2 см скачут {jumps} пикселей из {pixels}");
+        // Сейчас скачет 0,07 % (головки фонарей мельче пикселя); при 1920×1080 — 0,06 %.
+        assert!(
+            jumps * 500 <= pixels,
+            "даль мерцает: {jumps} пикселей из {pixels}"
+        );
+    }
+
+    /// Сцена «выставка» (итог этапа 8): всё, что умеет быстрый режим 3D, в одном кадре —
+    /// формы SDF, модели форм, модели glTF с текстурой, зеркало, глянец, свечение, солнце
+    /// и лампы. Кадр рисуется без ошибок Vulkan и не пуст.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn showroom_scene_renders() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 640,
+            height: 360,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/showroom.ron").into()),
+                space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                ..Default::default()
+            },
+        };
+        GLOW.set(true);
+        let frame = render_headless(&options, &scene);
+        GLOW.set(false);
+        let frame = frame.expect("кадр");
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        let stats = frame.space_stats.as_ref().expect("числа сцены 3D");
+        eprintln!(
+            "выставка: в кадре объектов {}, {:?}, процессор {:.2} + {:.2} мс",
+            stats.objects, stats.frame, stats.build_ms, stats.pack_ms
+        );
+        if let Some(t) = &frame.gpu_timings {
+            eprintln!("выставка: {}", t.describe());
+        }
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/showroom.rgba"), &frame.image.rgba);
+        }
+        assert_eq!(stats.dropped, 0);
+        assert!(stats.overflow.is_none());
+        assert_eq!(stats.frame.proxies, 3, "у трёх моделей glTF свои тени");
+        let mut colors: Vec<[u8; 3]> = frame
+            .image
+            .rgba
+            .chunks_exact(4)
+            .map(|p| [p[0] / 32, p[1] / 32, p[2] / 32])
+            .collect();
+        colors.sort_unstable();
+        colors.dedup();
+        assert!(colors.len() > 40, "цветов {}", colors.len());
+    }
+
     /// Сцена завода (8.7): больше 1000 объектов, те, что в кадре, помещаются в предел шейдера
     /// и буфер, кадр рисуется без ошибок проверки Vulkan. Время здесь не меряется
     /// (программная видеокарта) — его меряем на ПК.
@@ -1296,7 +1466,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let frame = render_headless(&options, &scene).expect("кадр");
         let stats = frame.space_stats.expect("числа сцены 3D");
@@ -1345,6 +1514,66 @@ pub(crate) mod tests {
         assert_eq!(validation_error_count(), errors, "ошибки валидации");
     }
 
+    /// 8.16: в сцене «эффекты» светящиеся материалы дают ореол (стена рядом с неоновой
+    /// трубкой со свечением светлее), а яркость выше белого не обрезается по каналам:
+    /// самый яркий шар остаётся оранжевым, а не жёлтым пятном.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn effects_scene_glows() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = HeadlessScene {
+            width: 480,
+            height: 270,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(include_str!("../../../scenes/3d/effects.ron").into()),
+                ..Default::default()
+            },
+        };
+        GLOW.set(true);
+        let on = render_headless(&options, &scene);
+        GLOW.set(false);
+        let off = render_headless(&options, &scene);
+        let (on, off) = (
+            on.expect("кадр со свечением"),
+            off.expect("кадр без свечения"),
+        );
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/effects-on.rgba"), &on.image.rgba);
+            let _ = std::fs::write(format!("{dir}/effects-off.rgba"), &off.image.rgba);
+        }
+        let (changed, worst, mean) = image_diff(&on.image, &off.image);
+        let pixels = (on.image.width * on.image.height) as usize;
+        eprintln!(
+            "свечение 3D: отличается {changed} пикселей из {pixels}, наибольшая {worst}, в среднем {mean:.2}"
+        );
+        assert!(
+            changed * 20 >= pixels,
+            "свечение почти ничего не меняет: {changed}"
+        );
+        // Ореол только добавляет свет там, где кадр не ярче белого: темнее не становится
+        // нигде, кроме мест ярче плеча перехода к белому (там канал может опуститься).
+        let darker = on
+            .image
+            .rgba
+            .chunks(4)
+            .zip(off.image.rgba.chunks(4))
+            .filter(|(a, b)| (0..3).all(|k| b[k] < 200) && (0..3).any(|k| a[k] + 2 < b[k]))
+            .count();
+        assert_eq!(darker, 0, "свечение затемнило {darker} пикселей");
+    }
+
     /// Л1: блестящие материалы сцены «зеркала» отражают сцену (флажок «Отражения 3D»
     /// меняет заметную часть кадра), а сцена без блестящих с ним не меняется вовсе.
     #[test]
@@ -1369,7 +1598,6 @@ pub(crate) mod tests {
                 space: Some(include_str!("../../../scenes/3d/mirrors.ron").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let on = render_headless(&options, &scene).expect("кадр с отражениями");
         REFLECTIONS.set(false);
@@ -1442,7 +1670,6 @@ pub(crate) mod tests {
                 space: Some(include_str!("../../../scenes/3d/mirrors.ron").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let fast = render_headless(&options, &scene).expect("кадр быстрого режима");
         let mut shots = Vec::new();
@@ -1538,6 +1765,73 @@ pub(crate) mod tests {
         assert!(late < early, "накопление не убирает шум: {early} и {late}");
     }
 
+    /// Кэш солнца в пути (R5е): в солнечной сцене «зеркала» кадр режима «качество» с кэшем
+    /// тот же, что без него (карта решает только то, что знает точно), а в закрытом зале с
+    /// лампами, где солнце везде за крышей, кадр тоже тот же, а лучей к солнцу нет.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn path_sun_cache_keeps_picture() {
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let scene = |space: &'static str| HeadlessScene {
+            width: 160,
+            height: 120,
+            time: 1.0,
+            shader_error: false,
+            scene: DemoScene::Space,
+            msaa: Msaa::X4,
+            perceptual_edges: false,
+            fill: crate::FillMode::default(),
+            zoom: false,
+            files: crate::UserFiles {
+                space: Some(space.into()),
+                ..Default::default()
+            },
+        };
+        let mirrors = scene(include_str!("../../../scenes/3d/mirrors.ron"));
+        let hall = scene(include_str!("../../../scenes/3d/lamps.ron"));
+        LIVE_FRAMES.set(8);
+        let mut shots = Vec::new();
+        for cache in [false, true] {
+            SUN_CACHE.set(cache);
+            shots.push((
+                render_headless(&options, &mirrors),
+                render_headless(&options, &hall),
+            ));
+        }
+        SUN_CACHE.set(false);
+        LIVE_FRAMES.set(0);
+        assert_eq!(validation_error_count(), errors, "ошибки валидации");
+        let mut shots = shots
+            .into_iter()
+            .map(|(m, h)| (m.expect("кадр «зеркал»"), h.expect("кадр зала")));
+        let (plain, cached) = (shots.next().unwrap(), shots.next().unwrap());
+        if let Ok(dir) = std::env::var("REYVEC_PATH_DUMP") {
+            let _ = std::fs::write(format!("{dir}/sun-plain.rgba"), &plain.0.image.rgba);
+            let _ = std::fs::write(format!("{dir}/sun-cached.rgba"), &cached.0.image.rgba);
+        }
+        let (changed, worst, mean) = image_diff(&plain.0.image, &cached.0.image);
+        let path_ms = |image: &HeadlessImage| {
+            image
+                .gpu_timings
+                .as_ref()
+                .and_then(|t| t.passes.iter().find(|p| p.name == "путь 3D").map(|p| p.ms))
+        };
+        let (_, _, hall_mean) = image_diff(&plain.1.image, &cached.1.image);
+        eprintln!(
+            "кэш солнца в пути: «зеркала» — точек другого цвета {changed}, сильнее всего {worst}, в среднем {mean:.3}; зал — в среднем {hall_mean:.3}, путь {:?} → {:?} мс",
+            path_ms(&plain.1),
+            path_ms(&cached.1)
+        );
+        assert!(mean < 0.5, "кэш солнца меняет кадр «зеркал»: {mean}");
+        assert!(hall_mean < 0.5, "кэш солнца меняет кадр зала: {hall_mean}");
+        // Время только печатается: на lavapipe под нагрузкой соседних тестов оно скачет
+        // (зал 160×120 один: 23,8 → 18,4 мс), а ускорение мерит 5080.
+    }
+
     #[test]
     #[ignore = "нужен драйвер Vulkan"]
     fn wall_seams_have_no_bright_dots() {
@@ -1574,7 +1868,6 @@ pub(crate) mod tests {
                 ),
                 ..Default::default()
             },
-            cascades: false,
         };
         PATH_BOUNCES.set(0);
         PATH_RESTIR.set(false);
@@ -1644,7 +1937,6 @@ pub(crate) mod tests {
                 space: Some(include_str!("../../../scenes/3d/lamps.ron").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         PATH_BOUNCES.set(0);
         PATH_DENOISE.set(false);
@@ -1774,7 +2066,7 @@ pub(crate) mod tests {
             "ReSTIR GI не убирает шум: {off_plain} и {off_gi}"
         );
         // Кэш света (шаг 5б): с шумодавом, 16-й кадр — яркость как у эталона, а путь
-        // дешевле (по времени прохода «путь 3D», если видеокарта его замеряет).
+        // дешевле (время прохода «путь 3D» печатается, если видеокарта его замеряет).
         LIVE_FRAMES.set(16);
         PATH_CACHE.set(false);
         let uncached = render_headless(&options, &scene);
@@ -1802,12 +2094,9 @@ pub(crate) mod tests {
             (b_uncached / b_full - 1.0).abs() < 0.15,
             "без кэша света другая яркость: {b_uncached} и {b_full}"
         );
-        if let (Some(slow), Some(fast)) = (path_ms(&uncached), path_ms(&clean)) {
-            assert!(
-                fast < slow,
-                "кэш света не ускоряет путь: {fast} и {slow} мс"
-            );
-        }
+        // Время прохода только печатается: на lavapipe в CI тесты идут рядом на тех же
+        // ядрах, и замер по часам скачет сильнее самой разницы (бывало 72 мс с кэшем против 67 без него).
+        // Ускорение мерит 5080 (docs/roadmap.md, R5б).
         // Отскок ReSTIR GI у одного пикселя из 4: яркость та же, путь дешевле.
         LIVE_FRAMES.set(16);
         PATH_GI_QUARTER.set(false);
@@ -1830,12 +2119,9 @@ pub(crate) mod tests {
             (b_clean / b_every - 1.0).abs() < 0.05,
             "отскок у 1 из 4 меняет яркость: {b_clean} и {b_every}"
         );
-        if let (Some(slow), Some(fast)) = (path_ms(&every), path_ms(&clean)) {
-            assert!(
-                fast < slow,
-                "отскок у 1 из 4 не ускоряет путь: {fast} и {slow} мс"
-            );
-        }
+        // Время прохода только печатается: на lavapipe в CI тесты идут рядом на тех же
+        // ядрах, и замер по часам скачет сильнее самой разницы (бывало и наоборот).
+        // Ускорение мерит 5080 (docs/roadmap.md, R5в).
     }
 
     /// Склад из стеллажей по 59 деталей рисуется тремя способами: детали — отдельные
@@ -1867,7 +2153,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         SPACE_COUNTERS.set(true);
         let split = render_headless(&options, &scene);
@@ -1985,7 +2270,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let render = |rt: bool, counted: bool| {
             SPACE_RT.set(rt);
@@ -2089,7 +2373,6 @@ pub(crate) mod tests {
                     space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                     ..Default::default()
                 },
-                cascades: false,
             };
             let render = |cache: bool| {
                 SUN_CACHE.set(cache);
@@ -2187,7 +2470,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let render = |reuse: bool| {
             SHADOW_REUSE.set(reuse);
@@ -2243,7 +2525,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::default(),
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         TENSOR_BENCH.set(true);
         BENCH_OUT.set(None);
@@ -2303,7 +2584,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let bricks = render_headless(&options, &scene(file.to_owned())).expect("кадр");
         PLANE_SHADOWS.set(true);
@@ -2364,7 +2644,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let room = HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -2376,14 +2655,6 @@ pub(crate) mod tests {
         };
         let cases: Vec<(&str, HeadlessScene, Option<HeadlessPlay>)> = vec![
             ("2D-комната", base.clone(), Some(room.clone())),
-            (
-                "2D-комната, каскады",
-                HeadlessScene {
-                    cascades: true,
-                    ..base.clone()
-                },
-                Some(room.clone()),
-            ),
             (
                 "лаборатория",
                 HeadlessScene {
@@ -2536,7 +2807,6 @@ pub(crate) mod tests {
                 space: Some(SPACE.into()),
                 ..Default::default()
             },
-            cascades: false,
         }
     }
 
@@ -2642,7 +2912,6 @@ pub(crate) mod tests {
                 space: Some(space.into()),
                 ..Default::default()
             },
-            cascades: false,
         }
     }
 
@@ -2880,7 +3149,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         // Ящик в кадре 960×505 и почти чёрные пиксели на нём.
         let dark = |image: &FrameImage| {
@@ -3133,7 +3401,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let play = HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -3213,7 +3480,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         // Комната, подъёмник в коридоре и склон в конце.
         let plays = [
@@ -3381,7 +3647,6 @@ pub(crate) mod tests {
                 fill: crate::FillMode::Triangles,
                 zoom: false,
                 files: crate::UserFiles::default(),
-                cascades: false,
             };
             let play = HeadlessPlay {
                 start: Some(start),
@@ -3471,7 +3736,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         for scale in [crate::SpaceScale::Full, crate::SpaceScale::Half] {
             SPACE_SCALE.set(scale);
@@ -3626,7 +3890,6 @@ pub(crate) mod tests {
                     space: Some(scene_text(split).into()),
                     ..Default::default()
                 },
-                cascades: false,
             };
             let f = render_headless(&options, &scene);
             NO_MESH_MSAA.set(false);
@@ -3721,7 +3984,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let play = HeadlessPlay {
             start: Some([-0.6, -0.5]),
@@ -3864,7 +4126,6 @@ pub(crate) mod tests {
                 space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                 ..Default::default()
             },
-            cascades: false,
         };
         let plain = render_headless(&options, &scene).expect("кадр");
         SPACE_COUNTERS.set(true);
@@ -3977,7 +4238,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         // Комната (точка теста уровня), у стола и у полки.
         for start in [[-0.6, -0.5], [0.0, -0.6], [0.4, -0.5]] {
@@ -4060,7 +4320,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         let starts = [[-0.6, -0.5], [0.4, -0.5]];
         for render in [crate::LevelRender::Sdf, crate::LevelRender::Field] {
@@ -4149,7 +4408,6 @@ pub(crate) mod tests {
             fill: crate::FillMode::Triangles,
             zoom: false,
             files: crate::UserFiles::default(),
-            cascades: false,
         };
         for render in [crate::LevelRender::Sdf, crate::LevelRender::Field] {
             let play = HeadlessPlay {
@@ -4289,6 +4547,66 @@ pub(crate) mod tests {
 
     /// Нужен драйвер Vulkan. В CI запускается на программном lavapipe:
     /// `cargo test -p reyvec-gpu -- --include-ignored`.
+    /// Интерфейс игры (И.1): скруглённый блок с обводкой и буквы поверх кадра.
+    /// Окно 480×270 — четверть экрана 1920×1080, все размеры файла делятся на 4.
+    #[test]
+    #[ignore = "нужен драйвер Vulkan"]
+    fn game_ui_draws_blocks_and_text() {
+        const SRC: &str = r#"
+            screen Test {
+                Rect().size(400, 200).background(#FF0000).radius(80)
+                    .border(#0000FF, 16).anchor(top_left, margin: 40)
+                Text("Ш").font(240).color(#FFFFFF).anchor(bottom_right, margin: 40)
+            }
+        "#;
+        let options = GpuOptions {
+            validation: true,
+            gpu: None,
+        };
+        let errors = validation_error_count();
+        let plain = render_triangle_headless(&options, 480, 270).expect("кадр без интерфейса");
+        tests::GAME_UI.set(Some(SRC));
+        let img = render_triangle_headless(&options, 480, 270);
+        tests::GAME_UI.set(None);
+        let img = img.expect("кадр с интерфейсом");
+        assert_eq!(validation_error_count(), errors, "ошибки проверки Vulkan");
+
+        // Блок: окно 10..110 × 10..60, скругление 20, обводка 4 пикселя.
+        let center = img.pixel(60, 35);
+        assert!(
+            center[0] > 250 && center[1] < 5 && center[2] < 5,
+            "середина блока {center:?}"
+        );
+        let border = img.pixel(60, 11);
+        assert!(
+            border[2] > 250 && border[0] < 5,
+            "обводка сверху {border:?}"
+        );
+        // Угол прямоугольника срезан скруглением: там кадр, как без интерфейса.
+        assert_eq!(img.pixel(11, 11), plain.pixel(11, 11), "угол блока");
+        // Рядом с блоком интерфейса нет.
+        assert_eq!(img.pixel(130, 35), plain.pixel(130, 35), "справа от блока");
+
+        // Буква в правом нижнем углу: много светлых точек, которых не было без
+        // интерфейса, и есть промежуточные (край сглажен).
+        let (mut white, mut soft) = (0, 0);
+        for y in 150..260 {
+            for x in 360..470 {
+                let (a, b) = (img.pixel(x, y), plain.pixel(x, y));
+                if a == b {
+                    continue;
+                }
+                if a[0] > 245 && a[1] > 245 && a[2] > 245 {
+                    white += 1;
+                } else {
+                    soft += 1;
+                }
+            }
+        }
+        assert!(white > 300, "светлых точек буквы {white}");
+        assert!(soft > 20, "точек на краю буквы {soft}");
+    }
+
     #[test]
     #[ignore = "нужен драйвер Vulkan"]
     fn triangle_is_drawn() {

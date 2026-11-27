@@ -1,0 +1,35 @@
+// Полоска здоровья и монеты героя (шаг И.3а). Видна в сценах с героем, пока меню
+// F3 закрыто. Данные игры пишутся путями, как есть:
+//   game.hero.hp       — сколько здоровья сейчас
+//   game.hero.hp_max   — сколько его всего
+//   game.hero.coins    — сколько монет подобрано
+//   game.hero.hurt     — герой только что ранен и пока неуязвим (true или false)
+// Поменялось значение — полоска и надписи меняются сами, ничего писать «каждый кадр»
+// не нужно. Правка этого файла сразу видна в окне.
+
+head {
+    theme("themes/base")
+    styles("styles/hud")
+}
+
+layer Hud {
+    Column(spacing: 6, align: center) {
+        Row(spacing: 10, align: center) {
+            Text(tr("hud.health")).class(label)
+            // Вставка \( ) кладёт значение прямо в строку.
+            Text("\(game.hero.hp) / \(game.hero.hp_max)").class(label)
+        }
+        // Полоска: значение от 0 до 1 — доля здоровья.
+        Bar(game.hero.hp / game.hero.hp_max)
+            .class(health)
+            // Мало здоровья — рамка красная; только что ранен — полоска светлеет.
+            .when(game.hero.hp <= 1) { .border(var(danger), 2) }
+            .when(game.hero.hurt) { .fill(#FFB0A8) }
+        Row(spacing: 8, align: center) {
+            Rect().size(14).radius(7).background(var(coin))
+            Text(tr("hud.coins", n: game.hero.coins)).class(label)
+        }
+    }
+    .class(hud)
+    .anchor(top, margin: 16)
+}

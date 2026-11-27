@@ -1,0 +1,38 @@
+// Темы примера (шаги И.2а–И.3а): каждая — набор переменных. В песочнице F4 меняет тему.
+// Переменная читается в стилях и экранах как var(имя).
+
+theme Forge {
+    panel     = #171A21E6     // фон окна
+    button    = #262B36       // фон кнопки
+    button_hover = #343B4A    // фон кнопки под мышью
+    button_down  = #1C2028    // фон нажатой кнопки
+    line      = #FFFFFF1A     // тонкая рамка
+    accent    = #F5A54A       // цвет раскалённого металла
+    text      = #E8ECF2
+    muted     = #9AA3B5
+    danger    = #E5484D
+    stamina   = #7FD36B
+    health    = #E0473F       // полоска здоровья (ui/hud.rui)
+    coin      = #FFCD46
+    radius    = 10
+    gap       = 14
+    gap_big   = var(gap) * 2
+}
+
+theme Ice {
+    panel     = #0E1C2CE6
+    button    = #1B3550
+    button_hover = #25496D
+    button_down  = #132840
+    line      = #BFE3FF33
+    accent    = #6BB8F5
+    text      = #EAF6FF
+    muted     = #8FB3CC
+    danger    = #FF6B8A
+    stamina   = #5FE0D0
+    health    = #FF6B8A
+    coin      = #FFE27A
+    radius    = 4
+    gap       = 10
+    gap_big   = var(gap) * 2
+}

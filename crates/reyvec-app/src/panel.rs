@@ -32,7 +32,6 @@ pub(crate) enum PanelAction {
     Zoom(bool),
     LightField(bool),
     Glow(bool),
-    Cascades(bool),
     Dither(bool),
     /// Сглаживание краёв форм сцены «3D» (7.6о).
     SpaceSmooth(bool),
@@ -306,8 +305,6 @@ pub(crate) struct PanelInfo<'a> {
     pub light_field: bool,
     /// Свечение и мягкий переход к белому в сцене «лампы и тени».
     pub glow: bool,
-    /// Опыт 4.6: свет каскадами лучей.
-    pub cascades: bool,
     /// Шум против полос при выводе.
     pub dither: bool,
 }
@@ -844,7 +841,8 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 actions.push(PanelAction::LightField(field));
             }
         }
-        if info.scene_id.uses_lights() {
+        // Свечение есть и у сцены «3D» (8.16): светящиеся материалы, блики, шарики ламп.
+        if info.scene_id.uses_lights() || info.scene_id == DemoScene::Space {
             let mut glow = info.glow;
             if ui
                 .checkbox(&mut glow, "Свечение и мягкие пересветы (B)")
@@ -855,18 +853,6 @@ fn controls(ui: &mut egui::Ui, info: &PanelInfo, actions: &mut Vec<PanelAction>)
                 .changed()
             {
                 actions.push(PanelAction::Glow(glow));
-            }
-            let mut cascades = info.cascades;
-            if ui
-                .checkbox(&mut cascades, "Свет каскадами лучей, опыт (C)")
-                .on_hover_text(
-                    "Другой способ считать свет (radiance cascades): из каждой точки лучи во \
-                 все стороны, а не к каждой лампе. Свет огибает углы и затекает в щели, \
-                 а цена почти не зависит от числа ламп. Для сравнения с обычным",
-                )
-                .changed()
-            {
-                actions.push(PanelAction::Cascades(cascades));
             }
         }
         let mut dither = info.dither;
@@ -1686,11 +1672,19 @@ fn grid_text(info: &PanelInfo) -> String {
     let grid = match (info.space_culling, info.space_grid) {
         (false, _) => "сетка отсева выключена (culling: false)".to_string(),
         (true, None) => "сетка отсева включена".to_string(),
-        (true, Some(g)) => format!(
-            "сетка отсева: клетка {:.2} м, {}×{}×{}, в списке клетки в среднем {:.1}, \
-             не больше {}",
-            g.cell, g.dims[0], g.dims[1], g.dims[2], g.mean_list, g.max_list
-        ),
+        (true, Some(g)) => {
+            let fine = g.fine.map_or(String::new(), |(cell, d)| {
+                format!(
+                    "; мелкая сетка в тесной части: клетка {cell:.2} м, {}×{}×{}",
+                    d[0], d[1], d[2]
+                )
+            });
+            format!(
+                "сетка отсева: клетка {:.2} м, {}×{}×{}, в списке клетки в среднем {:.1}, \
+                 не больше {}{fine}",
+                g.cell, g.dims[0], g.dims[1], g.dims[2], g.mean_list, g.max_list
+            )
+        }
     };
     match info.space_in_view {
         Some((kept, total)) => format!("{grid}, в кадре {kept} из {total}"),
@@ -1861,7 +1855,7 @@ fn space_stats_lines(ui: &mut egui::Ui, s: &reyvec_gpu::SpaceStats) {
     let share = (f64::from(s.objects) / max_objects as f64).max(s.words as f64 / max_words as f64);
     ui.label(
         mono(format!(
-            "Данные сцены 3D: объектов {} из {max_objects}, слов {} из {max_words} ({:.2} МБ из 4)",
+            "Данные сцены 3D: объектов {} из {max_objects}, слов {} из {max_words} ({:.2} МБ из 8)",
             s.objects,
             s.words,
             s.words as f64 * 4.0 / (1024.0 * 1024.0)
@@ -2372,7 +2366,6 @@ mod tests {
             fill_mode: FillMode::PerShape,
             light_field: false,
             glow: true,
-            cascades: false,
             dither: true,
         };
         let history: VecDeque<f32> = [0.2, 0.3, 5.0].into_iter().collect();

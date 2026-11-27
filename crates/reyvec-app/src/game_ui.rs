@@ -15,6 +15,7 @@ use winit::keyboard::KeyCode;
 
 use crate::console::{Console, ConsoleView};
 use crate::controls::{Controls, Input, MAX_KEYS, MenuAction, OPTIONS, controls_path};
+use crate::story_window::StoryWindow;
 
 /// Сколько живёт число урона, секунды, и на сколько поднимается (единиц сцены).
 const FLOAT_LIFE: f32 = 0.9;
@@ -55,6 +56,30 @@ pub(crate) struct GameView {
     pub zoom: f64,
     /// Твёрдое сцены (только пока консоль показывает столкновения).
     pub solids: Vec<reyvec_scene::game::Collider>,
+    /// Сюжет сцены (Сю.7), если у проекта есть папка `story/`.
+    pub story: Option<reyvec_scene::SharedStory>,
+}
+
+/// Строка главного меню паузы.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainRow {
+    Resume,
+    Controls,
+    SaveStory,
+    LoadStory,
+    Quit,
+}
+
+impl MainRow {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Resume => "Продолжить",
+            Self::Controls => "Управление",
+            Self::SaveStory => "Сохранить сюжет",
+            Self::LoadStory => "Загрузить сюжет",
+            Self::Quit => "Выйти из программы",
+        }
+    }
 }
 
 pub(crate) struct GameUi {
@@ -67,12 +92,18 @@ pub(crate) struct GameUi {
     floats: Vec<Float>,
     banner: f32,
     coins: u32,
+    /// Полоска здоровья из файла `ui/hud.rui` (И.3а) готова: свою не рисовать.
+    pub file_hud: bool,
     /// Строка под настройками: куда сохранено или что не так.
     note: Option<(String, bool)>,
     quit: bool,
     last: Instant,
     /// Консоль разработчика (6.11).
     pub console: Console,
+    /// Окно диалога и журнал (Сю.7).
+    story: StoryWindow,
+    /// Сюжет сцены из последнего кадра.
+    host: Option<reyvec_scene::SharedStory>,
 }
 
 impl GameUi {
@@ -88,11 +119,40 @@ impl GameUi {
             floats: Vec::new(),
             banner: 0.0,
             coins: 0,
+            file_hud: false,
             note: None,
             quit: false,
             last: Instant::now(),
             console: Console::new(),
+            story: StoryWindow::new(),
+            host: None,
         }
+    }
+
+    /// Строки главного меню: сохранение сюжета — только если сюжет есть.
+    fn main_rows(&self) -> Vec<MainRow> {
+        let mut rows = vec![MainRow::Resume, MainRow::Controls];
+        if self.host.is_some() {
+            rows.extend([MainRow::SaveStory, MainRow::LoadStory]);
+        }
+        rows.push(MainRow::Quit);
+        rows
+    }
+
+    /// Нажатие в игре для сюжета (Сю.7): ответ в разговоре, журнал. `true` — забрано.
+    pub(crate) fn story_key(&mut self, input: Input, down: bool) -> bool {
+        match &self.host {
+            Some(h) if !self.menu_open() && !self.console.is_open() => {
+                let h = h.clone();
+                self.story.key(&h, input, down)
+            }
+            _ => false,
+        }
+    }
+
+    /// Сколько монет подобрано в этой сцене.
+    pub(crate) fn coins(&self) -> u32 {
+        self.coins
     }
 
     /// Привязки и поведение управления.
@@ -119,7 +179,7 @@ impl GameUi {
     fn rows(&self) -> usize {
         match self.menu {
             Menu::Closed => 0,
-            Menu::Main => 3,
+            Menu::Main => self.main_rows().len(),
             // Действия, настройки поведения, «По умолчанию», «Назад».
             Menu::Controls => Action::ALL.len() + OPTIONS.len() + 2,
         }
@@ -140,14 +200,24 @@ impl GameUi {
     fn select(&mut self, row: usize) {
         match self.menu {
             Menu::Closed => {}
-            Menu::Main => match row {
-                0 => self.menu = Menu::Closed,
-                1 => {
+            Menu::Main => match self.main_rows().get(row).copied() {
+                Some(MainRow::Resume) => self.menu = Menu::Closed,
+                Some(MainRow::Controls) => {
                     self.menu = Menu::Controls;
                     self.selected = 0;
                     self.note = None;
                 }
-                _ => self.quit = true,
+                Some(MainRow::SaveStory) => {
+                    if let Some(h) = self.host.clone() {
+                        self.story.save(&h);
+                    }
+                }
+                Some(MainRow::LoadStory) => {
+                    if let Some(h) = self.host.clone() {
+                        self.story.load(&h);
+                    }
+                }
+                Some(MainRow::Quit) | None => self.quit = true,
             },
             Menu::Controls => {
                 let actions = Action::ALL.len();
@@ -264,7 +334,9 @@ impl GameUi {
 
         let screen = ctx.content_rect();
         let painter = ctx.layer_painter(LayerId::background());
-        if let Some(p) = &view.player {
+        if let Some(p) = &view.player
+            && !self.file_hud
+        {
             hud(&painter, screen, p, self.coins);
         }
         let project = |at: [f32; 2]| {
@@ -292,6 +364,12 @@ impl GameUi {
                 44.0,
                 RED.gamma_multiply(alpha),
             );
+        }
+        self.host.clone_from(&view.story);
+        if let Some(h) = &view.story
+            && !self.menu_open()
+        {
+            self.story.draw(ctx, h);
         }
         self.console.draw(
             ctx,
@@ -332,16 +410,22 @@ impl GameUi {
                     .selected(row == selected)
             };
             let mut clicked = None;
-            for (row, text) in ["Продолжить", "Управление", "Выйти из программы"]
-                .into_iter()
-                .enumerate()
-            {
-                if ui.add(big(text, row)).clicked() {
+            for (row, item) in self.main_rows().into_iter().enumerate() {
+                if ui.add(big(item.label(), row)).clicked() {
                     clicked = Some(row);
                 }
             }
             if let Some(row) = clicked {
                 self.select(row);
+            }
+            if let Some((text, bad)) = &self.story.note {
+                ui.add_space(6.0);
+                let color = if *bad {
+                    RED
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                ui.label(RichText::new(text).small().color(color));
             }
             ui.add_space(8.0);
             ui.label(RichText::new("Esc — вернуться в игру, ↑ ↓ и Enter — выбор").weak());
@@ -546,10 +630,13 @@ mod tests {
             floats: Vec::new(),
             banner: 0.0,
             coins: 0,
+            file_hud: false,
             note: None,
             quit: false,
             last: Instant::now(),
             console: Console::new(),
+            story: StoryWindow::at(std::env::temp_dir().join("reyvec-test-story.ron")),
+            host: None,
         }
     }
 
@@ -680,6 +767,7 @@ mod tests {
             center: [0.0, 0.0],
             zoom: 1.0,
             solids: Vec::new(),
+            story: None,
         };
         let ctx = egui::Context::default();
         for menu in [Menu::Closed, Menu::Main, Menu::Controls] {

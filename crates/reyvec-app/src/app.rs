@@ -123,6 +123,7 @@ pub fn run(config: AppConfig) -> Result<RunSummary, AppError> {
         modifiers: ModifiersState::empty(),
         gamepads: crate::gamepad::Gamepads::new(),
         game_ui: crate::game_ui::GameUi::new(),
+        rui_demo: crate::rui_demo::RuiDemo::new(),
         audio: reyvec_audio::Audio::new(true),
         fly: crate::fly::Fly::default(),
         last_frame: Instant::now(),
@@ -196,6 +197,8 @@ struct App {
     gamepads: crate::gamepad::Gamepads,
     /// Игровой интерфейс и настройка клавиш (6.10б).
     game_ui: crate::game_ui::GameUi,
+    /// Экран интерфейса игры из `ui/demo.rui` (И.1–И.2а): F3 — показать, F4 — тема.
+    rui_demo: crate::rui_demo::RuiDemo,
     /// Звук (6.7): звуки событий игры и музыка.
     audio: reyvec_audio::Audio,
     /// Полёт камерой в сцене «3D» (7.1) и время прошлого кадра для шага полёта.
@@ -415,17 +418,6 @@ impl App {
                 tracing::info!(
                     "Свечение и мягкие пересветы: {}",
                     if on { "вкл" } else { "выкл" }
-                );
-            }
-            PanelAction::Cascades(on) => {
-                r.set_cascades(on);
-                tracing::info!(
-                    "Свет: {}",
-                    if on {
-                        "каскадами лучей (опыт)"
-                    } else {
-                        "лучами к источникам"
-                    }
                 );
             }
             PanelAction::SpaceSmooth(on) => {
@@ -782,7 +774,9 @@ impl App {
             } else {
                 Vec::new()
             },
+            story: renderer.scene_logic().and_then(|l| l.story()),
         };
+        self.game_ui.file_hud = self.rui_demo.hud_ready();
         let game_ui = &mut self.game_ui;
         let in_game = renderer.scene() == DemoScene::File;
         let ui = self.panel.as_mut().and_then(|panel| {
@@ -876,13 +870,34 @@ impl App {
                 fill_mode: renderer.fill(),
                 light_field: renderer.light_field(),
                 glow: renderer.glow(),
-                cascades: renderer.cascades(),
                 dither: renderer.dither(),
             };
             panel.frame(window, &info, in_game.then_some((game_ui, &game_view)))
         });
         if self.game_ui.take_quit() {
             return self.close(event_loop);
+        }
+        // Интерфейс игры (И.1) рисуется поверх картинки сцены, её размера.
+        let ui_size = renderer
+            .view_rect()
+            .map_or([size.width, size.height], |r| [r[2], r[3]]);
+        // Полоска здоровья (И.3а) читает героя из сцены, как старая на egui.
+        let hero =
+            game_view
+                .player
+                .as_ref()
+                .filter(|_| in_game)
+                .map(|p| crate::rui_demo::HeroData {
+                    hp: p.hp,
+                    hp_max: p.max_hp,
+                    coins: self.game_ui.coins(),
+                    hurt: p.invulnerable,
+                });
+        let rui = self
+            .rui_demo
+            .frame([ui_size[0] as f32, ui_size[1] as f32], hero);
+        if let Err(e) = renderer.set_game_ui(rui) {
+            tracing::warn!("интерфейс игры не загрузился на видеокарту: {e}");
         }
         match renderer.render([size.width, size.height], time, ui) {
             Ok(FrameStatus::Presented) => {
@@ -1140,6 +1155,21 @@ impl ApplicationHandler for App {
         if let (Some(panel), Some(window)) = (self.panel.as_mut(), &self.window) {
             panel_took = panel.on_window_event(window, &event);
         }
+        // Экран интерфейса из ui/demo.rui (И.2б): пока он показан, его кнопки получают
+        // мышь, Tab, стрелки и Enter раньше игры и камеры.
+        if !panel_took {
+            let offset = self
+                .renderer
+                .as_ref()
+                .and_then(|r| r.view_rect())
+                .map_or([0.0, 0.0], |r| [r[0] as f32, r[1] as f32]);
+            if self
+                .rui_demo
+                .on_event(&event, offset, self.modifiers.shift_key())
+            {
+                return;
+            }
+        }
         let in_game = self
             .renderer
             .as_ref()
@@ -1157,6 +1187,10 @@ impl ApplicationHandler for App {
             }
             // Щелчок по панели песочницы — панели, а не игре.
             if panel_took && down && input.is_mouse() && !self.game_ui.menu_open() {
+                return;
+            }
+            // Разговор и журнал сюжета (Сю.7): цифры, пробел, Enter, J.
+            if !repeat && self.game_ui.story_key(input, down) {
                 return;
             }
             let stack = schemes(
@@ -1409,6 +1443,33 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
+                        logical_key: Key::Named(NamedKey::F3),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                // Shift+F3: «откуда взялось» каждое свойство экрана — в лог и консоль (~).
+                if self.modifiers.shift_key() {
+                    self.rui_demo.log_origins();
+                } else {
+                    self.rui_demo.toggle();
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::F4),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => self.rui_demo.next_theme(),
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
                         logical_key: Key::Named(NamedKey::F2),
                         state: ElementState::Pressed,
                         repeat: false,
@@ -1455,21 +1516,6 @@ impl ApplicationHandler for App {
                 if let Some(r) = self.renderer.as_ref() {
                     let on = !r.dither();
                     self.apply(PanelAction::Dither(on));
-                }
-            }
-            WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::KeyC),
-                        state: ElementState::Pressed,
-                        repeat: false,
-                        ..
-                    },
-                ..
-            } => {
-                if let Some(r) = self.renderer.as_ref() {
-                    let on = !r.cascades();
-                    self.apply(PanelAction::Cascades(on));
                 }
             }
             WindowEvent::KeyboardInput {
@@ -1867,6 +1913,10 @@ fn space_file_name(path: &std::path::Path) -> String {
         "stress" => "нагрузка",
         "vector" => "векторы в 3D",
         "mirrors" => "зеркала",
+        "lamps" => "зал с лампами",
+        "effects" => "эффекты",
+        "world" => "большой мир",
+        "showroom" => "выставка",
         _ => return stem,
     };
     known.to_owned()

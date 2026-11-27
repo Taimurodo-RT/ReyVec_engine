@@ -41,7 +41,6 @@ fn cases() -> Vec<Case> {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
-        cascades: false,
     };
     let scene = |time, shader_error| at(DemoScene::Gpu, time, shader_error);
     vec![
@@ -234,15 +233,6 @@ fn cases() -> Vec<Case> {
                 ..at(DemoScene::Lab, 2.0, false)
             },
         },
-        // Опыт 4.6: та же лаборатория со светом каскадами лучей (radiance cascades).
-        Case {
-            name: "lab-cascades-2s-msaa4",
-            scene: HeadlessScene {
-                msaa: Msaa::X4,
-                cascades: true,
-                ..at(DemoScene::Lab, 2.0, false)
-            },
-        },
         // Этап 5: сцена из файла `scenes/first-room.ron` (встроенная копия примера): предметы
         // с вложенностью (5.2) и движением (5.3): через 1 с лампа отклонилась, стрелки ушли.
         // С 6.1 в комнате герой (уже стоит на полу) и ящики под полкой.
@@ -290,6 +280,45 @@ fn cases() -> Vec<Case> {
             scene: HeadlessScene {
                 files: reyvec_app::UserFiles {
                     space: Some(include_str!("../../../scenes/3d/forge.ron").into()),
+                    space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
+        // 8.16: сцена «эффекты» (`scenes/3d/effects.ron`): светящиеся материалы с ореолом
+        // и переходом к белому, их отражения в глянцевом полу и хромовом шаре.
+        Case {
+            name: "space-effects-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/effects.ron").into()),
+                    space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
+        // 8.10а: сцена «большой мир» (`scenes/3d/world.ron`): город 400 м с вышками и
+        // холмами до 800 м, дымка сцены на 700 м.
+        Case {
+            name: "space-world-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/world.ron").into()),
+                    space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
+                    ..Default::default()
+                },
+                ..at(DemoScene::Space, 1.0, false)
+            },
+        },
+        // Итог этапа 8: сцена «выставка» (`scenes/3d/showroom.ron`) — формы SDF, модели
+        // форм, модели glTF с текстурой, зеркало, глянец, свечение, солнце и лампы разом.
+        Case {
+            name: "space-showroom-1s",
+            scene: HeadlessScene {
+                files: reyvec_app::UserFiles {
+                    space: Some(include_str!("../../../scenes/3d/showroom.ron").into()),
                     space_dir: Some(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d").into()),
                     ..Default::default()
                 },
@@ -605,7 +634,6 @@ fn light_scene_matches_cpu() {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
-        cascades: false,
     };
     let options = GpuOptions {
         validation: true,
@@ -680,7 +708,6 @@ fn lamps_scene_lights_around_lamps() {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
-        cascades: false,
     };
     let options = GpuOptions {
         validation: true,
@@ -729,7 +756,6 @@ fn blobs_scene_draws_slime_and_glowing_orb() {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
-        cascades: false,
     };
     let options = GpuOptions {
         validation: true,
@@ -802,7 +828,6 @@ fn file_scene_draws_what_the_text_says() {
             scene: Some(text.into()),
             ..Default::default()
         },
-        cascades: false,
     };
     let options = GpuOptions {
         validation: true,
@@ -863,7 +888,6 @@ fn play_frame(
             scene: text.map(Into::into),
             ..Default::default()
         },
-        cascades: false,
     };
     let options = GpuOptions {
         validation: true,
@@ -1376,7 +1400,6 @@ fn space_scene_shows_sky_floor_and_the_ball_in_the_middle() {
         fill: FillMode::Triangles,
         zoom: false,
         files: Default::default(),
-        cascades: false,
     };
     let options = GpuOptions {
         validation: true,

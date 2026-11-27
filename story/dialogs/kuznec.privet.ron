@@ -1,0 +1,29 @@
+// Пример «кузнец и руда»: первая встреча и взятие задания «меч».
+(
+    format: "reyvec-dialog",
+    version: 1,
+    id: "kuznec.privet",
+    title: "Кузнец: приветствие",
+    with: ["kuznec", "hero"],
+    nodes: [
+        Check(id: "nachalo", at: (0, -55), when: "kuznec.znakom", yes: "pomnit", no: "znakomstvo"),
+        // Сю.9: кузнец помнит руду — встречает теплее.
+        Check(id: "pomnit", at: (390, -330), when: "memory.kuznec.ruda_prinesena and relation.kuznec.hero > 0", yes: "spasibo", no: "po_imeni"),
+        Line(id: "spasibo", at: (780, -460), who: "kuznec", text: "{hero.name}! Спасибо ещё раз за руду. Меч скоро будет.", settings: (mood: "dobryi"), next: "vopros"),
+        Set(id: "znakomstvo", at: (390, 60), changes: [(var: "kuznec.znakom", to: true)], next: "chuzhak"),
+        Line(id: "chuzhak", at: (780, 60), who: "kuznec", text: "Чего надо, чужак? Я кузнец, если что.", next: "vopros"),
+        Line(id: "po_imeni", at: (780, -200), who: "kuznec", text: "А, {hero.name}! Заходи.", settings: (mood: "dobryi"), next: "vopros"),
+        Line(id: "vopros", at: (1170, -150), who: "kuznec", text: "Что тебе нужно?", choices: [
+            (text: "Мне нужен меч.", when: "quest.mech.state == \"none\"", next: "pro_mech"),
+            (text: "Я принёс руду.", when: "quest.mech.stage == \"otnesti\"", next: "k_rude"),
+            (text: "Просто смотрю.", next: "proshchai"),
+        ]),
+        Line(id: "pro_mech", at: (1560, -330), who: "kuznec", text: "Меч? Принеси три куска руды — выкую.", settings: (camera: true), next: "vzyat"),
+        Event(id: "vzyat", at: (1950, -330), name: "quest.start", args: ["mech"], next: "konec"),
+        Jump(id: "k_rude", at: (1560, -100), dialog: "kuznec.ruda"),
+        // Сю.10: эту реплику может написать модель (по характеру и памяти кузнеца). Модели
+        // нет или она ответила не по правилам — звучит запасной текст.
+        Generate(id: "proshchai", at: (1560, 60), who: "kuznec", task: "Проворчи, что смотреть можно, но руками ничего не трогать. Можно намекнуть, что тебе не хватает руды.", fallback: "Смотри, только руками не трогай.", words: 20, allowed: ["relation.add"], next: "konec"),
+        End(id: "konec", at: (1950, 40)),
+    ],
+)

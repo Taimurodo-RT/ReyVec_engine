@@ -65,6 +65,9 @@ static const uint PATH_CACHE = 256;
 // Бит pc.flags: новый рассеянный отскок для ReSTIR GI ведёт один пиксель квадрата 2×2 за
 // кадр (по очереди), остальные берут свет из своего запаса прошлого кадра и у соседей.
 static const uint PATH_GI_QUARTER = 512;
+// Бит pc.flags (R5е): кэш солнца готов, его картинка — в старших 16 битах pc.flags
+// (sun_light в include/light3d.slang).
+static const uint PATH_SUN_STATIC = 1024;
 
 // Кэш света в этом пикселе: 0 — нет, 1 — брать из кэша, 2 — учебный (наполнять).
 static uint g_cache = 0;
@@ -343,7 +346,7 @@ void gi_candidate(int2 px, uint w, uint h, Ray ray, float4 first, bool found, fl
 // Дымка — как у быстрого режима, по первой точке (длина `t`, −1 — небо).
 float fog_at(float t)
 {
-    return t >= 0.0 ? saturate(1.0 - exp(-0.0025 * t * t * 0.1)) : 0.0;
+    return t >= 0.0 ? haze_at(t) : 0.0;
 }
 
 [shader("compute")]
@@ -382,6 +385,7 @@ void cs_main(uint3 id : SV_DispatchThreadID)
     bool gi_found;
     float3 gi_q, gi_n;
     uint bounces = pc.flags & 15;
+    g_sun_static = live && (pc.flags & PATH_SUN_STATIC) != 0 && (pc.scene[11] & SCENE_SUN_STATIC) != 0;
     if (live && (pc.flags & PATH_CACHE) != 0)
     {
         g_cache = cache_training(id.xy, frame) ? 2u : 1u;

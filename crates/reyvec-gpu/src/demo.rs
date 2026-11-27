@@ -979,10 +979,6 @@ pub(crate) struct Demo {
     /// Свечение ярких мест (4.4): шаги вниз и вверх по цепочке уменьшенных картинок.
     bloom_down: vk::Pipeline,
     bloom_up: vk::Pipeline,
-    /// Опыт 4.6: свет каскадами лучей вместо лучей к каждому источнику.
-    rc_cascade: vk::Pipeline,
-    rc_gather: vk::Pipeline,
-    cascades: bool,
     /// Свечение и мягкий переход к белому в сцене «лампы и тени».
     glow: bool,
     /// Лёгкий шум при выводе против полос на плавных переходах.
@@ -1360,9 +1356,6 @@ impl Demo {
             blob_buffers,
             bloom_down: vk::Pipeline::null(),
             bloom_up: vk::Pipeline::null(),
-            rc_cascade: vk::Pipeline::null(),
-            rc_gather: vk::Pipeline::null(),
-            cascades: false,
             glow: true,
             dither: true,
             sprites: vk::Pipeline::null(),
@@ -1677,16 +1670,6 @@ impl Demo {
                 None,
             )?;
             demo.bloom_up = build(ctx, res, shaders, "bloom_up", BLOOM_FORMAT, Msaa::Off, None)?;
-            demo.rc_cascade = build(ctx, res, shaders, "rc_cascade", RC_FORMAT, Msaa::Off, None)?;
-            demo.rc_gather = build(
-                ctx,
-                res,
-                shaders,
-                "rc_gather",
-                LIGHT_FORMAT,
-                Msaa::Off,
-                None,
-            )?;
             demo.set_format(ctx, res, shaders, format)
         })();
         match built {
@@ -3449,16 +3432,6 @@ impl Demo {
         self.glow = on;
     }
 
-    /// Опыт 4.6: свет каскадами лучей (radiance cascades) вместо лучей к источникам.
-    pub fn cascades(&self) -> bool {
-        self.cascades
-    }
-
-    /// Включает свет каскадами лучей со следующего кадра.
-    pub fn set_cascades(&mut self, on: bool) {
-        self.cascades = on;
-    }
-
     /// Лёгкий шум при выводе против полос на плавных переходах (4.4).
     pub fn dither(&self) -> bool {
         self.dither
@@ -3837,8 +3810,6 @@ impl Demo {
                 }
                 "bloom_down" => (&mut self.bloom_down, BLOOM_FORMAT, Msaa::Off, None),
                 "bloom_up" => (&mut self.bloom_up, BLOOM_FORMAT, Msaa::Off, None),
-                "rc_cascade" => (&mut self.rc_cascade, RC_FORMAT, Msaa::Off, None),
-                "rc_gather" => (&mut self.rc_gather, LIGHT_FORMAT, Msaa::Off, None),
                 n if FIELD_SHADERS.contains(&n) => {
                     (self.field.slot(n), field_format(n), Msaa::Off, None)
                 }
@@ -4282,7 +4253,13 @@ impl Demo {
                 self.space_field.skip();
             } else if self.space_field_bake != vk::Pipeline::null() {
                 // Поле — по всем предметам, до отсева по взгляду.
-                let programs = crate::space::field_programs(&frame);
+                // Выключенному полю (7.12) формы не нужны: раньше они всё равно собирались
+                // каждый кадр (в городе — 2–3 мс процессора впустую).
+                let programs = if self.space_field.enabled {
+                    crate::space::field_programs(&frame)
+                } else {
+                    Vec::new()
+                };
                 space_field = self
                     .space_field
                     .prepare(ctx, res, slot, space_camera.eye, programs);
@@ -4293,13 +4270,22 @@ impl Demo {
             let ray_extent = self.space_scale.apply(extent);
             let ray_aspect = ray_extent.width as f32 / ray_extent.height.max(1) as f32;
             let view_proj = space_camera.view_proj(ray_aspect);
-            self.space_view_culled = level || !self.space.view_culling_off;
+            let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
+            // Большой мир (в прошлом кадре у сетки отсева была мелкая сетка, 8.10б) по
+            // взгляду не отсеивается: сетке всё равно, сколько предметов за кадром, а
+            // готовое с прошлого кадра (программы форм, списки клеток) годится, только
+            // пока набор предметов тот же. С отсевом каждый поворот камеры пересобирал
+            // сетку города — 6–12 мс процессора вместо 2.
+            let big_world = !level && self.space_grid.is_some_and(|g| g.fine.is_some());
+            self.space_view_culled = level || !(self.space.view_culling_off || big_world);
             if self.space_view_culled {
                 // У уровня солнца нет: его заслонки не держим, иначе в кадр комнаты
                 // тянулся бы коридор (разбор 2026-11-07).
-                self.space_view = reyvec_sdf::view3d::cull_frame(&mut frame, view_proj, !level);
+                // Без прохода отражений зеркал нет: блеск материалов отсеву не важен.
+                let mirrors: &[_] = if self.reflections { materials } else { &[] };
+                self.space_view =
+                    reyvec_sdf::view3d::cull_frame(&mut frame, view_proj, !level, mirrors);
             }
-            let materials = level_materials.as_deref().unwrap_or(&self.space.materials);
             space_reflect = self.reflections
                 && self.space_reflect != vk::Pipeline::null()
                 && materials.iter().any(|m| m.shine > 0.0);
@@ -4345,6 +4331,9 @@ impl Demo {
             }
             crate::space::set_prev_view_proj(&mut packed.words, restir_prev);
             crate::space::set_view_proj(&mut packed.words, view_proj);
+            if !level {
+                crate::space::set_haze(&mut packed.words, self.space.haze);
+            }
             crate::space::set_field(
                 &mut packed.words,
                 space_field.map(|f| (f.field, &self.space_field.window)),
@@ -4586,6 +4575,7 @@ impl Demo {
                     .filter(|r| r.reuse)
                     .and(self.shadow_reuse.last_counts),
             });
+            self.space_pack_cache.recycle(packed.words);
         } else {
             self.space_field.skip();
             self.space_stats = None;
@@ -4674,7 +4664,9 @@ impl Demo {
             let (_, _, _, color, _, _) =
                 self.add_space_passes(graph, bindless, frame, Some(target));
             if let Some(color) = color {
-                self.add_direct_output(graph, bindless, frame, color, target);
+                let bloom = (frame.scene == DemoScene::Space && self.glow)
+                    .then(|| self.add_bloom_passes(graph, bindless, frame, color, None));
+                self.add_direct_output(graph, bindless, frame, color, bloom, target);
             }
             return;
         }
@@ -4778,13 +4770,9 @@ impl Demo {
             .scene
             .uses_field()
             .then(|| self.add_field_passes(graph, bindless, frame, shadow_images));
-        let light = field.filter(|_| frame.scene.uses_lights()).map(|f| {
-            if self.cascades {
-                self.add_cascade_passes(graph, bindless, frame, f)
-            } else {
-                self.add_light_pass(graph, bindless, frame, f)
-            }
-        });
+        let light = field
+            .filter(|_| frame.scene.uses_lights())
+            .map(|f| self.add_light_pass(graph, bindless, frame, f));
 
         // Частицы (6.6): расчёт до прохода «сцена» (по шагу на каждый шаг логики), рисование
         // в нём поверх фигур.
@@ -4998,9 +4986,16 @@ impl Demo {
 
         let light = light.zip(field);
         // Свечение читает готовый кадр сцены, поэтому идёт после его сведения.
-        let bloom = light
-            .filter(|_| self.glow)
-            .map(|(l, _)| self.add_bloom_passes(graph, bindless, frame, scene, l));
+        // У сцены «3D» (8.16) картинки света нет: свет уже в кадре, свечение берёт его
+        // яркие места как есть (светящиеся материалы, блики, шарики ламп).
+        let bloom = if frame.scene == DemoScene::Space {
+            self.glow
+                .then(|| self.add_bloom_passes(graph, bindless, frame, scene, None))
+        } else {
+            light
+                .filter(|_| self.glow)
+                .map(|(l, _)| self.add_bloom_passes(graph, bindless, frame, scene, Some(l)))
+        };
         let mut uses = vec![(scene, Access::Sampled), (target, Access::ColorAttachment)];
         if let Some((l, f)) = light {
             uses.push((l, Access::Sampled));
@@ -5075,11 +5070,16 @@ impl Demo {
         bindless: &'a Bindless,
         frame: FrameData,
         color: ImageHandle,
+        bloom: Option<ImageHandle>,
         target: ImageHandle,
     ) {
         let layout = bindless.pipeline_layout;
-        let flags = u32::from(self.dither) * SPACE_FLAG_DITHER;
-        let uses = [(color, Access::Sampled), (target, Access::ColorAttachment)];
+        let flags = (u32::from(self.dither) * SPACE_FLAG_DITHER)
+            | (u32::from(bloom.is_some()) * UPSCALE_FLAG_GLOW);
+        let mut uses = vec![(color, Access::Sampled), (target, Access::ColorAttachment)];
+        if let Some(b) = bloom {
+            uses.push((b, Access::Sampled));
+        }
         graph.add_pass("вывод", &uses, move |p| {
             let push = space_push(
                 &frame.space_camera,
@@ -5088,6 +5088,7 @@ impl Demo {
                 frame.space_address,
                 SpaceSlots {
                     target: p.texture(color),
+                    cone: bloom.map_or(0, |b| p.texture(b)),
                     ..SpaceSlots::default()
                 },
                 flags,
@@ -5684,7 +5685,12 @@ impl Demo {
                 | if path.gi { PATH_GI } else { 0 }
                 | if path.cache.is_some() { PATH_CACHE } else { 0 }
                 | if path.gi_quarter { PATH_GI_QUARTER } else { 0 }
-                | if split.is_some() { PATH_SPLIT } else { 0 };
+                | if split.is_some() { PATH_SPLIT } else { 0 }
+                // Кэш солнца (R5е): та же карта, что у «теней 3D», картинка вне графа.
+                | frame
+                    .space_sun
+                    .filter(|s| s.ready)
+                    .map_or(0, |s| PATH_SUN_STATIC | (s.slot << 16));
             graph.add_pass("путь 3D", &path_uses, move |p| {
                 let (target, aux) = match split {
                     Some((light, albedo)) => (p.storage(light), p.storage(albedo)),
@@ -6335,7 +6341,9 @@ impl Demo {
         // Сглаживание по картинке (8.12а) читает освещённую картинку, поэтому освещение
         // тогда всегда красит «цвет 3D», а не окно.
         let post_aa = frame.scene == DemoScene::Space && self.post_aa_on();
-        let window = direct.filter(|_| ext == frame.extent && !post_aa);
+        // Свечение 3D (8.16) тоже читает освещённую картинку.
+        let glow = frame.scene == DemoScene::Space && self.glow;
+        let window = direct.filter(|_| ext == frame.extent && !post_aa && !glow);
         let lit = (direct.is_some() || ext != frame.extent || post_aa).then(|| {
             let color = window.unwrap_or_else(|| graph.create("цвет 3D", ext, SPACE_COLOR_FORMAT));
             let mut uses = vec![
@@ -6579,7 +6587,7 @@ impl Demo {
         bindless: &'a Bindless,
         frame: FrameData,
         scene: ImageHandle,
-        light: ImageHandle,
+        light: Option<ImageHandle>,
     ) -> ImageHandle {
         let layout = bindless.pipeline_layout;
         let sizes = bloom_sizes(frame.extent);
@@ -6609,17 +6617,23 @@ impl Demo {
             let target = down[i];
             let source = if i == 0 { scene } else { down[i - 1] };
             let mut uses = vec![(source, Access::Sampled), (target, Access::ColorAttachment)];
-            if i == 0 {
+            if let (0, Some(light)) = (i, light) {
                 uses.push((light, Access::Sampled));
             }
             let pipeline = self.bloom_down;
             graph.add_pass("свечение", &uses, move |p| {
                 let mut push = [0u8; 24];
                 push[..4].copy_from_slice(&p.texture(source).to_ne_bytes());
-                if i == 0 {
+                if let (0, Some(light)) = (i, light) {
                     push[4..8].copy_from_slice(&p.texture(light).to_ne_bytes());
                 }
-                push[8..12].copy_from_slice(&u32::from(i > 0).to_ne_bytes());
+                // Шаг: 0 — кадр со светом, 1 — уменьшение, 2 — кадр без картинки света.
+                let mode = match (i, light) {
+                    (0, Some(_)) => 0u32,
+                    (0, None) => 2,
+                    _ => 1,
+                };
+                push[8..12].copy_from_slice(&mode.to_ne_bytes());
                 push[12..16].copy_from_slice(&GLOW_THRESHOLD.to_ne_bytes());
                 let t = texel(size);
                 push[16..20].copy_from_slice(&t[0].to_ne_bytes());
@@ -6706,116 +6720,6 @@ impl Demo {
         light
     }
 
-    /// Опыт 4.6: свет каскадами лучей (`rc_cascade.slang`, `rc_gather.slang`). Каскады
-    /// считаются сверху вниз (каждый дополняет свои лучи лучами каскада выше), потом
-    /// «свет» собирает каскад 0 в картинку света того же вида, что у [`Self::add_light_pass`].
-    fn add_cascade_passes<'a>(
-        &'a self,
-        graph: &mut RenderGraph<'a>,
-        bindless: &'a Bindless,
-        frame: FrameData,
-        field: ImageHandle,
-    ) -> ImageHandle {
-        let layout = bindless.pipeline_layout;
-        let field_extent = field_size(frame.extent, self.field_downscale);
-        let camera = self.camera;
-        // Отрезок луча каскада 0 — одна точка поля; каждый следующий вчетверо длиннее.
-        let r0 = 2.0 / (field_extent.height as f32 * camera.zoom as f32);
-        let count = cascade_count(r0, frame.aspect, camera.zoom as f32);
-        let sizes: Vec<(vk::Extent2D, [u32; 2])> =
-            (0..count).map(|i| cascade_size(field_extent, i)).collect();
-        let images: Vec<ImageHandle> = sizes
-            .iter()
-            .map(|&(size, _)| graph.create("каскад света", size, RC_FORMAT))
-            .collect();
-        let draw = move |p: &PassContext,
-                         target: ImageHandle,
-                         size: vk::Extent2D,
-                         pipeline: vk::Pipeline,
-                         push: &[u8]| {
-            let (d, cmd) = (p.device, p.cmd);
-            // SAFETY: граф перевёл цель в раскладку рисования, а прочитанные картинки — в
-            // чтение; конвейер и буфер источников живы, пока кадр рисуется.
-            unsafe {
-                begin_color_pass(d, cmd, p.view(target), size);
-                bindless.bind(d, cmd);
-                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
-                d.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::ALL, 0, push);
-                d.cmd_draw(cmd, 3, 1, 0, 0);
-                d.cmd_end_rendering(cmd);
-            }
-        };
-        for i in (0..count).rev() {
-            let target = images[i as usize];
-            let (size, probes) = sizes[i as usize];
-            let upper = (i + 1 < count).then(|| (images[i as usize + 1], sizes[i as usize + 1].1));
-            let mut uses = vec![(field, Access::Sampled), (target, Access::ColorAttachment)];
-            if let Some((u, _)) = upper {
-                uses.push((u, Access::Sampled));
-            }
-            let pipeline = self.rc_cascade;
-            graph.add_pass("каскады света", &uses, move |p| {
-                let mut push = [0u8; 80];
-                push[..8].copy_from_slice(&frame.lights_address.to_ne_bytes());
-                let words: [u32; 5] = [
-                    frame.light_count,
-                    p.texture(field),
-                    upper.map_or(0, |(u, _)| p.texture(u)),
-                    i,
-                    u32::from(upper.is_none()),
-                ];
-                for (k, w) in words.into_iter().enumerate() {
-                    push[8 + 4 * k..12 + 4 * k].copy_from_slice(&w.to_ne_bytes());
-                }
-                let floats = [
-                    r0,
-                    camera.center.x as f32,
-                    camera.center.y as f32,
-                    frame.aspect,
-                    camera.zoom as f32,
-                ];
-                for (k, v) in floats.into_iter().enumerate() {
-                    push[28 + 4 * k..32 + 4 * k].copy_from_slice(&v.to_ne_bytes());
-                }
-                let up = upper.map_or([1, 1], |(_, pr)| pr);
-                let sizes = [
-                    field_extent.width,
-                    field_extent.height,
-                    probes[0],
-                    probes[1],
-                    up[0],
-                    up[1],
-                ];
-                for (k, v) in sizes.into_iter().enumerate() {
-                    push[48 + 4 * k..52 + 4 * k].copy_from_slice(&v.to_ne_bytes());
-                }
-                push[72..76].copy_from_slice(&RC_EMIT.to_ne_bytes());
-                draw(p, target, size, pipeline, &push);
-            });
-        }
-        let size = field_size(frame.extent, LIGHT_DOWNSCALE);
-        let light = graph.create("свет", size, LIGHT_FORMAT);
-        let c0 = images[0];
-        let probes = sizes[0].1;
-        let pipeline = self.rc_gather;
-        let ambient = frame.ambient;
-        graph.add_pass(
-            "свет",
-            &[(c0, Access::Sampled), (light, Access::ColorAttachment)],
-            move |p| {
-                let mut push = [0u8; 32];
-                push[..4].copy_from_slice(&p.texture(c0).to_ne_bytes());
-                push[8..12].copy_from_slice(&probes[0].to_ne_bytes());
-                push[12..16].copy_from_slice(&probes[1].to_ne_bytes());
-                for (k, v) in ambient.into_iter().enumerate() {
-                    push[16 + 4 * k..20 + 4 * k].copy_from_slice(&v.to_ne_bytes());
-                }
-                draw(p, light, size, pipeline, &push);
-            },
-        );
-        light
-    }
-
     fn destroy_pipelines(&mut self, ctx: &GpuContext) {
         // SAFETY: вызывается, когда видеокарта не использует конвейеры; null допустим.
         unsafe {
@@ -6863,8 +6767,6 @@ impl Demo {
             ctx.device.destroy_pipeline(self.object_mask, None);
             ctx.device.destroy_pipeline(self.bloom_down, None);
             ctx.device.destroy_pipeline(self.bloom_up, None);
-            ctx.device.destroy_pipeline(self.rc_cascade, None);
-            ctx.device.destroy_pipeline(self.rc_gather, None);
             ctx.device.destroy_pipeline(self.particle_update, None);
             ctx.device.destroy_pipeline(self.particle_draw, None);
             ctx.device.destroy_pipeline(self.particle_glow, None);
@@ -6911,8 +6813,6 @@ impl Demo {
         self.object_mask = vk::Pipeline::null();
         self.bloom_down = vk::Pipeline::null();
         self.bloom_up = vk::Pipeline::null();
-        self.rc_cascade = vk::Pipeline::null();
-        self.rc_gather = vk::Pipeline::null();
         self.particle_update = vk::Pipeline::null();
         self.particle_draw = vk::Pipeline::null();
         self.particle_glow = vk::Pipeline::null();
@@ -7251,6 +7151,9 @@ const SPACE_FLAG_SHADOW_MAP: u32 = 8;
 /// растяжения в проходе «вывод» (raymarch_upscale.slang) и у «освещения 3D» при 100 %
 /// (raymarch_shade.slang).
 const SPACE_FLAG_DITHER: u32 = 64;
+/// Флаг «вывода» прямого вывода «3D»: в поле `cone` — картинка свечения (8.16,
+/// UPSCALE_FLAG_GLOW в raymarch_upscale.slang).
+const UPSCALE_FLAG_GLOW: u32 = 256;
 /// Освещение умножает цвет материалов с текстурой на «цвет полигонов 3D» (8.14б2): её
 /// номер — старшие 16 бит `meshes` в константах.
 const SPACE_FLAG_MESH_COLOR: u32 = 128;
@@ -7286,6 +7189,9 @@ const PATH_CACHE: u32 = 256;
 /// Флаг прохода «путь 3D»: новый отскок ReSTIR GI у одного пикселя квадрата 2×2 за кадр;
 /// группы запуска — по месту в квадрате, их число по сторонам чётное (PATH_GI_QUARTER).
 const PATH_GI_QUARTER: u32 = 512;
+/// Флаг прохода «путь 3D»: карта кэша солнца готова, её номер — в старших 16 битах флагов
+/// (PATH_SUN_STATIC в raymarch_path.slang).
+const PATH_SUN_STATIC: u32 = 1024;
 /// Флаги «ReSTIR: кандидаты» для «кэш света: сводка»: свести, стереть (raymarch_restir.slang).
 const CACHE_RESOLVE: u32 = 2;
 const CACHE_CLEAR: u32 = 4;
@@ -7300,44 +7206,6 @@ const DENOISE_PASSES: u32 = 4;
 const SPACE_COLOR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Тени сцены «3D» (7.4): солнце, затенение в углах и две лампы — доли от 0 до 1.
 const SHADOW3D_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
-/// Каскады лучей (опыт 4.6): цвет, принесённый лучом, и пропустил ли он свет дальше.
-const RC_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
-/// Яркость поверхности источника в каскадах на единицу его цвета и размера: свет на
-/// расстоянии d от лампы около цвет · RC_EMIT / (π d). Подобрано по снимку лаборатории:
-/// при 1,0 стена была белёсой целиком (свет каскадов гаснет с расстоянием медленнее
-/// обычного, у которого есть дальность).
-const RC_EMIT: f32 = 0.4;
-/// Каскадов больше не бывает (на случай очень мелкого поля или сильного отдаления).
-const MAX_CASCADES: u32 = 8;
-
-/// Сколько каскадов нужно, чтобы лучи (отрезок каскада 0 длиной `r0`, каждый следующий
-/// вчетверо длиннее) дотянулись через весь экран по диагонали.
-fn cascade_count(r0: f32, aspect: f32, zoom: f32) -> u32 {
-    let diagonal = 2.0 * (aspect * aspect + 1.0).sqrt() / zoom.max(1e-3);
-    let mut count = 1;
-    while count < MAX_CASCADES && r0 * (4f32.powi(count as i32) - 1.0) / 3.0 < diagonal {
-        count += 1;
-    }
-    count
-}
-
-/// Размер картинки каскада `i` для поля `field` и число его зондов: зонды через 2^i
-/// точек поля, у каждого квадрат 2^(i+1) × 2^(i+1) лучей.
-fn cascade_size(field: vk::Extent2D, i: u32) -> (vk::Extent2D, [u32; 2]) {
-    let spacing = 1u32 << i;
-    let side = 2u32 << i;
-    let probes = [
-        field.width.div_ceil(spacing).max(1),
-        field.height.div_ceil(spacing).max(1),
-    ];
-    (
-        vk::Extent2D {
-            width: probes[0] * side,
-            height: probes[1] * side,
-        },
-        probes,
-    )
-}
 
 /// Формат картинок свечения: яркость выше белого нужна, прозрачность нет.
 const BLOOM_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -7749,29 +7617,6 @@ mod tests {
         assert_eq!(mask_rect(r(8, 20, 8, 4), 4, size), r(2, 5, 2, 1));
         // У края кадра не выходит за маску.
         assert_eq!(mask_rect(r(1900, 1000, 20, 9), 4, size), r(475, 250, 5, 3));
-    }
-
-    #[test]
-    fn cascades_reach_across_the_screen() {
-        // Поле 960×540 (кадр 1920×1080, поле вдвое меньше): точка поля 2/540 единицы.
-        let field = vk::Extent2D {
-            width: 960,
-            height: 540,
-        };
-        let r0 = 2.0 / 540.0;
-        let n = cascade_count(r0, 16.0 / 9.0, 1.0);
-        let reach = r0 * (4f32.powi(n as i32) - 1.0) / 3.0;
-        assert!(
-            reach >= 2.0 * (16.0f32 / 9.0).hypot(1.0),
-            "{n} каскадов, {reach}"
-        );
-        assert_eq!(n, 6);
-        // Каждый каскад — картинка примерно вдвое больше поля по каждой стороне.
-        for i in 0..n {
-            let (size, probes) = cascade_size(field, i);
-            assert_eq!(size.width, probes[0] * (2 << i));
-            assert!(size.width >= 2 * field.width && size.width < 2 * field.width + (4 << i));
-        }
     }
 
     #[test]

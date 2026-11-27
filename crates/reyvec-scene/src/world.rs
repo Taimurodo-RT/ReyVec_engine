@@ -401,6 +401,10 @@ struct LastPress(u64);
 #[derive(Resource)]
 struct LastStep(f64);
 
+/// Время сцены прошлого шага сюжета (паузы карточек «Подождать», Сю.7).
+#[derive(Resource)]
+struct StoryClock(f64);
+
 /// Насколько ниже места появления персонаж считается упавшим из уровня.
 const FALL_OUT: f64 = 5.0;
 /// Самый длинный шаг персонажа; если времени прошло больше, шагов делается несколько.
@@ -455,6 +459,7 @@ impl SceneWorld {
         world.init_resource::<Pending>();
         world.init_resource::<Events>();
         world.insert_resource(LastStep(0.0));
+        world.insert_resource(StoryClock(0.0));
         world.insert_resource(PhysicsRes {
             physics: Physics::new(reyvec_game::Tuning::default().gravity()),
             bodies: Vec::new(),
@@ -465,8 +470,17 @@ impl SceneWorld {
             seed: 0x5eed,
             extra: phys::Extra::default(),
         });
+        let mut scripts = reyvec_script::Scripts::new();
+        // Сюжет проекта (Сю.5): папка `story/` рядом со сценой или выше.
+        if let Some(story_dir) = file.dir.as_deref().and_then(find_story_dir) {
+            let (story, problems) = reyvec_story::Story::load_dir(&story_dir);
+            for p in &problems {
+                tracing::warn!("сюжет: {} {}: {}", p.file, p.place, p.text);
+            }
+            scripts.set_story(story);
+        }
         world.insert_resource(ScriptRes {
-            scripts: reyvec_script::Scripts::new(),
+            scripts,
             until_check: SCRIPT_CHECK_STEPS,
         });
         let mut spawner = Spawner {
@@ -533,6 +547,7 @@ impl SceneWorld {
                 play,
                 physics_step,
                 run_scripts,
+                drive_story,
                 combat_look,
                 pose_bones,
                 propagate_again,
@@ -565,6 +580,34 @@ impl SceneWorld {
     pub fn refresh(&mut self) {
         let t = self.world.resource::<SceneTime>().0;
         self.update_at(t);
+    }
+
+    /// Сюжет сцены (папка `story/` проекта), если он есть: его состояние и начатый
+    /// скриптом разговор (`story.talk`).
+    pub fn story(&self) -> Option<reyvec_script::SharedStory> {
+        self.world.resource::<ScriptRes>().scripts.story().cloned()
+    }
+
+    /// Новый мир того же проекта (сцену сохранили или открыли другую): сюжет идёт дальше
+    /// с того же места — переменные, задания и начатый разговор берутся из `old`.
+    /// Сюжет мог поменяться в файлах: состояние сверяется с ним ([`reyvec_story::Story::restore`]).
+    pub fn keep_story_from(&mut self, old: &SceneWorld) {
+        let (Some(new), Some(old)) = (self.story(), old.story()) else {
+            return;
+        };
+        if std::sync::Arc::ptr_eq(&new, &old) {
+            return;
+        }
+        let old = reyvec_script::lock_story(&old);
+        let mut new = reyvec_script::lock_story(&new);
+        match old.save().and_then(|text| new.story.restore(&text)) {
+            Ok(state) => new.state = state,
+            Err(e) => tracing::warn!("сюжет при смене мира: {e}"),
+        }
+        if old.busy() {
+            new.talk = old.talk.clone();
+            new.screen = old.screen.clone();
+        }
     }
 
     /// Снимок для рисования после последнего [`SceneWorld::update`].
@@ -701,6 +744,16 @@ impl SceneWorld {
             .find(|(_, n)| n.as_str() == name)
             .map(|(e, _)| e)
     }
+}
+
+/// Папка `story/` проекта: рядом со сценой или в одной из папок выше (сцены обычно лежат
+/// в `scenes/`, сюжет — в корне проекта).
+fn find_story_dir(scene_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    scene_dir
+        .ancestors()
+        .take(4)
+        .map(|d| d.join("story"))
+        .find(|d| d.join("vars.ron").is_file() || d.join("dialogs").is_dir())
 }
 
 struct Spawner<'a> {
@@ -1224,6 +1277,7 @@ fn play(
     mut phys: ResMut<PhysicsRes>,
     mut players: Query<(&mut Player, &mut Placement)>,
     mut targets: Query<(Entity, &mut Target), Without<Player>>,
+    scripts: Res<ScriptRes>,
 ) {
     phys.dt = 0.0;
     let dt = (time.0 - last.0).clamp(0.0, 0.25);
@@ -1237,7 +1291,13 @@ fn play(
     {
         events.list.pop_front();
     }
-    let input = input.0;
+    // Идёт разговор (Сю.7): герой стоит, клавиши достаются окну диалога.
+    let talking = scripts.scripts.story().is_some_and(reyvec_script::talking);
+    let input = if talking {
+        InputFrame::default()
+    } else {
+        input.0
+    };
     pending.jump |= input.pressed(Action::Jump);
     pending.dash |= input.pressed(Action::Dash);
     pending.attack |= input.pressed(Action::Attack);
@@ -1686,6 +1746,13 @@ fn physics_step(
 
 /// Скрипты (6.9): на каждом шаге логики каждый предмет со скриптом решает, что делать.
 /// Раз в [`SCRIPT_CHECK_STEPS`] шагов изменённые файлы перечитываются.
+/// Ведёт начатый разговор сюжета (Сю.7): ответы игрока, паузы, карточки «Скрипт».
+fn drive_story(time: Res<SceneTime>, mut clock: ResMut<StoryClock>, mut res: ResMut<ScriptRes>) {
+    let dt = (time.0 - clock.0).clamp(0.0, 0.25) as f32;
+    clock.0 = time.0;
+    res.scripts.story_step(dt);
+}
+
 fn run_scripts(
     time: Res<SceneTime>,
     combat: Res<Combat>,

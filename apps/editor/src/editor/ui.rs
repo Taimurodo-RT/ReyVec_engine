@@ -6,7 +6,7 @@
 //! Поэтому интерфейс раскладывается и проверяется тестами без окна и видеокарты.
 
 use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Id, Layout, Margin, Pos2,
@@ -22,7 +22,9 @@ use super::contour;
 use super::doc::{Change, Edit};
 use super::explorer::{self, Explorer};
 use super::geom;
-use super::layout::{ASSETS_WORKSPACE, START_WORKSPACE, Side, Tab, WORKSPACES, Workspace};
+use super::layout::{
+    ASSETS_WORKSPACE, START_WORKSPACE, STORY_WORKSPACE, Side, Tab, WORKSPACES, Workspace,
+};
 use super::model_params;
 use super::outline::{self, Kind};
 use super::overlay::{self, Overlay, ViewMode};
@@ -129,6 +131,10 @@ pub(crate) enum Action {
     ToggleHidden(Vec<usize>),
     /// Закрыть, сохранив правки.
     SaveAndClose,
+    /// Сохранить сцену и открыть уровень (Р.12).
+    SaveAndOpen(PathBuf),
+    /// Выбросить правки сцены и открыть уровень.
+    DiscardAndOpen(PathBuf),
     /// Закрыть без сохранения.
     ForceClose,
     /// Во время игры: камера перестаёт следить за героем, сцену можно двигать (F8).
@@ -298,8 +304,10 @@ pub(crate) struct Info<'a> {
     pub hidden: &'a HashSet<Vec<usize>>,
     /// В буфере обмена есть предмет.
     pub can_paste: bool,
-    /// Сцены в папке открытой: «Файл → Открыть».
-    pub scenes: &'a [std::path::PathBuf],
+    /// Уровни проекта: «Файл → Открыть уровень».
+    pub scenes: &'a [super::files::Level],
+    /// Уровень, открытый в «Мире» (сцена 2D или 3D).
+    pub level: Option<&'a Path>,
     /// Есть автосохранение, которое можно вернуть.
     pub can_restore: bool,
     /// Файл сцены «Мира» (его не переносят и не удаляют в проводнике).
@@ -359,6 +367,8 @@ pub(crate) struct EditorUi {
     ov: Overlay,
     /// Спросить, сохранить ли правки перед закрытием.
     asking_close: bool,
+    /// Открыть этот уровень, когда ответят, что делать с правками сцены (Р.12).
+    asking_open: Option<PathBuf>,
     /// Ещё выбранные, кроме главного (Ctrl+щелчок в иерархии, Shift+щелчок в сцене).
     more: Vec<Vec<usize>>,
     /// Инспектор закреплён на этом предмете: выбор других его не меняет.
@@ -369,6 +379,10 @@ pub(crate) struct EditorUi {
     log_filter: LogFilter,
     /// Выбранная часть модели во «Формах» (путь в дереве частей).
     shape_selected: Vec<usize>,
+    /// Скопированная деталь модели или предмет сцены 3D (текст из файла).
+    shape_clipboard: Option<String>,
+    /// Идёт ли игра (из прошлого `draw`): окну сцены 3D, у которого нет `Info`.
+    play_now: PlayState,
     /// Как новая деталь из палитры складывается с выбранной.
     shape_combine: shape_edit::Combine,
     /// Свёрнутые части в дереве модели.
@@ -391,6 +405,8 @@ pub(crate) struct EditorUi {
     space: space::SceneUi,
     /// Лепка глины (М.9б).
     clay: clay::ClayUi,
+    /// Пространство «Сюжет» (Сю.2).
+    story: super::story_ui::StoryUi,
 }
 
 /// Фильтр консоли.
@@ -448,11 +464,14 @@ impl EditorUi {
             drop_target: None,
             ov: Overlay::default(),
             asking_close: false,
+            asking_open: None,
             more: Vec::new(),
             pinned: None,
             ruler: None,
             log_filter: LogFilter::All,
             shape_selected: Vec::new(),
+            shape_clipboard: None,
+            play_now: PlayState::Edit,
             shape_combine: shape_edit::Combine::Add,
             shape_closed: HashSet::new(),
             shape_locked: HashSet::new(),
@@ -464,6 +483,7 @@ impl EditorUi {
             shape_menu: None,
             space: space::SceneUi::default(),
             clay: clay::ClayUi::default(),
+            story: super::story_ui::StoryUi::default(),
         }
     }
 
@@ -478,6 +498,16 @@ impl EditorUi {
         if let Some(i) = WORKSPACES.iter().position(|w| w.name == name) {
             self.workspace = i;
         }
+    }
+
+    /// Открыта вкладка «Ассеты» (с проводником или моделью во «Формах»).
+    pub(crate) fn in_assets(&self) -> bool {
+        WORKSPACES[self.workspace].name == ASSETS_WORKSPACE
+    }
+
+    /// Спросить, сохранить ли правки сцены перед тем, как открыть уровень `path`.
+    pub(crate) fn ask_open(&mut self, path: PathBuf) {
+        self.asking_open = Some(path);
     }
 
     /// Вместо сцены сейчас проводник «Ассетов»: движку незачем рисовать сцену крупно.
@@ -572,6 +602,7 @@ impl EditorUi {
     /// Раскладывает и рисует весь интерфейс.
     pub(crate) fn draw(&mut self, ui: &mut Ui, info: &Info) {
         let ctx = ui.ctx().clone();
+        self.play_now = info.play;
         self.hotkeys(&ctx, info);
         if self.frames.len() == FRAME_HISTORY {
             self.frames.pop_front();
@@ -594,7 +625,7 @@ impl EditorUi {
             )
             .show(ui, |ui| status_bar(ui, info, &self.status));
         // «Играть» из «Ассетов» — игру видно только в «Мире».
-        if self.files_mode(info)
+        if self.in_assets()
             && self
                 .actions
                 .iter()
@@ -603,6 +634,45 @@ impl EditorUi {
             self.open_workspace("Мир");
         }
         let ws = &WORKSPACES[self.workspace];
+        if ws.name == STORY_WORKSPACE {
+            // «Сюжет» (Сю.2) — своё окно на всё место, как у Obsidian: сцены и панелей нет.
+            self.files_shown = true;
+            self.viewport = None;
+            self.viewport_hovered = false;
+            let project = self.explorer.project().map(Path::to_path_buf);
+            self.story.sync(project.as_deref());
+            let mut logs = Vec::new();
+            let mut open_script = None;
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                for out in self.story.draw(ui) {
+                    match out {
+                        super::story_ui::StoryOut::Log(c, t) => logs.push((c, t)),
+                        super::story_ui::StoryOut::OpenScript(path, line) => {
+                            open_script = Some((path, line));
+                        }
+                    }
+                }
+            });
+            self.push_log(logs);
+            // Ссылка «в скриптах» (Сю.8): скрипт в редакторе кода «Ассетов», на строке.
+            if let Some((path, line)) = open_script {
+                self.open_code(&path);
+                if let Some(c) = self.code.as_mut() {
+                    c.go_line(line);
+                }
+                self.open_workspace(ASSETS_WORKSPACE);
+            }
+            if info.frameless && !info.maximized {
+                self.window_edges(&ctx);
+            }
+            if self.asking_close {
+                self.close_dialog(&ctx, info);
+            }
+            self.projects_dialog(&ctx, info);
+            self.open_dialog(&ctx, info);
+            return;
+        }
+        self.story.save_dirty();
         self.files_shown = self.files_mode(info);
         if self.files_shown {
             // Проводник на всё место между верхней и нижней полосами: сцены и панелей нет.
@@ -616,6 +686,7 @@ impl EditorUi {
                 self.close_dialog(&ctx, info);
             }
             self.projects_dialog(&ctx, info);
+            self.open_dialog(&ctx, info);
             return;
         }
         let panel_frame = Frame::NONE.fill(PANEL);
@@ -647,6 +718,7 @@ impl EditorUi {
             self.close_dialog(&ctx, info);
         }
         self.projects_dialog(&ctx, info);
+        self.open_dialog(&ctx, info);
     }
 
     /// В открытом скрипте несохранённые правки.
@@ -781,6 +853,50 @@ impl EditorUi {
         }
     }
 
+    /// «Сохранить правки перед тем, как открыть другой уровень?»
+    fn open_dialog(&mut self, ctx: &egui::Context, info: &Info) {
+        let Some(path) = self.asking_open.clone() else {
+            return;
+        };
+        let mut done = false;
+        let modal = egui::Modal::new(Id::unique("editor-open-level")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(
+                RichText::new("Сохранить правки?")
+                    .size(FONT_HEADING)
+                    .color(Color32::WHITE),
+            );
+            ui.add_space(GAP_M);
+            ui.label(
+                RichText::new(format!(
+                    "В сцене {} есть несохранённые правки. Потом откроется «{}».",
+                    info.scene_name,
+                    pf_name(&path)
+                ))
+                .color(TEXT_DIM),
+            );
+            ui.add_space(GAP_XL);
+            ui.horizontal(|ui| {
+                let save =
+                    egui::Button::new(RichText::new("Сохранить и открыть").color(BG)).fill(ACCENT);
+                if ui.add_enabled(info.can_save, save).clicked() {
+                    self.actions.push(Action::SaveAndOpen(path.clone()));
+                    done = true;
+                }
+                if ui.button("Не сохранять").clicked() {
+                    self.actions.push(Action::DiscardAndOpen(path.clone()));
+                    done = true;
+                }
+                if ui.button("Отмена").clicked() {
+                    done = true;
+                }
+            });
+        });
+        if done || modal.should_close() {
+            self.asking_open = None;
+        }
+    }
+
     fn hotkeys(&mut self, ctx: &egui::Context, info: &Info) {
         use egui::{Key, Modifiers};
         let (f5, esc) = ctx.input(|i| (i.key_pressed(Key::F5), i.key_pressed(Key::Escape)));
@@ -791,7 +907,10 @@ impl EditorUi {
             });
         } else if esc && info.play != PlayState::Edit {
             self.actions.push(Action::Stop);
-        } else if esc && info.shape.is_some() && !ctx.egui_wants_keyboard_input() {
+        } else if esc
+            && info.shape.as_ref().is_some_and(|s| !s.scene)
+            && !ctx.egui_wants_keyboard_input()
+        {
             self.actions.push(Action::CloseShape);
             return;
         }
@@ -870,6 +989,9 @@ impl EditorUi {
             let del = del && !(shape.scene && self.lamp_delete(shape.text));
             for (on, cmd) in [
                 (f, PartCmd::Focus),
+                (copy && !cut, PartCmd::Copy),
+                (cut, PartCmd::Cut),
+                (paste.is_some(), PartCmd::Paste),
                 (dup, PartCmd::Duplicate),
                 (del, PartCmd::Remove),
             ] {
@@ -1042,7 +1164,16 @@ impl EditorUi {
                 .push(Action::ShapeCamera(ShapeCam::Focus(path)));
             return;
         }
+        if cmd == PartCmd::Paste {
+            return self.shape_paste(text, &root, &path);
+        }
         let Some(part) = root.at(&path) else { return };
+        if cmd == PartCmd::Copy {
+            if part.removable {
+                self.shape_clipboard = Some(text[part.outer.clone()].to_owned());
+            }
+            return;
+        }
         if self.part_locked(&path) {
             tracing::info!("Деталь закреплена: сначала снимите замок в иерархии");
             return;
@@ -1062,7 +1193,15 @@ impl EditorUi {
             root.at(&p).filter(|s| s.removable).map(|s| (s, p))
         };
         let (result, select) = match cmd {
-            PartCmd::Focus => return,
+            PartCmd::Focus | PartCmd::Copy | PartCmd::Paste => return,
+            PartCmd::Cut => {
+                if part.removable {
+                    self.shape_clipboard = Some(text[part.outer.clone()].to_owned());
+                }
+                let mut p = path.clone();
+                p.pop();
+                (shape_edit::remove(text, part), p)
+            }
             PartCmd::Duplicate => {
                 let mut p = path.clone();
                 if let Some(l) = p.last_mut() {
@@ -1097,6 +1236,39 @@ impl EditorUi {
                 self.actions.push(Action::ShapeText { text, commit: true });
             }
             Err(e) => tracing::warn!("Модель не правится: {e}"),
+        }
+    }
+
+    /// Вставить скопированное сразу за выбранным (в тот же список), а если выбрано то,
+    /// у чего свой список деталей, или ничего — в конец списка верхней части.
+    fn shape_paste(&mut self, text: &str, root: &shape_edit::Part, path: &[usize]) {
+        let Some(item) = self.shape_clipboard.clone() else {
+            return;
+        };
+        // У сцены 3D список предметов — сама верхняя часть.
+        let list_of = |p: &shape_edit::Part| {
+            p.list
+                .or_else(|| shape_edit::is_scene(p).then_some(p.outer.start))
+        };
+        let (open, index, mut select) = match path.split_last() {
+            Some((&last, up)) if root.at(path).is_some_and(|p| p.removable) => {
+                let Some(list) = root.at(up).and_then(list_of) else {
+                    return;
+                };
+                (list, last + 1, up.to_vec())
+            }
+            _ => {
+                let Some(list) = list_of(root) else { return };
+                (list, root.children.len(), Vec::new())
+            }
+        };
+        select.push(index);
+        match super::ron_edit::insert_item_at(text, open, index, &item) {
+            Ok(text) => {
+                self.shape_selected = select;
+                self.actions.push(Action::ShapeText { text, commit: true });
+            }
+            Err(e) => tracing::warn!("Не вставить: {e}"),
         }
     }
 
@@ -2134,10 +2306,12 @@ impl EditorUi {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = GAP_M;
-                    if ui
-                        .button(RichText::new("Закрыть").size(FONT_CHIP))
-                        .on_hover_text("Вернуться к сцене (Esc)")
-                        .clicked()
+                    // Уровень «Мира» не закрывают: вместо него открывают другой.
+                    if !shape.scene
+                        && ui
+                            .button(RichText::new("Закрыть").size(FONT_CHIP))
+                            .on_hover_text("Вернуться к проводнику (Esc)")
+                            .clicked()
                     {
                         actions.push(Action::CloseShape);
                     }
@@ -2195,69 +2369,78 @@ impl EditorUi {
         self.viewport_hovered = response.hovered() || response.dragged();
         // Пока лепят глину (М.9б), левая кнопка у кисти: ручек нет.
         let sculpting = self.clay_file(shape).is_some();
+        // Игра в уровне 3D (Р.14): только полёт камеры — ни ручек, ни ламп, ни выбора.
+        let playing = shape.scene && self.play_now != PlayState::Edit;
         // Режимы ручек детали — столбик значков у левого края окна.
         let tools = Rect::from_min_size(
             rect.left_top() + vec2(12.0, 72.0),
             vec2(36.0, 3.0 * 28.0 + 8.0),
         );
-        ui.painter()
-            .rect_filled(tools, RADIUS_S, PANEL.gamma_multiply(0.9));
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(tools.shrink(4.0))
-                .layout(Layout::top_down(Align::Center)),
-            |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                // Пока лепят глину (М.9б), в столбике — кисти, а не ручки.
-                if sculpting {
-                    for b in clay::BRUSHES {
-                        if clay::brush_button(ui, b, self.clay.brush == b)
-                            .on_hover_text(clay::brush_hint(b))
+        if !playing {
+            ui.painter()
+                .rect_filled(tools, RADIUS_S, PANEL.gamma_multiply(0.9));
+        }
+        if !playing {
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(tools.shrink(4.0))
+                    .layout(Layout::top_down(Align::Center)),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    // Пока лепят глину (М.9б), в столбике — кисти, а не ручки.
+                    if sculpting {
+                        for b in clay::BRUSHES {
+                            if clay::brush_button(ui, b, self.clay.brush == b)
+                                .on_hover_text(clay::brush_hint(b))
+                                .clicked()
+                            {
+                                self.clay.brush = b;
+                            }
+                        }
+                        return;
+                    }
+                    for m in GizmoMode::ALL {
+                        if gizmo_button(ui, m, self.gizmo_mode == m)
+                            .on_hover_text(m.hint())
                             .clicked()
                         {
-                            self.clay.brush = b;
+                            self.gizmo_mode = m;
                         }
                     }
-                    return;
-                }
-                for m in GizmoMode::ALL {
-                    if gizmo_button(ui, m, self.gizmo_mode == m)
-                        .on_hover_text(m.hint())
-                        .clicked()
-                    {
-                        self.gizmo_mode = m;
-                    }
-                }
-            },
-        );
+                },
+            );
+        }
         // Левая кнопка — выбор и ручки детали (М.4), правая — повернуть, средняя —
         // сдвинуть.
         // Ручки модели не как в файле (М.6, «Посмотреть»): на подставке не то, что в
         // тексте, поэтому стрелки деталей спрятаны.
-        let gizmo = if shape.preview.is_empty() && !sculpting {
+        let gizmo = if shape.preview.is_empty() && !sculpting && !playing {
             self.shape_gizmo(ui, shape)
         } else {
             None
         };
         // Лампы сцены 3D (М.8б) — кружки поверх; мышь сначала им.
-        let dots = if shape.scene {
+        let dots = if shape.scene && !playing {
             self.lamp_dots(ui, shape, rect)
         } else {
             Vec::new()
         };
         let lamp_busy = shape.scene
+            && !playing
             && self.gizmo_drag.is_none()
             && self.lamp_pointer(ui, &response, shape, &dots);
-        let clay_busy = !lamp_busy && self.clay_pointer(ui, &response, shape);
-        if !lamp_busy && !clay_busy {
+        let clay_busy = !lamp_busy && !playing && self.clay_pointer(ui, &response, shape);
+        if !lamp_busy && !clay_busy && !playing {
             self.shape_pointer(ui, &response, shape, gizmo.as_ref());
         }
-        if shape.scene {
+        if shape.scene && !playing {
             self.scene_drop(ui, &response, shape, rect);
         }
         let d = response.drag_delta();
+        // В игре оглядываются и левой кнопкой: выбирать нечего.
         let camera_drag = response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle);
+            || response.dragged_by(egui::PointerButton::Middle)
+            || (playing && response.dragged_by(egui::PointerButton::Primary));
         if camera_drag && d != Vec2::ZERO {
             let pan = response.dragged_by(egui::PointerButton::Middle);
             self.actions.push(cam(if pan {
@@ -2282,7 +2465,7 @@ impl EditorUi {
             // W A S D, Q E ведут камеру в полёте и, как в других редакторах, пока зажата
             // правая кнопка (без неё W E R — ручки детали).
             let looking = ui.input(|i| i.pointer.secondary_down());
-            if (shape.free || looking) && !ui.ctx().egui_wants_keyboard_input() {
+            if (shape.free || looking || playing) && !ui.ctx().egui_wants_keyboard_input() {
                 let (dir, dt) = ui.input(|i| {
                     let k = |a: egui::Key, b: egui::Key| {
                         f32::from(u8::from(i.key_down(a))) - f32::from(u8::from(i.key_down(b)))
@@ -2528,26 +2711,29 @@ impl EditorUi {
                     actions.push(Action::NewScene);
                     ui.close();
                 }
-                ui.add_enabled_ui(free, |ui| {
-                    ui.menu_button("Открыть сцену", |ui| {
-                        ui.set_min_width(200.0);
+                // Уровень можно открыть и с правками: редактор спросит, сохранить ли их.
+                ui.add_enabled_ui(info.play == PlayState::Edit, |ui| {
+                    ui.menu_button("Открыть уровень", |ui| {
+                        ui.set_min_width(240.0);
                         if info.scenes.is_empty() {
-                            ui.label(RichText::new("Других сцен нет").color(MUTED));
+                            ui.label(RichText::new("В папке scenes уровней нет").color(MUTED));
                         }
-                        for p in info.scenes {
-                            let name = p
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let current = name == info.scene_name;
-                            if ui.selectable_label(current, name).clicked() && !current {
-                                actions.push(Action::OpenScene(p.clone()));
+                        for l in info.scenes {
+                            let current = info.level == Some(l.path.as_path());
+                            let text = if l.three_d {
+                                format!("{}   3D", l.name)
+                            } else {
+                                l.name.clone()
+                            };
+                            if ui.selectable_label(current, text).clicked() && !current {
+                                actions.push(Action::OpenScene(l.path.clone()));
                                 ui.close();
                             }
                         }
                     })
                     .response
-                    .on_disabled_hover_text(why);
+                    .on_hover_text("Уровень откроется в «Мире» вместо этого")
+                    .on_disabled_hover_text("Сначала остановите игру");
                 });
                 if ui
                     .add_enabled(
@@ -5637,6 +5823,10 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PartCmd {
     Focus,
+    /// Ctrl+C, Ctrl+X, Ctrl+V (Р.13): как у предметов сцены 2D.
+    Copy,
+    Cut,
+    Paste,
     Duplicate,
     Up,
     Down,
@@ -5949,6 +6139,7 @@ mod tests {
             hidden: &NO_HIDDEN,
             can_paste: false,
             scenes: &[],
+            level: None,
             can_restore: false,
             scene_path: None,
             ejected: false,
@@ -5989,8 +6180,9 @@ mod tests {
                 frame(&ctx, &mut ui, &info(Some(&file), play), Vec::new());
                 frame(&ctx, &mut ui, &info(None, play), Vec::new());
             }
-            if space.name == ASSETS_WORKSPACE {
-                // Во «Ассетах» без открытого ассета — проводник вместо сцены.
+            if space.name == ASSETS_WORKSPACE || space.name == STORY_WORKSPACE {
+                // Во «Ассетах» без открытого ассета — проводник вместо сцены, в «Сюжете» —
+                // заметки сюжета (Сю.2).
                 assert!(ui.viewport().is_none() && ui.scene_hidden());
                 continue;
             }
@@ -6067,8 +6259,21 @@ mod tests {
         assert!(ui.take_actions().is_empty(), "без нажатий нет действий");
         assert!(ui.viewport().is_some(), "окно сцены занято подставкой");
         let esc = key(egui::Key::Escape, egui::Modifiers::NONE);
-        frame(&ctx, &mut ui, &shape_info, vec![esc]);
+        frame(&ctx, &mut ui, &shape_info, vec![esc.clone()]);
         assert_eq!(ui.take_actions(), vec![Action::CloseShape]);
+        // Уровень 3D «Мира» Esc не закрывает: вместо него открывают другой (Р.12).
+        if let Some(s) = shape_info.shape.as_mut() {
+            s.scene = true;
+        }
+        frame(&ctx, &mut ui, &shape_info, vec![esc]);
+        assert!(ui.take_actions().is_empty());
+        // «Играть» из «Ассетов» с открытой моделью — переход в «Мир».
+        ui.open_workspace(ASSETS_WORKSPACE);
+        assert!(ui.in_assets());
+        let f5 = key(egui::Key::F5, egui::Modifiers::NONE);
+        frame(&ctx, &mut ui, &shape_info, vec![f5]);
+        assert_eq!(ui.take_actions(), vec![Action::Play]);
+        assert!(!ui.in_assets());
     }
 
     #[test]
@@ -6590,6 +6795,138 @@ mod tests {
     }
 
     #[test]
+    fn scene_objects_copy_cut_and_paste() {
+        // Р.13: в уровне 3D Ctrl+C, Ctrl+X, Ctrl+V работают с предметами, как в 2D.
+        let text = r##"(format: "reyvec-space", version: 1,
+    materials: [(name: "серый", color: "#808080")],
+    objects: [
+        (name: "ящик", material: "серый", shape: Box(size: (0.2, 0.2, 0.2))),
+        (name: "шар", material: "серый", at: (1.0, 0.0, 0.0), shape: Sphere(radius: 0.2)),
+    ],
+)"##;
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Edit);
+        shape_info.shape = Some(ShapeInfo {
+            name: "сцена",
+            spin: false,
+            free: false,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            post_aa: false,
+            in_view: true,
+            passes: &[],
+            camera: reyvec_sdf::Camera3D::default(),
+            shift: [0.0; 3],
+            error: None,
+            text,
+            preview: &NO_PREVIEW,
+            cost: None,
+            scene: true,
+            root: std::path::Path::new("."),
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        ui.take_actions();
+        ui.shape_selected = vec![0];
+        frame(&ctx, &mut ui, &shape_info, vec![egui::Event::Copy]);
+        assert!(ui.take_actions().is_empty(), "копия файл не меняет");
+        assert!(ui.shape_clipboard.is_some(), "скопировано");
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            vec![egui::Event::Paste(String::new())],
+        );
+        let pasted = match ui.take_actions().as_slice() {
+            [Action::ShapeText { text, commit: true }] => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(pasted.matches("\"ящик\"").count(), 2, "{pasted}");
+        assert_eq!(ui.shape_selected, vec![1]);
+        let file: reyvec_sdf::space_file::SpaceFile = ron::from_str(&pasted).unwrap();
+        assert_eq!(file.objects.len(), 3);
+        // Вырезать — копия в буфере, предмета в файле нет.
+        ui.shape_selected = vec![1];
+        frame(&ctx, &mut ui, &shape_info, vec![egui::Event::Cut]);
+        let cut = match ui.take_actions().as_slice() {
+            [Action::ShapeText { text, .. }] => text.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(!cut.contains("\"шар\""));
+        assert!(
+            ui.shape_clipboard
+                .as_deref()
+                .is_some_and(|c| c.contains("\"шар\""))
+        );
+    }
+
+    #[test]
+    fn level_3d_play_flies_and_does_not_edit() {
+        // Р.14: в просмотре уровня 3D левая кнопка оглядывается, W летит, ничего не
+        // выбирается и не правится; Esc — назад к правке.
+        let text = r##"(format: "reyvec-space", version: 1,
+    materials: [(name: "серый", color: "#808080")],
+    objects: [(name: "ящик", material: "серый", shape: Box(size: (0.4, 0.4, 0.4)))],
+)"##;
+        let ctx = new_ctx();
+        let mut ui = EditorUi::new(None);
+        let mut shape_info = info(None, PlayState::Playing);
+        shape_info.shape = Some(ShapeInfo {
+            name: "сцена",
+            spin: false,
+            free: true,
+            hidden: &[],
+            scale: reyvec_gpu::SpaceScale::Full,
+            triangles: false,
+            post_aa: false,
+            in_view: true,
+            passes: &[],
+            camera: reyvec_sdf::Camera3D::default(),
+            shift: [0.0; 3],
+            error: None,
+            text,
+            preview: &NO_PREVIEW,
+            cost: None,
+            scene: true,
+            root: std::path::Path::new("."),
+        });
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        frame(&ctx, &mut ui, &shape_info, Vec::new());
+        ui.take_actions();
+        let at = ui.viewport().expect("окно сцены").center();
+        frame(&ctx, &mut ui, &shape_info, pointer(at, Some(true)));
+        for k in 1..=4 {
+            frame(
+                &ctx,
+                &mut ui,
+                &shape_info,
+                pointer(at + vec2(8.0 * k as f32, 0.0), None),
+            );
+        }
+        frame(
+            &ctx,
+            &mut ui,
+            &shape_info,
+            pointer(at + vec2(32.0, 0.0), Some(false)),
+        );
+        let acts = ui.take_actions();
+        assert!(
+            acts.iter()
+                .any(|a| matches!(a, Action::ShapeCamera(ShapeCam::Orbit(_)))),
+            "{acts:?}"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::ShapeText { .. })),
+            "{acts:?}"
+        );
+        assert!(ui.shape_selected.is_empty(), "в игре не выбирают");
+        let esc = key(egui::Key::Escape, egui::Modifiers::NONE);
+        frame(&ctx, &mut ui, &shape_info, vec![esc]);
+        assert_eq!(ui.take_actions(), vec![Action::Stop]);
+    }
+
+    #[test]
     fn scene_lamps_are_picked_dragged_and_deleted() {
         let cam = reyvec_sdf::Camera3D::default();
         let (o, d) = cam.ray([0.0, 0.0], 1.0);
@@ -7036,6 +7373,9 @@ mod tests {
             (START_WORKSPACE, PlayState::Playing, false, false),
             (1, PlayState::Edit, false, false),
             (0, PlayState::Edit, false, false),
+            // «Сюжет» ещё дважды: задание и персонаж (вид заметок, Сю.2).
+            (0, PlayState::Paused, false, false),
+            (0, PlayState::Playing, false, false),
             (3, PlayState::Edit, false, false),
             (5, PlayState::Edit, false, false),
             // Пауза в «Мире» снимается с профайлером внизу: широкая панель, много колонок.
@@ -7088,6 +7428,19 @@ mod tests {
                 ui.explorer.go(dir.clone());
                 ui.explorer.view = explorer::ViewKind::Tiles;
                 ui.explorer.selected = vec![dir.join("конвейер.shape.ron")];
+            }
+            if ws == 0 {
+                use crate::editor::story_ui::Item;
+                ui.story.sync(Some(&root));
+                let item = match play {
+                    PlayState::Edit => Item::Dialog("kuznec.privet".into()),
+                    PlayState::Paused => Item::Quest("mech".into()),
+                    PlayState::Playing => Item::Character("kuznec".into()),
+                };
+                ui.story.open(item, false);
+                if play == PlayState::Edit {
+                    ui.story.preview_play("kuznec.privet");
+                }
             }
             if ws == 5 {
                 // Сборка: профайлер справа; и он же внизу «Мира» в отдельной картинке ниже.
@@ -7251,6 +7604,13 @@ mod tests {
             let menu = if menu { "-меню" } else { "" };
             let name = if shape {
                 "Формы-стеллаж.png".to_owned()
+            } else if ws == 0 {
+                let what = match play {
+                    PlayState::Edit => "диалог",
+                    PlayState::Paused => "задание",
+                    PlayState::Playing => "персонаж",
+                };
+                format!("Сюжет-{what}.png")
             } else {
                 format!("{}-{:?}{menu}.png", WORKSPACES[ws].name, play)
             };

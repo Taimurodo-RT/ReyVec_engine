@@ -12,8 +12,9 @@ use reyvec_sdf::shape3d::{
     MAX_MATERIALS, MAX_OBJECTS, Material3, Program, Shape3, compile, pack_scene, pack_scene_cached,
 };
 
-/// Сколько слов помещается в буфер сцены кадра (4 МБ: треугольники 2.5D-вида, 7.9б).
-pub(crate) const MAX_WORDS: usize = 1024 * 1024;
+/// Сколько слов помещается в буфер сцены кадра (8 МБ: треугольники 2.5D-вида, 7.9б; с
+/// 8.10б — ещё мелкая сетка отсева большого мира, с ней город занимает до 1 М слов).
+pub(crate) const MAX_WORDS: usize = 2 * 1024 * 1024;
 
 /// Предупреждения о пределах уже записаны в журнал (пишутся один раз, пока предел
 /// нарушен; панель показывает их каждый кадр, 7.18б).
@@ -266,6 +267,8 @@ pub struct GridStats {
     pub dims: [u32; 3],
     pub mean_list: f32,
     pub max_list: u32,
+    /// Мелкая сетка поверх тесной части (8.10б): размер клетки и число клеток.
+    pub fine: Option<(f32, [u32; 3])>,
 }
 
 /// Сетка отсева по словам сцены (раскладка — `Grid::write`); `None` — сетки нет.
@@ -293,6 +296,16 @@ pub(crate) fn grid_stats(words: &[u32]) -> Option<GridStats> {
             sum as f32 / count as f32
         },
         max_list: max,
+        fine: words
+            .get(g + 19)
+            .map(|&h| h as usize)
+            .filter(|&h| h != 0 && h + 6 < words.len())
+            .map(|h| {
+                (
+                    f32::from_bits(words[h + 3]),
+                    [words[h + 4], words[h + 5], words[h + 6]],
+                )
+            }),
     })
 }
 
@@ -331,11 +344,19 @@ pub(crate) fn pack_with(
 pub(crate) struct PackCache {
     pub grid: reyvec_sdf::grid3d::GridCache,
     meshes: Vec<(reyvec_sdf::space_file::MeshFrame, Vec<u32>)>,
-    programs: Vec<CachedProgram>,
+    programs: ProgramCache,
     /// С какими границами частей (М.1) собраны запомненные программы.
     part_bounds: bool,
     /// Делились ли тяжёлые формы на детали ([`reyvec_sdf::shape3d::split_parts`]).
     split: bool,
+}
+
+impl PackCache {
+    /// Отдаёт память слов отслужившего кадра следующему: в большом мире это 3,5 МБ, и
+    /// новая память под них каждый кадр стоила около миллисекунды.
+    pub(crate) fn recycle(&mut self, words: Vec<u32>) {
+        self.grid.recycle_words(words);
+    }
 }
 
 /// То же, что [`pack_with`], с готовым из `cache`; слова те же.
@@ -460,11 +481,22 @@ pub(crate) fn programs(frame: &SpaceFrame) -> Vec<Program> {
 }
 
 /// Запомненные программы формы (8.8б): форма и что из неё вышло (программы её деталей,
-/// [`reyvec_sdf::shape3d::compile_parts`]); `None` — не запоминается.
+/// [`reyvec_sdf::shape3d::compile_parts`], или одна программа); `None` — не запоминается.
 type CachedProgram = Option<(
     Shape3,
     Result<Vec<Program>, reyvec_sdf::shape3d::CompileError>,
 )>;
+
+/// Запомненные программы форм кадра в двух видах: с делением тяжёлых форм на детали и
+/// без него. Второй нужен, когда с деталями предметов больше [`MAX_OBJECTS`] (город с
+/// холма): до 8.10б2 этот запасной путь собирал все формы заново каждый кадр.
+#[derive(Default)]
+pub(crate) struct ProgramCache {
+    split: Vec<CachedProgram>,
+    whole: Vec<CachedProgram>,
+    /// Сколько форм собрано заново за всё время (для тестов).
+    pub compiled: usize,
+}
 
 /// То же; форма, такая же, как на том же месте в прошлом кадре, берёт готовые программы
 /// из `cache` (8.8б: неподвижные предметы не превращаются в программу каждый кадр).
@@ -472,21 +504,49 @@ type CachedProgram = Option<(
 /// видит детали). Если с деталями предметов больше [`MAX_OBJECTS`], формы не делятся.
 pub(crate) fn programs_cached(
     frame: &SpaceFrame,
-    cache: Option<&mut Vec<CachedProgram>>,
+    mut cache: Option<&mut ProgramCache>,
 ) -> Vec<Program> {
-    let split = reyvec_sdf::shape3d::split_parts();
-    let programs = programs_with(frame, cache, split);
-    if split && programs.len() > MAX_OBJECTS {
-        return programs_with(frame, None, false);
+    let fresh = |found: &[Found]| found.iter().filter(|f| f.is_some()).count();
+    if reyvec_sdf::shape3d::split_parts() {
+        let found = resolve(frame, cache.as_mut().map(|c| &mut c.split), true);
+        if let Some(c) = cache.as_mut() {
+            c.compiled += fresh(&found);
+        }
+        if count(&found, cache.as_ref().map(|c| &c.split)) <= MAX_OBJECTS {
+            return emit(frame, found, cache.as_ref().map(|c| &c.split));
+        }
     }
-    programs
+    let found = resolve(frame, cache.as_mut().map(|c| &mut c.whole), false);
+    if let Some(c) = cache.as_mut() {
+        c.compiled += fresh(&found);
+    }
+    emit(frame, found, cache.as_ref().map(|c| &c.whole))
 }
 
-fn programs_with(
+#[cfg(test)]
+fn programs_with(frame: &SpaceFrame, split: bool) -> Vec<Program> {
+    emit(frame, resolve(frame, None, split), None)
+}
+
+/// Программы одной формы кадра: готовые в запомненном (`None`) или собранные сейчас.
+type Found = Option<Result<Vec<Program>, reyvec_sdf::shape3d::CompileError>>;
+
+/// Формы кадра по порядку: предметы, заменители, светящиеся.
+fn frame_shapes(frame: &SpaceFrame) -> impl Iterator<Item = &Shape3> {
+    frame
+        .shapes
+        .iter()
+        .chain(&frame.proxies)
+        .chain(&frame.glows)
+}
+
+/// Собирает программы форм кадра, которых нет в `cache` (форма на том же месте другая),
+/// и запоминает их. Готовые не копируются: ответ `None` на их месте.
+fn resolve(
     frame: &SpaceFrame,
     mut cache: Option<&mut Vec<CachedProgram>>,
     split: bool,
-) -> Vec<Program> {
+) -> Vec<Found> {
     let total = frame.shapes.len() + frame.proxies.len() + frame.glows.len();
     if let Some(cache) = cache.as_mut() {
         cache.truncate(total);
@@ -498,18 +558,16 @@ fn programs_with(
             compile(s).map(|p| vec![p])
         }
     };
-    let mut at = 0;
-    let mut compile_cached =
-        |s: &Shape3| -> Result<Vec<Program>, reyvec_sdf::shape3d::CompileError> {
-            let n = at;
-            at += 1;
+    frame_shapes(frame)
+        .enumerate()
+        .map(|(n, s)| {
             let Some(cache) = cache.as_mut() else {
-                return compile_one(s);
+                return Some(compile_one(s));
             };
-            if let Some(Some((source, programs))) = cache.get(n)
+            if let Some(Some((source, _))) = cache.get(n)
                 && source == s
             {
-                return programs.clone();
+                return None;
             }
             let programs = compile_one(s);
             // Формы с полем слоя (и с ошибкой) не запоминаются: копия держала бы поле, и
@@ -518,38 +576,68 @@ fn programs_with(
             let holds_field = programs
                 .as_ref()
                 .map_or(true, |p| p.iter().any(|p| !p.fields.is_empty()));
-            let entry = (!holds_field).then(|| (s.clone(), programs.clone()));
-            if n < cache.len() {
-                cache[n] = entry;
+            if n >= cache.len() {
+                cache.resize(n + 1, None);
+            }
+            if holds_field {
+                cache[n] = None;
+                Some(programs)
             } else {
-                cache.push(entry);
+                cache[n] = Some((s.clone(), programs));
+                None
             }
-            programs
-        };
+        })
+        .collect()
+}
+
+/// Программы формы `n`: собранные сейчас или готовые.
+fn found_at<'a>(
+    found: &'a Found,
+    cache: Option<&'a Vec<CachedProgram>>,
+    n: usize,
+) -> Option<&'a Result<Vec<Program>, reyvec_sdf::shape3d::CompileError>> {
+    found
+        .as_ref()
+        .or_else(|| cache?.get(n)?.as_ref().map(|(_, programs)| programs))
+}
+
+/// Сколько предметов выйдет из собранного.
+fn count(found: &[Found], cache: Option<&Vec<CachedProgram>>) -> usize {
+    found
+        .iter()
+        .enumerate()
+        .filter_map(|(n, f)| found_at(f, cache, n)?.as_ref().ok())
+        .map(Vec::len)
+        .sum()
+}
+
+/// Программы кадра из собранного: с флагами заменителей, светящихся и неподвижности.
+/// Форма, которую не вышло превратить в программу, пропускается с записью в журнал.
+fn emit(frame: &SpaceFrame, found: Vec<Found>, cache: Option<&Vec<CachedProgram>>) -> Vec<Program> {
     // Флаги неподвижности (8.8б): по одному на предмет, потом на заменитель.
-    let still = |i: usize| frame.still.get(i).copied().unwrap_or(false);
-    let mut build =
-        |shapes: &[Shape3], first: Option<usize>, shadow_only: bool, no_shadow: bool| {
-            let mut out = Vec::with_capacity(shapes.len());
-            for (i, s) in shapes.iter().enumerate() {
-                match compile_cached(s) {
-                    Ok(parts) => {
-                        for mut p in parts {
-                            p.shadow_only = shadow_only;
-                            p.no_shadow = no_shadow;
-                            p.still = first.is_some_and(|f| still(f + i));
-                            out.push(p);
-                        }
-                    }
-                    Err(e) => tracing::warn!("форма 3D пропущена: {e}"),
-                }
-            }
-            out
+    let still = |n: usize| frame.still.get(n).copied().unwrap_or(false);
+    let (shapes, proxies) = (frame.shapes.len(), frame.proxies.len());
+    let mut out = Vec::with_capacity(found.len());
+    for (n, f) in found.into_iter().enumerate() {
+        let shadow_only = n >= shapes && n < shapes + proxies;
+        let no_shadow = n >= shapes + proxies;
+        let mut push = |mut p: Program| {
+            p.shadow_only = shadow_only;
+            p.no_shadow = no_shadow;
+            p.still = !no_shadow && still(n);
+            out.push(p);
         };
-    let mut programs = build(&frame.shapes, Some(0), false, false);
-    programs.extend(build(&frame.proxies, Some(frame.shapes.len()), true, false));
-    programs.extend(build(&frame.glows, None, false, true));
-    programs
+        match f {
+            Some(Ok(parts)) => parts.into_iter().for_each(&mut push),
+            Some(Err(e)) => tracing::warn!("форма 3D пропущена: {e}"),
+            None => match cache.and_then(|c| c.get(n)?.as_ref()) {
+                Some((_, Ok(parts))) => parts.iter().cloned().for_each(&mut push),
+                Some((_, Err(e))) => tracing::warn!("форма 3D пропущена: {e}"),
+                None => {}
+            },
+        }
+    }
+    out
 }
 
 /// Формы для запечённого поля (7.10б): все предметы и заменители кадра, до отсева по
@@ -1027,6 +1115,11 @@ pub(crate) fn set_ao_field_only(words: &mut [u32]) {
     words[11] |= SCENE_AO_FIELD_ONLY;
 }
 
+/// Дальность дымки сцены, м (слово 14 заголовка; 0 — обычная, `HAZE` в шейдере).
+pub(crate) fn set_haze(words: &mut [u32], meters: f32) {
+    words[14] = meters.to_bits();
+}
+
 /// Солнца нет (2.5D-вид: уровень в помещении).
 pub(crate) fn set_no_sun(words: &mut [u32]) {
     words[11] |= SCENE_NO_SUN;
@@ -1127,6 +1220,204 @@ mod tests {
         assert_eq!(set, empty, "без раздела моделей заголовок цел");
     }
 
+    /// Устойчивость к плохим числам в файле сцены (проверка этапа 8): нулевые, отрицательные
+    /// и огромные размеры, нулевые периоды и дальности не роняют сборку кадра — файл
+    /// правят на лету, и опечатка не должна закрывать песочницу.
+    #[test]
+    fn bad_numbers_in_a_scene_do_not_panic() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        let text = include_str!("../../../scenes/3d/showroom.ron");
+        let swaps: [(&str, &[&str]); 12] = [
+            (
+                "radius: 0.35",
+                &[
+                    "radius: 0.0",
+                    "radius: -1.0",
+                    "radius: 1e30",
+                    "radius: 1e-30",
+                ],
+            ),
+            (
+                "size: (1.0, 1.0, 1.0)",
+                &["size: (0.0, 0.0, 0.0)", "size: (-1.0, 1e30, 0.0)"],
+            ),
+            (
+                "thickness: 0.11",
+                &["thickness: 0.0", "thickness: 5.0", "thickness: -1.0"],
+            ),
+            (
+                "height: 0.9, bottom: 0.35, top: 0.05",
+                &[
+                    "height: 0.0, bottom: 0.0, top: 0.0",
+                    "height: -1.0, bottom: 1e30, top: -5.0",
+                ],
+            ),
+            (
+                "height: 0.8, radius: 0.16",
+                &["height: 0.0, radius: 0.0", "height: -3.0, radius: 1e20"],
+            ),
+            (
+                "smooth: 0.25",
+                &["smooth: 0.0", "smooth: -1.0", "smooth: 1e30"],
+            ),
+            (
+                "period: 1.6",
+                &["period: 0.0", "period: -1.0", "period: 1e-30"],
+            ),
+            ("period: 10.0", &["period: 0.0"]),
+            ("range: 6.0", &["range: 0.0", "range: -1.0", "range: 1e30"]),
+            ("scale: 0.5", &["scale: 0.0", "scale: -1.0", "scale: 1e30"]),
+            ("spin: (40.0, 60.0, 0.0)", &["spin: (1e30, -1e30, 1e30)"]),
+            (
+                "normal: (0.0, 1.0, 0.0)",
+                &["normal: (0.0, 0.0, 0.0)", "normal: (1e30, 0.0, 0.0)"],
+            ),
+        ];
+        for (from, tos) in swaps {
+            assert!(text.contains(from), "в сцене есть «{from}»");
+            for to in tos {
+                let bad = text.replacen(from, to, 1);
+                // Отказ с сообщением — тоже хороший ответ; главное — не паника.
+                let Ok(scene) = reyvec_sdf::SpaceScene::parse_in(&bad, Some(dir)) else {
+                    continue;
+                };
+                let mut cache = PackCache::default();
+                for time in [0.0, 1.0, 1e6] {
+                    let frame = scene.frame(time);
+                    let packed = pack_cached(
+                        &frame,
+                        &scene.materials,
+                        true,
+                        true,
+                        GridOptions::default(),
+                        &mut cache,
+                    );
+                    assert!(
+                        packed.words.len() <= MAX_WORDS,
+                        "«{to}»: слов {}",
+                        packed.words.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Большой мир (8.9): сколько стоит упаковка кадра города на процессоре — первый
+    /// кадр и следующие (неподвижное берётся из прошлого кадра). Время только печатается.
+    #[test]
+    fn world_pack_times() {
+        let text = include_str!("../../../scenes/3d/world.ron");
+        let scene = reyvec_sdf::SpaceScene::parse_in(text, None).unwrap();
+        let mut cache = PackCache::default();
+        for k in 0..5 {
+            let frame = scene.frame(1.0 + k as f32 / 60.0);
+            let start = std::time::Instant::now();
+            let packed = pack_cached(
+                &frame,
+                &scene.materials,
+                true,
+                true,
+                GridOptions::default(),
+                &mut cache,
+            );
+            eprintln!(
+                "мир, кадр {k}: упаковка {:.2} мс, слов {}, сетка {:?}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                packed.words.len(),
+                packed.grid
+            );
+            assert_eq!(packed.dropped, 0);
+            assert!(packed.overflow.is_none());
+        }
+        let whole = scene.frame(1.0);
+        eprintln!(
+            "мир: предметов {}, с деталями {}",
+            programs_with(&whole, false).len(),
+            programs_with(&whole, true).len()
+        );
+        // Камера поворачивается: отсев по взгляду каждый кадр оставляет другой набор.
+        for culled in [true, false] {
+            let mut cache = PackCache::default();
+            let mut times = Vec::new();
+            for k in 0..12 {
+                let mut frame = scene.frame(1.0 + k as f32 / 60.0);
+                let start = std::time::Instant::now();
+                if culled {
+                    let cam = reyvec_sdf::Camera3D::looking_at(
+                        glam::Vec3::new(-11.4, 1.5, 177.8),
+                        glam::Vec3::new(-25.0 + k as f32 * 2.0, 4.7, 163.9),
+                    );
+                    reyvec_sdf::view3d::cull_frame(
+                        &mut frame,
+                        cam.view_proj(16.0 / 9.0),
+                        true,
+                        &scene.materials,
+                    );
+                }
+                let cull = start.elapsed().as_secs_f64() * 1000.0;
+                let packed = pack_cached(
+                    &frame,
+                    &scene.materials,
+                    true,
+                    true,
+                    GridOptions::default(),
+                    &mut cache,
+                );
+                times.push(format!(
+                    "{cull:.2}+{:.2} ({})",
+                    start.elapsed().as_secs_f64() * 1000.0 - cull,
+                    packed.objects
+                ));
+                cache.recycle(packed.words);
+            }
+            eprintln!("мир, поворот камеры, отсев {culled}: {}", times.join(", "));
+        }
+    }
+
+    /// Упаковка с готовым из прошлого кадра (8.8б, 8.10б2) даёт те же слова, что и
+    /// упаковка с нуля, — и в городе, где с деталями предметов больше предела и формы не
+    /// делятся (запасной путь), и в сценах с делением. Со второго кадра заново собираются
+    /// только формы движущихся предметов.
+    #[test]
+    fn cached_pack_matches_fresh_pack() {
+        let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../scenes/3d"));
+        for (name, text) in [
+            ("world", include_str!("../../../scenes/3d/world.ron")),
+            ("showroom", include_str!("../../../scenes/3d/showroom.ron")),
+            (
+                "warehouse",
+                include_str!("../../../scenes/3d/warehouse.ron"),
+            ),
+        ] {
+            let scene = reyvec_sdf::SpaceScene::parse_in(text, Some(dir)).unwrap();
+            let mut cache = PackCache::default();
+            for k in 0..4 {
+                let frame = scene.frame(1.0 + k as f32 / 60.0);
+                let before = cache.programs.compiled;
+                let cached = pack_cached(
+                    &frame,
+                    &scene.materials,
+                    true,
+                    true,
+                    GridOptions::default(),
+                    &mut cache,
+                );
+                let fresh = pack_with(&frame, &scene.materials, true, true, GridOptions::default());
+                assert!(cached.words == fresh.words, "{name}, кадр {k}");
+                let compiled = cache.programs.compiled - before;
+                if k > 0 {
+                    // Движущийся предмет считается в обоих видах (с деталями и без).
+                    let moving = frame.still.iter().filter(|&&s| !s).count() + frame.glows.len();
+                    assert!(
+                        compiled <= 2 * moving,
+                        "{name}, кадр {k}: собрано заново {compiled}, движется {moving}"
+                    );
+                }
+                cache.recycle(cached.words);
+            }
+        }
+    }
+
     /// Тяжёлые модели делятся на детали-предметы, а все сцены 3D всё равно помещаются в
     /// предел предметов шейдера (иначе формы не делятся, и каждый кадр собирается дважды).
     #[test]
@@ -1149,8 +1440,8 @@ mod tests {
         for (name, text) in scenes {
             let scene = reyvec_sdf::SpaceScene::parse_in(text, Some(dir)).unwrap();
             let frame = scene.frame(1.0);
-            let split = programs_with(&frame, None, true).len();
-            let whole = programs_with(&frame, None, false).len();
+            let split = programs_with(&frame, true).len();
+            let whole = programs_with(&frame, false).len();
             eprintln!("{name}: предметов {whole}, с деталями {split}");
             assert!(split <= MAX_OBJECTS, "{name}: {split} предметов");
             if name == "warehouse" {

@@ -1,0 +1,17 @@
+// English texts of the interface screens (step И.2в). Keys are the same as in ru.ron.
+(
+    name: "English",
+    texts: {
+        "demo.hint": "Interface from ui/demo.rui, theme, style and language files",
+        "demo.keys": "Tab and arrows to choose, Enter to press",
+        "menu.continue": "Continue",
+        "menu.new_game": "New game",
+        "menu.save": "Save",
+        "menu.settings": "Settings",
+        "menu.language": "Language: English",
+        "menu.quit": "Quit",
+        "hud.stamina": "Stamina",
+        "hud.coins": "Coins: {n}",
+        "hud.health": "Health",
+    },
+)

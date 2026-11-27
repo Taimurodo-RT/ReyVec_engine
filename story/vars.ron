@@ -1,0 +1,14 @@
+// Переменные мира: имя → значение в начале игры. Тип (да/нет, целое, дробное, текст)
+// берётся из значения. Условия в диалогах читают их так: `kuznec.znakom`, `hero.money >= 10`.
+(
+    format: "reyvec-story-vars",
+    version: 1,
+    vars: {
+        "hero.name": "Странник",
+        "hero.money": 5,
+        "hero.ruda": 0,
+        "kuznec.znakom": false,
+        "kuznec.nastroenie": 0,
+        "hero.mech": false,
+    },
+)

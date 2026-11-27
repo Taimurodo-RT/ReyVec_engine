@@ -266,6 +266,30 @@
                 Rect(at: (0.0, 0.0), size: (0.11, 0.11), color: "#5a3a20", stroke: 0.01),
             ],
         ),
+        // Сюжет (Сю.7): кузнец в коридоре. Герой подошёл — начинается разговор из
+        // папки story/ (scripts/kuznec.luau). Возьми задание «Меч» — дальше по коридору
+        // появятся три куска руды (scripts/ruda.luau). J — журнал заданий.
+        (
+            name: "кузнец",
+            at: (5.0, -0.6),
+            depth: 2,
+            shadow: true,
+            script: "scripts/kuznec.luau",
+            touch: (0.3, 0.36),
+            shapes: [
+                Rect(at: (-0.04, -0.13), size: (0.05, 0.1), color: "#3a2a1e"),
+                Rect(at: (0.04, -0.13), size: (0.05, 0.1), color: "#3a2a1e"),
+                Rect(at: (0.0, 0.0), size: (0.2, 0.2), corner: 0.04, color: "#7a4a2a"),
+                Rect(at: (0.0, -0.01), size: (0.13, 0.17), corner: 0.02, color: "#4a3a30"),
+                Circle(at: (0.0, 0.15), r: 0.06, color: "#d8a878"),
+                Rect(at: (0.0, 0.12), size: (0.1, 0.04), corner: 0.02, color: "#5a3a20"),
+                Rect(at: (0.14, 0.02), size: (0.025, 0.16), color: "#6a4a2a"),
+                Rect(at: (0.14, 0.1), size: (0.08, 0.05), corner: 0.01, color: "#808890"),
+            ],
+        ),
+        (name: "руда 1", at: (9.4, -0.72), depth: 2, script: "scripts/ruda.luau", touch: (0.1, 0.1), shapes: [Circle(at: (0.0, 0.0), r: 0.045, color: "#6a5f58"), Circle(at: (0.012, 0.01), r: 0.018, color: "#c86a3a")]),
+        (name: "руда 2", at: (9.9, -0.72), depth: 2, script: "scripts/ruda.luau", touch: (0.1, 0.1), shapes: [Circle(at: (0.0, 0.0), r: 0.045, color: "#6a5f58"), Circle(at: (-0.01, 0.012), r: 0.018, color: "#c86a3a")]),
+        (name: "руда 3", at: (10.4, -0.72), depth: 2, script: "scripts/ruda.luau", touch: (0.1, 0.1), shapes: [Circle(at: (0.0, 0.0), r: 0.045, color: "#6a5f58"), Circle(at: (0.008, -0.01), r: 0.018, color: "#c86a3a")]),
         // Монеты: одна в комнате справа от героя, три над досками в коридоре.
         (name: "монета 1", at: (1.25, -0.62), depth: 2, script: "scripts/coin.luau", touch: (0.08, 0.08), shapes: [Circle(at: (0.0, 0.0), r: 0.035, color: "#e0a830"), Circle(at: (0.0, 0.0), r: 0.022, color: "#ffd860")]),
         (name: "монета 2", at: (6.9, 0.0), depth: 2, script: "scripts/coin.luau", touch: (0.08, 0.08), shapes: [Circle(at: (0.0, 0.0), r: 0.035, color: "#e0a830"), Circle(at: (0.0, 0.0), r: 0.022, color: "#ffd860")]),

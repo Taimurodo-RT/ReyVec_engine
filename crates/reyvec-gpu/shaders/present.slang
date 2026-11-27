@@ -28,6 +28,7 @@ struct Push
 [[vk::binding(1, 0)]] SamplerState samplers[2];
 
 #include "include/dither.slang"
+#include "include/tonemap.slang"
 
 struct VertexOut
 {
@@ -77,24 +78,6 @@ float4 light_at(float2 uv)
 static const uint FLAG_GLOW = 1;
 static const uint FLAG_DITHER = 2;
 
-// Мягкий переход к белому: до SHOULDER яркость как есть (цвета векторов не меняются),
-// выше плавно приближается к 1 и никогда её не перескакивает. Сжимается самый яркий
-// канал, остальные в той же пропорции, поэтому оттенок сохраняется; очень яркое
-// (в несколько раз ярче белого) постепенно белеет, как пересвет на фото.
-static const float SHOULDER = 0.8;
-
-float3 tonemap(float3 c)
-{
-    float m = max(c.r, max(c.g, c.b));
-    if (m <= SHOULDER)
-        return c;
-    float over = (m - SHOULDER) / (1.0 - SHOULDER);
-    float mapped = SHOULDER + (1.0 - SHOULDER) * (1.0 - exp(-over));
-    float3 hue = c * (mapped / m);
-    float white = saturate((m - 1.0) / 4.0);
-    return lerp(hue, float3(mapped, mapped, mapped), white * 0.6);
-}
-
 [shader("fragment")]
 float4 fs_main(VertexOut input) : SV_Target
 {
@@ -111,6 +94,16 @@ float4 fs_main(VertexOut input) : SV_Target
             float3 glow = textures[pc.bloom].SampleLevel(samplers[0], uv, 0.0).rgb;
             color.rgb = tonemap(color.rgb + glow * pc.glow);
         }
+    }
+    else if ((pc.flags & FLAG_GLOW) != 0)
+    {
+        // Сцена «3D» (8.16): свет уже в кадре; добавляется ореол ярких мест, и яркость
+        // выше белого мягко сводится к белому.
+        uint w, h;
+        textures[pc.texture].GetDimensions(w, h);
+        float2 uv = input.position.xy / float2(w, h);
+        float3 glow = textures[pc.bloom].SampleLevel(samplers[0], uv, 0.0).rgb;
+        color.rgb = tonemap(color.rgb + glow * pc.glow);
     }
     if ((pc.flags & FLAG_DITHER) != 0)
         color.rgb = dither(color.rgb, input.position.xy);

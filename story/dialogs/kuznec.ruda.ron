@@ -1,0 +1,20 @@
+// Пример «кузнец и руда»: герой принёс руду.
+(
+    format: "reyvec-dialog",
+    version: 1,
+    id: "kuznec.ruda",
+    title: "Кузнец: руда принесена",
+    with: ["kuznec"],
+    nodes: [
+        Line(id: "nachalo", at: (0, -85), who: "kuznec", text: "Ого, три куска! Хорошая руда.", settings: (mood: "dobryi"), next: "otdat"),
+        Set(id: "otdat", at: (390, -55), changes: [(var: "hero.ruda", add: -3), (var: "kuznec.nastroenie", add: 1)], next: "etap"),
+        Event(id: "etap", at: (780, -55), name: "quest.stage", args: ["mech", "zhdat"], next: "zapomnit"),
+        // Память и отношения (Сю.9): кузнец запомнит руду надолго и станет добрее к герою.
+        Event(id: "zapomnit", at: (780, 120), name: "memory.add", args: ["kuznec", "ruda_prinesena", "Герой принёс три куска руды", 8], next: "dobree"),
+        Event(id: "dobree", at: (780, 280), name: "relation.add", args: ["kuznec", "hero", 3], next: "kogda"),
+        Random(id: "kogda", at: (1170, -55), next: ["zavtra", "den"]),
+        Line(id: "zavtra", at: (1560, -190), who: "kuznec", text: "Приходи завтра, меч будет готов.", next: "konec"),
+        Line(id: "den", at: (1560, 20), who: "kuznec", text: "Дай мне день, и меч будет твоим.", next: "konec"),
+        End(id: "konec", at: (1950, -55)),
+    ],
+)

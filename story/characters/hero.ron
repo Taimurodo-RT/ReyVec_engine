@@ -1,0 +1,7 @@
+(
+    format: "reyvec-character",
+    version: 1,
+    id: "hero",
+    name: "Герой",
+    color: "#F5A54A",
+)

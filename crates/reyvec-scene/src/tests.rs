@@ -48,8 +48,8 @@ fn example_scene_parses_and_builds() {
         .count();
     // Слои с тенью: стол, полка, герой, ящики под полкой, 6 препятствий коридора (6.1),
     // подъёмник и столб (6.2), уступы (6.4), 2 манекена (6.5), жук (6.9), мяч и 2 ящика
-    // с физикой (6.10); окно без слоя.
-    assert_eq!(shadow_layers, 19);
+    // с физикой (6.10), кузнец (Сю.7); окно без слоя.
+    assert_eq!(shadow_layers, 20);
     // Герой (6.1) и твёрдое: пол, стена слева, столешница, 6 банок с крышками, 3 книги,
     // полка, 2 ящика, 6 препятствий коридора, подъёмник и столб; с 6.4 край уступов и
     // сами уступы: 13 склонов, 4 доски и всего 6 прямоугольников из сотен клеток блоков.
@@ -1125,6 +1125,11 @@ fn walk_to(w: &mut SceneWorld, t: &mut usize, x: f32, limit: usize) -> PlayerVie
             *t = steps(w, *t, 40);
             return w.snapshot().player.unwrap();
         }
+        // Кузнец в коридоре (Сю.7) заговаривает с проходящим героем: тест кладёт трубку
+        // (кузнец не заговорит снова, пока герой не отойдёт).
+        if let Some(s) = w.story() {
+            s.lock().unwrap().stop();
+        }
         let stuck = last.on_ground && last.vel[0].abs() < 0.01;
         let input = if stuck {
             InputFrame::new(&[dir], &[Action::Jump])
@@ -1853,6 +1858,114 @@ fn script_level(dir: &std::path::Path, beetle: &str) -> SceneWorld {
     SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap()
 }
 
+/// Сю.5: скрипт кузнеца начинает разговор, когда герой подошёл; сюжет найден в папке
+/// проекта выше папки сцены.
+#[test]
+fn smith_script_starts_a_talk_when_the_hero_comes() {
+    use reyvec_game::Action::Right;
+    use reyvec_game::InputFrame;
+    let root = std::env::temp_dir().join(format!("reyvec-story-{}", std::process::id()));
+    let dir = root.join("scenes");
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../story");
+    for sub in ["", "characters", "dialogs", "quests", "lang"] {
+        std::fs::create_dir_all(root.join("story").join(sub)).unwrap();
+        for e in std::fs::read_dir(example.join(sub)).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_file() {
+                std::fs::copy(
+                    &p,
+                    root.join("story").join(sub).join(p.file_name().unwrap()),
+                )
+                .unwrap();
+            }
+        }
+    }
+    std::fs::write(
+        dir.join("scripts/kuznec.luau"),
+        "function update(me)\n  if me.touching and not story.busy() then\n    story.talk(\"kuznec.privet\")\n  end\nend\n",
+    )
+    .unwrap();
+    let text = minimal(
+        r##"nodes: [
+        (name: "пол", solids: [(at: (0.0, -0.9), size: (8.0, 0.2))]),
+        (name: "герой", at: (-1.0, -0.65), player: (size: (0.14, 0.28)), shapes: [Rect(at: (0.0, 0.0), size: (0.14, 0.28), color: "#fff")]),
+        (name: "кузнец", at: (-0.3, -0.62), script: "scripts/kuznec.luau", touch: (0.2, 0.3),
+            shapes: [Rect(at: (0.0, 0.0), size: (0.2, 0.36), color: "#8a5a3a")]),
+    ]"##,
+    );
+    let file = SceneFile::parse_in(&text, Some(&dir)).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let story = w.story().expect("сюжет найден в папке выше сцены");
+    let mut t = steps(&mut w, 0, 30);
+    assert!(
+        story.lock().unwrap().talk.is_none(),
+        "герой далеко — разговора нет"
+    );
+    w.set_input(InputFrame::new(&[Right], &[Right]));
+    for _ in 0..90 {
+        t = steps(&mut w, t, 1);
+        if story.lock().unwrap().busy() {
+            break;
+        }
+    }
+    assert!(
+        w.snapshot().scripts.errors.is_empty(),
+        "{:?}",
+        w.snapshot().scripts
+    );
+    let h = story.lock().unwrap();
+    assert_eq!(
+        h.talk.as_ref().map(|t| t.dialog.as_str()),
+        Some("kuznec.privet")
+    );
+    drop(h);
+    // Сю.7: шаг логики ведёт разговор до реплики; пока он идёт, герой стоит, хотя
+    // «вправо» всё ещё нажато.
+    t = steps(&mut w, t, 2);
+    let line = |story: &crate::SharedStory| match &story.lock().unwrap().screen {
+        Some(crate::Screen::Line(s)) => s.text.clone(),
+        other => panic!("на экране {other:?}"),
+    };
+    assert!(line(&story).starts_with("Чего надо"), "{}", line(&story));
+    // Разбег гасится за несколько шагов, дальше герой не идёт.
+    t = steps(&mut w, t, 30);
+    let at = w.player_body().unwrap().pos[0];
+    t = steps(&mut w, t, 30);
+    assert!(
+        (w.player_body().unwrap().pos[0] - at).abs() < 1e-3,
+        "герой стоит"
+    );
+    // Ответы игрока: «дальше», вариант «Просто смотрю», «дальше» — разговор окончен.
+    for answer in [
+        crate::Answer::Next,
+        crate::Answer::Choose(1),
+        crate::Answer::Next,
+    ] {
+        story.lock().unwrap().answer = Some(answer);
+        t = steps(&mut w, t, 1);
+    }
+    assert!(
+        !story.lock().unwrap().busy(),
+        "{:?}",
+        story.lock().unwrap().screen
+    );
+    assert_eq!(
+        story.lock().unwrap().state.vars["kuznec.znakom"],
+        reyvec_story::Value::Bool(true)
+    );
+    // Сцену сохранили (новый мир того же проекта): сюжет помнит знакомство.
+    let mut again = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    again.keep_story_from(&w);
+    assert_eq!(
+        again.story().unwrap().lock().unwrap().state.vars["kuznec.znakom"],
+        reyvec_story::Value::Bool(true)
+    );
+    let _ = t;
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn scripts_drive_an_enemy_and_a_coin_and_pick_up_edits() {
     use reyvec_game::Action::Right;
@@ -2294,4 +2407,106 @@ fn mouse_attack_swings_toward_the_cursor() {
         }
     }
     assert_eq!(swings, vec![-1.0, 1.0]);
+}
+
+/// Сю.7: пример «кузнец и руда» в первой комнате песочницы проходится целиком —
+/// разговор, задание, руда в коридоре, второй разговор, награда.
+#[test]
+fn smith_and_ore_example_plays_through_in_the_first_room() {
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let story = w.story().expect("папка story/ в корне репозитория");
+    let mut t = steps(&mut w, 0, 10);
+    let go = |w: &mut SceneWorld, x: f64| {
+        let mut b = w.player_body().unwrap();
+        b.pos = [x, -0.62];
+        b.vel = [0.0, 0.0];
+        w.set_player_body(b);
+    };
+    // Ответить: «дальше» или вариант, пока разговор идёт.
+    let talk = |w: &mut SceneWorld, t: &mut usize, choice: &str| {
+        for _ in 0..20 {
+            *t = steps(w, *t, 1);
+            let mut h = story.lock().unwrap();
+            if !h.busy() {
+                return;
+            }
+            let answer = match &h.screen {
+                Some(crate::Screen::Line(s)) if !s.choices.is_empty() => crate::Answer::Choose(
+                    s.choices
+                        .iter()
+                        .position(|c| c.text == choice)
+                        .unwrap_or_else(|| panic!("нет варианта {choice}: {:?}", s.choices)),
+                ),
+                Some(_) => crate::Answer::Next,
+                None => continue,
+            };
+            h.answer = Some(answer);
+        }
+        panic!("разговор не кончился: {:?}", story.lock().unwrap().screen);
+    };
+    let dialog = |w: &mut SceneWorld, t: &mut usize| {
+        for _ in 0..10 {
+            *t = steps(w, *t, 1);
+            if let Some(talk) = &story.lock().unwrap().talk {
+                return talk.dialog.clone();
+            }
+        }
+        panic!("кузнец молчит: {:?}", w.snapshot().scripts.errors);
+    };
+    go(&mut w, 5.0);
+    assert_eq!(dialog(&mut w, &mut t), "kuznec.privet");
+    talk(&mut w, &mut t, "Мне нужен меч.");
+    let stage = |s: &crate::SharedStory| {
+        let h = s.lock().unwrap();
+        h.story.quest_state(&h.state, "mech")
+    };
+    assert_eq!(stage(&story).stage, "ruda");
+    for x in [9.4, 9.9, 10.4] {
+        go(&mut w, x);
+        t = steps(&mut w, t, 3);
+    }
+    assert_eq!(stage(&story).stage, "otnesti", "{:?}", w.snapshot().scripts);
+    go(&mut w, 5.0);
+    assert_eq!(dialog(&mut w, &mut t), "kuznec.ruda");
+    talk(&mut w, &mut t, "");
+    let h = story.lock().unwrap();
+    assert_eq!(h.story.quest_state(&h.state, "mech").stage, "zhdat");
+    assert_eq!(h.state.vars["hero.ruda"], reyvec_story::Value::Int(0));
+    assert!(h.problems.is_empty(), "{:?}", h.problems);
+    assert!(w.snapshot().scripts.errors.is_empty());
+}
+
+/// Сю.12: рядом с кузнецом слышно, как он переговаривается с учеником.
+#[test]
+fn hero_near_the_smith_overhears_the_apprentice_talk() {
+    let file = SceneFile::parse_in(EXAMPLE, example_dir()).unwrap();
+    let mut lib = library();
+    let mut w = SceneWorld::new(&file, &mut lib, &mut ShapeCache::new()).unwrap();
+    let story = w.story().expect("папка story/ в корне репозитория");
+    let mut b = w.player_body().unwrap();
+    b.pos = [6.5, -0.62];
+    b.vel = [0.0, 0.0];
+    w.set_player_body(b);
+    let mut heard = Vec::new();
+    let mut t = 0;
+    for _ in 0..8 * 60 {
+        t = steps(&mut w, t, 1);
+        let h = story.lock().unwrap();
+        for l in &h.heard {
+            if !heard.contains(&l.text) {
+                heard.push(l.text.clone());
+            }
+        }
+    }
+    assert!(
+        heard.iter().any(|t| t.contains("мехи")) && heard.iter().any(|t| t.contains("Руды")),
+        "{heard:?}"
+    );
+    assert!(
+        !story.lock().unwrap().busy(),
+        "игрока в разговор не втянули"
+    );
+    assert!(w.snapshot().scripts.errors.is_empty());
 }

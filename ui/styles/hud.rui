@@ -1,0 +1,19 @@
+// Стили полоски здоровья (шаг И.3а).
+
+style hud {
+    .padding(10, 18)
+    .background(#00000070)
+    .radius(var(radius))
+}
+
+style label {
+    .font(18)
+    .color(var(text))
+}
+
+style Bar.health {
+    .size(260, 14)
+    .radius(7)
+    .background(#00000080)
+    .fill(var(health))
+}

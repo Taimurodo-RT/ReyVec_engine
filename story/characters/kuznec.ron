@@ -1,0 +1,23 @@
+(
+    format: "reyvec-character",
+    version: 1,
+    id: "kuznec",
+    name: "Кузнец Борис",
+    color: "#E07A5F",
+    // Для автора, а позже и для модели (живые NPC, шаг Сю.10).
+    about: "Ворчливый, но добрый кузнец деревни. Говорит коротко. Ценит работу руками, не любит болтунов. Ему вечно не хватает руды.",
+    lines: (view: Window, mood: "spokoiny"),
+    // Отношения в начале игры (Сю.9): к незнакомцу кузнец относится настороженно.
+    relations: {"hero": -1},
+    // Распорядок дня (Сю.12): игра начинается в 8 утра, час игры — минута.
+    day: [
+        (from: 6, place: "kuznya", doing: "rabotaet"),
+        (from: 12, place: "ploshad", doing: "obedaet"),
+        (from: 13, place: "kuznya", doing: "rabotaet"),
+        (from: 22, place: "dom", doing: "spit"),
+    ],
+    // Разговоры с другими (Сю.12): когда оба в одном месте, не чаще раза в час игры.
+    chats: [
+        (with: "uchenik", dialog: "kuznec.uchenik", every: 1),
+    ],
+)

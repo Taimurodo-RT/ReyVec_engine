@@ -1,0 +1,328 @@
+//! `reyvec-story`: сюжет ReyVec без окна и видеокарты (решение 0023, `docs/story.md`).
+//!
+//! Сюжет — данные проекта в папке `story/`:
+//!
+//! ```text
+//! story/
+//!   vars.ron               переменные мира и их значения в начале игры
+//!   characters/*.ron       персонажи: имя, характер, настройки реплик по умолчанию
+//!   dialogs/*.ron          диалоги: карточки (реплика, развилка, событие, …) и стрелки
+//!   quests/*.ron           задания: стадии, цели, записи журнала
+//!   lang/<язык>.ron        переводы: ключ реплики → текст
+//! ```
+//!
+//! [`Story::load_dir`] читает папку и проверяет её ([`check`]). [`Story::talk`] начинает
+//! разговор, [`Story::step`] ведёт его до следующей реплики или события, [`Talk::choose`]
+//! передаёт выбор игрока. Всё, что меняется по ходу игры (переменные, задания, выборы),
+//! лежит в [`State`] — это часть сохранения.
+
+pub mod check;
+pub mod cond;
+pub mod format;
+pub mod life;
+pub mod memory;
+pub mod play;
+pub mod quest;
+pub mod rename;
+pub mod text;
+pub mod writer;
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
+
+pub use check::Problem;
+pub use format::{Character, Dialog, LineSettings, Node, Quest, Value, VarsFile, View};
+pub use play::{Generated, Shown, ShownChoice, Step, Talk};
+pub use quest::{QuestState, Status};
+
+/// Пример сюжета «кузнец и руда» (папка `story/` в корне репозитория), для тестов.
+pub const EXAMPLE: &[(&str, &str)] = &[
+    ("vars.ron", include_str!("../../../story/vars.ron")),
+    (
+        "characters/hero.ron",
+        include_str!("../../../story/characters/hero.ron"),
+    ),
+    (
+        "characters/kuznec.ron",
+        include_str!("../../../story/characters/kuznec.ron"),
+    ),
+    (
+        "characters/uchenik.ron",
+        include_str!("../../../story/characters/uchenik.ron"),
+    ),
+    (
+        "dialogs/kuznec.privet.ron",
+        include_str!("../../../story/dialogs/kuznec.privet.ron"),
+    ),
+    (
+        "dialogs/kuznec.ruda.ron",
+        include_str!("../../../story/dialogs/kuznec.ruda.ron"),
+    ),
+    (
+        "dialogs/kuznec.uchenik.ron",
+        include_str!("../../../story/dialogs/kuznec.uchenik.ron"),
+    ),
+    (
+        "quests/mech.ron",
+        include_str!("../../../story/quests/mech.ron"),
+    ),
+    ("lang/en.ron", include_str!("../../../story/lang/en.ron")),
+];
+
+/// Сюжет проекта: всё прочитанное из `story/` и разобранные условия.
+#[derive(Default)]
+pub struct Story {
+    pub vars: BTreeMap<String, Value>,
+    pub characters: BTreeMap<String, Character>,
+    pub dialogs: BTreeMap<String, Dialog>,
+    pub quests: BTreeMap<String, Quest>,
+    /// Язык → ключ → текст.
+    pub lang: BTreeMap<String, HashMap<String, String>>,
+    /// Из какого файла пришёл персонаж, диалог или задание (для сообщений).
+    pub files: HashMap<String, String>,
+    pub(crate) conds: cond::Conditions,
+    /// Модель для карточек «Сгенерировать» (Сю.10). Нет — звучит запасной текст.
+    pub writer: Option<Box<dyn writer::Writer>>,
+}
+
+/// Состояние сюжета в игре — часть сохранения ([`Story::save`], [`Story::restore`]).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct State {
+    pub vars: BTreeMap<String, Value>,
+    pub quests: BTreeMap<String, QuestState>,
+    /// Какие варианты ответа игрок уже выбирал (ключи вариантов).
+    pub chosen: BTreeSet<String>,
+    /// Язык текстов; пусто — основной (как написано в диалогах).
+    pub lang: String,
+    /// Зерно случайных карточек: одинаковое зерно — одинаковый путь.
+    pub seed: u64,
+    /// Какие диалоги уже начинались (`story.seen` в скриптах).
+    pub talked: BTreeSet<String>,
+    /// Память и отношения персонажей (Сю.9): имя персонажа → что помнит.
+    pub memory: BTreeMap<String, memory::Memory>,
+    /// Сколько секунд идёт игра (по этому времени забываются факты и идут часы).
+    pub time: f64,
+    /// Жизнь персонажей (Сю.12): где каждый, с кем говорил, что ещё скажет.
+    pub life: BTreeMap<String, life::Life>,
+}
+
+impl Story {
+    /// Читает сюжет из текстов «путь в `story/` → содержимое». Ошибки чтения и проверки —
+    /// в списке; сюжет собирается из того, что прочиталось.
+    pub fn from_texts(files: &[(&str, &str)]) -> (Story, Vec<Problem>) {
+        let mut story = Story::default();
+        let mut problems = Vec::new();
+        for (path, text) in files {
+            let path = path.replace('\\', "/");
+            if let Err(e) = story.add(&path, text) {
+                problems.push(Problem::error(&path, "", e));
+            }
+        }
+        problems.extend(check::check(&mut story));
+        (story, problems)
+    }
+
+    /// Читает папку `story/`. Нет папки — пустой сюжет без ошибок.
+    pub fn load_dir(dir: &Path) -> (Story, Vec<Problem>) {
+        let mut texts = Vec::new();
+        let mut problems = Vec::new();
+        let vars = dir.join("vars.ron");
+        if vars.exists() {
+            match std::fs::read_to_string(&vars) {
+                Ok(t) => texts.push(("vars.ron".to_string(), t)),
+                Err(e) => problems.push(Problem::error("vars.ron", "", e.to_string())),
+            }
+        }
+        for sub in ["characters", "dialogs", "quests", "lang"] {
+            let Ok(rd) = std::fs::read_dir(dir.join(sub)) else {
+                continue;
+            };
+            let mut paths: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            paths.sort();
+            for p in paths {
+                if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ron")) {
+                    continue;
+                }
+                let name = format!(
+                    "{sub}/{}",
+                    p.file_name().unwrap_or_default().to_string_lossy()
+                );
+                match std::fs::read_to_string(&p) {
+                    Ok(t) => texts.push((name, t)),
+                    Err(e) => problems.push(Problem::error(&name, "", e.to_string())),
+                }
+            }
+        }
+        let refs: Vec<(&str, &str)> = texts
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let (story, more) = Story::from_texts(&refs);
+        problems.extend(more);
+        (story, problems)
+    }
+
+    fn add(&mut self, path: &str, text: &str) -> Result<(), String> {
+        let kind = path.split('/').next().unwrap_or("");
+        match kind {
+            "vars.ron" => {
+                let f: VarsFile = format::parse(text)?;
+                expect_format(&f.format, "reyvec-story-vars")?;
+                self.vars = f.vars;
+            }
+            "characters" => {
+                let c: Character = format::parse(text)?;
+                expect_format(&c.format, "reyvec-character")?;
+                self.files.insert(format!("c:{}", c.id), path.into());
+                if self.characters.insert(c.id.clone(), c).is_some() {
+                    return Err("персонаж с таким именем уже есть".into());
+                }
+            }
+            "dialogs" => {
+                let d: Dialog = format::parse(text)?;
+                expect_format(&d.format, "reyvec-dialog")?;
+                self.files.insert(format!("d:{}", d.id), path.into());
+                if self.dialogs.insert(d.id.clone(), d).is_some() {
+                    return Err("диалог с таким именем уже есть".into());
+                }
+            }
+            "quests" => {
+                let q: Quest = format::parse(text)?;
+                expect_format(&q.format, "reyvec-quest")?;
+                self.files.insert(format!("q:{}", q.id), path.into());
+                if self.quests.insert(q.id.clone(), q).is_some() {
+                    return Err("задание с таким именем уже есть".into());
+                }
+            }
+            "lang" => {
+                let words: HashMap<String, String> = format::parse(text)?;
+                let code = path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(".ron")
+                    .to_string();
+                self.lang.insert(code, words);
+            }
+            _ => return Err("неизвестная папка сюжета".into()),
+        }
+        Ok(())
+    }
+
+    /// Состояние мира в начале игры.
+    pub fn new_state(&self) -> State {
+        State {
+            vars: self.vars.clone(),
+            // Все задания сразу, «не взятыми»: условие `quest.mech.state == "none"`
+            // работает и до начала задания.
+            quests: self
+                .quests
+                .keys()
+                .map(|id| (id.clone(), QuestState::default()))
+                .collect(),
+            // Отношения в начале игры — из файлов персонажей.
+            memory: self
+                .characters
+                .values()
+                .filter(|c| !c.relations.is_empty())
+                .map(|c| {
+                    (
+                        c.id.clone(),
+                        memory::Memory {
+                            facts: Vec::new(),
+                            relations: c.relations.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            ..State::default()
+        }
+    }
+
+    /// Сохранение сюжета: текст RON с переменными, заданиями и выборами игрока.
+    pub fn save(&self, state: &State) -> Result<String, String> {
+        ron::ser::to_string_pretty(state, ron::ser::PrettyConfig::default())
+            .map_err(|e| format!("не сохранить сюжет: {e}"))
+    }
+
+    /// Состояние из сохранения. Сюжет мог поменяться после сохранения: новые переменные
+    /// и задания берутся из начала игры, а исчезнувшие выбрасываются. Переменная,
+    /// у которой поменялся вид (было число, стало да/нет), тоже берётся из начала.
+    pub fn restore(&self, text: &str) -> Result<State, String> {
+        let saved: State = ron::from_str(text).map_err(|e| format!("сохранение сюжета: {e}"))?;
+        let mut state = self.new_state();
+        for (name, v) in saved.vars {
+            if let Some(now) = state.vars.get_mut(&name)
+                && std::mem::discriminant(now) == std::mem::discriminant(&v)
+            {
+                *now = v;
+            }
+        }
+        for (id, q) in saved.quests {
+            if let Some(now) = state.quests.get_mut(&id) {
+                *now = q;
+            }
+        }
+        state.chosen = saved.chosen;
+        state.lang = saved.lang;
+        state.seed = saved.seed;
+        state.talked = saved.talked;
+        // Память — только тех, кто ещё есть в сюжете.
+        for (npc, m) in saved.memory {
+            if self.characters.contains_key(&npc) {
+                state.memory.insert(npc, m);
+            }
+        }
+        state.time = saved.time;
+        for (npc, l) in saved.life {
+            if self.characters.contains_key(&npc) {
+                state.life.insert(npc, l);
+            }
+        }
+        Ok(state)
+    }
+
+    /// Истинно ли условие Luau при этом состоянии.
+    pub fn eval(&mut self, expr: &str, state: &State) -> Result<bool, String> {
+        self.conds.eval(expr, state)
+    }
+
+    /// Текст по ключу на языке состояния; нет перевода — основной текст.
+    pub fn text<'a>(&'a self, key: &str, main: &'a str, state: &State) -> &'a str {
+        if state.lang.is_empty() {
+            return main;
+        }
+        self.lang
+            .get(&state.lang)
+            .and_then(|w| w.get(key))
+            .map_or(main, String::as_str)
+    }
+
+    /// Файл, из которого пришёл диалог.
+    pub fn dialog_file(&self, id: &str) -> &str {
+        self.files
+            .get(&format!("d:{id}"))
+            .map_or("", String::as_str)
+    }
+}
+
+fn expect_format(got: &str, want: &str) -> Result<(), String> {
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!("format: \"{got}\", а ждали \"{want}\""))
+    }
+}
+
+/// Годится ли имя: латиница в нижнем регистре, цифры, `_` и `.` (не в начале и конце).
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && !id.ends_with('.')
+        && !id.contains("..")
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+        && !id.starts_with(|c: char| c.is_ascii_digit())
+}

@@ -1,0 +1,50 @@
+// Пример экрана интерфейса игры (шаги И.1–И.2в, решение 0022).
+// В песочнице: F3 показывает и прячет, F4 меняет тему, кнопка «Язык» — язык.
+// Правка этого файла, темы, стилей или языков (ui/lang) сразу видна в окне.
+// Тексты пишутся ключами: tr("menu.save"), а слова — в ui/lang/ru.ron и en.ron.
+// Размеры — в пикселях экрана 1920×1080, на другом окне всё растягивается.
+
+head {
+    theme("themes/base")      // переменные: цвета, размеры
+    styles("styles/demo")     // как выглядят окна, кнопки, тексты
+}
+
+screen Demo {
+    // Меню в середине экрана.
+    Column(align: stretch) {
+        Text("ReyVec").class(title)
+        Text(tr("demo.hint")).class(hint)
+        // Подсказка видна, только когда игрок на клавиатуре.
+        Text(tr("demo.keys")).class(hint)
+            .opacity(0)
+            .when(input: keyboard) { .opacity(1) }
+
+        Rect().height(8)
+
+        // Мышь подсвечивает кнопку, Tab и стрелки выбирают, Enter нажимает.
+        // Что нажато — видно в консоли (~); «Язык» меняет язык, «Выход» прячет экран.
+        Button(tr("menu.continue")).id(continue)
+        Button(tr("menu.new_game")).id(new_game)
+        Button(tr("menu.save")).id(save).disabled()
+        Button(tr("menu.settings")).id(settings)
+        Button(tr("menu.language")).id(language)
+        Button(tr("menu.quit")).id(close).class(danger)
+    }
+    .class(menu, panel)
+
+    // Полоска выносливости в левом нижнем углу. Своё значение muted действует
+    // только внутри этого столбца: подпись светлее, чем в меню.
+    Column(spacing: 6) {
+        Text(tr("hud.stamina")).font(18).color(var(muted))
+        Stack {
+            Rect().size(190, 12).background(var(stamina)).radius(6).align(left)
+        }
+        .size(260, 12)
+        .background(#00000080)
+        .radius(6)
+        // {n} в тексте заменяется числом. Пока число записано здесь, связь с игрой — И.3.
+        Text(tr("hud.coins", n: 120)).font(18).color(var(muted))
+    }
+    .var(muted: #C8D0DC)
+    .anchor(bottom_left, margin: 32)
+}

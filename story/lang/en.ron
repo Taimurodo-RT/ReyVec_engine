@@ -1,0 +1,21 @@
+// Английский: ключ реплики → текст. Ключ — `<диалог>.<карточка>`, у варианта ответа
+// ещё `.<номер>`. Нет перевода — звучит основной текст.
+{
+    "kuznec.privet.chuzhak": "What do you want, stranger? I'm the smith, by the way.",
+    "kuznec.privet.po_imeni": "Ah, {hero.name}! Come in.",
+    "kuznec.privet.spasibo": "{hero.name}! Thanks again for the ore. The sword will be ready soon.",
+    "kuznec.privet.vopros": "What do you need?",
+    "kuznec.privet.vopros.1": "I need a sword.",
+    "kuznec.privet.vopros.2": "I brought the ore.",
+    "kuznec.privet.vopros.3": "Just looking.",
+    "kuznec.privet.pro_mech": "A sword? Bring me three chunks of ore and I'll forge one.",
+    "kuznec.privet.proshchai": "Look all you want, just don't touch.",
+    "kuznec.ruda.nachalo": "Whoa, three chunks! Good ore.",
+    "kuznec.ruda.zavtra": "Come back tomorrow, the sword will be ready.",
+    "kuznec.ruda.den": "Give me a day and the sword is yours.",
+    "kuznec.uchenik.meha": "Petka, work the bellows!",
+    "kuznec.uchenik.otvet": "I am, uncle Boris. Still no ore though…",
+    "kuznec.uchenik.ruda": "No ore, no sword.",
+    "kuznec.uchenik.gotovo": "Uncle Boris, will you forge me a sword like that?",
+    "kuznec.uchenik.podrasti": "Grow up first.",
+}

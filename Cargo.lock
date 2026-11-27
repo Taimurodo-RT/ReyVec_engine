@@ -3396,6 +3396,8 @@ dependencies = [
  "reyvec-gpu",
  "reyvec-scene",
  "reyvec-sdf",
+ "reyvec-text",
+ "reyvec-ui",
  "reyvec-vector",
  "ron",
  "serde",
@@ -3434,6 +3436,7 @@ dependencies = [
  "reyvec-scene",
  "reyvec-script",
  "reyvec-sdf",
+ "reyvec-story",
  "reyvec-vector",
  "ron",
  "serde",
@@ -3465,6 +3468,7 @@ dependencies = [
  "reyvec-sdf",
  "reyvec-svg",
  "reyvec-text",
+ "reyvec-ui",
  "reyvec-vector",
  "thiserror 2.0.21",
  "tracing",
@@ -3502,6 +3506,7 @@ dependencies = [
  "reyvec-motif",
  "reyvec-script",
  "reyvec-sdf",
+ "reyvec-story",
  "reyvec-svg",
  "reyvec-vector",
  "ron",
@@ -3515,6 +3520,7 @@ name = "reyvec-script"
 version = "0.1.0"
 dependencies = [
  "mlua",
+ "reyvec-story",
  "tracing",
 ]
 
@@ -3529,6 +3535,16 @@ dependencies = [
  "ron",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "reyvec-story"
+version = "0.1.0"
+dependencies = [
+ "mlua",
+ "ron",
+ "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -3551,6 +3567,18 @@ dependencies = [
  "parley",
  "reyvec-vector",
  "skrifa",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "reyvec-ui"
+version = "0.1.0"
+dependencies = [
+ "reyvec-text",
+ "reyvec-vector",
+ "ron",
+ "serde",
+ "taffy",
  "thiserror 2.0.21",
 ]
 
@@ -4016,6 +4044,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "taffy"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31f7bd2d97198df05186f93a3a3c306845f40e8b3c22bf9279cdd7e5cf5fea7d"
+dependencies = [
+ "serde",
+ "slotmap",
+ "smallvec",
 ]
 
 [[package]]

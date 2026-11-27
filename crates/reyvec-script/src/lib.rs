@@ -24,6 +24,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 use mlua::{Function, Lua, RegistryKey, Table, VmState};
+use reyvec_story::Value;
+
+mod story;
+pub use story::{
+    Answer, Func, Heard, KEEP, NPC_FUNCS, QUEST_FUNCS, STORY_FUNCS, Screen, SharedStory, StoryHost,
+    lock as lock_story, talking,
+};
 
 /// Сколько раз один вызов скрипта может пройти проверку Luau (она стоит на каждом обороте
 /// цикла и вызове функции), прежде чем его оборвут. Счёт, а не часы: раньше предел был
@@ -161,6 +168,8 @@ struct ScriptFile {
     name: String,
     modified: Option<SystemTime>,
     update: Option<Function>,
+    /// Глобальные имена файла: здесь карточка «Скрипт» сюжета ищет свою функцию.
+    env: Option<Table>,
     error: Option<String>,
 }
 
@@ -175,6 +184,8 @@ pub struct Scripts {
     epoch: Instant,
     /// Сколько раз перечитаны файлы (для панели и тестов).
     pub reloads: u32,
+    /// Сюжет игры для `story.*` и `quest.*` (Сю.5).
+    story: Option<SharedStory>,
 }
 
 impl Default for Scripts {
@@ -214,7 +225,67 @@ impl Scripts {
             deadline,
             epoch,
             reloads: 0,
+            story: None,
         }
+    }
+
+    /// Даёт скриптам сюжет: таблицы `story` и `quest`. Возвращает общую копию — её ведёт
+    /// игра (разговор, сохранение). Вызывать до загрузки скриптов не обязательно: таблицы
+    /// видны всем скриптам сразу.
+    pub fn set_story(&mut self, story: reyvec_story::Story) -> SharedStory {
+        let host = Arc::new(std::sync::Mutex::new(StoryHost::new(story)));
+        if let Err(e) = story::install(&self.lua, &host) {
+            tracing::warn!("сюжет для скриптов: {e}");
+        }
+        self.story = Some(Arc::clone(&host));
+        host
+    }
+
+    /// Сюжет, если он есть.
+    pub fn story(&self) -> Option<&SharedStory> {
+        self.story.as_ref()
+    }
+
+    /// Шаг сюжета (Сю.7): ведёт начатый разговор ([`StoryHost::advance`]) и зовёт функции
+    /// скриптов, которые просят карточки «Скрипт».
+    pub fn story_step(&mut self, dt: f32) {
+        let Some(host) = self.story.clone() else {
+            return;
+        };
+        let mut dt = dt;
+        // Предел: сюжет, который зовёт функции по кругу без реплик.
+        for _ in 0..16 {
+            let Some((func, args)) = story::lock(&host).advance(dt) else {
+                return;
+            };
+            dt = 0.0;
+            if let Err(e) = self.call_story(&func, &args) {
+                story::lock(&host).problem(e);
+            }
+        }
+    }
+
+    /// Зовёт функцию `func` из первого скрипта, где она есть (карточка «Скрипт» сюжета).
+    pub fn call_story(&mut self, func: &str, args: &[Value]) -> Result<(), String> {
+        let found = self.files.iter().find_map(|f| {
+            let env = f.env.as_ref()?;
+            let fun = env.raw_get::<Option<Function>>(func).ok().flatten()?;
+            Some((f.name.clone(), fun))
+        });
+        let Some((name, fun)) = found else {
+            return Err(format!(
+                "карточка «Скрипт»: ни в одном скрипте нет функции {func}()"
+            ));
+        };
+        let args = args
+            .iter()
+            .map(|v| story::to_lua(&self.lua, v))
+            .collect::<mlua::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?;
+        self.arm();
+        let called = fun.call::<()>(mlua::MultiValue::from_iter(args));
+        self.disarm();
+        called.map_err(|e| named(&name, &e))
     }
 
     /// Загружает скрипт из файла (один и тот же файл — один раз). Ошибка не мешает:
@@ -232,6 +303,7 @@ impl Scripts {
             name,
             modified: None,
             update: None,
+            env: None,
             error: None,
         });
         let i = self.files.len() - 1;
@@ -247,6 +319,7 @@ impl Scripts {
             name: name.into(),
             modified: None,
             update: None,
+            env: None,
             error: None,
         });
         let i = self.files.len() - 1;
@@ -267,7 +340,7 @@ impl Scripts {
 
     fn compile_source(&mut self, i: usize, source: &str) {
         let name = self.files[i].name.clone();
-        let result = (|| -> mlua::Result<Function> {
+        let result = (|| -> mlua::Result<(Function, Table)> {
             let env = self.lua.create_table()?;
             let meta = self.lua.create_table()?;
             meta.raw_set("__index", self.lua.globals())?;
@@ -281,13 +354,16 @@ impl Scripts {
                 .exec();
             self.disarm();
             run?;
-            env.get::<Option<Function>>("update")?
-                .ok_or_else(|| mlua::Error::runtime("нет функции update(me, hero, dt)"))
+            let update = env
+                .get::<Option<Function>>("update")?
+                .ok_or_else(|| mlua::Error::runtime("нет функции update(me, hero, dt)"))?;
+            Ok((update, env))
         })();
         let f = &mut self.files[i];
         match result {
-            Ok(update) => {
+            Ok((update, env)) => {
                 f.update = Some(update);
+                f.env = Some(env);
                 f.error = None;
             }
             Err(e) => {
