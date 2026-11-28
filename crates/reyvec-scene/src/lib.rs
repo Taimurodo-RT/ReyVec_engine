@@ -20,7 +20,7 @@
 //! против часовой стрелки. Цвета — строки `"#rrggbb"` или `"#rrggbbaa"` (sRGB, как в
 //! редакторах); яркость источников и светящихся объектов задаёт `power`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -308,6 +308,85 @@ pub struct NodeDesc {
     /// вышел» и поле сил (ветер, другая тяжесть, магнит).
     #[serde(default)]
     pub zone: Option<ZoneDesc>,
+    /// Свойства (9.8): имя → да/нет, число или текст (цвет — текстом `"#rrggbb"`).
+    /// Встроенные: `damage` (касание ранит героя на столько), `burns` (горит: ранит на
+    /// 1 и мерцает), `grab: false` (руками не взять), `glow` (SDF-объекты предмета
+    /// светятся). Остальные — свои: их читают скрипты (`me.props`).
+    #[serde(default)]
+    pub props: BTreeMap<String, Prop>,
+    /// Метки (9.8): слова, по которым предмет узнают скрипты и сигналы (`me.tags`).
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Значение свойства предмета (9.8).
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum Prop {
+    Flag(bool),
+    Number(f64),
+    Text(String),
+}
+
+impl Prop {
+    pub fn number(&self) -> Option<f64> {
+        match self {
+            Self::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn flag(&self) -> Option<bool> {
+        match self {
+            Self::Flag(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Для скрипта.
+    pub fn script(&self) -> reyvec_script::PropValue {
+        match self {
+            Self::Flag(b) => reyvec_script::PropValue::Flag(*b),
+            Self::Number(n) => reyvec_script::PropValue::Number(*n),
+            Self::Text(t) => reyvec_script::PropValue::Text(t.clone()),
+        }
+    }
+}
+
+/// Встроенные свойства и какого они вида: число, да/нет.
+const BUILTIN_PROPS: &[(&str, &str)] = &[
+    ("damage", "число от 0 до 100"),
+    ("burns", "да/нет (true или false)"),
+    ("grab", "да/нет (true или false)"),
+    ("glow", "да/нет (true или false)"),
+];
+
+/// Свойства и метки предмета без ошибок: встроенные — своего вида, имена не пустые.
+fn check_props(props: &BTreeMap<String, Prop>, tags: &[String]) -> Result<(), String> {
+    for (k, v) in props {
+        if k.trim().is_empty() {
+            return Err("props: пустое имя свойства".into());
+        }
+        if let Prop::Number(n) = v
+            && !n.is_finite()
+        {
+            return Err(format!("props: {k} — нужно число"));
+        }
+        let Some((_, kind)) = BUILTIN_PROPS.iter().find(|(name, _)| name == k) else {
+            continue;
+        };
+        let ok = match k.as_str() {
+            "damage" => v.number().is_some_and(|n| (0.0..=100.0).contains(&n)),
+            _ => v.flag().is_some(),
+        };
+        if !ok {
+            return Err(format!("props: {k} — нужно {kind}"));
+        }
+    }
+    if let Some(t) = tags.iter().find(|t| t.trim().is_empty()) {
+        return Err(format!("tags: пустая метка «{t}»"));
+    }
+    Ok(())
 }
 
 /// Зона: `size` — ширина и высота, `wind` — скорость ветра или течения (x, y), `gravity`
@@ -951,6 +1030,8 @@ impl NodeDesc {
             spawn: None,
             layer: None,
             zone: None,
+            props: BTreeMap::new(),
+            tags: Vec::new(),
         }
     }
 
@@ -997,6 +1078,7 @@ impl NodeDesc {
         };
         let fail = |m: String| SceneError::new(format!("{here}: {m}"));
         check_point("at", self.at).map_err(fail)?;
+        check_props(&self.props, &self.tags).map_err(fail)?;
         if !(self.depth.is_finite() && self.depth.abs() <= MAX_COORD) {
             return Err(fail(format!(
                 "depth {} — нужно от −{MAX_COORD} до {MAX_COORD}",
@@ -2589,11 +2671,13 @@ pub use reyvec_script::{Answer, Heard, Screen, SharedStory, StoryHost, lock_stor
 pub use reyvec_story as story;
 pub use tiles::TilesDesc;
 pub use world::{
-    DebugCommand, Dynamic, GlobalPlacement, LightSource, Motion, Placement, Pointer, SceneTime,
-    SceneWorld, SdfShape, SvgPicture, VectorShape,
+    DebugCommand, Dynamic, GlobalPlacement, LightSource, Motion, Placement, Pointer, Props,
+    SceneTime, SceneWorld, SdfShape, SvgPicture, VectorShape,
 };
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_logic;
 #[cfg(test)]
 mod tests_phys;

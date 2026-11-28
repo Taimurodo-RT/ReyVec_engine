@@ -256,7 +256,10 @@ impl Physics {
             let Some(b) = self.bounds(id) else {
                 continue;
             };
-            if !b.overlaps(&ahead) || !self.bodies.get(*h).is_some_and(|b| b.is_dynamic()) {
+            if !b.overlaps(&ahead)
+                || self.no_grab.contains(h)
+                || !self.bodies.get(*h).is_some_and(|b| b.is_dynamic())
+            {
                 continue;
             }
             // Сзади — только вплотную; спереди — ближе к рукам лучше.

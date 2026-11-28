@@ -18,7 +18,7 @@
 //! Единицы — единицы сцены (герой ростом 0,28). Чтобы допуски `rapier` подходили к
 //! таким мелким телам, задан масштаб длины [`LENGTH_UNIT`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use rapier2d::prelude::*;
@@ -86,6 +86,8 @@ pub struct BodyDesc {
     /// Слой и маска столкновений (9.6а, [`crate::layer`]).
     pub layer: u32,
     pub mask: u32,
+    /// Можно взять в руки (9.8, свойство `grab`).
+    pub grab: bool,
 }
 
 impl Default for BodyDesc {
@@ -103,6 +105,7 @@ impl Default for BodyDesc {
             material: Material::Wood,
             layer: crate::layer::BODY,
             mask: crate::layer::ALL,
+            grab: true,
         }
     }
 }
@@ -243,6 +246,8 @@ pub struct Physics {
     touches: Vec<Touch>,
     /// Поля сил дали телам силы на этот шаг (сбросить после шага).
     forced: bool,
+    /// Тела, которые не берутся в руки (9.8).
+    no_grab: HashSet<RigidBodyHandle>,
 }
 
 /// Больше касаний не копим, если их никто не забирает.
@@ -285,6 +290,7 @@ impl Physics {
             mover_keys: HashMap::new(),
             touches: Vec::new(),
             forced: false,
+            no_grab: HashSet::new(),
         }
     }
 
@@ -312,6 +318,9 @@ impl Physics {
             .rotation(angle.to_radians() as f32)
             .build();
         let h = self.bodies.insert(body);
+        if !d.grab {
+            self.no_grab.insert(h);
+        }
         let c = d
             .collider()
             .density(d.density.max(0.01) as f32)
@@ -448,6 +457,7 @@ impl Physics {
     }
 
     fn drop_body(&mut self, h: RigidBodyHandle) {
+        self.no_grab.remove(&h);
         self.bodies.remove(
             h,
             &mut self.islands,
