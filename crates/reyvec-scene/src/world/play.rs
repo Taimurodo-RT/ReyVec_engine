@@ -228,34 +228,14 @@ pub(super) fn play(
             .filter(|_| !p.god)
             .find(|(_, t)| t.contact > 0 && t.dummy.alive() && me.overlaps(&t.dummy.bounds()));
         if let Some((_, t)) = touch {
-            let amount = t.contact;
-            let from = t.dummy.body.pos[0];
-            let at = [p.body.pos[0] as f32, p.body.pos[1] as f32];
-            match p.health.hurt(amount) {
-                Hurt::Ignored => {}
-                hurt => {
-                    // Отбрасывает от врага и чуть вверх.
-                    let dir = if p.body.pos[0] >= from { 1.0 } else { -1.0 };
-                    p.body.vel = [dir * HURT_PUSH[0], HURT_PUSH[1]];
-                    p.body.on_ground = false;
-                    events.list.push_back((
-                        step,
-                        GameEvent::Hurt {
-                            at,
-                            amount,
-                            dir: dir as f32,
-                        },
-                    ));
-                    combat.shake = 0.03;
-                    combat.shake_time = 0.25;
-                    combat.shake_left = 0.25;
-                    if hurt == Hurt::Died {
-                        events.list.push_back((step, GameEvent::Died { at }));
-                        p.body = Body::new(p.spawn);
-                        p.health.restore();
-                    }
-                }
-            }
+            hurt_hero(
+                p,
+                t.contact,
+                t.dummy.body.pos[0],
+                step,
+                &mut events,
+                &mut combat,
+            );
         }
         place.at = p.body.pos;
         place.flip = p.body.facing < 0.0;
@@ -303,6 +283,46 @@ pub(super) fn play(
         if d.body.pos[1] < d.spawn[1] - FALL_OUT {
             d.body = Body::new(d.spawn);
             d.moved = [0.0, 0.0];
+        }
+    }
+}
+
+/// Героя ранили на `amount` (касание врага, упавший ящик): отбрасывает от `from` по
+/// горизонтали и чуть вверх, тряска; кончилось здоровье — появляется снова в начале.
+pub(super) fn hurt_hero(
+    p: &mut Player,
+    amount: u32,
+    from: f64,
+    step: u64,
+    events: &mut Events,
+    combat: &mut Combat,
+) {
+    if p.god {
+        return;
+    }
+    let at = [p.body.pos[0] as f32, p.body.pos[1] as f32];
+    match p.health.hurt(amount) {
+        Hurt::Ignored => {}
+        hurt => {
+            let dir = if p.body.pos[0] >= from { 1.0 } else { -1.0 };
+            p.body.vel = [dir * HURT_PUSH[0], HURT_PUSH[1]];
+            p.body.on_ground = false;
+            events.list.push_back((
+                step,
+                GameEvent::Hurt {
+                    at,
+                    amount,
+                    dir: dir as f32,
+                },
+            ));
+            combat.shake = 0.03;
+            combat.shake_time = 0.25;
+            combat.shake_left = 0.25;
+            if hurt == Hurt::Died {
+                events.list.push_back((step, GameEvent::Died { at }));
+                p.body = Body::new(p.spawn);
+                p.health.restore();
+            }
         }
     }
 }

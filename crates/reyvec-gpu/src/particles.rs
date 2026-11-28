@@ -548,6 +548,65 @@ pub(crate) fn burst(event: &reyvec_scene::GameEvent, seed: u64) -> Vec<Particle>
                 });
             }
         }
+        E::Impact {
+            at,
+            speed,
+            material,
+        } => {
+            // Сила удара от 0 (едва слышно) до 1 (с высоты в рост героя и сильнее).
+            let k = ((speed - 0.6) / 3.0).clamp(0.0, 1.0);
+            let up = |r: &mut Rand, lo: f32, hi: f32| {
+                let angle = r.range(0.25, std::f32::consts::PI - 0.25);
+                let s = r.range(lo, hi);
+                [s * angle.cos(), s * angle.sin()]
+            };
+            let sparks = |n: usize, r: &mut Rand, out: &mut Vec<Particle>| {
+                for _ in 0..n {
+                    let v = up(r, 0.8, 1.2 + 2.0 * k);
+                    let life = r.range(0.15, 0.4);
+                    out.push(Particle {
+                        pos: at,
+                        vel: v,
+                        life,
+                        max_life: life,
+                        size: r.range(0.012, 0.022),
+                        gravity: 0.8,
+                        color: [4.0, 2.2, 0.6, 1.0],
+                        drag: 1.5,
+                        bounce: 0.4,
+                        flags: PARTICLE_COLLIDE | PARTICLE_SHRINK | PARTICLE_GLOW,
+                    });
+                }
+            };
+            use reyvec_scene::Material as M;
+            match material {
+                M::Metal => sparks(4 + (16.0 * k) as usize, &mut r, &mut out),
+                M::Stone => {
+                    for _ in 0..3 + (10.0 * k) as usize {
+                        let v = up(&mut r, 0.15, 0.4 + 0.5 * k);
+                        let mut d = dust(at, v, &mut r);
+                        d.color = [0.7, 0.7, 0.72, 0.55];
+                        out.push(d);
+                    }
+                    if k > 0.5 {
+                        sparks(3, &mut r, &mut out);
+                    }
+                }
+                M::Wood => {
+                    // Щепки: мелкие бурые, падают быстрее пыли.
+                    for _ in 0..2 + (8.0 * k) as usize {
+                        let v = up(&mut r, 0.3, 0.6 + 0.9 * k);
+                        let mut d = dust(at, v, &mut r);
+                        d.color = [0.75, 0.5, 0.28, 0.9];
+                        d.size = r.range(0.012, 0.024);
+                        d.gravity = 0.9;
+                        d.drag = 1.5;
+                        out.push(d);
+                    }
+                }
+                M::Rubber => {}
+            }
+        }
         E::Hit { at, dir } => {
             // Искры: ярче белого (их подхватывает свечение), летят веером от удара.
             for i in 0..28 {
@@ -857,6 +916,26 @@ mod tests {
             1,
         );
         assert!(hard.len() > soft.len(), "сильнее упал — больше пыли");
+        // Удары материалов: металл искрит ярче белого, резина ничего не роняет.
+        let knock = |material, speed| {
+            burst(
+                &GameEvent::Impact {
+                    at: [0.0, 0.0],
+                    speed,
+                    material,
+                },
+                3,
+            )
+        };
+        use reyvec_scene::Material as M;
+        let metal = knock(M::Metal, 4.0);
+        assert!(metal.len() >= 16 && metal.iter().all(|p| p.color[0] > 1.0));
+        assert!(
+            knock(M::Metal, 1.0).len() < metal.len(),
+            "слабее — меньше искр"
+        );
+        assert!(knock(M::Rubber, 4.0).is_empty());
+        assert!(!knock(M::Wood, 2.0).is_empty() && !knock(M::Stone, 2.0).is_empty());
     }
 
     #[test]

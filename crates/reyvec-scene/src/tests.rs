@@ -2526,3 +2526,57 @@ fn hero_near_the_smith_overhears_the_apprentice_talk() {
     );
     assert!(w.snapshot().scripts.errors.is_empty());
 }
+
+#[test]
+fn falling_metal_crate_rings_and_hurts_the_dummy_under_it() {
+    // 9.6: удар звучит материалом, тяжёлый ящик с высоты ранит того, на кого упал.
+    let text = minimal(
+        r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "герой", at: (-2.0, -0.7), player: (size: (0.1, 0.2)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+    (name: "манекен", at: (1.0, -0.65), dummy: (size: (0.16, 0.3), hp: 20),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.16, 0.3), color: "#f00")]),
+    (name: "ящик", at: (1.0, 0.4), body: (size: (0.2, 0.2), material: Metal),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.2, 0.2), color: "#888")]),
+    (name: "мяч", at: (-1.0, 0.0), body: (size: (0.1, 0.1), round: true, material: Rubber),
+        shapes: [Circle(at: (0.0, 0.0), r: 0.05, color: "#e33")]),
+]"##,
+    );
+    let mut w = world(&text);
+    let mut seen = 0;
+    let mut t = 0;
+    let mut damage = Vec::new();
+    let mut knocks = Vec::new();
+    for _ in 0..90 {
+        t = steps(&mut w, t, 1);
+        for e in fresh(&w, &mut seen) {
+            match e {
+                GameEvent::Damage { amount, .. } => damage.push(amount),
+                GameEvent::Impact {
+                    material, speed, ..
+                } => knocks.push((material, speed)),
+                _ => {}
+            }
+        }
+    }
+    eprintln!("урон {damage:?}, удары {knocks:?}");
+    assert_eq!(damage.len(), 1, "ящик ранил один раз: {damage:?}");
+    assert!((3..=15).contains(&damage[0]), "{damage:?}");
+    assert!(
+        knocks
+            .iter()
+            .any(|(m, s)| *m == crate::Material::Metal && *s > 2.5),
+        "{knocks:?}"
+    );
+    assert!(
+        knocks.iter().any(|(m, _)| *m == crate::Material::Rubber),
+        "{knocks:?}"
+    );
+    // Мяч упругий: отскакивает (не одно касание пола).
+    let rubber = knocks
+        .iter()
+        .filter(|(m, _)| *m == crate::Material::Rubber)
+        .count();
+    assert!(rubber >= 2, "{knocks:?}");
+}

@@ -28,9 +28,11 @@ use crate::{Aabb, Collider};
 
 mod joints;
 mod soft;
+mod touch;
 
 pub use joints::{JointDesc, JointId, JointKind, Motor};
 pub use soft::{Pin, SoftDesc, SoftId, SoftKind, SoftView};
+pub use touch::{Material, Touch, Toucher};
 
 /// Масштаб длины для допусков `rapier`: типичный размер тела в единицах сцены.
 pub const LENGTH_UNIT: f32 = 0.2;
@@ -77,6 +79,8 @@ pub struct BodyDesc {
     /// путь за шаг, и оно не пролетает сквозь тонкое. Пули друг друга так не проверяют,
     /// поэтому обычным телам этого не включаем: иначе кубик падает сквозь тонкую полку.
     pub bullet: bool,
+    /// Материал (9.6): звук и искры при ударе.
+    pub material: Material,
 }
 
 impl Default for BodyDesc {
@@ -91,6 +95,7 @@ impl Default for BodyDesc {
             damping: 0.0,
             gravity: 1.0,
             bullet: false,
+            material: Material::Wood,
         }
     }
 }
@@ -193,7 +198,18 @@ pub struct Physics {
     /// Время мира, с: для моторов туда-обратно.
     time: f64,
     step_ms: f64,
+    /// События касаний во время шага Rapier (9.6).
+    collector: touch::Collector,
+    /// Скорость тел до шага: скорость, вращение, середина масс (сила удара).
+    vel_before: HashMap<RigidBodyHandle, (Vector, f32, Vector)>,
+    /// Номер кинематического тела по его ручке.
+    mover_keys: HashMap<RigidBodyHandle, u64>,
+    /// Касания с прошлого [`Self::take_touches`].
+    touches: Vec<Touch>,
 }
+
+/// Больше касаний не копим, если их никто не забирает.
+const MAX_TOUCHES: usize = 4096;
 
 impl Physics {
     /// Мир с тяжестью `gravity` (единиц в секунду за секунду, вниз).
@@ -227,6 +243,10 @@ impl Physics {
             grip: None,
             time: 0.0,
             step_ms: 0.0,
+            collector: touch::Collector::default(),
+            vel_before: HashMap::new(),
+            mover_keys: HashMap::new(),
+            touches: Vec::new(),
         }
     }
 
@@ -255,6 +275,8 @@ impl Physics {
             .density(d.density.max(0.01) as f32)
             .restitution(d.bounce.clamp(0.0, 1.0) as f32)
             .friction(d.friction.max(0.0) as f32)
+            .user_data(d.material.to_bits())
+            .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.colliders.insert_with_parent(c, h, &mut self.bodies);
         self.last.insert(h, at);
@@ -354,10 +376,14 @@ impl Physics {
                     .build(),
             );
             let collider = self.colliders.insert_with_parent(
-                ColliderBuilder::new(s.shape.clone()).friction(0.7).build(),
+                ColliderBuilder::new(s.shape.clone())
+                    .friction(0.7)
+                    .user_data(Material::Stone.to_bits())
+                    .build(),
                 body,
                 &mut self.bodies,
             );
+            self.mover_keys.insert(body, key);
             self.movers.insert(
                 key,
                 Mover {
@@ -394,6 +420,7 @@ impl Physics {
         for k in gone {
             if let Some(m) = self.movers.remove(&k) {
                 let _ = m.collider;
+                self.mover_keys.remove(&m.body);
                 self.drop_body(m.body);
             }
         }
@@ -415,6 +442,13 @@ impl Physics {
         self.time += f64::from(dt);
         self.drive_motors();
         self.pull_grip(dt);
+        self.vel_before.clear();
+        for (h, b) in self.bodies.iter() {
+            if !b.is_fixed() {
+                self.vel_before
+                    .insert(h, (b.linvel(), b.angvel(), b.center_of_mass()));
+            }
+        }
         self.pipeline.step(
             self.gravity,
             &self.params,
@@ -428,8 +462,9 @@ impl Physics {
             &mut self.soft_bodies,
             &mut self.ccd,
             &(),
-            &(),
+            &self.collector,
         );
+        self.collect_touches();
         self.check_breaks(dt);
         self.step_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
@@ -691,6 +726,74 @@ impl Physics {
         if let Some(x) = push_speed(f64::from(vel.x), speed, pusher, f64::from(b.mass()), dt) {
             vel.x = x as f32;
             b.set_linvel(vel, true);
+        }
+    }
+
+    /// Касания с прошлого вызова (9.6): кто кого, где и с какой силой.
+    pub fn take_touches(&mut self) -> Vec<Touch> {
+        std::mem::take(&mut self.touches)
+    }
+
+    /// Масса тела.
+    pub fn mass(&self, id: BodyId) -> Option<f64> {
+        self.bodies.get(id.0).map(|b| f64::from(b.mass()))
+    }
+
+    /// Кто это: тело физики или кинематическое тело уровня, героя, врага.
+    fn toucher(&self, c: ColliderHandle) -> Option<(Toucher, Material, RigidBodyHandle)> {
+        let col = self.colliders.get(c)?;
+        let body = col.parent()?;
+        let material = Material::from_bits(col.user_data);
+        if self.last.contains_key(&body) {
+            return Some((Toucher::Body(BodyId(body)), material, body));
+        }
+        let key = self.mover_keys.get(&body)?;
+        Some((Toucher::Solid(*key), material, body))
+    }
+
+    /// События шага Rapier — в касания: сила удара по скоростям до шага.
+    fn collect_touches(&mut self) {
+        let raw = match self.collector.0.lock() {
+            Ok(mut list) => std::mem::take(&mut *list),
+            Err(_) => return,
+        };
+        for r in raw {
+            let (Some((a, ma, ha)), Some((b, mb, hb))) = (self.toucher(r.c1), self.toucher(r.c2))
+            else {
+                continue;
+            };
+            let (at, normal) = r.contact.unwrap_or_else(|| {
+                let at = self
+                    .bodies
+                    .get(ha)
+                    .map(|b| b.translation())
+                    .unwrap_or(Vector::ZERO);
+                (at, Vector::ZERO)
+            });
+            let vel = |h: RigidBodyHandle| {
+                self.vel_before
+                    .get(&h)
+                    .map(|&(v, w, com)| touch::point_velocity(v, w, com, at))
+                    .unwrap_or(Vector::ZERO)
+            };
+            let (va, vb) = (vel(ha), vel(hb));
+            let toward = [
+                f64::from(va.dot(normal)).max(0.0),
+                f64::from(-vb.dot(normal)).max(0.0),
+            ];
+            let speed = f64::from((va - vb).dot(normal)).max(0.0);
+            if self.touches.len() < MAX_TOUCHES {
+                self.touches.push(Touch {
+                    a,
+                    b,
+                    begin: r.begin,
+                    at: p(at),
+                    normal: p(normal),
+                    speed: if r.begin { speed } else { 0.0 },
+                    toward: if r.begin { toward } else { [0.0, 0.0] },
+                    materials: [ma, mb],
+                });
+            }
         }
     }
 

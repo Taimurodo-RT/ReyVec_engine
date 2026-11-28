@@ -1,6 +1,6 @@
 //! Звук событий игры (6.7): какой звук, насколько громко и с какой стороны.
 
-use reyvec_audio::Sound;
+use reyvec_audio::{Knock, Sound};
 use reyvec_scene::GameEvent;
 
 /// Звук события, громкость в децибелах и место в сцене (для положения слева направо).
@@ -18,6 +18,21 @@ pub(crate) fn sound_for(event: &GameEvent) -> Option<(Sound, f32, [f32; 2])> {
         GameEvent::Hurt { at, .. } => (Sound::Hurt, -4.0, at),
         GameEvent::Died { at } => (Sound::Land, 0.0, at),
         GameEvent::Damage { .. } => return None,
+        // Удар тел (9.6): чем сильнее, тем громче (с 4 единиц в секунду — в полную силу).
+        GameEvent::Impact {
+            at,
+            speed,
+            material,
+        } => {
+            use reyvec_scene::Material as M;
+            let knock = match material {
+                M::Wood => Knock::Wood,
+                M::Metal => Knock::Metal,
+                M::Stone => Knock::Stone,
+                M::Rubber => Knock::Rubber,
+            };
+            (Sound::Knock(knock), -22.0 + 5.0 * speed.min(4.0), at)
+        }
     })
 }
 
@@ -58,6 +73,16 @@ mod tests {
         })
         .unwrap();
         assert!(hit.1 > step.1, "удар громче шага");
+        let knock = |speed| {
+            sound_for(&GameEvent::Impact {
+                at: [0.0, 0.0],
+                speed,
+                material: reyvec_scene::Material::Metal,
+            })
+            .unwrap()
+        };
+        assert_eq!(knock(1.0).0, Sound::Knock(Knock::Metal));
+        assert!(knock(4.0).1 > knock(1.0).1 && knock(9.0).1 <= 0.0);
     }
 
     #[test]

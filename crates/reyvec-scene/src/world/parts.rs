@@ -306,6 +306,8 @@ pub(super) struct PhysicsRes {
     pub(super) seed: u64,
     /// Полигон (6.13): сочленения, мягкие тела, выброс тел, мышь.
     pub(super) extra: phys::Extra,
+    /// Когда тело последний раз стучало (номер шага, 9.6): дребезг не звучит очередью.
+    pub(super) knocks: std::collections::HashMap<reyvec_game::physics::Toucher, u64>,
 }
 
 /// Невидимая заранее созданная копия предмета с `spawn`: место для выброшенного тела.

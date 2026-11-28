@@ -301,18 +301,21 @@ pub struct NodeDesc {
 
 /// Физическое тело предмета: `size` — ширина и высота (у круглого `round: true` —
 /// диаметр по ширине; у капсулы `capsule: true` — прямоугольник, в который она вписана),
-/// `points` — выпуклый многоугольник по точкам вместо прямоугольника, `density` —
-/// плотность (тяжелее — труднее толкнуть), `bounce` — упругость от 0 до 1, `friction` —
-/// трение, `fixed: true` — неподвижное (опора), `damping` — сопротивление воздуха,
-/// `gravity` — во сколько раз действует тяжесть, `bullet: true` — быстрое тело (не
-/// пролетает сквозь тонкое; выброшенные `spawn` тела — всегда такие).
+/// `points` — выпуклый многоугольник по точкам вместо прямоугольника, `material` —
+/// материал (9.6: `Wood`, `Metal`, `Stone`, `Rubber`; звук и искры удара, плотность,
+/// упругость и трение по умолчанию), `density` — плотность (тяжелее — труднее толкнуть),
+/// `bounce` — упругость от 0 до 1, `friction` — трение, `fixed: true` — неподвижное
+/// (опора), `damping` — сопротивление воздуха, `gravity` — во сколько раз действует
+/// тяжесть, `bullet: true` — быстрое тело (не пролетает сквозь тонкое; выброшенные
+/// `spawn` тела — всегда такие).
 #[derive(Clone, Debug, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(from = "BodyFile")]
 pub struct BodyDesc {
     pub size: P,
     pub round: bool,
     pub capsule: bool,
     pub points: Vec<P>,
+    pub material: Material,
     pub density: f64,
     pub bounce: f64,
     pub friction: f64,
@@ -322,17 +325,100 @@ pub struct BodyDesc {
     pub bullet: bool,
 }
 
+/// Материал тела в файле сцены (9.6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub enum Material {
+    /// Дерево: стук, щепки.
+    #[default]
+    Wood,
+    /// Металл: звон, искры; тяжёлый и скользкий.
+    Metal,
+    /// Камень: тяжёлый удар, пыль; не отскакивает.
+    Stone,
+    /// Резина: шлепок; прыгает и не скользит.
+    Rubber,
+}
+
+impl Material {
+    pub fn of_physics(m: reyvec_game::physics::Material) -> Self {
+        use reyvec_game::physics::Material as M;
+        match m {
+            M::Wood => Material::Wood,
+            M::Metal => Material::Metal,
+            M::Stone => Material::Stone,
+            M::Rubber => Material::Rubber,
+        }
+    }
+
+    pub fn physics(self) -> reyvec_game::physics::Material {
+        use reyvec_game::physics::Material as M;
+        match self {
+            Material::Wood => M::Wood,
+            Material::Metal => M::Metal,
+            Material::Stone => M::Stone,
+            Material::Rubber => M::Rubber,
+        }
+    }
+}
+
+/// Тело как оно записано в файле: чего не указано, берётся от материала.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct BodyFile {
+    size: Option<P>,
+    round: bool,
+    capsule: bool,
+    points: Vec<P>,
+    material: Material,
+    density: Option<f64>,
+    bounce: Option<f64>,
+    friction: Option<f64>,
+    fixed: bool,
+    damping: Option<f64>,
+    gravity: Option<f64>,
+    bullet: bool,
+}
+
+impl From<BodyFile> for BodyDesc {
+    fn from(f: BodyFile) -> Self {
+        let d = Self::of(f.material);
+        Self {
+            size: f.size.unwrap_or(d.size),
+            round: f.round,
+            capsule: f.capsule,
+            points: f.points,
+            material: f.material,
+            density: f.density.unwrap_or(d.density),
+            bounce: f.bounce.unwrap_or(d.bounce),
+            friction: f.friction.unwrap_or(d.friction),
+            fixed: f.fixed,
+            damping: f.damping.unwrap_or(d.damping),
+            gravity: f.gravity.unwrap_or(d.gravity),
+            bullet: f.bullet,
+        }
+    }
+}
+
 impl Default for BodyDesc {
     fn default() -> Self {
+        Self::of(Material::Wood)
+    }
+}
+
+impl BodyDesc {
+    /// Тело из материала `m` со свойствами по умолчанию.
+    pub fn of(m: Material) -> Self {
         let d = reyvec_game::physics::BodyDesc::default();
+        let pm = m.physics();
         Self {
             size: (d.size[0], d.size[1]),
             round: false,
             capsule: false,
             points: Vec::new(),
-            density: d.density,
-            bounce: d.bounce,
-            friction: d.friction,
+            material: m,
+            density: pm.density(),
+            bounce: pm.bounce(),
+            friction: pm.friction(),
             fixed: d.fixed,
             damping: d.damping,
             gravity: d.gravity,
@@ -363,6 +449,7 @@ impl BodyDesc {
             damping: self.damping,
             gravity: self.gravity,
             bullet: self.bullet,
+            material: self.material.physics(),
         }
     }
 
@@ -1256,6 +1343,13 @@ pub enum GameEvent {
     Hurt { at: [f32; 2], amount: u32, dir: f32 },
     /// Здоровье героя кончилось: где он был (появится снова в начале).
     Died { at: [f32; 2] },
+    /// Удар тел (9.6): место, сила (скорость сближения, единиц в секунду) и материал,
+    /// который звучит.
+    Impact {
+        at: [f32; 2],
+        speed: f32,
+        material: Material,
+    },
 }
 
 /// Что видно о персонаже игрока снаружи мира: для камеры и панели.

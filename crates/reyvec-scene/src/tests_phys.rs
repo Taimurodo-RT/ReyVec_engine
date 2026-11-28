@@ -247,3 +247,39 @@ fn particles_see_figures_bodies_and_soft_bodies() {
         "звезда вращается"
     );
 }
+
+#[test]
+fn crate_pushed_off_the_high_shelf_hurts_the_dummy() {
+    // 9.6: на полигоне железный ящик, сброшенный с высокой полки, ранит манекен под ней.
+    let mut w = polygon();
+    let mut t = run(&mut w, 0.0, 1.0);
+    let e = w.find("манекен под полкой").unwrap();
+    let hp = w
+        .world_mut()
+        .get::<crate::world::Target>(e)
+        .unwrap()
+        .dummy
+        .hp;
+    // Тянем мышью железный ящик за правый край полки и отпускаем над манекеном.
+    let crate_at = place(&mut w, "железный ящик на полке").at;
+    let grab = |at: [f64; 2], held: bool| crate::Pointer {
+        at,
+        held,
+        blast: false,
+    };
+    for i in 0..90 {
+        let x = crate_at[0] + 0.3 * (f64::from(i) / 40.0).min(1.0);
+        w.set_pointer(grab([x, crate_at[1] + 0.05], true));
+        t = run(&mut w, t, 1.0 / 60.0);
+    }
+    w.set_pointer(grab([crate_at[0] + 0.3, crate_at[1]], false));
+    run(&mut w, t, 2.0);
+    let left = w
+        .world_mut()
+        .get::<crate::world::Target>(e)
+        .unwrap()
+        .dummy
+        .hp;
+    eprintln!("здоровье манекена {hp} → {left}");
+    assert!(left < hp, "ящик не ранил: {hp} → {left}");
+}
