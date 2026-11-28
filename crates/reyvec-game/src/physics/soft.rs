@@ -258,6 +258,7 @@ impl Physics {
                     surface.moved = p(mid - was);
                 }
                 surface.pushable = true;
+                surface.layer = crate::layer::BODY;
                 out.push(surface);
             }
         }

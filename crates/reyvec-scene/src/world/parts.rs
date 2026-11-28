@@ -171,6 +171,8 @@ pub struct Solid {
     pub form: Option<std::sync::Arc<reyvec_game::Form>>,
     /// Собранная форма и растяжение, при котором она собрана.
     pub built: Option<([f64; 2], reyvec_game::SharedShape)>,
+    /// Слой и маска столкновений (9.6а); ставит сборка мира по предмету.
+    pub layer: Option<(u32, u32)>,
 }
 
 impl Solid {
@@ -183,6 +185,7 @@ impl Solid {
             slope,
             form: None,
             built: None,
+            layer: None,
         }
     }
 }
@@ -218,6 +221,8 @@ pub struct Player {
     pub health: Health,
     /// Бессмертие из консоли разработчика: враги не ранят.
     pub god: bool,
+    /// Слой и маска столкновений (9.6а).
+    pub layer: (u32, u32),
 }
 
 /// Предмет со скриптом (6.9): его таблица `me` в скрипте, прямоугольник касания героя
@@ -259,6 +264,8 @@ pub struct Target {
     pub color: Color,
     /// Урон герою от касания (6.10б).
     pub contact: u32,
+    /// Слой и маска столкновений (9.6а).
+    pub layer: (u32, u32),
 }
 
 /// Физическое тело предмета (6.10).

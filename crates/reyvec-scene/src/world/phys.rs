@@ -115,7 +115,14 @@ impl Extra {
         });
     }
 
-    pub(super) fn add_emitter(&mut self, n: &NodeDesc, spawn: SpawnDesc, slots: Vec<Entity>) {
+    /// Выброс тел предмета `n` в слое `layer` (9.6а: слой и маска).
+    pub(super) fn add_emitter(
+        &mut self,
+        n: &NodeDesc,
+        spawn: SpawnDesc,
+        slots: Vec<Entity>,
+        (layer, mask): (u32, u32),
+    ) {
         let Some(body) = &n.body else {
             return;
         };
@@ -123,6 +130,8 @@ impl Extra {
             spawn,
             body: reyvec_game::physics::BodyDesc {
                 bullet: true,
+                layer,
+                mask,
                 ..body.physics()
             },
             at: [n.at.0, n.at.1],

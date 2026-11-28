@@ -119,7 +119,10 @@ pub(super) fn gather_solids(
             slope: 0.0,
         }));
         solids.1.push(g.dynamic);
-        solids.2.push(surface);
+        let (layer, mask) = s
+            .layer
+            .unwrap_or((reyvec_game::layer::LEVEL, reyvec_game::layer::ALL));
+        solids.2.push(surface.in_layer(layer, mask));
     }
 }
 
