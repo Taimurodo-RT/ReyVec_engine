@@ -11,6 +11,8 @@
         "settings.title": "Settings",
         "settings.language": "Language: {name}",
         "settings.theme": "Theme: {name}",
+        "settings.volume": "Volume: {n}%",
+        "settings.music": "Music",
         "settings.back": "Back",
         "menu.quit": "Quit",
         "hud.stamina": "Stamina",

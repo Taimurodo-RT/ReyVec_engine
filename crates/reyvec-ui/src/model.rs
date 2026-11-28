@@ -95,6 +95,8 @@ pub struct Look {
     /// У `Bar`: цвет заполненной части и сколько заполнено, от 0 до 1.
     pub fill: Option<Color>,
     pub value: f32,
+    /// У `Slider` и `Toggle`: цвет кружка, который тянут.
+    pub knob: Option<Color>,
 }
 
 impl Default for Look {
@@ -106,6 +108,7 @@ impl Default for Look {
             opacity: 1.0,
             fill: None,
             value: 0.0,
+            knob: None,
         }
     }
 }
@@ -170,6 +173,24 @@ pub struct Element {
     pub dynamic: u8,
     /// Что делает кнопка при нажатии, по порядку.
     pub actions: Vec<Action>,
+    /// У `Slider` и `Toggle`: куда в данных игры они смотрят и пишут (`$settings.…`).
+    pub bind: Option<Bind>,
+}
+
+/// Связь в обе стороны (И.3в): путь в данных и как его меняют.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bind {
+    pub path: String,
+    pub control: Control,
+}
+
+/// Чем меняется значение по связи.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Control {
+    /// Ползунок: число от `from` до `to` шагами `step` (0 — без шагов).
+    Slider { from: f32, to: f32, step: f32 },
+    /// Переключатель: да или нет.
+    Toggle,
 }
 
 /// Действие кнопки: команда движка (`open(Settings)`, `close()`) или функция Luau
@@ -217,7 +238,7 @@ pub struct Screen {
 }
 
 const KINDS: &[&str] = &[
-    "Column", "Row", "Stack", "Rect", "Text", "Spacer", "Button", "Bar",
+    "Column", "Row", "Stack", "Rect", "Text", "Spacer", "Button", "Bar", "Slider", "Toggle",
 ];
 const MODIFIERS: &[&str] = &[
     "class",
@@ -238,6 +259,7 @@ const MODIFIERS: &[&str] = &[
     "visible",
     "value",
     "fill",
+    "knob",
     "font",
     "color",
     "id",
@@ -513,6 +535,16 @@ fn apply(m: &Modifier, el: &mut Element) -> Result<(), UiError> {
         "visible" => {
             count(1..=1)?;
             p.visible = truth(&m.args[0].value, m.args[0].pos)?;
+        }
+        "knob" => {
+            if el.bind.is_none() {
+                return Err(meaning(
+                    m.pos,
+                    format!("{what} бывает только у Slider и Toggle"),
+                ));
+            }
+            count(1..=1)?;
+            el.look.knob = Some(color(&m.args[0], &what)?);
         }
         "value" | "fill" => {
             if el.kind != Kind::Bar {
@@ -1177,6 +1209,56 @@ fn action(c: &Node, vars: &Vars, screens: &[String]) -> Result<Action, UiError> 
     })
 }
 
+/// Связь `Slider($settings.audio.volume, from: 0, to: 1, step: 0.1)` или
+/// `Toggle($settings.audio.music)`.
+fn control(node: &Node, ctx: &Ctx<'_>) -> Result<Bind, UiError> {
+    let toggle = node.kind == "Toggle";
+    let help = if toggle {
+        "Toggle: связь с данными, Toggle($settings.audio.music)"
+    } else {
+        "Slider: связь с данными и пределы, Slider($settings.audio.volume, from: 0, to: 1, step: 0.1)"
+    };
+    let args = ctx.vars.resolve_args(&node.args)?;
+    let Some(Arg {
+        name: None,
+        value: Value::Bind(path),
+        pos,
+    }) = args.first()
+    else {
+        return Err(meaning(node.pos, help));
+    };
+    if !crate::data::is_path(path) {
+        return Err(meaning(
+            *pos,
+            format!("${path}: связь — это путь в данных игры, $settings.… или $game.…"),
+        ));
+    }
+    let (mut from, mut to, mut step) = (0.0, 1.0, 0.0);
+    for a in &args[1..] {
+        let slot = match (toggle, a.name.as_deref()) {
+            (false, Some("from")) => &mut from,
+            (false, Some("to")) => &mut to,
+            (false, Some("step")) => &mut step,
+            _ => return Err(meaning(a.pos, help)),
+        };
+        *slot = number(a, help)?;
+    }
+    if !toggle && (to <= from || step < 0.0) {
+        return Err(meaning(
+            node.pos,
+            "Slider: to больше from, а шаг step не меньше нуля",
+        ));
+    }
+    Ok(Bind {
+        path: path.clone(),
+        control: if toggle {
+            Control::Toggle
+        } else {
+            Control::Slider { from, to, step }
+        },
+    })
+}
+
 fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<Element, UiError> {
     let kind_name = node.kind.as_str();
     if !KINDS.contains(&kind_name) {
@@ -1184,6 +1266,7 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
     }
     let mut initial = Placement::default();
     let mut patched: Option<Node> = None;
+    let mut bind: Option<Bind> = None;
     // В фигурных скобках блоки пишутся с большой буквы, действия кнопки — с маленькой:
     // `Button("Настройки") { open(Settings) }`.
     let (mut kids, calls) = match &node.children {
@@ -1303,6 +1386,57 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
             initial.height = Len::Px(12.0);
             Kind::Bar
         }
+        // Ползунок и переключатель — полоска, которую можно тянуть и нажимать: её
+        // заполнение считается из значения по связи, как `Bar(…)`.
+        "Slider" | "Toggle" => {
+            if kids.is_some() {
+                return Err(meaning(
+                    node.pos,
+                    format!("у {kind_name} не бывает вложенных блоков в {{ }}"),
+                ));
+            }
+            let b = control(node, ctx)?;
+            let path = Box::new(Value::Name(b.path.clone()));
+            let value = match b.control {
+                Control::Slider { from, to, .. } => Value::Op(
+                    Box::new(Value::Op(path, '-', Box::new(Value::Number(from)))),
+                    '/',
+                    Box::new(Value::Number(to - from)),
+                ),
+                Control::Toggle => Value::If(
+                    path,
+                    Box::new(Value::Number(1.0)),
+                    Box::new(Value::Number(0.0)),
+                ),
+            };
+            let mut mods = vec![Modifier {
+                name: "value".into(),
+                args: vec![Arg {
+                    name: None,
+                    value,
+                    pos: node.pos,
+                }],
+                inner: None,
+                pos: node.pos,
+            }];
+            mods.extend(node.modifiers.iter().cloned());
+            patched = Some(Node {
+                kind: node.kind.clone(),
+                args: Vec::new(),
+                children: None,
+                modifiers: mods,
+                pos: node.pos,
+            });
+            if b.control == Control::Toggle {
+                initial.width = Len::Px(56.0);
+                initial.height = Len::Px(28.0);
+            } else {
+                initial.width = Len::Px(320.0);
+                initial.height = Len::Px(8.0);
+            }
+            bind = Some(b);
+            Kind::Bar
+        }
         _ => unreachable!("имя проверено выше"),
     };
     let node = patched.as_ref().unwrap_or(node);
@@ -1325,12 +1459,13 @@ fn element(node: &Node, ctx: &Ctx<'_>, index: usize, siblings: usize) -> Result<
         script: Vec::new(),
         index,
         siblings,
-        interactive: kind_name == "Button",
+        interactive: kind_name == "Button" || bind.is_some(),
         disabled: flag(&node.modifiers, "disabled")?,
         checked: flag(&node.modifiers, "checked")?,
         id: id_of(&node.modifiers)?,
         dynamic: 0,
         actions: Vec::new(),
+        bind,
     };
     let (from_styles, own) = styled(ctx, &me, &node.modifiers)?;
     let vars = own_vars(
@@ -1437,6 +1572,7 @@ pub fn screen(
         id: None,
         dynamic: 0,
         actions: Vec::new(),
+        bind: None,
     };
     let (from_styles, own) = styled(&root_ctx, &me, &decl.modifiers)?;
     let vars = own_vars(

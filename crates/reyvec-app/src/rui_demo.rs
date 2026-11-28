@@ -60,6 +60,14 @@ pub(crate) struct HeroData {
     pub hurt: bool,
 }
 
+/// Настройки звука для экрана «Настройки» (`settings.audio.*`, И.3в).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SoundSettings {
+    /// Общая громкость от 0 до 1.
+    pub volume: f32,
+    pub music: bool,
+}
+
 /// Один экран из файла со слежкой за правкой.
 struct Page {
     /// Файл экрана в папке `ui/`.
@@ -245,6 +253,9 @@ struct Choice {
 pub(crate) enum Request {
     World(DebugCommand),
     Quit,
+    /// Ползунок громкости и переключатель музыки в «Настройках» (И.3в).
+    Volume(f32),
+    Music(bool),
 }
 
 /// Команды для функций `ui/demo.luau`: `ui.close()`, `game.respawn()`.
@@ -307,6 +318,22 @@ impl RuiDemo {
 
     /// Что интерфейс попросил у игры с прошлого кадра.
     pub(crate) fn take_requests(&mut self) -> Vec<Request> {
+        // Что ползунки и переключатели поменяли по связи `$settings.…`.
+        if let Some(s) = self.demo.screen.as_mut() {
+            for c in s.take_changes() {
+                match (c.path.as_str(), &c.value) {
+                    ("settings.audio.volume", Value::Number(v)) => {
+                        self.requests.push(Request::Volume(*v));
+                    }
+                    ("settings.audio.music", Value::Name(on)) => {
+                        self.requests.push(Request::Music(on == "true"));
+                    }
+                    (path, v) => {
+                        tracing::info!("интерфейс: {path} = {}", reyvec_ui::data::show(v));
+                    }
+                }
+            }
+        }
         std::mem::take(&mut self.requests)
     }
 
@@ -495,10 +522,10 @@ impl RuiDemo {
             WindowEvent::KeyboardInput { event: key, .. } if key.state == ElementState::Pressed => {
                 let k = match &key.logical_key {
                     Key::Named(NamedKey::Tab) if shift => UiKey::Prev,
-                    Key::Named(NamedKey::Tab | NamedKey::ArrowDown | NamedKey::ArrowRight) => {
-                        UiKey::Next
-                    }
-                    Key::Named(NamedKey::ArrowUp | NamedKey::ArrowLeft) => UiKey::Prev,
+                    Key::Named(NamedKey::Tab | NamedKey::ArrowDown) => UiKey::Next,
+                    Key::Named(NamedKey::ArrowUp) => UiKey::Prev,
+                    Key::Named(NamedKey::ArrowLeft) => UiKey::Left,
+                    Key::Named(NamedKey::ArrowRight) => UiKey::Right,
                     Key::Named(NamedKey::Enter | NamedKey::Space) => UiKey::Activate,
                     _ => return false,
                 };
@@ -532,7 +559,12 @@ impl RuiDemo {
     /// `viewport` — размер картинки, поверх которой рисуется интерфейс (пиксели);
     /// `hero` — данные героя, если в сцене он есть. Меню F3 закрывает полоску здоровья:
     /// стопка из нескольких экранов — шаг И.4.
-    pub(crate) fn frame(&mut self, viewport: [f32; 2], hero: Option<HeroData>) -> Draw<'_> {
+    pub(crate) fn frame(
+        &mut self,
+        viewport: [f32; 2],
+        hero: Option<HeroData>,
+        sound: SoundSettings,
+    ) -> Draw<'_> {
         if self.scripts_checked.elapsed() >= POLL {
             self.scripts_checked = Instant::now();
             if self.scripts.reload_changed() > 0 {
@@ -551,6 +583,10 @@ impl RuiDemo {
                 let theme = s.theme().unwrap_or("—").to_owned();
                 s.set_text("settings.lang", &lang);
                 s.set_text("settings.theme", &theme);
+                // Связь в обе стороны: громкость и музыка — из игры, их же меняют ползунок
+                // и переключатель. Музыку, включённую клавишей O, экран видит сам.
+                s.set_number("settings.audio.volume", f64::from(sound.volume));
+                s.set_flag("settings.audio.music", sound.music);
             }
             return self.demo.frame(&self.dir, viewport, &self.choice);
         }
@@ -711,8 +747,39 @@ mod tests {
         let mut s = built_in("demo.rui");
         assert_eq!(s.current(), "Demo");
         assert!(s.open("Settings"));
-        assert!(!s.draw([1920.0, 1080.0]).quads.is_empty());
+        s.set_text("settings.lang", "Русский");
+        s.set_text("settings.theme", "Forge");
+        s.set_number("settings.audio.volume", 0.4);
+        s.set_flag("settings.audio.music", true);
+        let draw = s.draw([1920.0, 1080.0]);
+        assert!(!draw.quads.is_empty());
+        let bound: Vec<&str> = draw
+            .targets
+            .iter()
+            .filter_map(|t| t.bind.as_ref().map(|b| b.path.as_str()))
+            .collect();
+        assert_eq!(bound, ["settings.audio.volume", "settings.audio.music"]);
+        // Строки с ползунком и переключателем не вылезают за окно: кнопки во всю ширину.
+        let right = |name: &str| {
+            draw.targets
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.rect[2])
+                .unwrap()
+        };
+        let edge = right("Назад");
+        for t in draw.targets.iter().filter(|t| t.bind.is_some()) {
+            assert!(t.rect[2] <= edge + 0.5, "{:?} за краем {edge}", t.rect);
+        }
         assert!(s.problem().is_none(), "{:?}", s.problem());
+        // Две стрелки вправо у ползунка громкости: 0.4 → 0.5, это просьба к звуку.
+        while s.focused().is_none_or(|f| !f.is_empty()) {
+            s.key(reyvec_ui::UiKey::Next);
+        }
+        s.key(reyvec_ui::UiKey::Right);
+        s.key(reyvec_ui::UiKey::Right);
+        let last = s.take_changes().pop().unwrap();
+        assert_eq!(last.value, Value::Number(0.5));
         assert!(s.back());
         assert_eq!(s.current(), "Demo");
     }

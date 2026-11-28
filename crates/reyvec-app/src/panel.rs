@@ -2309,6 +2309,7 @@ mod tests {
                 played: 42,
                 skipped: 0,
                 music: true,
+                volume: 1.0,
             }),
             particles: Some(reyvec_gpu::ParticleStats {
                 live: 1200,
