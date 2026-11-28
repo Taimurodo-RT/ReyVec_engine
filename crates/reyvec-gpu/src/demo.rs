@@ -991,6 +991,8 @@ pub(crate) struct Demo {
     /// Светящиеся частицы (искры) поверх освещённого кадра, в проходе «вывод».
     particle_glow: vk::Pipeline,
     particle_steps: Vec<crate::particles::ParticleFrame>,
+    /// Препятствий для частиц у экрана в последнем кадре и сколько не влезло (9.5).
+    particle_obstacles: (u32, u32),
     /// Новые частицы по шагам логики, пока мир шагает по сценарию без окна.
     particle_queue: Vec<(f64, f32, Vec<crate::particles::Particle>)>,
     /// Последний шаг логики, события которого уже дали частицы.
@@ -1364,6 +1366,7 @@ impl Demo {
             particle_draw: vk::Pipeline::null(),
             particle_glow: vk::Pipeline::null(),
             particle_steps: Vec::new(),
+            particle_obstacles: (0, 0),
             particle_queue: Vec::new(),
             seen_event_step: 0,
             fresh_events: Vec::new(),
@@ -3251,34 +3254,23 @@ impl Demo {
             vec![(now, dt, emitted)]
         };
         self.particle_time = Some(now);
-        // Твёрдое для отскока: только то, что рядом с экраном (с запасом на полёт).
+        // Препятствия для частиц (9.5): только то, что рядом с экраном (с запасом на
+        // полёт), по клеткам сетки.
         let view = crate::cull::ViewRect::new(
             [self.camera.center.x as f32, self.camera.center.y as f32],
             self.camera.zoom as f32,
             aspect,
         );
         let margin = 0.5;
-        let solids: Vec<crate::particles::ParticleSolid> = self
-            .file_scene
-            .solids
-            .iter()
-            .filter(|c| {
-                let (lo, hi) = (c.aabb.min, c.aabb.max);
-                hi[0] as f32 >= view.lo[0] - margin
-                    && lo[0] as f32 <= view.hi[0] + margin
-                    && hi[1] as f32 >= view.lo[1] - margin
-                    && lo[1] as f32 <= view.hi[1] + margin
-            })
-            .map(|c| crate::particles::ParticleSolid {
-                lo: [c.aabb.min[0] as f32, c.aabb.min[1] as f32],
-                hi: [c.aabb.max[0] as f32, c.aabb.max[1] as f32],
-                slope: c.slope as f32,
-                oneway: c.oneway,
-            })
-            .collect();
+        let world = crate::particle_world::ParticleWorld::build(
+            &self.file_scene.obstacles,
+            [view.lo[0] - margin, view.lo[1] - margin],
+            [view.hi[0] + margin, view.hi[1] + margin],
+        );
+        self.particle_obstacles = (world.len() as u32, world.dropped as u32);
         self.particle_steps =
             self.particles
-                .prepare(res, slot, steps, &solids, crate::particles::GRAVITY);
+                .prepare(res, slot, steps, &world, crate::particles::GRAVITY);
     }
 
     /// Частицы в работе (для панели и проверок).
@@ -3287,6 +3279,8 @@ impl Demo {
             live: self.particle_steps.last().map_or(0, |f| f.span.count),
             dropped: self.particles.dropped,
             fountain: self.fountain,
+            obstacles: self.particle_obstacles.0,
+            obstacles_dropped: self.particle_obstacles.1,
         }
     }
 

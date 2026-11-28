@@ -212,3 +212,38 @@ fn hero_stands_on_the_soft_jelly_and_squashes_it() {
     assert!(on_soft > 120, "на желе шагов: {on_soft}");
     assert!(feet > -0.78 + 0.03, "не провалился до пола: {feet}");
 }
+
+#[test]
+fn particles_see_figures_bodies_and_soft_bodies() {
+    // 9.5: препятствия для частиц — настоящие формы: контур звезды (тонкие отрезки),
+    // ящики физики (повёрнутые прямоугольники), желе (капсулы по краю).
+    use reyvec_game::ObstacleShape;
+    let mut w = polygon();
+    run(&mut w, 0.0, 0.5);
+    let scene = w.snapshot();
+    let lines = scene
+        .obstacles
+        .iter()
+        .filter(|o| matches!(o.shape, ObstacleShape::Capsule { r, .. } if r == 0.0))
+        .count();
+    let round = scene
+        .obstacles
+        .iter()
+        .filter(|o| matches!(o.shape, ObstacleShape::Capsule { r, .. } if r > 0.0))
+        .count();
+    let boxes = scene
+        .obstacles
+        .iter()
+        .filter(|o| matches!(o.shape, ObstacleShape::Box { .. }))
+        .count();
+    eprintln!("линий {lines}, круглых {round}, прямоугольников {boxes}");
+    assert!(lines >= 10, "контуры фигур: {lines}");
+    assert!(round >= 48, "желе и шары: {round}");
+    assert!(boxes >= 200, "ящики и уровень: {boxes}");
+    // Вращающаяся звезда движется: у её отрезков есть скорость.
+    assert!(
+        scene.obstacles.iter().any(|o| o.spin.abs() > 0.1
+            && matches!(o.shape, ObstacleShape::Capsule { r, .. } if r == 0.0)),
+        "звезда вращается"
+    );
+}

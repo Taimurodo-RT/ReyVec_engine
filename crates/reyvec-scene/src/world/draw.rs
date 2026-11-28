@@ -165,6 +165,13 @@ pub(super) fn collect(
         events: events.list.iter().copied().collect(),
         solids: solids.0.clone(),
         solids_dynamic: solids.1.clone(),
+        obstacles: {
+            let mut out = Vec::new();
+            for s in solids.2.iter().chain(&phys.surfaces) {
+                reyvec_game::obstacle::obstacles(s, phys.step_dt, &mut out);
+            }
+            out
+        },
         scripts: crate::ScriptInfo {
             files: scripts.scripts.len(),
             actors: scripted.iter().count(),

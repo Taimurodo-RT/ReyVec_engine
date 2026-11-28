@@ -1526,6 +1526,12 @@ fn particles_text(p: &reyvec_gpu::ParticleStats) -> String {
     if p.dropped > 0 {
         text.push_str(&format!(", не влезло {}", p.dropped));
     }
+    if p.obstacles > 0 {
+        text.push_str(&format!(", препятствий {}", p.obstacles));
+    }
+    if p.obstacles_dropped > 0 {
+        text.push_str(&format!(" (не влезло {})", p.obstacles_dropped));
+    }
     text
 }
 
@@ -2315,6 +2321,8 @@ mod tests {
                 live: 1200,
                 dropped: 0,
                 fountain: false,
+                obstacles: 40,
+                obstacles_dropped: 0,
             }),
             loading: reyvec_gpu::LoadStats {
                 background: true,

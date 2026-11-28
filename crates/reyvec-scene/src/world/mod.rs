@@ -98,6 +98,7 @@ impl SceneWorld {
             bodies: Vec::new(),
             surfaces: Vec::new(),
             presses: Vec::new(),
+            step_dt: 0.0,
             pushes: Vec::new(),
             dt: 0.0,
             breaks: Vec::new(),

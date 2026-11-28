@@ -44,6 +44,7 @@ mod headless;
 mod lab;
 mod level3d;
 mod lights;
+mod particle_world;
 mod particles;
 mod path_ref;
 mod pipeline;
