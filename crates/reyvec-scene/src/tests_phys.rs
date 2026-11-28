@@ -192,3 +192,23 @@ fn shapes_of_the_polygon_collide_with_their_real_form() {
         }
     }
 }
+
+#[test]
+fn hero_stands_on_the_soft_jelly_and_squashes_it() {
+    // 9.4: желе — опора героя. Мягкое желе под ним сминается, но не пропускает до пола.
+    let mut w = polygon();
+    let mut t = run(&mut w, 0.0, 2.0);
+    w.set_player_body(reyvec_game::Body::new([15.1, 0.3]));
+    let mut on_soft = 0;
+    for _ in 0..180 {
+        t = run(&mut w, t, 1.0 / 60.0);
+        let b = w.player_body().unwrap();
+        on_soft +=
+            usize::from(b.on_ground && b.ground().is_some_and(|g| g >= (1 << 62) + (1 << 56)));
+    }
+    let b = w.player_body().unwrap();
+    let feet = b.pos[1] - 0.14;
+    eprintln!("герой на желе: {:?}, на мягком шагов {on_soft}", b.pos);
+    assert!(on_soft > 120, "на желе шагов: {on_soft}");
+    assert!(feet > -0.78 + 0.03, "не провалился до пола: {feet}");
+}
