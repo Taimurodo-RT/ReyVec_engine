@@ -2097,6 +2097,10 @@ fn hero_kicks_the_ball_stands_on_a_crate_and_breaks_into_debris() {
     w.set_input(InputFrame::new(&[], &[]));
     t = steps(&mut w, t, 60);
     let crate_at = body_at(&mut w, "ящик лёгкий");
+    // Жук теперь упирается в ящики (9.2: один мир столкновений) и ждёт героя у ящика:
+    // без бессмертия его касание сбросило бы героя.
+    w.debug(&crate::world::DebugCommand::God(Some(true)))
+        .unwrap();
     w.set_player_body(reyvec_game::Body::new([crate_at[0], crate_at[1] + 0.35]));
     t = steps(&mut w, t, 40);
     let p = w.snapshot().player.unwrap();

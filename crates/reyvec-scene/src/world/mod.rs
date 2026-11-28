@@ -30,7 +30,7 @@ use reyvec_game::anim::AnimInput;
 use reyvec_game::physics::{BodyId, Physics};
 use reyvec_game::{
     Aabb, Action, Animator, AttackTuning, Body, Bone, Collider, Dummy, Fighter, Health, Hurt,
-    InputFrame, Intent, Tuning,
+    InputFrame, Intent, Space, Tuning,
 };
 
 use crate::assets::{self, MorphTrack};
@@ -96,7 +96,8 @@ impl SceneWorld {
         world.insert_resource(PhysicsRes {
             physics: Physics::new(reyvec_game::Tuning::default().gravity()),
             bodies: Vec::new(),
-            platforms: Vec::new(),
+            surfaces: Vec::new(),
+            pushes: Vec::new(),
             dt: 0.0,
             breaks: Vec::new(),
             pieces: Vec::new(),

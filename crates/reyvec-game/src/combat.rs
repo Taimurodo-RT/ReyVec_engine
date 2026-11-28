@@ -11,6 +11,7 @@
 
 use crate::Aabb;
 use crate::controller::{Body, Collider, Intent, Tuning};
+use crate::space::Space;
 
 /// Настройки удара.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -328,11 +329,11 @@ impl Dummy {
         }
     }
 
-    /// Шаг тела длиной `dt` среди `solids` (без героя).
-    pub fn step(&mut self, solids: &[Collider], dt: f64) {
+    /// Шаг тела длиной `dt` в мире столкновений `space` (без героя).
+    pub fn step(&mut self, space: &Space, dt: f64) {
         let before = self.body.pos;
         if self.alive() {
-            self.body.step(&self.tuning, self.intent, solids, dt);
+            self.body.step(&self.tuning, self.intent, space, dt);
             // Нажатие прыжка — только на первом из шагов.
             self.intent.jump_pressed = false;
         }
@@ -363,6 +364,8 @@ impl Dummy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TOL: f64 = 3.0 * crate::space::SKIN;
 
     fn floor() -> Vec<Collider> {
         vec![
@@ -453,7 +456,7 @@ mod tests {
         let mut d = Dummy::new([1.0, 0.15], [0.16, 0.3], 5, 2.0);
         let solids = floor();
         for _ in 0..30 {
-            d.step(&solids, DT);
+            d.step(&Space::of(&solids), DT);
         }
         assert!(d.body.on_ground);
         let y0 = d.body.pos[1];
@@ -461,11 +464,11 @@ mod tests {
         let mut top = y0;
         let mut landed = false;
         for _ in 0..120 {
-            d.step(&solids, DT);
+            d.step(&Space::of(&solids), DT);
             top = top.max(d.body.pos[1]);
             let b = d.bounds();
-            assert!(b.max[0] <= 2.0 + 1e-9, "манекен прошёл стену: {b:?}");
-            assert!(b.min[1] >= -1e-9, "манекен в полу: {b:?}");
+            assert!(b.max[0] <= 2.0 + TOL, "манекен прошёл стену: {b:?}");
+            assert!(b.min[1] >= -TOL, "манекен в полу: {b:?}");
             landed |= d.body.on_ground && top > y0 + 0.02;
         }
         assert!(
@@ -474,7 +477,7 @@ mod tests {
         );
         assert!(landed, "приземлился");
         assert!(
-            (d.bounds().max[0] - 2.0).abs() < 1e-6,
+            (d.bounds().max[0] - 2.0).abs() < TOL,
             "доехал до стены и встал у неё"
         );
         assert!(d.body.vel[0].abs() < 1e-9);
@@ -504,7 +507,7 @@ mod tests {
         let solids = floor();
         let mut d = Dummy::new([0.0, 0.15], [0.16, 0.3], 9, 1.0);
         for _ in 0..10 {
-            d.step(&solids, DT);
+            d.step(&Space::of(&solids), DT);
         }
         let t = Tuning::default();
         let mut hero = Body::new([0.0, 0.6]);
@@ -512,12 +515,12 @@ mod tests {
         for _ in 0..60 {
             all.truncate(solids.len());
             all.push(d.collider(1));
-            hero.step(&t, Intent::default(), &all, DT);
-            d.step(&solids, DT);
+            hero.step(&t, Intent::default(), &Space::of(&all), DT);
+            d.step(&Space::of(&solids), DT);
         }
         assert!(hero.on_ground);
         assert!(
-            (hero.bounds(&t).min[1] - d.bounds().max[1]).abs() < 1e-6,
+            (hero.bounds(&t).min[1] - d.bounds().max[1]).abs() < TOL,
             "стоит на манекене"
         );
         d.hurt(1, [1.5, 0.0]);
@@ -525,8 +528,8 @@ mod tests {
         for _ in 0..30 {
             all.truncate(solids.len());
             all.push(d.collider(1));
-            hero.step(&t, Intent::default(), &all, DT);
-            d.step(&solids, DT);
+            hero.step(&t, Intent::default(), &Space::of(&all), DT);
+            d.step(&Space::of(&solids), DT);
         }
         assert!(
             hero.pos[0] > x0 + 0.05,

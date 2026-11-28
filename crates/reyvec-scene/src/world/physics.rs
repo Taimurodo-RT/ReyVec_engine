@@ -42,6 +42,16 @@ pub(super) fn physics_step(
         .map(|(e, t)| (e.to_bits(), Collider::solid(t.dummy.bounds())))
         .collect();
     phys.physics.set_solids(level.chain(heroes).chain(enemies));
+    // Герои толкают тела сбоку (9.2): тело разгоняется тем медленнее, чем тяжелее.
+    for (id, speed) in std::mem::take(&mut phys.pushes) {
+        let Some(&body) = id
+            .checked_sub(PLATFORM_IDS)
+            .and_then(|i| phys.bodies.get(i as usize))
+        else {
+            continue;
+        };
+        phys.physics.push(body, speed, HERO_MASS, dt);
+    }
     // Удар героя отбрасывает тела.
     for (_, mut player) in &mut players {
         let p = &mut *player;
@@ -157,5 +167,5 @@ pub(super) fn physics_step(
         }
     }
     let ids = phys.bodies.clone();
-    phys.platforms = phys.physics.platforms(&ids, PLATFORM_IDS);
+    phys.surfaces = phys.physics.surfaces(&ids, PLATFORM_IDS);
 }

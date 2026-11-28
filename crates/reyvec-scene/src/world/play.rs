@@ -71,26 +71,19 @@ pub(super) fn play(
     // Запас на неточность дробей: ровно один шаг логики — один шаг персонажа.
     let steps = (dt / PLAYER_STEP - 1e-6).ceil().max(1.0) as usize;
     let sdt = dt / steps as f64;
-    // Платформы сдвинулись один раз за шаг логики: везут только в первом из шагов.
-    let still = |c: &Collider| Collider {
-        moved: [0.0, 0.0],
-        ..*c
-    };
     // Для героя манекены — тоже твёрдые тела (на них можно встать, их не пройти).
     let bodies: Vec<Collider> = targets
         .iter()
         .filter(|(_, t)| t.dummy.alive())
         .map(|(e, t)| t.dummy.collider(e.to_bits()))
         .collect();
-    // Физические тела (6.10) для героя — платформы: на них встают, сбоку герой их толкает.
-    let with_bodies: Vec<Collider> = solids
-        .0
-        .iter()
-        .chain(&bodies)
-        .chain(&phys.platforms)
-        .copied()
-        .collect();
-    let with_bodies_still: Vec<Collider> = with_bodies.iter().map(still).collect();
+    // Мир столкновений героя (9.2): уровень, манекены и настоящие формы тел физики. На
+    // тела встают, сбоку их толкают. Опоры сдвинулись один раз за шаг логики: везут
+    // только в первом из шагов.
+    let mut space = Space::of(&solids.0);
+    space.extend_colliders(&bodies);
+    space.extend(phys.surfaces.iter().cloned());
+    let space_still = space.still();
 
     let mut stop = false;
     for (mut player, mut place) in &mut players {
@@ -106,13 +99,12 @@ pub(super) fn play(
                 dash_pressed: first && presses.dash,
                 up: input.held(Action::Up),
             };
-            let colliders = if first {
-                &with_bodies
-            } else {
-                &with_bodies_still
-            };
+            let here = if first { &space } else { &space_still };
             let fall = -p.body.vel[1];
-            let ev = p.body.step(&p.tuning, intent, colliders, sdt);
+            let ev = p.body.step(&p.tuning, intent, here, sdt);
+            if let Some(push) = ev.pushed {
+                phys.pushes.push(push);
+            }
             let feet = [
                 p.body.pos[0] as f32,
                 (p.body.pos[1] - p.tuning.size[1] * 0.5) as f32,
@@ -284,14 +276,16 @@ pub(super) fn play(
         // для них тоже твёрдый (6.9): враг со скриптом упирается в героя, а не входит в
         // него.
         let me = e.to_bits();
-        let mine: Vec<Collider> = solids
-            .0
+        let others: Vec<Collider> = bodies
             .iter()
-            .chain(bodies.iter().filter(|c| c.id != me))
+            .filter(|c| c.id != me)
             .copied()
             .chain(heroes_now.iter().map(|h| Collider::solid(*h)))
             .collect();
-        let mine_still: Vec<Collider> = mine.iter().map(still).collect();
+        let mut mine = Space::of(&solids.0);
+        mine.extend_colliders(&others);
+        mine.extend(phys.surfaces.iter().cloned());
+        let mine_still = mine.still();
         let mut moved = [0.0, 0.0];
         for i in 0..steps {
             d.step(if i == 0 { &mine } else { &mine_still }, sdt);

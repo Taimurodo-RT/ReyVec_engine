@@ -270,8 +270,10 @@ pub(super) struct PhysicsRes {
     pub(super) physics: Physics,
     /// Тела предметов (без обломков) по порядку: для героя они платформы.
     pub(super) bodies: Vec<BodyId>,
-    /// Платформы для героя после прошлого шага физики.
-    pub(super) platforms: Vec<Collider>,
+    /// Тела как поверхности для героя и врагов после прошлого шага физики (9.2).
+    pub(super) surfaces: Vec<reyvec_game::Surface>,
+    /// Кого толкнули герои на этом шаге: номер поверхности тела и желаемая скорость.
+    pub(super) pushes: Vec<(u64, f64)>,
     /// Сколько шагать физике (пишет `play`: время шага без стоп-кадра).
     pub(super) dt: f64,
     pub(super) breaks: Vec<Break>,
@@ -309,6 +311,8 @@ pub(super) const CONTACT_REACH: f64 = 0.02;
 pub(super) const HURT_PUSH: [f64; 2] = [2.2, 2.0];
 /// Номера платформ из физических тел для героя (не пересекаются с номерами сущностей).
 pub(super) const PLATFORM_IDS: u64 = 1 << 62;
+/// Масса героя для толкания тел (плотность 1 на площадь героя ростом 0,28).
+pub(super) const HERO_MASS: f64 = 0.04;
 
 /// Фигура взмаха удара: видна только в фазе удара героя.
 #[derive(Component, Clone, Copy, Debug, Default)]

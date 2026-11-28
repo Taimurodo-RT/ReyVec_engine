@@ -47,10 +47,11 @@ fn hero_pushes_a_box_and_can_stand_on_it() {
     );
     assert!(at[0] > 0.6, "ящик сдвинулся: {at:?}");
     // Для героя ящик — платформа сверху.
-    let plat = w.platforms(&[b], 100);
+    let surf = w.surfaces(&[b], 100);
     assert!(
-        plat[0].oneway && (plat[0].aabb.max[1] - -0.65).abs() < 0.01,
-        "{plat:?}"
+        surf[0].pushable && (surf[0].aabb.max[1] - -0.65).abs() < 0.01,
+        "{:?}",
+        surf[0].aabb
     );
     // Героя больше нет — его тело убрано, ящик стоит.
     w.set_solids([floor()]);
