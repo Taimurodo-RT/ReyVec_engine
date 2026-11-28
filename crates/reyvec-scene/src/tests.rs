@@ -2580,3 +2580,47 @@ fn falling_metal_crate_rings_and_hurts_the_dummy_under_it() {
         .count();
     assert!(rubber >= 2, "{knocks:?}");
 }
+
+#[test]
+fn ghost_layer_passes_walls_the_hero_bumps_into() {
+    // 9.6а: стена в слое «стена». Герой в неё упирается, герой-призрак проходит; ящик
+    // слоя «призрак» падает сквозь полку того же слоя, обычный ящик на ней лежит.
+    use reyvec_game::Action::Right;
+    use reyvec_game::InputFrame;
+    let scene = |hero_layer: &str| {
+        minimal(&format!(
+            r##"collision: [(name: "стена"), (name: "призрак", ignores: ["стена"])],
+nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (6.0, 0.2))]),
+    (name: "стена", layer: "стена", solids: [(at: (0.6, -0.4), size: (0.1, 0.8)), (at: (-1.5, -0.3), size: (1.0, 0.05))]),
+    (name: "герой", at: (0.0, -0.7), {hero_layer} player: (size: (0.1, 0.2)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+    (name: "ящик", at: (-1.8, 0.0), body: (size: (0.1, 0.1)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.1), color: "#888")]),
+    (name: "ящик-призрак", at: (-1.2, 0.0), layer: "призрак", body: (size: (0.1, 0.1)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.1), color: "#888")]),
+]"##
+        ))
+    };
+    let run = |hero_layer: &str| {
+        let mut w = world(&scene(hero_layer));
+        w.set_input(InputFrame::new(&[Right], &[Right]));
+        steps(&mut w, 0, 120);
+        let hero = w.player_body().unwrap().pos[0];
+        let e = w.find("ящик").unwrap();
+        let plain = w.world_mut().get::<Placement>(e).unwrap().at[1];
+        let e = w.find("ящик-призрак").unwrap();
+        let ghost = w.world_mut().get::<Placement>(e).unwrap().at[1];
+        (hero, plain, ghost)
+    };
+    let (hero, plain, ghost) = run("");
+    assert!(hero < 0.55, "герой упёрся в стену: {hero}");
+    assert!(plain > -0.3, "ящик лежит на полке: {plain}");
+    assert!(ghost < -0.7, "ящик-призрак упал на пол: {ghost}");
+    let (hero, ..) = run(r#"layer: "призрак","#);
+    assert!(hero > 0.7, "призрак прошёл сквозь стену: {hero}");
+    // Неизвестный слой — понятная ошибка.
+    let bad = minimal(r#"nodes: [(name: "x", layer: "нет такого")]"#);
+    let err = SceneFile::parse(&bad).unwrap_err().to_string();
+    assert!(err.contains("нет такого"), "{err}");
+}

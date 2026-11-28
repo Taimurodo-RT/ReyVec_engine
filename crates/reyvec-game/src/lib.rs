@@ -35,7 +35,7 @@ pub use form::Form;
 pub use input::{Action, InputFrame, InputReader, InputShared};
 pub use obstacle::{Obstacle, ObstacleShape};
 pub use rapier2d::parry::shape::SharedShape;
-pub use space::{Filter, Hit, Space, Surface};
+pub use space::{Filter, Hit, Space, Surface, layer};
 
 /// Прямоугольник со сторонами вдоль осей: от `min` до `max`.
 #[derive(Clone, Copy, Debug, PartialEq)]

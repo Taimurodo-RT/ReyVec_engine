@@ -540,3 +540,43 @@ fn falling_box_hits_what_is_under_it_but_a_runner_does_not_hit_the_box() {
         "ящик сам не летел: {seen:?}"
     );
 }
+
+#[test]
+fn ghost_body_falls_through_the_level_layer_it_ignores() {
+    // 9.6а: тело в своём слое, который не сталкивается с полом, проваливается; обычное
+    // стоит. Мир персонажа — только то, с чем встречается его слой.
+    let ghost_layer = 1 << crate::layer::FIRST_CUSTOM;
+    let mut w = Physics::new(9.3);
+    let plain = w.add([0.0, 0.0], 0.0, [0.0, 0.0], &BodyDesc::default());
+    let ghost = w.add(
+        [0.5, 0.0],
+        0.0,
+        [0.0, 0.0],
+        &BodyDesc {
+            layer: ghost_layer,
+            mask: crate::layer::ALL & !crate::layer::LEVEL,
+            ..BodyDesc::default()
+        },
+    );
+    for _ in 0..90 {
+        w.set_solids([floor()]);
+        w.step(DT);
+    }
+    assert!(w.pose(plain).unwrap().0[1] > -0.8, "обычное стоит");
+    assert!(w.pose(ghost).unwrap().0[1] < -1.0, "призрак провалился");
+    let s = w.surfaces(&[plain, ghost], 10);
+    assert_eq!(
+        (s[1].layer, s[1].mask & crate::layer::LEVEL),
+        (ghost_layer, 0)
+    );
+    let mut space = crate::Space::of(&[floor().1]);
+    space.extend(s);
+    let hero = (crate::layer::HERO, crate::layer::ALL);
+    assert_eq!(space.meeting(hero.0, hero.1).len(), 3);
+    let ghost_eye = (ghost_layer, crate::layer::ALL & !crate::layer::LEVEL);
+    assert_eq!(
+        space.meeting(ghost_eye.0, ghost_eye.1).len(),
+        2,
+        "призраку пол не мешает"
+    );
+}

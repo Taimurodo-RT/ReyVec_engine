@@ -11,6 +11,10 @@ pub(super) struct Spawner<'a> {
     pub(super) entities: usize,
     /// Строится содержимое героя: внутри него бывают кости.
     pub(super) in_player: bool,
+    /// Слои столкновений сцены (9.6а) и слой строящегося предмета (вложенные
+    /// наследуют слой родителя).
+    pub(super) layers: crate::Layers,
+    pub(super) layer: Option<String>,
 }
 
 impl Spawner<'_> {
@@ -38,6 +42,11 @@ impl Spawner<'_> {
         let f = Arc::new(assets::load_motif(&file, self.library)?);
         self.cache.motifs.insert(file.key, f.clone());
         Ok(f)
+    }
+
+    /// Слой и маска строящегося предмета; без своего слоя — `default`.
+    pub(super) fn layer_of(&self, default: u32) -> (u32, u32) {
+        self.layers.of_node(self.layer.as_deref(), default)
     }
 
     pub(super) fn next(&mut self) -> u32 {
@@ -169,10 +178,14 @@ impl Spawner<'_> {
                 self.world.entity_mut(e).insert((SpawnSlot, Dynamic));
                 slots.push(e);
             }
+            let layer = self.layers.of_node(
+                n.layer.as_deref().or(self.layer.as_deref()),
+                reyvec_game::layer::BODY,
+            );
             self.world
                 .resource_mut::<PhysicsRes>()
                 .extra
-                .add_emitter(n, spawn, slots);
+                .add_emitter(n, spawn, slots, layer);
             return Ok(());
         }
         self.node_one(n, parent, path).map(|_| ())
@@ -194,6 +207,10 @@ impl Spawner<'_> {
             flip: false,
             flash: 0.0,
         };
+        let outer_layer = self.layer.clone();
+        if n.layer.is_some() {
+            self.layer = n.layer.clone();
+        }
         let name = if n.name.is_empty() {
             path.to_string()
         } else {
@@ -204,6 +221,7 @@ impl Spawner<'_> {
             parent,
         );
         if let Some(p) = &n.player {
+            let layer = self.layer_of(reyvec_game::layer::HERO);
             self.world.entity_mut(me).insert((
                 Player {
                     tuning: p.tuning(),
@@ -215,15 +233,24 @@ impl Spawner<'_> {
                     anim: Animator::default(),
                     health: Health::new(p.hp),
                     god: false,
+                    layer,
                 },
                 Dynamic,
             ));
         }
         if let Some(b) = &n.body {
+            let (layer, mask) = self.layer_of(reyvec_game::layer::BODY);
             let mut res = self.world.resource_mut::<PhysicsRes>();
-            let id = res
-                .physics
-                .add(placement.at, n.angle, [0.0, 0.0], &b.physics());
+            let id = res.physics.add(
+                placement.at,
+                n.angle,
+                [0.0, 0.0],
+                &reyvec_game::physics::BodyDesc {
+                    layer,
+                    mask,
+                    ..b.physics()
+                },
+            );
             res.bodies.push(id);
             res.extra.add_body(&name, id);
             res.extra.add_joints(n, id);
@@ -281,12 +308,14 @@ impl Spawner<'_> {
                 })
                 .fold((0.0, Color::WHITE), |a, b| if b.0 > a.0 { b } else { a })
                 .1;
+            let layer = self.layer_of(reyvec_game::layer::ENEMY);
             self.world.entity_mut(me).insert((
                 Target {
                     dummy: Dummy::new(placement.at, [d.size.0, d.size.1], d.hp, d.respawn),
                     opacity: n.opacity,
                     color,
                     contact: d.contact,
+                    layer,
                 },
                 Dynamic,
             ));
@@ -501,12 +530,21 @@ impl Spawner<'_> {
                 self.world.entity_mut(e).insert(s);
             }
         }
+        // Твёрдое этого предмета — в его слое.
+        let level = self.layer_of(reyvec_game::layer::LEVEL);
+        let mut q = self.world.query::<&mut Solid>();
+        for mut s in q.iter_mut(self.world) {
+            if s.layer.is_none() {
+                s.layer = Some(level);
+            }
+        }
         let was = self.in_player;
         self.in_player |= n.player.is_some();
         for (j, child) in n.children.iter().enumerate() {
             self.node(child, Some(me), &format!("{name} → предмет {}", j + 1))?;
         }
         self.in_player = was;
+        self.layer = outer_layer;
         Ok(me)
     }
 }

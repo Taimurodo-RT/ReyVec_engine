@@ -159,6 +159,9 @@ pub struct SceneFile {
     /// Слои векторных фигур снизу вверх (способ 5.1; слой — это предмет без места).
     #[serde(default)]
     pub layers: Vec<LayerDesc>,
+    /// Слои столкновений (9.6а): кто с кем не сталкивается.
+    #[serde(default)]
+    pub collision: Vec<CollisionLayer>,
     #[serde(default)]
     pub lights: Vec<LightDesc>,
     /// Объекты из SDF: рисуются под векторными фигурами.
@@ -297,6 +300,97 @@ pub struct NodeDesc {
     /// Выброс тел (6.13): предмет с `body` — образец, такие тела вылетают из его места.
     #[serde(default)]
     pub spawn: Option<SpawnDesc>,
+    /// Слой столкновений (9.6а): имя из `collision` файла или встроенное («уровень»,
+    /// «герой», «враг», «тело»). Без него — по тому, что это за предмет.
+    #[serde(default)]
+    pub layer: Option<String>,
+}
+
+/// Слой столкновений сцены (9.6а): имя и с какими слоями он не сталкивается. «Не
+/// сталкивается» действует в обе стороны.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollisionLayer {
+    pub name: String,
+    #[serde(default)]
+    pub ignores: Vec<String>,
+}
+
+/// Встроенные слои столкновений и их биты.
+pub const BUILTIN_LAYERS: [(&str, u32); 4] = [
+    ("уровень", reyvec_game::layer::LEVEL),
+    ("герой", reyvec_game::layer::HERO),
+    ("враг", reyvec_game::layer::ENEMY),
+    ("тело", reyvec_game::layer::BODY),
+];
+
+/// Слои столкновений сцены: бит и маска по имени.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Layers {
+    names: Vec<(String, u32)>,
+    /// Пары слоёв (биты), которые не сталкиваются.
+    ignored: Vec<(u32, u32)>,
+}
+
+impl Layers {
+    pub fn of(list: &[CollisionLayer]) -> Result<Self, String> {
+        let mut names: Vec<(String, u32)> = BUILTIN_LAYERS
+            .iter()
+            .map(|(n, b)| ((*n).to_string(), *b))
+            .collect();
+        for l in list {
+            if names.iter().any(|(n, _)| *n == l.name) {
+                if BUILTIN_LAYERS.iter().any(|(n, _)| *n == l.name) {
+                    continue;
+                }
+                return Err(format!("collision: слой «{}» назван дважды", l.name));
+            }
+            let bit = reyvec_game::layer::FIRST_CUSTOM + (names.len() as u32 - 4);
+            if bit >= 32 {
+                return Err("collision: слоёв больше 32".into());
+            }
+            names.push((l.name.clone(), 1 << bit));
+        }
+        let mut out = Self {
+            names,
+            ignored: Vec::new(),
+        };
+        for l in list {
+            let a = out.bit(&l.name).unwrap_or(0);
+            for other in &l.ignores {
+                let b = out
+                    .bit(other)
+                    .ok_or_else(|| format!("collision: у слоя «{}» нет слоя «{other}»", l.name))?;
+                out.ignored.push((a, b));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Бит слоя по имени.
+    pub fn bit(&self, name: &str) -> Option<u32> {
+        self.names.iter().find(|(n, _)| n == name).map(|(_, b)| *b)
+    }
+
+    /// С какими слоями сталкивается слой `bit`.
+    pub fn mask(&self, bit: u32) -> u32 {
+        let mut m = reyvec_game::layer::ALL;
+        for &(a, b) in &self.ignored {
+            if a == bit {
+                m &= !b;
+            }
+            if b == bit {
+                m &= !a;
+            }
+        }
+        m
+    }
+
+    /// Слой и маска предмета: его `layer` или встроенный `default`.
+    pub fn of_node(&self, layer: Option<&str>, default: u32) -> (u32, u32) {
+        let bit = layer.and_then(|n| self.bit(n)).unwrap_or(default);
+        (bit, self.mask(bit))
+    }
 }
 
 /// Физическое тело предмета: `size` — ширина и высота (у круглого `round: true` —
@@ -450,6 +544,7 @@ impl BodyDesc {
             gravity: self.gravity,
             bullet: self.bullet,
             material: self.material.physics(),
+            ..reyvec_game::physics::BodyDesc::default()
         }
     }
 
@@ -804,6 +899,7 @@ impl NodeDesc {
             soft: None,
             repeat: None,
             spawn: None,
+            layer: None,
         }
     }
 
@@ -1661,6 +1757,23 @@ impl SceneFile {
             return Err(SceneError::new(format!(
                 "version: {} — эта версия движка понимает только версию {VERSION}",
                 self.version
+            )));
+        }
+        // Слои столкновений (9.6а): имена слоёв предметов известны.
+        let layers = Layers::of(&self.collision).map_err(SceneError::new)?;
+        fn unknown<'a>(nodes: &'a [NodeDesc], layers: &Layers) -> Option<(&'a str, &'a str)> {
+            nodes.iter().find_map(|n| {
+                n.layer
+                    .as_deref()
+                    .filter(|l| layers.bit(l).is_none())
+                    .map(|l| (n.name.as_str(), l))
+                    .or_else(|| unknown(&n.children, layers))
+            })
+        }
+        if let Some((node, l)) = unknown(&self.nodes, &layers) {
+            return Err(SceneError::new(format!(
+                "предмет «{node}»: слоя столкновений «{l}» нет — назови его в collision или \
+                 возьми встроенный (уровень, герой, враг, тело)"
             )));
         }
         let nodes: usize = self

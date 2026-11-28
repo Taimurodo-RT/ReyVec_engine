@@ -158,19 +158,19 @@ pub(super) fn physics_step(
     let step = events.step;
     // Кинематические тела: уровень, герои, целые враги.
     let level = solids.2.iter().cloned();
-    let boxed = |id: u64, b: Aabb| {
-        let mut s = Surface::of_collider(&Collider::solid(b));
+    let boxed = |id: u64, b: Aabb, (layer, mask): (u32, u32)| {
+        let mut s = Surface::of_collider(&Collider::solid(b)).in_layer(layer, mask);
         s.id = id;
         s
     };
     let heroes: Vec<Surface> = players
         .iter()
-        .map(|(e, p)| boxed(e.to_bits(), p.body.bounds(&p.tuning)))
+        .map(|(e, p)| boxed(e.to_bits(), p.body.bounds(&p.tuning), p.layer))
         .collect();
     let enemies: Vec<Surface> = targets
         .iter()
         .filter(|(_, t)| t.dummy.alive())
-        .map(|(e, t)| boxed(e.to_bits(), t.dummy.bounds()))
+        .map(|(e, t)| boxed(e.to_bits(), t.dummy.bounds(), t.layer))
         .collect();
     phys.physics
         .set_surfaces(level.chain(heroes).chain(enemies));

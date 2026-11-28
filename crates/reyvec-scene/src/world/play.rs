@@ -74,22 +74,25 @@ pub(super) fn play(
     let steps = (dt / PLAYER_STEP - 1e-6).ceil().max(1.0) as usize;
     let sdt = dt / steps as f64;
     // Для героя манекены — тоже твёрдые тела (на них можно встать, их не пройти).
-    let bodies: Vec<Collider> = targets
+    let bodies: Vec<Surface> = targets
         .iter()
         .filter(|(_, t)| t.dummy.alive())
-        .map(|(e, t)| t.dummy.collider(e.to_bits()))
+        .map(|(e, t)| {
+            Surface::of_collider(&t.dummy.collider(e.to_bits())).in_layer(t.layer.0, t.layer.1)
+        })
         .collect();
     // Мир столкновений героя (9.2): уровень, манекены и настоящие формы тел физики. На
     // тела встают, сбоку их толкают. Опоры сдвинулись один раз за шаг логики: везут
-    // только в первом из шагов.
-    let mut space = solid_space(&solids);
-    space.extend_colliders(&bodies);
-    space.extend(phys.surfaces.iter().cloned());
-    let space_still = space.still();
+    // только в первом из шагов. Каждый видит только слои, с которыми сталкивается (9.6а).
+    let mut world_space = solid_space(&solids);
+    world_space.extend(bodies.iter().cloned());
+    world_space.extend(phys.surfaces.iter().cloned());
 
     let mut stop = false;
     for (mut player, mut place) in &mut players {
         let p = &mut *player;
+        let space = world_space.meeting(p.layer.0, p.layer.1);
+        let space_still = space.still();
         // С какой скоростью приземлился за этот шаг логики (удар по опоре, 9.4).
         let mut landing = 0.0f64;
         for i in 0..steps {
@@ -248,11 +251,15 @@ pub(super) fn play(
         };
     }
     // Где герой теперь, после своего шага: в него упираются манекены.
-    let heroes_now: Vec<Aabb> = players
+    let heroes_now: Vec<Surface> = players
         .iter()
-        .map(|(p, _)| p.body.bounds(&p.tuning))
+        .map(|(p, _)| {
+            Surface::of_collider(&Collider::solid(p.body.bounds(&p.tuning)))
+                .in_layer(p.layer.0, p.layer.1)
+        })
         .collect();
     for (e, mut t) in &mut targets {
+        let layer = t.layer;
         let d = &mut t.dummy;
         if stop {
             d.moved = [0.0, 0.0];
@@ -262,15 +269,11 @@ pub(super) fn play(
         // для них тоже твёрдый (6.9): враг со скриптом упирается в героя, а не входит в
         // него.
         let me = e.to_bits();
-        let others: Vec<Collider> = bodies
-            .iter()
-            .filter(|c| c.id != me)
-            .copied()
-            .chain(heroes_now.iter().map(|h| Collider::solid(*h)))
-            .collect();
         let mut mine = solid_space(&solids);
-        mine.extend_colliders(&others);
+        mine.extend(bodies.iter().filter(|s| s.id != me).cloned());
+        mine.extend(heroes_now.iter().cloned());
         mine.extend(phys.surfaces.iter().cloned());
+        let mine = mine.meeting(layer.0, layer.1);
         let mine_still = mine.still();
         let mut moved = [0.0, 0.0];
         for i in 0..steps {

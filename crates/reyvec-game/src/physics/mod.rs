@@ -81,6 +81,9 @@ pub struct BodyDesc {
     pub bullet: bool,
     /// Материал (9.6): звук и искры при ударе.
     pub material: Material,
+    /// Слой и маска столкновений (9.6а, [`crate::layer`]).
+    pub layer: u32,
+    pub mask: u32,
 }
 
 impl Default for BodyDesc {
@@ -96,6 +99,8 @@ impl Default for BodyDesc {
             gravity: 1.0,
             bullet: false,
             material: Material::Wood,
+            layer: crate::layer::BODY,
+            mask: crate::layer::ALL,
         }
     }
 }
@@ -277,6 +282,7 @@ impl Physics {
             .friction(d.friction.max(0.0) as f32)
             .user_data(d.material.to_bits())
             .active_events(ActiveEvents::COLLISION_EVENTS)
+            .collision_groups(groups(d.layer, d.mask))
             .build();
         self.colliders.insert_with_parent(c, h, &mut self.bodies);
         self.last.insert(h, at);
@@ -379,6 +385,7 @@ impl Physics {
                 ColliderBuilder::new(s.shape.clone())
                     .friction(0.7)
                     .user_data(Material::Stone.to_bits())
+                    .collision_groups(groups(s.layer, s.mask))
                     .build(),
                 body,
                 &mut self.bodies,
@@ -707,6 +714,9 @@ impl Physics {
                 s.turned = turned;
                 s.center = now;
                 s.pushable = b.is_dynamic();
+                let g = col.collision_groups();
+                s.layer = g.memberships.bits();
+                s.mask = g.filter.bits();
                 out.push(s);
             }
         }
@@ -851,6 +861,15 @@ fn same_shape(a: &SharedShape, b: &SharedShape) -> bool {
                 .all(|(p, q)| (*p - *q).length() < 1e-7);
     }
     false
+}
+
+/// Группы Rapier из слоя и маски (9.6а): сталкиваются, если каждый в маске другого.
+fn groups(layer: u32, mask: u32) -> InteractionGroups {
+    InteractionGroups::new(
+        Group::from_bits_retain(layer),
+        Group::from_bits_retain(mask),
+        InteractionTestMode::And,
+    )
 }
 
 fn v(a: [f64; 2]) -> Vector {

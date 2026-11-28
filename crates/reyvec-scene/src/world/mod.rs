@@ -128,6 +128,8 @@ impl SceneWorld {
             order: 0,
             entities: 0,
             in_player: false,
+            layers: crate::Layers::of(&file.collision).map_err(SceneError::new)?,
+            layer: None,
         };
         // Источники и объекты верхнего уровня (способ 5.1) — в общем корне без места.
         let root = NodeDesc {
@@ -160,6 +162,7 @@ impl SceneWorld {
             soft: None,
             repeat: None,
             spawn: None,
+            layer: None,
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;

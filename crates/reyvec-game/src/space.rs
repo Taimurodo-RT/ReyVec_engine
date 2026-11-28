@@ -30,6 +30,27 @@ use crate::{Aabb, Collider, EPS};
 /// без зазора персонаж мог бы войти в стену на долю миллиметра и застрять.
 pub const SKIN: f64 = 1e-4;
 
+/// Слои столкновений (9.6а): у каждого тела и поверхности есть слой (один бит) и маска
+/// «с какими слоями сталкиваюсь». Двое сталкиваются, только если каждый есть в маске
+/// другого. Первые четыре слоя — встроенные, остальные сцена называет сама.
+pub mod layer {
+    /// Уровень: стены, пол, фигуры сцены.
+    pub const LEVEL: u32 = 1;
+    pub const HERO: u32 = 1 << 1;
+    pub const ENEMY: u32 = 1 << 2;
+    /// Тела физики и мягкие тела.
+    pub const BODY: u32 = 1 << 3;
+    /// Со всеми.
+    pub const ALL: u32 = u32::MAX;
+    /// Первый слой, который называет сцена.
+    pub const FIRST_CUSTOM: u32 = 4;
+
+    /// Сталкиваются ли двое (слой и маска каждого).
+    pub fn meet(a: (u32, u32), b: (u32, u32)) -> bool {
+        a.0 & b.1 != 0 && b.0 & a.1 != 0
+    }
+}
+
 /// Поверхность мира столкновений: форма на месте и что о ней нужно контроллеру.
 #[derive(Clone)]
 pub struct Surface {
@@ -52,6 +73,9 @@ pub struct Surface {
     pub moved: [f64; 2],
     pub turned: f64,
     pub center: [f64; 2],
+    /// Слой и маска (9.6а, [`layer`]): уровень и со всеми по умолчанию.
+    pub layer: u32,
+    pub mask: u32,
 }
 
 impl Surface {
@@ -90,6 +114,8 @@ impl Surface {
             moved: c.moved,
             turned: 0.0,
             center,
+            layer: layer::LEVEL,
+            mask: layer::ALL,
         }
     }
 
@@ -110,7 +136,16 @@ impl Surface {
             pushable: false,
             moved: [0.0, 0.0],
             turned: 0.0,
+            layer: layer::LEVEL,
+            mask: layer::ALL,
         }
+    }
+
+    /// Та же поверхность в слое `layer` с маской `mask`.
+    pub fn in_layer(mut self, layer: u32, mask: u32) -> Self {
+        self.layer = layer;
+        self.mask = mask;
+        self
     }
 
     /// Поверхность формы `shape` с серединой `at`, повёрнутая на `angle` (радианы).
@@ -257,6 +292,19 @@ impl Space {
     pub fn still(&self) -> Self {
         Self {
             surfaces: self.surfaces.iter().map(Surface::still).collect(),
+        }
+    }
+
+    /// Только то, с чем сталкивается слой `layer` с маской `mask` (9.6а): мир
+    /// столкновений персонажа.
+    pub fn meeting(&self, layer: u32, mask: u32) -> Self {
+        Self {
+            surfaces: self
+                .surfaces
+                .iter()
+                .filter(|s| layer::meet((s.layer, s.mask), (layer, mask)))
+                .cloned()
+                .collect(),
         }
     }
 

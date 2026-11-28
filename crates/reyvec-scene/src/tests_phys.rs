@@ -283,3 +283,33 @@ fn crate_pushed_off_the_high_shelf_hurts_the_dummy() {
     eprintln!("здоровье манекена {hp} → {left}");
     assert!(left < hp, "ящик не ранил: {hp} → {left}");
 }
+
+#[test]
+fn ghost_beetle_runs_through_the_grate_to_the_hero() {
+    // 9.6а: в полигоне жук-призрак видит героя за решёткой и проходит сквозь неё.
+    let mut w = polygon();
+    let mut t = run(&mut w, 0.0, 0.5);
+    let e = w.find("жук-призрак").unwrap();
+    let start = w
+        .world_mut()
+        .get::<crate::world::Target>(e)
+        .unwrap()
+        .dummy
+        .body
+        .pos[0];
+    let mut crossed = false;
+    for _ in 0..240 {
+        w.set_player_body(reyvec_game::Body::new([-10.2, -0.6]));
+        t = run(&mut w, t, 1.0 / 60.0);
+        let x = w
+            .world_mut()
+            .get::<crate::world::Target>(e)
+            .unwrap()
+            .dummy
+            .body
+            .pos[0];
+        crossed |= x > -10.5;
+    }
+    assert!(start < -10.7, "жук начинает за решёткой: {start}");
+    assert!(crossed, "жук прошёл сквозь решётку");
+}
