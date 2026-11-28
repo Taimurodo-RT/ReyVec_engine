@@ -35,6 +35,10 @@ pub use soft::{Pin, SoftDesc, SoftId, SoftKind, SoftView};
 /// Масштаб длины для допусков `rapier`: типичный размер тела в единицах сцены.
 pub const LENGTH_UNIT: f32 = 0.2;
 
+/// Сдвиг кинематического тела за шаг, больше которого это перенос, а не движение: быстрее
+/// рывка героя (0,3 за шаг — 18 единиц в секунду).
+const TELEPORT: f32 = 0.3;
+
 /// Форма тела.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum BodyShape {
@@ -183,6 +187,8 @@ pub struct Physics {
     broken: usize,
     /// Как рисовать мягкие тела: номер вида по номеру мягкого тела.
     soft_styles: HashMap<SoftBodyHandle, u32>,
+    /// Где были частицы мягких тел до последнего шага (на сколько сдвинулся отрезок).
+    soft_last: HashMap<SoftBodyHandle, Vec<Vector>>,
     grip: Option<(Grip, Vector)>,
     /// Время мира, с: для моторов туда-обратно.
     time: f64,
@@ -217,6 +223,7 @@ impl Physics {
             breaks: Vec::new(),
             broken: 0,
             soft_styles: HashMap::new(),
+            soft_last: HashMap::new(),
             grip: None,
             time: 0.0,
             step_ms: 0.0,
@@ -331,6 +338,12 @@ impl Physics {
                     m.shape = s.shape;
                 }
                 if let Some(b) = self.bodies.get_mut(m.body) {
+                    // Перенос (герой появился заново, отладка поставила его в другое
+                    // место) — сразу на новое место. Иначе Rapier счёл бы перенос очень
+                    // быстрым движением и отшвырнул всё, чего тело касалось.
+                    if (b.translation() - s.pose.translation).length() > TELEPORT {
+                        b.set_position(s.pose, true);
+                    }
                     b.set_next_kinematic_position(s.pose);
                 }
                 continue;
@@ -392,6 +405,10 @@ impl Physics {
                 *at = p(b.translation());
                 self.last_angle.insert(*h, f64::from(b.rotation().angle()));
             }
+        }
+        self.soft_last.clear();
+        for (h, s) in self.soft_bodies.iter() {
+            self.soft_last.insert(h, s.particle_positions().collect());
         }
         self.params.dt = dt.clamp(1e-4, 0.05) as f32;
         let dt = self.params.dt;
@@ -670,19 +687,47 @@ impl Physics {
         if !b.is_dynamic() {
             return;
         }
-        let mass = f64::from(b.mass()).max(1e-6);
-        // Лёгкое тело идёт почти со скоростью персонажа, тяжёлое — медленно.
-        let target = speed * (pusher / (pusher + mass)).clamp(0.05, 0.95) * 1.6;
-        let target = target.clamp(-speed.abs(), speed.abs());
         let mut vel = b.linvel();
-        let cur = f64::from(vel.x);
-        let accel = 12.0 * pusher / (pusher + mass);
-        let dv = (target - cur).clamp(-accel * dt, accel * dt);
-        if (target > 0.0 && cur < target) || (target < 0.0 && cur > target) {
-            vel.x = (cur + dv) as f32;
+        if let Some(x) = push_speed(f64::from(vel.x), speed, pusher, f64::from(b.mass()), dt) {
+            vel.x = x as f32;
             b.set_linvel(vel, true);
         }
     }
+
+    /// Тяжесть мира, единиц в секунду за секунду (вниз).
+    pub fn gravity(&self) -> f64 {
+        -f64::from(self.gravity.y)
+    }
+
+    /// Персонаж массой `mass` стоит на теле в точке `at` и давит на него (9.4): своим
+    /// весом за шаг `dt` и, если только что упал со скоростью `fall`, ударом. Качели
+    /// наклоняются под героем, ящик на желе проминает его.
+    pub fn press(&mut self, id: BodyId, at: [f64; 2], mass: f64, fall: f64, dt: f64) {
+        let g = self.gravity();
+        let Some(b) = self.bodies.get_mut(id.0) else {
+            return;
+        };
+        if !b.is_dynamic() {
+            return;
+        }
+        let m = f64::from(b.mass()).max(1e-6);
+        // Удар неупругий: тело получает долю скорости упавшего.
+        let impulse = mass * g * dt + fall.max(0.0) * mass * m / (mass + m);
+        b.apply_impulse_at_point(Vector::new(0.0, -impulse as f32), v(at), true);
+    }
+}
+
+/// Новая скорость вбок толкаемого массой `mass` (тело или частицы мягкого тела) при
+/// скорости `cur`, если персонаж массой `pusher` хочет идти со скоростью `speed`; `None` —
+/// оно уже идёт не медленнее. Лёгкое идёт почти со скоростью персонажа, тяжёлое —
+/// медленно.
+fn push_speed(cur: f64, speed: f64, pusher: f64, mass: f64, dt: f64) -> Option<f64> {
+    let mass = mass.max(1e-6);
+    let target = speed * (pusher / (pusher + mass)).clamp(0.05, 0.95) * 1.6;
+    let target = target.clamp(-speed.abs(), speed.abs());
+    let accel = 12.0 * pusher / (pusher + mass);
+    let dv = (target - cur).clamp(-accel * dt, accel * dt);
+    ((target > 0.0 && cur < target) || (target < 0.0 && cur > target)).then_some(cur + dv)
 }
 
 /// Та же форма: тот же объект или прямоугольник того же размера (у героя и врагов
@@ -715,3 +760,6 @@ fn p(a: Vector) -> [f64; 2] {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_soft;

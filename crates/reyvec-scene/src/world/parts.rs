@@ -293,6 +293,9 @@ pub(super) struct PhysicsRes {
     pub(super) surfaces: Vec<reyvec_game::Surface>,
     /// Кого толкнули герои на этом шаге: номер поверхности тела и желаемая скорость.
     pub(super) pushes: Vec<(u64, f64)>,
+    /// Кто на чём стоит на этом шаге (9.4): герои и враги давят весом на тела и мягкие
+    /// тела под ногами.
+    pub(super) presses: Vec<Press>,
     /// Сколько шагать физике (пишет `play`: время шага без стоп-кадра).
     pub(super) dt: f64,
     pub(super) breaks: Vec<Break>,
@@ -330,6 +333,35 @@ pub(super) const CONTACT_REACH: f64 = 0.02;
 pub(super) const HURT_PUSH: [f64; 2] = [2.2, 2.0];
 /// Номера платформ из физических тел для героя (не пересекаются с номерами сущностей).
 pub(super) const PLATFORM_IDS: u64 = 1 << 62;
+/// Номера поверхностей мягких тел для героя (9.4): выше номеров тел.
+pub(super) const SOFT_IDS: u64 = PLATFORM_IDS + (1 << 56);
+
+/// Персонаж стоит на теле или мягком теле: номер опоры, полоса по низу его
+/// прямоугольника и с какой скоростью он на неё упал (0 — уже стоял).
+pub(super) struct Press {
+    pub(super) ground: u64,
+    pub(super) feet: Aabb,
+    pub(super) fall: f64,
+}
+
+impl Press {
+    /// Опора персонажа, если это тело физики или мягкое тело.
+    pub(super) fn of(body: &Body, tuning: &reyvec_game::Tuning, fall: f64) -> Option<Self> {
+        let ground = body
+            .ground()
+            .filter(|g| body.on_ground && *g >= PLATFORM_IDS)?;
+        let b = body.bounds(tuning);
+        Some(Self {
+            ground,
+            feet: Aabb {
+                min: [b.min[0], b.min[1] - 0.005],
+                max: [b.max[0], b.min[1] + 0.005],
+            },
+            fall,
+        })
+    }
+}
+
 /// Масса героя для толкания тел (плотность 1 на площадь героя ростом 0,28).
 pub(super) const HERO_MASS: f64 = 0.04;
 

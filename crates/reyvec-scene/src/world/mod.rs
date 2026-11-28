@@ -97,6 +97,7 @@ impl SceneWorld {
             physics: Physics::new(reyvec_game::Tuning::default().gravity()),
             bodies: Vec::new(),
             surfaces: Vec::new(),
+            presses: Vec::new(),
             pushes: Vec::new(),
             dt: 0.0,
             breaks: Vec::new(),

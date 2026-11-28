@@ -440,3 +440,23 @@ fn bodies_added_later_land_on_a_thin_welded_shelf() {
         assert!(at[1] > -0.25, "кубик провалился сквозь полку: {at:?}");
     }
 }
+
+#[test]
+fn moved_hero_does_not_fling_what_it_stood_on() {
+    // Герой стоял на ящике и появился в другом месте: ящик остаётся лежать (раньше
+    // Rapier считал перенос быстрым движением и подбрасывал ящик).
+    let mut w = Physics::new(9.3);
+    let b = w.add([0.0, -0.725], 0.0, [0.0, 0.0], &BodyDesc::default());
+    let hero = |x: f64, y: f64| (2, Collider::solid(Aabb::around([x, y], [0.07, 0.14])));
+    for _ in 0..30 {
+        w.set_solids([floor(), hero(0.0, -0.65 + 0.14 + 1e-4)]);
+        w.step(DT);
+    }
+    let mut highest = f64::MIN;
+    for _ in 0..30 {
+        w.set_solids([floor(), hero(-0.3, -0.8 + 0.14 + 1e-4)]);
+        w.step(DT);
+        highest = highest.max(w.pose(b).unwrap().0[1]);
+    }
+    assert!(highest < -0.725 + 0.01, "ящик подбросило: {highest}");
+}

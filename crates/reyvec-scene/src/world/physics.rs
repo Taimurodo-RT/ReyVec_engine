@@ -49,7 +49,12 @@ pub(super) fn physics_step(
     phys.physics
         .set_surfaces(level.chain(heroes).chain(enemies));
     // Герои толкают тела сбоку (9.2): тело разгоняется тем медленнее, чем тяжелее.
+    // Мягкое тело толкается отрезком (9.4).
     for (id, speed) in std::mem::take(&mut phys.pushes) {
+        if let Some(key) = id.checked_sub(SOFT_IDS) {
+            phys.physics.push_soft(key, speed, HERO_MASS, dt);
+            continue;
+        }
         let Some(&body) = id
             .checked_sub(PLATFORM_IDS)
             .and_then(|i| phys.bodies.get(i as usize))
@@ -57,6 +62,17 @@ pub(super) fn physics_step(
             continue;
         };
         phys.physics.push(body, speed, HERO_MASS, dt);
+    }
+    // Стоящие давят весом на то, что под ногами (9.4): качели наклоняются, желе
+    // сминается, гамак прогибается.
+    for press in std::mem::take(&mut phys.presses) {
+        if let Some(key) = press.ground.checked_sub(SOFT_IDS) {
+            phys.physics
+                .press_soft(key, press.feet, HERO_MASS, press.fall, dt);
+        } else if let Some(&body) = phys.bodies.get((press.ground - PLATFORM_IDS) as usize) {
+            let at = [press.feet.center()[0], press.feet.center()[1]];
+            phys.physics.press(body, at, HERO_MASS, press.fall, dt);
+        }
     }
     // Удар героя отбрасывает тела.
     for (_, mut player) in &mut players {
@@ -174,4 +190,6 @@ pub(super) fn physics_step(
     }
     let ids = phys.bodies.clone();
     phys.surfaces = phys.physics.surfaces(&ids, PLATFORM_IDS);
+    let soft = phys.physics.soft_surfaces(SOFT_IDS);
+    phys.surfaces.extend(soft);
 }
