@@ -949,8 +949,11 @@ impl NodeDesc {
 #[serde(deny_unknown_fields)]
 pub enum ShapeDesc {
     /// Прямоугольник с серединой в `at`, размером `size`, скруглением углов `corner`.
-    /// `solid: true` — твёрдый: персонаж на него встаёт и сквозь него не проходит (6.1).
-    /// `oneway: true` — платформа: держит только сверху, снизу и сбоку проходишь (6.2).
+    ///
+    /// У всех фигур: `solid: true` — твёрдая: персонаж на неё встаёт и сквозь неё не
+    /// проходит (6.1), тела физики о неё ударяются; форма столкновения — настоящая
+    /// форма фигуры (9.3). `oneway: true` — платформа: держит только сверху, снизу и
+    /// сбоку проходишь (6.2).
     Rect {
         at: P,
         size: P,
@@ -973,6 +976,10 @@ pub enum ShapeDesc {
         color: Hex,
         #[serde(default)]
         stroke: Option<f64>,
+        #[serde(default)]
+        solid: bool,
+        #[serde(default)]
+        oneway: bool,
     },
     /// Многоугольник по точкам `points` (относительно `at`).
     Polygon {
@@ -984,6 +991,10 @@ pub enum ShapeDesc {
         color: Hex,
         #[serde(default)]
         stroke: Option<f64>,
+        #[serde(default)]
+        solid: bool,
+        #[serde(default)]
+        oneway: bool,
     },
     /// Ломаная линия толщиной `width` по точкам `points` (концы и углы круглые).
     Line {
@@ -994,6 +1005,10 @@ pub enum ShapeDesc {
         #[serde(default)]
         angle: f64,
         color: Hex,
+        #[serde(default)]
+        solid: bool,
+        #[serde(default)]
+        oneway: bool,
     },
     /// Контур в записи SVG (`"M 0 0 Q 0.5 1 1 0 Z"`), но y вверх, как во всей сцене.
     /// `scale` увеличивает контур (толщина `stroke` не меняется).
@@ -1008,6 +1023,10 @@ pub enum ShapeDesc {
         color: Hex,
         #[serde(default)]
         stroke: Option<f64>,
+        #[serde(default)]
+        solid: bool,
+        #[serde(default)]
+        oneway: bool,
     },
 }
 
@@ -1072,6 +1091,33 @@ pub struct ObjectDesc {
     pub glow: bool,
     #[serde(default)]
     pub shadow: bool,
+    /// Твёрдый (9.3): герой встаёт, тела ударяются; форма — круги и капсулы частей.
+    #[serde(default)]
+    pub solid: bool,
+}
+
+impl ObjectDesc {
+    /// Форма столкновения из частей.
+    pub(crate) fn form(&self) -> reyvec_game::Form {
+        let p = |q: P| [q.0, q.1];
+        reyvec_game::Form::Parts(
+            self.parts
+                .iter()
+                .map(|part| match part {
+                    PartDesc::Circle { at, r } => reyvec_game::Form::Capsule {
+                        a: p(*at),
+                        b: p(*at),
+                        r: f64::from(*r),
+                    },
+                    PartDesc::Capsule { from, to, r } => reyvec_game::Form::Capsule {
+                        a: p(*from),
+                        b: p(*to),
+                        r: f64::from(*r),
+                    },
+                })
+                .collect(),
+        )
+    }
 }
 
 fn default_blend() -> f32 {
@@ -1806,6 +1852,58 @@ impl ShapeDesc {
         }
     }
 
+    /// Твёрдая ли фигура (`solid`) и платформа ли (`oneway`).
+    pub(crate) fn solid_flags(&self) -> (bool, bool) {
+        match self {
+            Self::Rect { solid, oneway, .. }
+            | Self::Circle { solid, oneway, .. }
+            | Self::Polygon { solid, oneway, .. }
+            | Self::Line { solid, oneway, .. }
+            | Self::Path { solid, oneway, .. } => (*solid, *oneway),
+        }
+    }
+
+    /// Форма столкновения в собственных координатах фигуры (9.3): прямоугольник и
+    /// круг — точно, остальное — контур, разбитый на отрезки до 2 мм от кривой.
+    pub(crate) fn form(&self) -> reyvec_game::Form {
+        use reyvec_game::Form;
+        match self {
+            Self::Rect { size, corner, .. } => Form::Box {
+                half: [size.0 * 0.5, size.1 * 0.5],
+                corner: *corner,
+            },
+            Self::Circle {
+                r, stroke: None, ..
+            } => Form::Ball { r: *r },
+            _ => {
+                let (_, path, stroke) = self.geometry();
+                let (loops, open) = flatten_path(&path, 0.002);
+                match stroke {
+                    Some(w) => Form::Stroke {
+                        lines: loops
+                            .into_iter()
+                            .map(|mut l| {
+                                if let Some(&first) = l.first() {
+                                    l.push(first);
+                                }
+                                l
+                            })
+                            .chain(open)
+                            .collect(),
+                        r: w * 0.5,
+                    },
+                    // Незамкнутый залитый контур заливка замыкает сама.
+                    None => Form::Fill {
+                        loops: loops
+                            .into_iter()
+                            .chain(open.into_iter().filter(|l| l.len() > 2))
+                            .collect(),
+                    },
+                }
+            }
+        }
+    }
+
     /// Форма фигуры в библиотеке: знакомая из `cache` или новая (нарезается здесь).
     pub(crate) fn shape_id(
         &self,
@@ -1826,6 +1924,35 @@ impl ShapeDesc {
         };
         Ok(id)
     }
+}
+
+/// Ломаные контура.
+type Lines = Vec<Vec<[f64; 2]>>;
+
+/// Контур кривыми → ломаные: замкнутые (без повтора первой точки) и открытые.
+fn flatten_path(path: &BezPath, tolerance: f64) -> (Lines, Lines) {
+    let (mut closed, mut open) = (Vec::new(), Vec::new());
+    let mut cur: Vec<[f64; 2]> = Vec::new();
+    kurbo::flatten(path, tolerance, |el| match el {
+        kurbo::PathEl::MoveTo(p) => {
+            if cur.len() > 1 {
+                open.push(std::mem::take(&mut cur));
+            }
+            cur = vec![[p.x, p.y]];
+        }
+        kurbo::PathEl::LineTo(p) => cur.push([p.x, p.y]),
+        kurbo::PathEl::ClosePath => {
+            if cur.len() > 2 {
+                closed.push(std::mem::take(&mut cur));
+            }
+            cur.clear();
+        }
+        _ => {}
+    });
+    if cur.len() > 1 {
+        open.push(cur);
+    }
+    (closed, open)
 }
 
 /// Форма фигуры сцены: белая (цвет даёт оттенок экземпляра), обводка с круглыми

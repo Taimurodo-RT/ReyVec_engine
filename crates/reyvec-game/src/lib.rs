@@ -22,6 +22,7 @@
 pub mod anim;
 pub mod combat;
 pub mod controller;
+pub mod form;
 pub mod input;
 pub mod physics;
 pub mod space;
@@ -29,7 +30,9 @@ pub mod space;
 pub use anim::{Animator, Bone, BonePose, Clip, Pose};
 pub use combat::{AttackTuning, Dummy, Fighter, Health, Hurt};
 pub use controller::{Body, Collider, Intent, StepEvents, Tuning};
+pub use form::Form;
 pub use input::{Action, InputFrame, InputReader, InputShared};
+pub use rapier2d::parry::shape::SharedShape;
 pub use space::{Filter, Hit, Space, Surface};
 
 /// Прямоугольник со сторонами вдоль осей: от `min` до `max`.

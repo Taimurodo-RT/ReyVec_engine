@@ -80,7 +80,7 @@ pub(super) fn play(
     // Мир столкновений героя (9.2): уровень, манекены и настоящие формы тел физики. На
     // тела встают, сбоку их толкают. Опоры сдвинулись один раз за шаг логики: везут
     // только в первом из шагов.
-    let mut space = Space::of(&solids.0);
+    let mut space = solid_space(&solids);
     space.extend_colliders(&bodies);
     space.extend(phys.surfaces.iter().cloned());
     let space_still = space.still();
@@ -282,7 +282,7 @@ pub(super) fn play(
             .copied()
             .chain(heroes_now.iter().map(|h| Collider::solid(*h)))
             .collect();
-        let mut mine = Space::of(&solids.0);
+        let mut mine = solid_space(&solids);
         mine.extend_colliders(&others);
         mine.extend(phys.surfaces.iter().cloned());
         let mine_still = mine.still();
@@ -317,4 +317,11 @@ pub(super) fn combat_look(
         place.flash = (t.dummy.flash / reyvec_game::combat::FLASH_TIME) as f32;
         place.opacity = if t.dummy.alive() { t.opacity } else { 0.0 };
     }
+}
+
+/// Мир столкновений из твёрдого сцены (без героев, врагов и тел).
+fn solid_space(solids: &Solids) -> Space {
+    let mut s = Space::default();
+    s.extend(solids.2.iter().cloned());
+    s
 }

@@ -196,6 +196,8 @@ impl TilesDesc {
                     angle: 0.0,
                     color,
                     stroke: None,
+                    solid: false,
+                    oneway: false,
                 });
                 let mut bottom = r + 1;
                 while is_under(bottom, c) {
@@ -248,6 +250,8 @@ impl TilesDesc {
                     at: from,
                     angle: 0.0,
                     color: edge,
+                    solid: false,
+                    oneway: false,
                 });
             };
             for (r, c0, c1) in runs(rows, cols, |r, c| at(r, c) == Cell::Block && open(r, c)) {
