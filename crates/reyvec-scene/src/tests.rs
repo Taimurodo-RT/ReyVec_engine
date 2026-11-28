@@ -2624,3 +2624,63 @@ nodes: [
     let err = SceneFile::parse(&bad).unwrap_err().to_string();
     assert!(err.contains("нет такого"), "{err}");
 }
+
+#[test]
+fn zones_lift_the_jump_blow_crates_and_report_enter_and_exit() {
+    // 9.6б: в зоне слабой тяжести герой прыгает выше, ветер сдувает ящик, зона говорит
+    // «вошёл» и «вышел».
+    use reyvec_game::Action::Jump;
+    use reyvec_game::InputFrame;
+    let scene = |gravity: f64| {
+        minimal(&format!(
+            r##"nodes: [
+    (name: "пол", solids: [(at: (0.0, -0.9), size: (8.0, 0.2))]),
+    (name: "лёгкая", at: (0.0, 0.0), zone: (size: (1.0, 3.0), gravity: {gravity})),
+    (name: "ветер", at: (2.0, -0.5), zone: (size: (1.0, 1.0), wind: (2.0, 0.0))),
+    (name: "герой", at: (0.0, -0.7), player: (size: (0.1, 0.2)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.1, 0.2), color: "#fff")]),
+    (name: "ящик", at: (1.8, -0.74), body: (size: (0.12, 0.12)),
+        shapes: [Rect(at: (0.0, 0.0), size: (0.12, 0.12), color: "#888")]),
+]"##
+        ))
+    };
+    let jump = |gravity: f64| {
+        let mut w = world(&scene(gravity));
+        let mut t = steps(&mut w, 0, 20);
+        w.set_input(InputFrame::new(&[Jump], &[Jump]));
+        t = steps(&mut w, t, 1);
+        w.set_input(InputFrame::new(&[Jump], &[]));
+        let mut top = f64::MIN;
+        for _ in 0..120 {
+            t = steps(&mut w, t, 1);
+            top = top.max(w.player_body().unwrap().pos[1]);
+        }
+        let e = w.find("ящик").unwrap();
+        let crate_x = w.world_mut().get::<Placement>(e).unwrap().at[0];
+        (top, crate_x, w)
+    };
+    let (normal, crate_x, _) = jump(1.0);
+    let (light, ..) = jump(0.4);
+    assert!(
+        light > normal + 0.3,
+        "в лёгкой зоне выше: {light} против {normal}"
+    );
+    assert!(crate_x > 2.2, "ветер сдул ящик: {crate_x}");
+    // Вход и выход: герой появился внутри зоны, его переносят наружу.
+    let mut w = world(&scene(1.0));
+    let mut seen = 0;
+    let mut t = steps(&mut w, 0, 2);
+    let mut zone = Vec::new();
+    zone.extend(fresh(&w, &mut seen).into_iter().filter_map(|e| match e {
+        GameEvent::Zone { zone, enter, .. } => Some((zone, enter)),
+        _ => None,
+    }));
+    w.set_player_body(reyvec_game::Body::new([-2.0, -0.7]));
+    t = steps(&mut w, t, 2);
+    let _ = t;
+    zone.extend(fresh(&w, &mut seen).into_iter().filter_map(|e| match e {
+        GameEvent::Zone { zone, enter, .. } => Some((zone, enter)),
+        _ => None,
+    }));
+    assert_eq!(zone, vec![(0, true), (0, false)]);
+}

@@ -313,3 +313,15 @@ fn ghost_beetle_runs_through_the_grate_to_the_hero() {
     assert!(start < -10.7, "жук начинает за решёткой: {start}");
     assert!(crossed, "жук прошёл сквозь решётку");
 }
+
+#[test]
+fn magnet_holds_the_iron_bar_in_the_air() {
+    // 9.6б: в полигоне магнит поднимает железный брусок, а деревянный ящик рядом лежит.
+    let mut w = polygon();
+    run(&mut w, 0.0, 3.0);
+    let bar = place(&mut w, "железный брусок").at;
+    let wood = place(&mut w, "деревянный ящик").at;
+    eprintln!("брусок {bar:?}, ящик {wood:?}");
+    assert!(bar[1] > -0.6, "брусок в воздухе: {bar:?}");
+    assert!(wood[1] < -0.7, "дерево на полу: {wood:?}");
+}

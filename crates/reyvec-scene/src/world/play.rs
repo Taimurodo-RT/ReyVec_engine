@@ -17,6 +17,7 @@ pub(super) fn play(
     mut players: Query<(&mut Player, &mut Placement)>,
     mut targets: Query<(Entity, &mut Target), Without<Player>>,
     scripts: Res<ScriptRes>,
+    mut zones: Query<(&mut Zone, &GlobalPlacement)>,
 ) {
     phys.dt = 0.0;
     phys.presses.clear();
@@ -89,10 +90,15 @@ pub(super) fn play(
     world_space.extend(phys.surfaces.iter().cloned());
 
     let mut stop = false;
-    for (mut player, mut place) in &mut players {
+    for (hero, (mut player, mut place)) in players.iter_mut().enumerate() {
         let p = &mut *player;
         let space = world_space.meeting(p.layer.0, p.layer.1);
         let space_still = space.still();
+        // Зоны (9.6б): другая тяжесть меняет прыжок, ветер сдувает.
+        let field = field_at(zones.iter(), p.body.pos);
+        let tuning = p.tuning.in_gravity(field.gravity);
+        p.body.vel[0] += field.wind[0] * WIND_PUSH * dt;
+        p.body.vel[1] += field.wind[1] * WIND_PUSH * dt;
         // С какой скоростью приземлился за этот шаг логики (удар по опоре, 9.4).
         let mut landing = 0.0f64;
         for i in 0..steps {
@@ -108,7 +114,7 @@ pub(super) fn play(
             };
             let here = if first { &space } else { &space_still };
             let fall = -p.body.vel[1];
-            let ev = p.body.step(&p.tuning, intent, here, sdt);
+            let ev = p.body.step(&tuning, intent, here, sdt);
             if let Some(push) = ev.pushed {
                 phys.pushes.push(push);
             }
@@ -222,6 +228,28 @@ pub(super) fn play(
             p.body = Body::new(p.spawn);
         }
         phys.presses.extend(Press::of(&p.body, &p.tuning, landing));
+        // Вошёл в зону или вышел.
+        let me_key = p.body.pos;
+        for (mut z, g) in &mut zones {
+            let now = z.area(g).contains(me_key);
+            let id = hero as u64;
+            let was = z.inside.contains(&id);
+            if now != was {
+                if now {
+                    z.inside.push(id);
+                } else {
+                    z.inside.retain(|k| *k != id);
+                }
+                events.list.push_back((
+                    step,
+                    GameEvent::Zone {
+                        at: [me_key[0] as f32, me_key[1] as f32],
+                        zone: z.index,
+                        enter: now,
+                    },
+                ));
+            }
+        }
         // Враги ранят касанием (6.10б). Враг для героя твёрдый, поэтому вплотную они
         // только касаются: прямоугольник героя чуть шире.
         p.health.tick(dt);
@@ -275,12 +303,18 @@ pub(super) fn play(
         mine.extend(phys.surfaces.iter().cloned());
         let mine = mine.meeting(layer.0, layer.1);
         let mine_still = mine.still();
+        let field = field_at(zones.iter(), d.body.pos);
+        let saved = d.tuning;
+        d.tuning = saved.in_gravity(field.gravity);
+        d.body.vel[0] += field.wind[0] * WIND_PUSH * dt;
+        d.body.vel[1] += field.wind[1] * WIND_PUSH * dt;
         let mut moved = [0.0, 0.0];
         for i in 0..steps {
             d.step(if i == 0 { &mine } else { &mine_still }, sdt);
             moved[0] += d.moved[0];
             moved[1] += d.moved[1];
         }
+        d.tuning = saved;
         d.moved = moved;
         phys.presses.extend(Press::of(&d.body, &d.tuning, 0.0));
         if d.body.pos[1] < d.spawn[1] - FALL_OUT {
@@ -289,6 +323,9 @@ pub(super) fn play(
         }
     }
 }
+
+/// Как сильно ветер зоны толкает героя и врагов: доля скорости ветра за секунду.
+const WIND_PUSH: f64 = 3.0;
 
 /// Героя ранили на `amount` (касание врага, упавший ящик): отбрасывает от `from` по
 /// горизонтали и чуть вверх, тряска; кончилось здоровье — появляется снова в начале.

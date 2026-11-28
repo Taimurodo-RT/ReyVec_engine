@@ -304,6 +304,43 @@ pub struct NodeDesc {
     /// «герой», «враг», «тело»). Без него — по тому, что это за предмет.
     #[serde(default)]
     pub layer: Option<String>,
+    /// Зона (9.6б): невидимый прямоугольник вокруг места предмета — датчик «вошёл /
+    /// вышел» и поле сил (ветер, другая тяжесть, магнит).
+    #[serde(default)]
+    pub zone: Option<ZoneDesc>,
+}
+
+/// Зона: `size` — ширина и высота, `wind` — скорость ветра или течения (x, y), `gravity`
+/// — во сколько раз тяжесть (1 — как везде, 0 — невесомость), `magnet` — с какой силой
+/// тянет железо к середине.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ZoneDesc {
+    pub size: P,
+    pub wind: P,
+    pub gravity: f64,
+    pub magnet: f64,
+}
+
+impl Default for ZoneDesc {
+    fn default() -> Self {
+        Self {
+            size: (1.0, 1.0),
+            wind: (0.0, 0.0),
+            gravity: 1.0,
+            magnet: 0.0,
+        }
+    }
+}
+
+impl ZoneDesc {
+    pub fn field(&self) -> reyvec_game::physics::Field {
+        reyvec_game::physics::Field {
+            wind: [self.wind.0, self.wind.1],
+            gravity: self.gravity,
+            magnet: self.magnet,
+        }
+    }
 }
 
 /// Слой столкновений сцены (9.6а): имя и с какими слоями он не сталкивается. «Не
@@ -900,6 +937,7 @@ impl NodeDesc {
             repeat: None,
             spawn: None,
             layer: None,
+            zone: None,
         }
     }
 
@@ -1439,6 +1477,13 @@ pub enum GameEvent {
     Hurt { at: [f32; 2], amount: u32, dir: f32 },
     /// Здоровье героя кончилось: где он был (появится снова в начале).
     Died { at: [f32; 2] },
+    /// Герой вошёл в зону или вышел из неё (9.6б): середина героя, номер зоны по порядку
+    /// в файле.
+    Zone {
+        at: [f32; 2],
+        zone: u32,
+        enter: bool,
+    },
     /// Удар тел (9.6): место, сила (скорость сближения, единиц в секунду) и материал,
     /// который звучит.
     Impact {

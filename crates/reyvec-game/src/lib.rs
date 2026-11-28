@@ -87,6 +87,11 @@ impl Aabb {
     }
 
     /// Пересекается ли с `other` (касание не считается).
+    /// Точка внутри (или на краю).
+    pub fn contains(&self, p: [f64; 2]) -> bool {
+        p[0] >= self.min[0] && p[0] <= self.max[0] && p[1] >= self.min[1] && p[1] <= self.max[1]
+    }
+
     pub fn overlaps(&self, other: &Self) -> bool {
         (0..2).all(|i| self.min[i] < other.max[i] - EPS && self.max[i] > other.min[i] + EPS)
     }

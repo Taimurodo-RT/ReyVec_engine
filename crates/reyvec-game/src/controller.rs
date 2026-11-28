@@ -104,6 +104,22 @@ impl Tuning {
         2.0 * self.jump / self.jump_time
     }
 
+    /// Настройки в области, где тяжесть в `gravity` раз другая (9.6б): толчок прыжка тот
+    /// же, поэтому при слабой тяжести прыжок выше и дольше, падение медленнее. Тянуть
+    /// вверх персонажа нельзя: меньше 0,05 не бывает.
+    pub fn in_gravity(&self, gravity: f64) -> Self {
+        let k = gravity.max(0.05);
+        if (k - 1.0).abs() < 1e-9 {
+            return *self;
+        }
+        Self {
+            jump: self.jump / k,
+            jump_time: self.jump_time / k,
+            max_fall: self.max_fall * k.sqrt(),
+            ..*self
+        }
+    }
+
     pub fn half(&self) -> [f64; 2] {
         [self.size[0] * 0.5, self.size[1] * 0.5]
     }
@@ -1310,6 +1326,17 @@ mod tests {
         run(&mut b, &t, &floor(), 120, Intent::default());
         assert!(b.on_ground);
         assert!(b.step(&t, dash, &Space::of(&floor()), DT).dashed);
+    }
+
+    #[test]
+    fn weaker_gravity_keeps_the_jump_push_and_jumps_higher() {
+        let t = Tuning::default();
+        let light = t.in_gravity(0.5);
+        assert!((light.jump_speed() - t.jump_speed()).abs() < 1e-9);
+        assert!((light.gravity() - 0.5 * t.gravity()).abs() < 1e-9);
+        assert!((light.jump - 2.0 * t.jump).abs() < 1e-9);
+        assert_eq!(t.in_gravity(1.0), t);
+        assert!(t.in_gravity(-3.0).gravity() > 0.0);
     }
 
     #[test]

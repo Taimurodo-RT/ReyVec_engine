@@ -17,7 +17,7 @@ pub(crate) fn sound_for(event: &GameEvent) -> Option<(Sound, f32, [f32; 2])> {
         GameEvent::Hit { at, .. } => (Sound::Hit, -2.0, at),
         GameEvent::Hurt { at, .. } => (Sound::Hurt, -4.0, at),
         GameEvent::Died { at } => (Sound::Land, 0.0, at),
-        GameEvent::Damage { .. } => return None,
+        GameEvent::Damage { .. } | GameEvent::Zone { .. } => return None,
         // Удар тел (9.6): чем сильнее, тем громче (с 4 единиц в секунду — в полную силу).
         GameEvent::Impact {
             at,

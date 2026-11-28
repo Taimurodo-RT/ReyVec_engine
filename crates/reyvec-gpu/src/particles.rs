@@ -496,7 +496,7 @@ pub(crate) fn burst(event: &reyvec_scene::GameEvent, seed: u64) -> Vec<Particle>
             }
         }
         // Взмах слышно, но пыли он не поднимает; число урона рисует интерфейс.
-        E::Swing { .. } | E::Damage { .. } => {}
+        E::Swing { .. } | E::Damage { .. } | E::Zone { .. } => {}
         E::Hurt { at, dir, .. } => {
             // Красные брызги от героя в сторону отброса.
             for _ in 0..14 {
