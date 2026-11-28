@@ -25,45 +25,107 @@ pub(super) fn pose_bones(
     }
 }
 
-/// Твёрдые прямоугольники в координатах сцены и на сколько каждый сдвинулся за шаг.
+/// Твёрдое в координатах сцены и на сколько каждое сдвинулось и повернулось за шаг.
 pub(super) fn gather_solids(
     mut q: Query<(Entity, &mut Solid, &GlobalPlacement)>,
     mut solids: ResMut<Solids>,
 ) {
     solids.0.clear();
     solids.1.clear();
+    solids.2.clear();
     for (e, mut s, g) in &mut q {
-        let [hx, hy] = s.half;
-        let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[x, y]| {
-            let p = g.affine * reyvec_vector::Point::new(x, y);
-            [p.x, p.y]
-        });
-        let Some(aabb) = Aabb::of_points(corners) else {
-            continue;
-        };
         let c = g.affine.translation();
         let center = [c.x, c.y];
-        let moved = s
-            .last
-            .map_or([0.0, 0.0], |l| [center[0] - l[0], center[1] - l[1]]);
-        s.last = Some(center);
-        // Склон: подъём растягивается вместе с предметом, отражённый — в другую сторону.
-        let slope = if s.slope == 0.0 {
-            0.0
-        } else {
-            let a = g.affine.as_coeffs();
-            let flip = (a[0] * a[3] - a[1] * a[2]).signum();
-            s.slope * (aabb.max[1] - aabb.min[1]) / (2.0 * hy).max(1e-12) * flip
-        };
-        solids.0.push(Collider {
-            aabb,
-            oneway: s.oneway,
-            id: e.to_bits(),
-            moved,
-            slope,
+        // Поворот и растяжение места: первый столбец даёт поворот и растяжение по x,
+        // второй (повёрнутый обратно) — растяжение по y со знаком (отражение).
+        let [a, b, cc, d, _, _] = g.affine.as_coeffs();
+        let angle = b.atan2(a);
+        let sx = a.hypot(b);
+        let sy = -cc * angle.sin() + d * angle.cos();
+        let (moved, turned) = s.last.map_or(([0.0, 0.0], 0.0), |(l, la)| {
+            ([center[0] - l[0], center[1] - l[1]], wrap_angle(angle - la))
         });
+        s.last = Some((center, angle));
+        let id = e.to_bits();
+        let mut legacy = None;
+        let surface = match s.form.clone() {
+            Some(form) => {
+                let scale = [sx, sy];
+                let fresh = s
+                    .built
+                    .as_ref()
+                    .is_some_and(|(k, _)| (k[0] - sx).abs() < 1e-9 && (k[1] - sy).abs() < 1e-9);
+                if !fresh {
+                    s.built = form.build(sx, sy).map(|shape| (scale, shape));
+                }
+                let Some((_, shape)) = &s.built else {
+                    continue;
+                };
+                let mut f = Surface::placed(id, shape.clone(), center, angle);
+                f.oneway = s.oneway;
+                f.moved = moved;
+                f.turned = turned;
+                f
+            }
+            None => {
+                let [hx, hy] = s.half;
+                let corners = [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].map(|[x, y]| {
+                    let p = g.affine * reyvec_vector::Point::new(x, y);
+                    [p.x, p.y]
+                });
+                let Some(aabb) = Aabb::of_points(corners) else {
+                    continue;
+                };
+                if s.slope == 0.0 && angle.abs() > 1e-9 {
+                    // Повёрнутый прямоугольник — настоящей формой (9.3).
+                    let shape = reyvec_game::Form::Box {
+                        half: s.half,
+                        corner: 0.0,
+                    }
+                    .build(sx, sy);
+                    let Some(shape) = shape else { continue };
+                    let mut f = Surface::placed(id, shape, center, angle);
+                    f.oneway = s.oneway;
+                    f.moved = moved;
+                    f.turned = turned;
+                    f
+                } else {
+                    // Склон: подъём растягивается вместе с предметом, отражённый — в
+                    // другую сторону.
+                    let slope = if s.slope == 0.0 {
+                        0.0
+                    } else {
+                        let flip = (a * d - b * cc).signum();
+                        s.slope * (aabb.max[1] - aabb.min[1]) / (2.0 * hy).max(1e-12) * flip
+                    };
+                    let c = Collider {
+                        aabb,
+                        oneway: s.oneway,
+                        id,
+                        moved,
+                        slope,
+                    };
+                    legacy = Some(c);
+                    Surface::of_collider(&c)
+                }
+            }
+        };
+        // Частицам и показу — описанный прямоугольник (настоящая форма для них — 9.5).
+        solids.0.push(legacy.unwrap_or(Collider {
+            aabb: surface.aabb,
+            oneway: surface.oneway,
+            id,
+            moved,
+            slope: 0.0,
+        }));
         solids.1.push(g.dynamic);
+        solids.2.push(surface);
     }
+}
+
+fn wrap_angle(a: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    (a + PI).rem_euclid(TAU) - PI
 }
 
 /// Второй расчёт мест: после шага персонажа.

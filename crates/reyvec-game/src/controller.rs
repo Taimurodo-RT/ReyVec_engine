@@ -505,8 +505,9 @@ impl Body {
         }
 
         // Столкновения: сначала вбок, потом по вертикали. Идущий по земле не замечает
-        // ступеньки ниже `step_up` и встаёт на неё. Пологие поверхности вбок не держат:
-        // на них встаёт середина ног (ниже, `stand_on_slopes`).
+        // ступеньки ниже `step_up` и встаёт на неё; пологий склон фигуры (повёрнутый
+        // ящик, холм) — та же ступенька. Склоны тайлов держат середину ног (ниже,
+        // `stand_on_slopes`), остальное — сам прямоугольник.
         let walking = self.on_ground && self.vel[1] <= 0.0;
         let foot_before = [self.pos[0], self.pos[1] - half[1]];
         let dx = self.vel[0] * dt;
@@ -514,8 +515,13 @@ impl Body {
         if walking {
             probe.min[1] += tuning.step_up();
         }
-        let across = Filter::default().normals(space::not_walkable_slope);
+        let across = Filter::default();
         let (mut moved_x, mut by_x) = space.sweep(probe, 0, dx, &across);
+        if walking && by_x.is_some_and(|h| space::walkable(h.normal)) {
+            // Вверх по пологому: шаг целиком, а `climb_step` поднимает на склон.
+            moved_x = dx;
+            by_x = None;
+        }
         self.pos[0] += moved_x;
         if walking && !self.climb_step(tuning, space) {
             // На ступеньку не встать (над ней низко): упёрся, как в стену.
@@ -541,53 +547,14 @@ impl Body {
         }
         let dy = self.vel[1] * dt;
         let platforms = self.drop_left <= 0.0;
-        // Вниз держит только ровное (пологое — середина ног); вверх — всё.
-        let vertical = if dy < 0.0 {
-            Filter::default()
-                .platforms(platforms)
-                .normals(space::not_slope)
-        } else {
-            Filter::default()
-        };
+        let vertical = Filter::default().platforms(platforms && dy < 0.0);
         let (moved, by) = space.sweep(Aabb::around(self.pos, half), 1, dy, &vertical);
         let was_on_ground = self.on_ground;
         self.on_ground = false;
         self.ground = None;
         self.on_platform = false;
         self.pos[1] += moved;
-        if let Some(hit) = by {
-            if dy < 0.0 && space::floor(hit.normal) {
-                self.on_ground = true;
-                self.ground = Some(hit.id);
-                self.on_platform = hit.oneway;
-                self.vel[1] = 0.0;
-            } else if dy < 0.0 {
-                // Крутая поверхность (круче, чем можно идти): не опора, по ней
-                // соскальзывают вниз вдоль неё.
-                let n = hit.normal;
-                let t = if n[0] > 0.0 {
-                    [n[1], -n[0]]
-                } else {
-                    [-n[1], n[0]]
-                };
-                let rest = dy - moved;
-                let along = rest * t[1];
-                let (k, _) = space.cast(
-                    Aabb::around(self.pos, half),
-                    [t[0] * along, t[1] * along],
-                    &vertical,
-                );
-                self.pos[0] += t[0] * along * k;
-                self.pos[1] += t[1] * along * k;
-                let apart = space.keep_apart(Aabb::around(self.pos, half), hit.index);
-                self.pos[0] += apart[0];
-                self.pos[1] += apart[1];
-                self.vel[1] *= t[1] * t[1];
-            } else {
-                ev.hit_ceiling = true;
-                self.vel[1] = 0.0;
-            }
-        }
+        self.take_vertical_hit(by, dy, moved, half, space, &vertical, &mut ev);
 
         // Пологие поверхности держат середину ног; бегущего по земле прижимают, а не
         // дают слететь.
@@ -595,11 +562,9 @@ impl Body {
         self.stand_on_slopes(tuning, space, foot_before, snap, platforms);
         if walking && !self.on_ground && snap > 0.0 {
             // Сошёл со склона на ровное или с ровного чуть ниже — тоже прижимается.
-            let f = Filter::default()
-                .platforms(platforms)
-                .normals(space::not_slope);
+            let f = Filter::default().platforms(platforms);
             let (down, by) = space.sweep(self.bounds(tuning), 1, -snap, &f);
-            if let Some(hit) = by {
+            if let Some(hit) = by.filter(|h| space::walkable(h.normal)) {
                 self.pos[1] += down;
                 self.on_ground = true;
                 self.ground = Some(hit.id);
@@ -631,6 +596,54 @@ impl Body {
             ev.grabbed = true;
         }
         ev
+    }
+
+    /// Чем кончился сдвиг по вертикали: встал на ровное, соскальзывает по крутому или
+    /// ударился головой.
+    #[allow(clippy::too_many_arguments)]
+    fn take_vertical_hit(
+        &mut self,
+        by: Option<space::Hit>,
+        dy: f64,
+        moved: f64,
+        half: [f64; 2],
+        space: &Space,
+        vertical: &Filter,
+        ev: &mut StepEvents,
+    ) {
+        if let Some(hit) = by {
+            if dy < 0.0 && space::walkable(hit.normal) {
+                self.on_ground = true;
+                self.ground = Some(hit.id);
+                self.on_platform = hit.oneway;
+                self.vel[1] = 0.0;
+            } else if dy < 0.0 {
+                // Крутая поверхность (круче, чем можно идти): не опора, по ней
+                // соскальзывают вниз вдоль неё.
+                let n = hit.normal;
+                let t = if n[0] > 0.0 {
+                    [n[1], -n[0]]
+                } else {
+                    [-n[1], n[0]]
+                };
+                let rest = dy - moved;
+                let along = rest * t[1];
+                let (k, _) = space.cast(
+                    Aabb::around(self.pos, half),
+                    [t[0] * along, t[1] * along],
+                    vertical,
+                );
+                self.pos[0] += t[0] * along * k;
+                self.pos[1] += t[1] * along * k;
+                let apart = space.keep_apart(Aabb::around(self.pos, half), hit.index);
+                self.pos[0] += apart[0];
+                self.pos[1] += apart[1];
+                self.vel[1] *= t[1] * t[1];
+            } else {
+                ev.hit_ceiling = true;
+                self.vel[1] = 0.0;
+            }
+        }
     }
 
     /// Движущийся предмет въехал в персонажа (подъёмник опустился на голову, стена
@@ -715,10 +728,19 @@ impl Body {
             min: [b.min[0], b.min[1] + up],
             max: [b.max[0], b.max[1] + up],
         };
-        let flat = Filter::default().normals(space::floor);
-        let (down, hit) = space.sweep(raised, 1, -up, &flat);
+        let (down, hit) = space.sweep(raised, 1, -up, &Filter::default());
         let lift = up + down;
-        if hit.is_none() || lift <= space::SKIN * 2.0 {
+        if !hit.is_some_and(|h| space::walkable(h.normal)) {
+            // Опоры нет (крутой край). Поднятый прямоугольник прошёл
+            // над препятствием, но сам персонаж мог упереться в его бок под скруглённым
+            // краем (банка со скруглённой крышкой): вошёл в стену — не прошёл. В склон
+            // (нормаль пологая) входить можно: его держит середина ног.
+            let walled = space.surfaces().iter().enumerate().any(|(i, s)| {
+                !s.oneway && !s.slope && space.contact(b, i).is_some_and(|(n, _)| space::wall(n))
+            });
+            return !walled;
+        }
+        if lift <= 0.0 {
             return true;
         }
         // На ступеньке персонаж ни во что не входит: ни головой, ни боком (выступ
@@ -763,6 +785,11 @@ impl Body {
         let Some((h, hit)) = space.ray_down([foot[0], from], from - foot[1] + reach_max, &f) else {
             return;
         };
+        // Середину ног держат склоны тайлов и ровное; пологие фигуры держат сам
+        // прямоугольник (выше, при сдвиге по вертикали).
+        if !space.surfaces()[hit.index].slope && !space::floor(hit.normal) {
+            return;
+        }
         // Край прямоугольника мог стоять на углу соседнего блока выше склона.
         let steep = (hit.normal[0] / hit.normal[1]).abs();
         let reach = if snap > 0.0 {
@@ -777,7 +804,7 @@ impl Body {
         }
         // Опуститься к склону можно, только если по пути нет ничего твёрдого.
         if foot[1] > h {
-            let solid = Filter::default().normals(space::not_slope);
+            let solid = Filter::default();
             let (down, by) = space.sweep(self.bounds(tuning), 1, h - foot[1], &solid);
             if by.is_some() && down > h - foot[1] {
                 return;
@@ -1729,9 +1756,9 @@ mod tests {
     }
 
     #[test]
-    fn stands_on_a_turned_box_with_the_middle_of_the_feet() {
+    fn stands_on_a_turned_box_with_the_corner_of_the_feet() {
         let t = Tuning::default();
-        // Ящик 0,6 × 0,6, повёрнут на 20°: верх — пологий склон.
+        // Ящик 0,6 × 0,6, повёрнут на 20°: верх — пологий склон вверх влево.
         let angle = 20f64.to_radians();
         let crate_ = Surface::of_shape(
             5,
@@ -1744,16 +1771,59 @@ mod tests {
             b.step(&t, Intent::default(), &space, DT);
         }
         assert!(b.on_ground && b.ground() == Some(5), "{:?}", b.pos);
-        // Середина ног на верхней грани: высота грани над x = 0.
+        // Прямоугольник стоит на грани левым нижним углом: середина ног выше грани на
+        // половину ширины × наклон (склоны тайлов держат середину, фигуры — угол).
         let top = 0.3 + 0.3 / angle.cos();
         let foot = b.pos[1] - t.size[1] * 0.5;
-        assert!((foot - top).abs() < 0.01, "ноги {foot}, грань {top}");
+        let lift = t.size[0] * 0.5 * angle.tan();
+        assert!(
+            (foot - top - lift).abs() < 0.01,
+            "ноги {foot}, грань {top} + {lift}"
+        );
+        assert!(!space.overlaps(b.bounds(&t), &Filter::default()));
         // Стоит и не сползает.
         let x = b.pos[0];
         for _ in 0..60 {
             b.step(&t, Intent::default(), &space, DT);
         }
         assert!((b.pos[0] - x).abs() < TOL && b.on_ground, "{:?}", b.pos);
+    }
+
+    #[test]
+    fn walks_up_and_down_a_leaning_plank() {
+        // Доска 1,2 м под 25° лежит на полу: по ней заходят наверх и спускаются, не
+        // отрываясь от неё и не входя внутрь.
+        let t = Tuning::default();
+        let angle = 25f64.to_radians();
+        let (hl, ht) = (0.6, 0.02);
+        let c = [0.5 + hl * angle.cos(), hl * angle.sin()];
+        let plank = Surface::of_shape(
+            8,
+            cuboid([hl, ht]),
+            Pose::new(Vector::new(c[0] as f32, c[1] as f32), angle as f32),
+        );
+        let space = floor_and(vec![plank]);
+        let mut b = standing(&t);
+        let mut top: f64 = 0.0;
+        for i in 0..45 {
+            b.step(&t, walk(1.0), &space, DT);
+            assert!(
+                !space.overlaps(b.bounds(&t), &Filter::default()),
+                "шаг {i}: внутри доски {:?}",
+                b.pos
+            );
+            top = top.max(b.pos[1] - t.size[1] * 0.5);
+        }
+        assert!(top > 0.2 && b.on_ground, "не поднялся по доске: {top}");
+        for i in 0..80 {
+            b.step(&t, walk(-1.0), &space, DT);
+            assert!(
+                !space.overlaps(b.bounds(&t), &Filter::default()),
+                "назад, шаг {i}: внутри доски {:?}",
+                b.pos
+            );
+        }
+        assert!(b.on_ground && b.pos[0] < 0.5, "{:?}", b.pos);
     }
 
     #[test]
@@ -1868,5 +1938,34 @@ mod tests {
         assert!(!stood_on_wedge, "стоял на крутой грани");
         assert!(b.on_ground && b.ground() == Some(0), "{:?}", b.pos);
         assert!(b.pos[0] > 1.0 / f64::from(k), "не съехал: {:?}", b.pos);
+    }
+    #[test]
+    fn does_not_walk_into_a_jar_with_a_round_top_just_under_the_step() {
+        // Банка со скруглённой крышкой чуть ниже высоты ступеньки: подняться на неё
+        // нельзя (ровного верха под ногами нет), войти в её бок — тоже.
+        let t = Tuning::default();
+        let top = t.step_up() - 0.003;
+        let jar = Surface::of_shape(
+            7,
+            crate::Form::Box {
+                half: [0.05, 0.125],
+                corner: 0.03,
+            }
+            .build(1.0, 1.0)
+            .unwrap(),
+            Pose::from_translation(Vector::new(0.5, (top - 0.125) as f32)),
+        );
+        let space = floor_and(vec![jar]);
+        let mut b = standing(&t);
+        for i in 0..90 {
+            b.step(&t, walk(1.0), &space, DT);
+            let bb = b.bounds(&t);
+            assert!(
+                !space.overlaps(bb, &Filter::default()),
+                "шаг {i}: {:?} {:?}",
+                b.pos,
+                b.vel
+            );
+        }
     }
 }

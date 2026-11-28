@@ -31,17 +31,23 @@ pub(super) fn physics_step(
     }
     let step = events.step;
     // Кинематические тела: уровень, герои, целые враги.
-    let level = solids.0.iter().map(|c| (c.id, *c));
-    let heroes: Vec<(u64, Collider)> = players
+    let level = solids.2.iter().cloned();
+    let boxed = |id: u64, b: Aabb| {
+        let mut s = Surface::of_collider(&Collider::solid(b));
+        s.id = id;
+        s
+    };
+    let heroes: Vec<Surface> = players
         .iter()
-        .map(|(e, p)| (e.to_bits(), Collider::solid(p.body.bounds(&p.tuning))))
+        .map(|(e, p)| boxed(e.to_bits(), p.body.bounds(&p.tuning)))
         .collect();
-    let enemies: Vec<(u64, Collider)> = targets
+    let enemies: Vec<Surface> = targets
         .iter()
         .filter(|(_, t)| t.dummy.alive())
-        .map(|(e, t)| (e.to_bits(), Collider::solid(t.dummy.bounds())))
+        .map(|(e, t)| boxed(e.to_bits(), t.dummy.bounds()))
         .collect();
-    phys.physics.set_solids(level.chain(heroes).chain(enemies));
+    phys.physics
+        .set_surfaces(level.chain(heroes).chain(enemies));
     // Герои толкают тела сбоку (9.2): тело разгоняется тем медленнее, чем тяжелее.
     for (id, speed) in std::mem::take(&mut phys.pushes) {
         let Some(&body) = id

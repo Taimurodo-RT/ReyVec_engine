@@ -116,8 +116,7 @@ pub struct BodyId(RigidBodyHandle);
 struct Mover {
     body: RigidBodyHandle,
     collider: ColliderHandle,
-    half: [f64; 2],
-    slope: f64,
+    shape: SharedShape,
     /// Отмечено на этом шаге (неотмеченные убираются).
     seen: bool,
 }
@@ -307,54 +306,54 @@ impl Physics {
         std::mem::take(&mut self.breaks)
     }
 
-    /// Твёрдое уровня, герой и враги на этот шаг: кинематические тела. `key` отличает
-    /// их номера от номеров друг друга. Чего нет в списке с прошлого раза — убирается
-    /// в [`Self::step`].
+    /// Твёрдое уровня, герой и враги на этот шаг прямоугольниками и склонами (см.
+    /// [`Self::set_surfaces`]); `key` — номер.
     pub fn set_solids(&mut self, solids: impl IntoIterator<Item = (u64, Collider)>) {
-        for (key, c) in solids {
-            let half = [
-                (c.aabb.max[0] - c.aabb.min[0]) * 0.5,
-                (c.aabb.max[1] - c.aabb.min[1]) * 0.5,
-            ];
-            let center = [
-                (c.aabb.max[0] + c.aabb.min[0]) * 0.5,
-                (c.aabb.max[1] + c.aabb.min[1]) * 0.5,
-            ];
-            let same = self.movers.get(&key).is_some_and(|m| {
-                (m.half[0] - half[0]).abs() < 1e-9
-                    && (m.half[1] - half[1]).abs() < 1e-9
-                    && m.slope == c.slope
-            });
-            if !same {
-                if let Some(old) = self.movers.remove(&key) {
-                    self.drop_body(old.body);
-                }
-                let body = self.bodies.insert(
-                    RigidBodyBuilder::kinematic_position_based()
-                        .translation(v(center))
-                        .build(),
-                );
-                let collider = self.colliders.insert_with_parent(
-                    mover_shape(half, c.slope).friction(0.7).build(),
-                    body,
-                    &mut self.bodies,
-                );
-                self.movers.insert(
-                    key,
-                    Mover {
-                        body,
-                        collider,
-                        half,
-                        slope: c.slope,
-                        seen: true,
-                    },
-                );
-            } else if let Some(m) = self.movers.get_mut(&key) {
+        self.set_surfaces(solids.into_iter().map(|(key, c)| {
+            let mut s = Surface::of_collider(&c);
+            s.id = key;
+            s
+        }));
+    }
+
+    /// Твёрдое уровня, герой и враги на этот шаг: кинематические тела настоящей формы
+    /// (9.3). Номер — [`Surface::id`]. Чего нет в списке с прошлого раза — убирается в
+    /// [`Self::step`]. Форма меняется, только если стала другой.
+    pub fn set_surfaces(&mut self, solids: impl IntoIterator<Item = Surface>) {
+        for s in solids {
+            let key = s.id;
+            if let Some(m) = self.movers.get_mut(&key) {
                 m.seen = true;
-                if let Some(b) = self.bodies.get_mut(m.body) {
-                    b.set_next_kinematic_translation(v(center));
+                if !same_shape(&m.shape, &s.shape) {
+                    if let Some(c) = self.colliders.get_mut(m.collider) {
+                        c.set_shape(s.shape.clone());
+                    }
+                    m.shape = s.shape;
                 }
+                if let Some(b) = self.bodies.get_mut(m.body) {
+                    b.set_next_kinematic_position(s.pose);
+                }
+                continue;
             }
+            let body = self.bodies.insert(
+                RigidBodyBuilder::kinematic_position_based()
+                    .pose(s.pose)
+                    .build(),
+            );
+            let collider = self.colliders.insert_with_parent(
+                ColliderBuilder::new(s.shape.clone()).friction(0.7).build(),
+                body,
+                &mut self.bodies,
+            );
+            self.movers.insert(
+                key,
+                Mover {
+                    body,
+                    collider,
+                    shape: s.shape,
+                    seen: true,
+                },
+            );
         }
     }
 
@@ -686,26 +685,24 @@ impl Physics {
     }
 }
 
-fn mover_shape(half: [f64; 2], slope: f64) -> ColliderBuilder {
-    if slope == 0.0 {
-        return ColliderBuilder::cuboid(half[0] as f32, half[1] as f32);
+/// Та же форма: тот же объект или прямоугольник того же размера (у героя и врагов
+/// форма собирается заново каждый шаг).
+fn same_shape(a: &SharedShape, b: &SharedShape) -> bool {
+    if std::sync::Arc::ptr_eq(&a.0, &b.0) {
+        return true;
     }
-    // Склон: треугольник в прямоугольнике, подъём в сторону знака `slope`.
-    let (hx, hy) = (half[0] as f32, half[1] as f32);
-    let (a, b, c) = if slope > 0.0 {
-        (
-            Vector::new(-hx, -hy),
-            Vector::new(hx, -hy),
-            Vector::new(hx, hy),
-        )
-    } else {
-        (
-            Vector::new(-hx, -hy),
-            Vector::new(hx, -hy),
-            Vector::new(-hx, hy),
-        )
-    };
-    ColliderBuilder::triangle(a, b, c)
+    if let (Some(x), Some(y)) = (a.as_cuboid(), b.as_cuboid()) {
+        return (x.half_extents - y.half_extents).length() < 1e-7;
+    }
+    // Склоны тайлов собираются заново каждый шаг (`Surface::of_collider`).
+    if let (Some(x), Some(y)) = (a.as_convex_polygon(), b.as_convex_polygon()) {
+        return x.points().len() == y.points().len()
+            && x.points()
+                .iter()
+                .zip(y.points())
+                .all(|(p, q)| (*p - *q).length() < 1e-7);
+    }
+    false
 }
 
 fn v(a: [f64; 2]) -> Vector {

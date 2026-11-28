@@ -155,17 +155,36 @@ impl Motion {
     }
 }
 
-/// Твёрдый прямоугольник (6.1) с серединой в месте сущности и половинами сторон `half`.
-/// Если сущность повёрнута, твёрдым становится описанный вокруг неё прямоугольник.
-#[derive(Component, Clone, Copy, Debug, PartialEq)]
+/// Твёрдое (6.1) с серединой в месте сущности. Без `form` — прямоугольник с
+/// половинами сторон `half` (склон, если `slope`); с `form` — настоящая форма фигуры
+/// (9.3), которая поворачивается и растягивается вместе с сущностью.
+#[derive(Component, Clone, Debug)]
 pub struct Solid {
     pub half: [f64; 2],
     /// Платформа: держит только сверху (6.2).
     pub oneway: bool,
-    /// Середина на прошлом шаге: по ней видно, что предмет едет (6.2).
-    pub last: Option<[f64; 2]>,
+    /// Середина и поворот на прошлом шаге: по ним видно, что предмет едет (6.2).
+    pub last: Option<([f64; 2], f64)>,
     /// Склон (6.4): подъём слева направо, 0 — не склон ([`Collider::slope`]).
     pub slope: f64,
+    /// Форма фигуры (9.3).
+    pub form: Option<std::sync::Arc<reyvec_game::Form>>,
+    /// Собранная форма и растяжение, при котором она собрана.
+    pub built: Option<([f64; 2], reyvec_game::SharedShape)>,
+}
+
+impl Solid {
+    /// Прямоугольник (или склон) без своей формы.
+    pub fn rect(half: [f64; 2], oneway: bool, slope: f64) -> Self {
+        Self {
+            half,
+            oneway,
+            last: None,
+            slope,
+            form: None,
+            built: None,
+        }
+    }
 }
 
 /// Персонаж игрока (6.1): настройки, состояние и место появления; удар (6.5).
@@ -350,10 +369,15 @@ pub(super) struct Pending {
     pub(super) attack_at: Option<[f64; 2]>,
 }
 
-/// Твёрдые прямоугольники сцены в её координатах (собираются после расчёта мест) и для
-/// каждого — двигается ли он (метка [`Dynamic`] у него или предка).
+/// Твёрдое сцены в её координатах (собирается после расчёта мест): описанные
+/// прямоугольники (для частиц и показа), для каждого — двигается ли он (метка
+/// [`Dynamic`] у него или предка), и настоящие формы для мира столкновений (9.3).
 #[derive(Resource, Default)]
-pub(super) struct Solids(pub(super) Vec<Collider>, pub(super) Vec<bool>);
+pub(super) struct Solids(
+    pub(super) Vec<Collider>,
+    pub(super) Vec<bool>,
+    pub(super) Vec<Surface>,
+);
 
 /// Ввод игрока на этот шаг логики.
 #[derive(Resource, Default, Clone, Copy)]

@@ -30,7 +30,7 @@ use reyvec_game::anim::AnimInput;
 use reyvec_game::physics::{BodyId, Physics};
 use reyvec_game::{
     Aabb, Action, Animator, AttackTuning, Body, Bone, Collider, Dummy, Fighter, Health, Hurt,
-    InputFrame, Intent, Space, Tuning,
+    InputFrame, Intent, Space, Surface, Tuning,
 };
 
 use crate::assets::{self, MorphTrack};
@@ -336,8 +336,9 @@ impl SceneWorld {
 
     /// Твёрдое сцены на последнем шаге и настройки героя (для проверок).
     #[cfg(test)]
-    pub(crate) fn colliders(&mut self) -> (Vec<Collider>, Option<Tuning>) {
-        let solids = self.world.resource::<Solids>().0.clone();
+    pub(crate) fn colliders(&mut self) -> (Vec<(Collider, Surface)>, Option<Tuning>) {
+        let s = self.world.resource::<Solids>();
+        let solids = s.0.iter().copied().zip(s.2.iter().cloned()).collect();
         let mut q = self.world.query::<&Player>();
         let tuning = q.iter(&self.world).next().map(|p| p.tuning);
         (solids, tuning)

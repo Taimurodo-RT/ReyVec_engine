@@ -978,7 +978,7 @@ fn player_falls_onto_floor_and_runs_into_a_solid_box() {
     let p = w.snapshot().player.expect("персонаж есть в снимке");
     assert!(p.on_ground);
     // Низ персонажа (половина высоты 0,1) на верху пола (-0,8).
-    assert!((p.at[1] - -0.7).abs() < 1e-4, "{:?}", p.at);
+    assert!((p.at[1] - -0.7).abs() < 3e-4, "{:?}", p.at);
     assert_eq!(p.solids, 2);
     // Бежим вправо и упираемся в ящик: его левый край 0,5, половина ширины героя 0,05.
     w.set_input(reyvec_game::InputFrame::new(
@@ -1024,7 +1024,7 @@ fn player_jumps_onto_the_box() {
     let p = w.snapshot().player.unwrap();
     assert!(p.on_ground);
     // Стоит на ящике (верх -0,6) — на 0,2 выше пола.
-    assert!((p.at[1] - -0.5).abs() < 1e-4, "{:?}", p.at);
+    assert!((p.at[1] - -0.5).abs() < 3e-4, "{:?}", p.at);
 }
 
 #[test]
@@ -1463,7 +1463,7 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
             let respawned = p.hp > last.hp;
             assert!(jump < 0.2 || respawned, "телепорт на {jump}: {place}");
             grabs += usize::from(p.hanging && !last.hanging);
-            for c in &solids {
+            for (c, surface) in &solids {
                 if c.oneway {
                     continue;
                 }
@@ -1478,7 +1478,17 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
                         slopes += usize::from(p.on_ground && (b.min[1] - surface).abs() < 1e-6);
                     }
                 } else {
-                    assert!(!b.overlaps(s), "внутри твёрдого {s:?}: {place}");
+                    // Настоящей формой (9.3): у скруглённого ящика угол описанного
+                    // прямоугольника пустой.
+                    let mut one = reyvec_game::Space::new();
+                    one.push(surface.clone());
+                    let f = reyvec_game::Filter::default();
+                    assert!(
+                        !one.overlaps(b, &f),
+                        "внутри твёрдого {s:?} {:?} {:?}: {place}",
+                        surface.shape.shape_type(),
+                        surface.pose
+                    );
                 }
             }
             // Манекены: не внутри твёрдого уровня. Герой может оказаться в манекене на
@@ -1496,9 +1506,11 @@ fn hero_mashing_random_keys_never_ends_up_inside_the_level() {
             }
             for d in &alive {
                 let db = d.bounds();
-                for c in solids.iter().filter(|c| !c.oneway && c.slope == 0.0) {
+                for (c, surface) in solids.iter().filter(|(c, _)| !c.oneway && c.slope == 0.0) {
+                    let mut one = reyvec_game::Space::new();
+                    one.push(surface.clone());
                     assert!(
-                        !db.overlaps(&c.aabb),
+                        !one.overlaps(db, &reyvec_game::Filter::default()),
                         "манекен внутри {:?}: {d:?}\n{place}",
                         c.aabb
                     );

@@ -139,3 +139,56 @@ fn repeat_makes_named_copies_and_chains_them_with_prev() {
     assert!((gap - 0.1).abs() < 0.01, "звенья разошлись: {gap}");
     assert!(b.at[1] < 0.45, "цепь не провисла: {:?}", b.at);
 }
+
+#[test]
+fn shapes_of_the_polygon_collide_with_their_real_form() {
+    // 9.3: ящик съезжает по дуге холма, герой стоит на вращающейся звезде, а с края
+    // скруглённой банки и с капли соскальзывает на пол.
+    let mut w = polygon();
+    let mut t = run(&mut w, 0.0, 0.2);
+    let start = place(&mut w, "ящик на холме").at;
+    w.set_player_body(reyvec_game::Body::new([-2.7, 0.1]));
+    let mut on_star = 0;
+    let star = w.find("звезда").unwrap().to_bits();
+    let mut star_ids = std::collections::HashSet::new();
+    let (solids, _) = w.colliders();
+    for (c, s) in &solids {
+        if s.shape.as_polyline().is_some() {
+            star_ids.insert(c.id);
+        }
+    }
+    assert!(!star_ids.is_empty(), "звезда — контур, а не прямоугольник");
+    for _ in 0..180 {
+        t = run(&mut w, t, 1.0 / 60.0);
+        let b = w.player_body().unwrap();
+        on_star += usize::from(b.on_ground && b.ground().is_some_and(|g| star_ids.contains(&g)));
+    }
+    let _ = star;
+    assert!(on_star > 60, "на звезде шагов: {on_star}");
+    // Ящик соскользнул с вершины холма вправо, к подножию.
+    let end = place(&mut w, "ящик на холме").at;
+    eprintln!("ящик на холме: {start:?} → {end:?}");
+    assert!(
+        end[0] > start[0] + 0.3,
+        "ящик не съехал: {start:?} → {end:?}"
+    );
+    assert!(end[1] < -0.6, "ящик не внизу: {end:?}");
+    // С края банки и с капли герой не стоит внутри: ставим над краем — оказывается на полу.
+    for x in [-5.43, -6.18] {
+        w.set_player_body(reyvec_game::Body::new([x, -0.2]));
+        t = run(&mut w, t, 2.0);
+        let b = w.player_body().unwrap();
+        let (solids, _) = w.colliders();
+        let bb = reyvec_game::Aabb::around(b.pos, [0.07, 0.14]);
+        for (_, s) in &solids {
+            let mut one = reyvec_game::Space::new();
+            one.push(s.clone());
+            assert!(
+                !one.overlaps(bb, &reyvec_game::Filter::default()),
+                "герой внутри {:?} у {x}: {:?}",
+                s.shape.shape_type(),
+                b.pos
+            );
+        }
+    }
+}

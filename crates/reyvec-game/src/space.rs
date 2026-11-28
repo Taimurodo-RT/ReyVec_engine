@@ -113,6 +113,11 @@ impl Surface {
         }
     }
 
+    /// Поверхность формы `shape` с серединой `at`, повёрнутая на `angle` (радианы).
+    pub fn placed(id: u64, shape: SharedShape, at: [f64; 2], angle: f64) -> Self {
+        Self::of_shape(id, shape, Pose::new(v(at), angle as f32))
+    }
+
     /// Двигалась ли за шаг.
     pub fn moving(&self) -> bool {
         self.moved != [0.0, 0.0] || self.turned != 0.0
@@ -178,6 +183,11 @@ impl<'a> Filter<'a> {
 /// Нормаль «пол»: почти вверх.
 pub fn floor(n: [f64; 2]) -> bool {
     n[1] > 0.98
+}
+
+/// Нормаль «можно стоять»: не круче 60°.
+pub fn walkable(n: [f64; 2]) -> bool {
+    n[1] > 0.5
 }
 
 /// Нормаль «стена»: почти вбок.

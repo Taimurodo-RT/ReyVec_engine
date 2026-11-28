@@ -125,6 +125,8 @@ impl Spawner<'_> {
             r: 0.5,
             color: crate::Hex(Color::WHITE),
             stroke: None,
+            solid: false,
+            oneway: false,
         }
         .shape_id(self.library, self.cache)
         .map_err(fail)?;
@@ -298,12 +300,7 @@ impl Spawner<'_> {
                         ..Placement::IDENTITY
                     },
                     GlobalPlacement::ROOT,
-                    Solid {
-                        half: [s.size.0 * 0.5, s.size.1 * 0.5],
-                        oneway: s.oneway,
-                        last: None,
-                        slope: 0.0,
-                    },
+                    Solid::rect([s.size.0 * 0.5, s.size.1 * 0.5], s.oneway, 0.0),
                 ),
                 Some(me),
             );
@@ -319,12 +316,7 @@ impl Spawner<'_> {
                             ..Placement::IDENTITY
                         },
                         GlobalPlacement::ROOT,
-                        Solid {
-                            half: s.half,
-                            oneway: s.oneway,
-                            last: None,
-                            slope: s.slope,
-                        },
+                        Solid::rect(s.half, s.oneway, s.slope),
                     ),
                     Some(me),
                 );
@@ -386,20 +378,22 @@ impl Spawner<'_> {
                 ),
                 Some(me),
             );
-            if let ShapeDesc::Rect {
-                size,
-                solid,
-                oneway,
-                ..
-            } = shape
-                && (*solid || *oneway)
-            {
-                self.world.entity_mut(e).insert(Solid {
-                    half: [size.0 * 0.5, size.1 * 0.5],
-                    oneway: *oneway,
-                    last: None,
-                    slope: 0.0,
-                });
+            let (solid, oneway) = shape.solid_flags();
+            if solid || oneway {
+                let mut s = match shape {
+                    // Прямоугольник без скругления — как раньше (описанный, если не
+                    // повёрнут, иначе настоящей формой).
+                    ShapeDesc::Rect {
+                        size, corner: 0.0, ..
+                    } => Solid::rect([size.0 * 0.5, size.1 * 0.5], oneway, 0.0),
+                    _ => {
+                        let mut s = Solid::rect([0.0, 0.0], oneway, 0.0);
+                        s.form = Some(Arc::new(shape.form()));
+                        s
+                    }
+                };
+                s.oneway = oneway;
+                self.world.entity_mut(e).insert(s);
             }
         }
         for (j, shape) in n.strike.iter().enumerate() {
@@ -488,7 +482,7 @@ impl Spawner<'_> {
         }
         for object in &n.objects {
             let order = self.next();
-            self.spawn(
+            let e = self.spawn(
                 (
                     Placement::IDENTITY,
                     GlobalPlacement::ROOT,
@@ -499,6 +493,13 @@ impl Spawner<'_> {
                 ),
                 Some(me),
             );
+            if object.solid {
+                // Форма столкновения — сами круги и капсулы (без сглаживания стыков
+                // `blend`: оно добавляет миллиметры, герою их не видно).
+                let mut s = Solid::rect([0.0, 0.0], false, 0.0);
+                s.form = Some(Arc::new(object.form()));
+                self.world.entity_mut(e).insert(s);
+            }
         }
         let was = self.in_player;
         self.in_player |= n.player.is_some();
