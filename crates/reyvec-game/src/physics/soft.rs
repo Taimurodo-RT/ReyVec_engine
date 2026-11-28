@@ -279,19 +279,31 @@ impl Physics {
     /// Персонаж массой `mass` стоит ногами `feet` (полоса по низу его прямоугольника)
     /// на мягком теле и давит на частицы под ногами (9.4): своим весом за шаг `dt` и, если
     /// только что упал со скоростью `fall`, ударом. Под весом желе сминается, а гамак
-    /// прогибается тем глубже, чем он легче и мягче. `false` — под ногами нет частиц.
-    pub fn press_soft(&mut self, feet: Aabb, mass: f64, fall: f64, dt: f64) -> bool {
+    /// прогибается тем глубже, чем он легче и мягче. `key` — опора персонажа (номер
+    /// поверхности из [`Self::soft_surfaces`] без базы): её частицы давятся всегда, даже
+    /// если персонаж стоит на ней краем ног. `false` — опоры уже нет.
+    pub fn press_soft(&mut self, key: u64, feet: Aabb, mass: f64, fall: f64, dt: f64) -> bool {
         let weight = (mass * self.gravity() * dt) as f32;
-        let mut touched = false;
         let mut under: Vec<(SoftBodyHandle, usize)> = Vec::new();
+        let Some((ground, a, b)) = self.soft_segment(key) else {
+            return false;
+        };
+        for i in [a, b] {
+            if self
+                .soft_bodies
+                .get(ground)
+                .is_some_and(|s| !s.particles()[i].is_pinned())
+            {
+                under.push((ground, i));
+            }
+        }
         for (h, s) in self.soft_bodies.iter() {
             let reach = feet.grow(f64::from(s.particle_radius()) * 1.5 + 0.01);
             for (i, q) in s.particle_positions().enumerate() {
                 let q = p(q);
-                if !reach.overlaps(&Aabb { min: q, max: q }) {
+                if !reach.overlaps(&Aabb { min: q, max: q }) || under.contains(&(h, i)) {
                     continue;
                 }
-                touched = true;
                 if !s.particles()[i].is_pinned() {
                     under.push((h, i));
                 }
@@ -302,7 +314,7 @@ impl Physics {
             .filter_map(|(h, i)| self.soft_bodies.get(*h).map(|s| s.particles()[*i].mass()))
             .sum();
         if total <= 0.0 {
-            return touched;
+            return true;
         }
         // Вес — поровну на всю массу под ногами; удар — неупругий: частицы под ногами
         // получают скорость упавшего (тем меньше, чем они тяжелее его).

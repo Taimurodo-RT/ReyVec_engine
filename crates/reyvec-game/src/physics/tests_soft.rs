@@ -60,13 +60,13 @@ impl World {
             self.w
                 .press(b, [self.hero.pos[0], foot], HERO_MASS, fall, DT);
         }
-        if ground.is_some_and(|g| g >= SOFT_IDS) {
+        if let Some(key) = ground.and_then(|g| g.checked_sub(SOFT_IDS)) {
             let h = self.t.half();
             let strip = Aabb {
                 min: [self.hero.pos[0] - h[0], foot - 0.005],
                 max: [self.hero.pos[0] + h[0], foot + 0.005],
             };
-            assert!(self.w.press_soft(strip, HERO_MASS, fall, DT));
+            assert!(self.w.press_soft(key, strip, HERO_MASS, fall, DT));
         }
         self.w.step(DT);
         let mut space = Space::of(&[floor()]);

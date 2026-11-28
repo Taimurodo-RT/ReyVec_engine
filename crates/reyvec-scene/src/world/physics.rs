@@ -66,9 +66,9 @@ pub(super) fn physics_step(
     // Стоящие давят весом на то, что под ногами (9.4): качели наклоняются, желе
     // сминается, гамак прогибается.
     for press in std::mem::take(&mut phys.presses) {
-        if press.ground >= SOFT_IDS {
+        if let Some(key) = press.ground.checked_sub(SOFT_IDS) {
             phys.physics
-                .press_soft(press.feet, HERO_MASS, press.fall, dt);
+                .press_soft(key, press.feet, HERO_MASS, press.fall, dt);
         } else if let Some(&body) = phys.bodies.get((press.ground - PLATFORM_IDS) as usize) {
             let at = [press.feet.center()[0], press.feet.center()[1]];
             phys.physics.press(body, at, HERO_MASS, press.fall, dt);
