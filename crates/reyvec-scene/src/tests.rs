@@ -2085,7 +2085,7 @@ fn body_at(w: &mut SceneWorld, name: &str) -> [f64; 2] {
 }
 
 #[test]
-fn hero_kicks_the_ball_stands_on_a_crate_and_breaks_into_debris() {
+fn hero_kicks_the_ball_stands_on_a_crate_and_the_dummy_falls_as_a_ragdoll() {
     use reyvec_game::Action::{Attack, Left, Right};
     use reyvec_game::InputFrame;
     let (mut w, mut t) = example_world();
@@ -2138,21 +2138,22 @@ fn hero_kicks_the_ball_stands_on_a_crate_and_breaks_into_debris() {
         after[0] > before[0] + 0.15,
         "удар отбросил ящик: {before:?} → {after:?}"
     );
-    // Манекен разбит: обломки летят, потом гаснут.
-    let visible = |w: &mut SceneWorld| {
+    // Манекен разбит (9.6г): вместо обломков оседает куклой из своих фигур, потом она
+    // гаснет.
+    let parts = |w: &mut SceneWorld, of: &str| {
         let mut q = w
             .world_mut()
             .query::<(&bevy_ecs::name::Name, &crate::world::Placement)>();
         q.iter(w.world_mut())
-            .filter(|(n, p)| n.as_str() == "обломок" && p.opacity > 0.0)
-            .count()
+            .filter(|(n, p)| n.as_str().starts_with(of) && p.opacity > 0.0)
+            .map(|(n, p)| (n.as_str().to_string(), p.at))
+            .collect::<Vec<_>>()
     };
-    assert_eq!(visible(&mut w), 0);
+    assert!(parts(&mut w, "манекен 1: кукла").is_empty());
     w.set_player_body(reyvec_game::Body::new([-0.7, -0.64]));
     w.set_input(InputFrame::new(&[Left], &[Left]));
     t = steps(&mut w, t, 1);
     // Герой идёт за манекеном и бьёт каждые 0,4 с, пока тот не разобьётся.
-    let mut most = 0;
     for i in 0..900 {
         let d = &w.dummies()[0];
         let hero = w.player_body().unwrap();
@@ -2161,18 +2162,32 @@ fn hero_kicks_the_ball_stands_on_a_crate_and_breaks_into_debris() {
         let pressed: &[reyvec_game::Action] = if near && i % 24 == 0 { &[Attack] } else { &[] };
         w.set_input(InputFrame::new(held, pressed));
         t = steps(&mut w, t, 1);
-        most = most.max(visible(&mut w));
         if !w.dummies()[0].alive() {
             break;
         }
     }
     w.set_input(InputFrame::new(&[], &[]));
     t = steps(&mut w, t, 1);
-    most = most.max(visible(&mut w));
-    assert_eq!(most, 10, "обломки разбитого манекена");
+    let first = parts(&mut w, "манекен 1: кукла");
+    assert_eq!(first.len(), 6, "все фигуры манекена в кукле: {first:?}");
+    assert!(parts(&mut w, "обломок").is_empty(), "обломков нет");
+    let head = |p: &[(String, [f64; 2])]| p.iter().find(|(n, _)| n.ends_with("кукла 6")).unwrap().1;
+    let head_at = head(&first);
+    t = steps(&mut w, t, 50);
+    let lying = parts(&mut w, "манекен 1: кукла");
+    eprintln!("голова куклы {head_at:?} → {:?}", head(&lying));
+    assert_eq!(lying.len(), 6);
+    assert!(
+        head(&lying)[1] < head_at[1] - 0.05,
+        "кукла не осела: {lying:?}"
+    );
     t = steps(&mut w, t, 60 * 4);
     let _ = t;
-    assert_eq!(visible(&mut w), 0, "обломки погасли");
+    assert!(
+        parts(&mut w, "манекен 1: кукла").is_empty(),
+        "кукла погасла"
+    );
+    assert!(w.dummies()[0].alive(), "манекен появился снова");
 }
 
 #[test]
