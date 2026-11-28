@@ -41,6 +41,9 @@ fn touches(
     let character =
         |t: Toucher| matches!(t, Toucher::Solid(k) if heroes.contains(&k) || enemies.contains(&k));
     let mut knocks: Vec<(f64, GameEvent, Toucher)> = Vec::new();
+    // Брошенное героем (9.6в) ранит хотя бы на единицу: деревянный ящик лёгкий, но
+    // бросок им — удар.
+    let flying: Vec<_> = phys.hands.values().flat_map(|h| h.flying()).collect();
     for touch in phys.physics.take_touches() {
         if !touch.begin {
             continue;
@@ -86,7 +89,10 @@ fn touches(
                 continue;
             }
             let mass = phys.physics.mass(body).unwrap_or(0.0);
-            let amount = (mass * toward / CRUSH_UNIT).floor() as u32;
+            let mut amount = (mass * toward / CRUSH_UNIT).floor() as u32;
+            if flying.contains(&body) {
+                amount = amount.max(1);
+            }
             if amount == 0 {
                 continue;
             }
@@ -132,6 +138,43 @@ fn touches(
     // Старые отметки не копятся.
     if step.is_multiple_of(600) {
         phys.knocks.retain(|_, s| *s + KNOCK_GAP > step);
+    }
+}
+
+/// Руки героев (9.6в): «взять» поднимает лёгкое и бросает его, тяжёлое тянется волоком.
+/// Бросок звучит взмахом.
+fn hands(
+    phys: &mut PhysicsRes,
+    step: u64,
+    dt: f64,
+    events: &mut Events,
+    players: &Query<(Entity, &mut Player)>,
+) {
+    use reyvec_game::physics::{HandsEvent, Holder};
+    let grab = phys.grab.take();
+    for (e, p) in players.iter() {
+        let key = e.to_bits();
+        let who = Holder {
+            pos: p.body.pos,
+            half: p.tuning.half(),
+            facing: p.body.facing,
+            vel: p.body.vel,
+            layer: p.layer.0,
+            mass: HERO_MASS,
+        };
+        let hands = phys.hands.entry(key).or_default();
+        if p.health.hp == 0 {
+            hands.drop_all(&mut phys.physics);
+            continue;
+        }
+        if let Some(down) = grab
+            && let Some(HandsEvent::Threw { vel, .. }) = hands.press(&mut phys.physics, &who, down)
+        {
+            let at = [p.body.pos[0] as f32, p.body.pos[1] as f32];
+            let dir = vel[0].signum() as f32;
+            events.list.push_back((step, GameEvent::Swing { at, dir }));
+        }
+        hands.step(&mut phys.physics, &who, dt);
     }
 }
 
@@ -282,6 +325,7 @@ pub(super) fn physics_step(
             }
         }
     }
+    hands(phys, step, dt, &mut events, &players);
     phys.extra.before_step(&mut phys.physics, dt, &mut slots);
     // Поля сил зон (9.6б): ветер, другая тяжесть, магнит.
     for (z, g) in &zones {

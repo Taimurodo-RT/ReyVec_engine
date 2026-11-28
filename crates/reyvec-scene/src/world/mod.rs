@@ -106,6 +106,8 @@ impl SceneWorld {
             seed: 0x5eed,
             extra: phys::Extra::default(),
             knocks: std::collections::HashMap::new(),
+            hands: std::collections::HashMap::new(),
+            grab: None,
         });
         let mut scripts = reyvec_script::Scripts::new();
         // Сюжет проекта (Сю.5): папка `story/` рядом со сценой или выше.

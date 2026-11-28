@@ -22,10 +22,12 @@ pub enum Action {
     Dash,
     /// Удар (6.5).
     Attack,
+    /// Взять, бросить (9.6в): поднять лёгкий предмет и бросить его, тяжёлый тянуть.
+    Grab,
 }
 
 impl Action {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Left,
         Self::Right,
         Self::Up,
@@ -33,6 +35,7 @@ impl Action {
         Self::Jump,
         Self::Dash,
         Self::Attack,
+        Self::Grab,
     ];
 
     /// Название для меню.
@@ -45,6 +48,7 @@ impl Action {
             Self::Jump => "Прыжок",
             Self::Dash => "Рывок",
             Self::Attack => "Удар",
+            Self::Grab => "Взять",
         }
     }
 
@@ -58,6 +62,7 @@ impl Action {
             Self::Jump => "прыжок",
             Self::Dash => "рывок",
             Self::Attack => "удар",
+            Self::Grab => "взять",
         }
     }
 

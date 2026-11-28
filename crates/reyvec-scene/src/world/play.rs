@@ -14,7 +14,7 @@ pub(super) fn play(
     mut pending: ResMut<Pending>,
     mut events: ResMut<Events>,
     mut phys: ResMut<PhysicsRes>,
-    mut players: Query<(&mut Player, &mut Placement)>,
+    mut players: Query<(Entity, &mut Player, &mut Placement)>,
     mut targets: Query<(Entity, &mut Target), Without<Player>>,
     scripts: Res<ScriptRes>,
     mut zones: Query<(&mut Zone, &GlobalPlacement)>,
@@ -43,6 +43,10 @@ pub(super) fn play(
     pending.jump |= input.pressed(Action::Jump);
     pending.dash |= input.pressed(Action::Dash);
     pending.attack |= input.pressed(Action::Attack);
+    if input.pressed(Action::Grab) {
+        pending.grab = true;
+        pending.grab_down = input.held(Action::Down);
+    }
     if input.aimed(Action::Attack) {
         pending.attack_at = input.aim();
     } else if input.pressed(Action::Attack) {
@@ -53,7 +57,7 @@ pub(super) fn play(
     combat.shake_left = (combat.shake_left - dt).max(0.0);
     let heroes: Vec<Aabb> = players
         .iter()
-        .map(|(p, _)| p.body.bounds(&p.tuning))
+        .map(|(_, p, _)| p.body.bounds(&p.tuning))
         .collect();
     for (_, mut t) in &mut targets {
         t.dummy
@@ -70,6 +74,7 @@ pub(super) fn play(
     }
     let presses = std::mem::take(&mut *pending);
     phys.dt = dt;
+    phys.grab = presses.grab.then_some(presses.grab_down);
 
     // Запас на неточность дробей: ровно один шаг логики — один шаг персонажа.
     let steps = (dt / PLAYER_STEP - 1e-6).ceil().max(1.0) as usize;
@@ -90,13 +95,17 @@ pub(super) fn play(
     world_space.extend(phys.surfaces.iter().cloned());
 
     let mut stop = false;
-    for (hero, (mut player, mut place)) in players.iter_mut().enumerate() {
+    for (hero, (entity, mut player, mut place)) in players.iter_mut().enumerate() {
         let p = &mut *player;
         let space = world_space.meeting(p.layer.0, p.layer.1);
         let space_still = space.still();
         // Зоны (9.6б): другая тяжесть меняет прыжок, ветер сдувает.
         let field = field_at(zones.iter(), p.body.pos);
-        let tuning = p.tuning.in_gravity(field.gravity);
+        let mut tuning = p.tuning.in_gravity(field.gravity);
+        // Тянет тяжёлое волоком (9.6в) — идёт медленнее.
+        if let Some(h) = phys.hands.get(&entity.to_bits()) {
+            tuning.speed *= h.slow(&phys.physics, HERO_MASS);
+        }
         p.body.vel[0] += field.wind[0] * WIND_PUSH * dt;
         p.body.vel[1] += field.wind[1] * WIND_PUSH * dt;
         // С какой скоростью приземлился за этот шаг логики (удар по опоре, 9.4).
@@ -281,10 +290,19 @@ pub(super) fn play(
     // Где герой теперь, после своего шага: в него упираются манекены.
     let heroes_now: Vec<Surface> = players
         .iter()
-        .map(|(p, _)| {
+        .map(|(_, p, _)| {
             Surface::of_collider(&Collider::solid(p.body.bounds(&p.tuning)))
                 .in_layer(p.layer.0, p.layer.1)
         })
+        .collect();
+    // Брошенное героем (9.6в) для врага не опора и не стена: оно в него влетает и ранит
+    // (касание в физике), а не подставляется под ноги.
+    let flying: Vec<u64> = phys
+        .hands
+        .values()
+        .flat_map(|h| h.flying())
+        .filter_map(|b| phys.bodies.iter().position(|&x| x == b))
+        .map(|i| PLATFORM_IDS + i as u64)
         .collect();
     for (e, mut t) in &mut targets {
         let layer = t.layer;
@@ -300,7 +318,12 @@ pub(super) fn play(
         let mut mine = solid_space(&solids);
         mine.extend(bodies.iter().filter(|s| s.id != me).cloned());
         mine.extend(heroes_now.iter().cloned());
-        mine.extend(phys.surfaces.iter().cloned());
+        mine.extend(
+            phys.surfaces
+                .iter()
+                .filter(|s| !flying.contains(&s.id))
+                .cloned(),
+        );
         let mine = mine.meeting(layer.0, layer.1);
         let mine_still = mine.still();
         let field = field_at(zones.iter(), d.body.pos);

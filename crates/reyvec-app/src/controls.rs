@@ -345,6 +345,7 @@ impl Default for Controls {
                     Input::Mouse(MouseKey::Left),
                 ],
             ),
+            (Action::Grab, vec![key(K::KeyC), key(K::KeyE)]),
         ] {
             c.binds.insert(ActionKey::of(a), inputs);
         }

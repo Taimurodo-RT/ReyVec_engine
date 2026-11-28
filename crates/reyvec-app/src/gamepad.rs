@@ -106,6 +106,7 @@ fn button_action(b: Button) -> Option<Action> {
         Button::South => Some(Action::Jump),
         Button::West | Button::RightTrigger | Button::RightTrigger2 => Some(Action::Dash),
         Button::North => Some(Action::Attack),
+        Button::East => Some(Action::Grab),
         Button::DPadLeft => Some(Action::Left),
         Button::DPadRight => Some(Action::Right),
         Button::DPadUp => Some(Action::Up),
