@@ -298,9 +298,13 @@ impl Physics {
                 .linear_damping(d.damping.max(0.0) as f32)
                 .angular_damping(d.damping.max(0.0) as f32)
                 .gravity_scale(d.gravity as f32)
-                // Быстрые тела не пролетают сквозь тонкие стены. Без этого Rapier всё равно
-                // проверяет путь быстрых тел до неподвижных; «пуля» проверяет ещё и до
-                // подвижных. (Мягкое предсказание касаний пробовали: роняет пирамиду.)
+                // Правила CCD (9.7), проверки пути — чтобы быстрое не проскочило тонкое:
+                // - до неподвижного уровня Rapier проверяет путь быстрых тел сам, всегда;
+                // - до едущего (лифт, вращающаяся звезда, герой) и до других тел — только
+                //   у «пули» (`bullet: true`: обломки, выброшенное).
+                // Включать всем нельзя: пробовали (6.12) — кубики проваливались сквозь
+                // полку; включать быстрым на шаг (9.7) — резиновые шары в куче не
+                // засыпают, а героя дёргает. Мягкое предсказание касаний роняет пирамиду.
                 .ccd_enabled(d.bullet)
         };
         let body = builder
@@ -384,7 +388,7 @@ impl Physics {
         }));
     }
 
-    /// Твёрдое уровня, герой и враги на этот шаг: кинематические тела настоящей формы
+    /// Твёрдое уровня, герой и враги на этот шаг: неподвижные, а сдвинувшиеся — кинематические тела настоящей формы
     /// (9.3). Номер — [`Surface::id`]. Чего нет в списке с прошлого раза — убирается в
     /// [`Self::step`]. Форма меняется, только если стала другой.
     pub fn set_surfaces(&mut self, solids: impl IntoIterator<Item = Surface>) {
@@ -399,6 +403,15 @@ impl Physics {
                     m.shape = s.shape;
                 }
                 if let Some(b) = self.bodies.get_mut(m.body) {
+                    // Неподвижное до сих пор (пол, стена) — неподвижное тело Rapier: через
+                    // него не связываются острова, и куча ящиков засыпает, пока в другом
+                    // конце уровня что-то движется. Сдвинулось — становится кинематическим.
+                    if b.is_fixed() {
+                        if *b.position() == s.pose {
+                            continue;
+                        }
+                        b.set_body_type(RigidBodyType::KinematicPositionBased, true);
+                    }
                     // Перенос (герой появился заново, отладка поставила его в другое
                     // место) — сразу на новое место. Иначе Rapier счёл бы перенос очень
                     // быстрым движением и отшвырнул всё, чего тело касалось.
@@ -409,11 +422,9 @@ impl Physics {
                 }
                 continue;
             }
-            let body = self.bodies.insert(
-                RigidBodyBuilder::kinematic_position_based()
-                    .pose(s.pose)
-                    .build(),
-            );
+            let body = self
+                .bodies
+                .insert(RigidBodyBuilder::fixed().pose(s.pose).build());
             let collider = self.colliders.insert_with_parent(
                 ColliderBuilder::new(s.shape.clone())
                     .friction(0.7)
@@ -468,7 +479,8 @@ impl Physics {
             m.seen = false;
         }
         for (h, at) in self.last.iter_mut() {
-            if let Some(b) = self.bodies.get(*h) {
+            // Спящее не двигалось: прошлое место то же (9.7: 2 000 спящих тел — даром).
+            if let Some(b) = self.bodies.get(*h).filter(|b| !b.is_sleeping()) {
                 *at = p(b.translation());
                 self.last_angle.insert(*h, f64::from(b.rotation().angle()));
             }
@@ -484,7 +496,7 @@ impl Physics {
         self.pull_grip(dt);
         self.vel_before.clear();
         for (h, b) in self.bodies.iter() {
-            if !b.is_fixed() {
+            if !b.is_fixed() && !b.is_sleeping() {
                 self.vel_before
                     .insert(h, (b.linvel(), b.angvel(), b.center_of_mass()));
             }
@@ -853,6 +865,11 @@ impl Physics {
     /// Касания с прошлого вызова (9.6): кто кого, где и с какой силой.
     pub fn take_touches(&mut self) -> Vec<Touch> {
         std::mem::take(&mut self.touches)
+    }
+
+    /// Тело спит: стоит и не считается, пока его не тронут.
+    pub fn is_sleeping(&self, id: BodyId) -> bool {
+        self.bodies.get(id.0).is_some_and(|b| b.is_sleeping())
     }
 
     /// Масса тела.

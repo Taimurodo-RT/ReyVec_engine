@@ -90,9 +90,20 @@ pub(super) fn play(
     // Мир столкновений героя (9.2): уровень, манекены и настоящие формы тел физики. На
     // тела встают, сбоку их толкают. Опоры сдвинулись один раз за шаг логики: везут
     // только в первом из шагов. Каждый видит только слои, с которыми сталкивается (9.6а).
+    // Тела физики — только рядом с героями (9.7): в сцене на 2 000 тел контроллер не
+    // перебирает дальние.
+    let near_heroes: Vec<Aabb> = players
+        .iter()
+        .map(|(_, p, _)| near(p.body.bounds(&p.tuning), p.body.vel, dt))
+        .collect();
     let mut world_space = solid_space(&solids);
     world_space.extend(bodies.iter().cloned());
-    world_space.extend(phys.surfaces.iter().cloned());
+    world_space.extend(
+        phys.surfaces
+            .iter()
+            .filter(|s| near_heroes.iter().any(|a| a.overlaps(&s.aabb)))
+            .cloned(),
+    );
 
     let mut stop = false;
     for (hero, (entity, mut player, mut place)) in players.iter_mut().enumerate() {
@@ -313,10 +324,11 @@ pub(super) fn play(
         let mut mine = solid_space(&solids);
         mine.extend(bodies.iter().filter(|s| s.id != me).cloned());
         mine.extend(heroes_now.iter().cloned());
+        let area = near(d.bounds(), d.body.vel, dt);
         mine.extend(
             phys.surfaces
                 .iter()
-                .filter(|s| !flying.contains(&s.id))
+                .filter(|s| area.overlaps(&s.aabb) && !flying.contains(&s.id))
                 .cloned(),
         );
         let mine = mine.meeting(layer.0, layer.1);
@@ -339,6 +351,19 @@ pub(super) fn play(
             d.body = Body::new(d.spawn);
             d.moved = [0.0, 0.0];
         }
+    }
+}
+
+/// Где персонаж может оказаться за шаг логики `dt` (с запасом): тела физики дальше
+/// этого его шагу не нужны.
+fn near(bounds: Aabb, vel: [f64; 2], dt: f64) -> Aabb {
+    let reach = [
+        0.3 + (vel[0].abs() + 1.0) * dt * 2.0,
+        0.3 + (vel[1].abs() + 1.0) * dt * 2.0,
+    ];
+    Aabb {
+        min: [bounds.min[0] - reach[0], bounds.min[1] - reach[1]],
+        max: [bounds.max[0] + reach[0], bounds.max[1] + reach[1]],
     }
 }
 

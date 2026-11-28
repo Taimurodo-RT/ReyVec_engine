@@ -518,7 +518,7 @@
             depth: 2,
             body: (size: (0.5, 0.04), density: 1.0),
             shapes: [Rect(at: (0.0, 0.0), size: (0.5, 0.04), color: "#8a6a4a")],
-            joints: [(kind: Weld, to: World, at: (-0.25, 0.0), breaks: 1.0)],
+            joints: [(kind: Weld, to: World, at: (-0.25, 0.0), breaks: 4.0)],
         ),
 
         // Машинка: кузов и два колеса на шарнирах с моторами, каждые 3 секунды едет
