@@ -210,12 +210,7 @@ pub(super) fn play(
                         ));
                         if broken {
                             // Разбит: обломки разлетаются (6.10).
-                            phys.breaks.push(Break {
-                                at: t.dummy.body.pos,
-                                size: t.dummy.tuning.size,
-                                color: t.color,
-                                dir,
-                            });
+                            phys.breaks.push(Break::of(&t, dir));
                         }
                         p.hits += 1;
                         combat.hit_stop = combat.hit_stop.max(p.attack.hit_stop);

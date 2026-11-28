@@ -42,6 +42,7 @@ mod parts;
 mod physics;
 mod places;
 mod play;
+mod ragdoll;
 mod scripts;
 mod spawn;
 
@@ -55,6 +56,7 @@ pub use phys::Pointer;
 use physics::*;
 use places::*;
 use play::*;
+pub use ragdoll::Ragdoll;
 use scripts::*;
 use spawn::*;
 
@@ -107,6 +109,7 @@ impl SceneWorld {
             extra: phys::Extra::default(),
             knocks: std::collections::HashMap::new(),
             hands: std::collections::HashMap::new(),
+            fallen: Vec::new(),
             grab: None,
         });
         let mut scripts = reyvec_script::Scripts::new();

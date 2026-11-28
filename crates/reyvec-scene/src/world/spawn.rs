@@ -56,6 +56,45 @@ impl Spawner<'_> {
         self.order
     }
 
+    /// Кукла врага (9.6г): части из его фигур и их невидимые копии без родителя.
+    fn ragdoll(&mut self, n: &NodeDesc, name: &str) -> Result<Ragdoll, SceneError> {
+        let (parts, torso) = ragdoll::parts_of(&n.shapes, n.scale);
+        let mut entities = Vec::with_capacity(parts.len());
+        for (j, shape) in n.shapes.iter().enumerate() {
+            let id = shape.shape_id(self.library, self.cache).map_err(|m| {
+                SceneError::new(format!("предмет «{name}», кукла, фигура {}: {m}", j + 1))
+            })?;
+            let color = shape.placement().2;
+            let order = self.next();
+            entities.push(self.spawn(
+                (
+                    Name::new(format!("{name}: кукла {}", j + 1)),
+                    Placement {
+                        depth: n.depth,
+                        shadow: n.shadow,
+                        opacity: 0.0,
+                        ..Placement::IDENTITY
+                    },
+                    GlobalPlacement::ROOT,
+                    VectorShape {
+                        id,
+                        tint: color.0,
+                        order,
+                        morph: None,
+                    },
+                    Dynamic,
+                ),
+                None,
+            ));
+        }
+        Ok(Ragdoll {
+            parts,
+            entities,
+            scale: n.scale,
+            torso,
+        })
+    }
+
     /// Запас обломков (6.10): квадраты, которые ждут, пока кого-нибудь разобьют.
     /// Создаётся один раз, при первом манекене.
     pub(super) fn debris_pool(&mut self) -> Result<(), SceneError> {
@@ -331,6 +370,7 @@ impl Spawner<'_> {
                     color,
                     contact: d.contact,
                     layer,
+                    ragdoll: None,
                 },
                 Dynamic,
             ));
@@ -438,6 +478,16 @@ impl Spawner<'_> {
                 };
                 s.oneway = oneway;
                 self.world.entity_mut(e).insert(s);
+            }
+        }
+        // Кукла (9.6г) — после фигур: формы уже нарезаны, копии их только берут (номера
+        // форм те же, что при подготовке сцены в фоне).
+        if let Some(d) = &n.dummy
+            && d.fall == crate::Fall::Ragdoll
+        {
+            let doll = self.ragdoll(n, &name)?;
+            if let Some(mut t) = self.world.get_mut::<Target>(me) {
+                t.ragdoll = Some(doll);
             }
         }
         for (j, shape) in n.strike.iter().enumerate() {

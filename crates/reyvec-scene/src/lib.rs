@@ -635,6 +635,18 @@ pub struct DummyDesc {
     pub respawn: f64,
     /// Сколько здоровья отнимает у героя касание (6.10б): 0 — безобидный манекен.
     pub contact: u32,
+    /// Как падает разбитый (9.6г): разлетается обломками или оседает куклой.
+    pub fall: Fall,
+}
+
+/// Как падает разбитый враг (9.6г).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub enum Fall {
+    /// Разлетается квадратными обломками своего цвета.
+    #[default]
+    Break,
+    /// Оседает тряпичной куклой из своих фигур на шарнирах.
+    Ragdoll,
 }
 
 impl Default for DummyDesc {
@@ -644,6 +656,7 @@ impl Default for DummyDesc {
             hp: 5,
             respawn: 2.0,
             contact: 0,
+            fall: Fall::Break,
         }
     }
 }

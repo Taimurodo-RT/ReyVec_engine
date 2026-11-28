@@ -229,7 +229,7 @@
             name: "манекен под полкой",
             at: (-8.22, -0.63),
             depth: 2,
-            dummy: (size: (0.16, 0.3), hp: 10, respawn: 2.0),
+            dummy: (size: (0.16, 0.3), hp: 10, respawn: 2.0, fall: Ragdoll),
             shapes: [
                 Rect(at: (0.0, -0.135), size: (0.14, 0.03), corner: 0.01, color: "#3a2a1c"),
                 Rect(at: (0.0, -0.07), size: (0.025, 0.12), color: "#5a4028"),

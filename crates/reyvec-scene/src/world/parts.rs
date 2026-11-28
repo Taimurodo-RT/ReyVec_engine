@@ -266,6 +266,8 @@ pub struct Target {
     pub contact: u32,
     /// Слой и маска столкновений (9.6а).
     pub layer: (u32, u32),
+    /// Кукла, которой оседает разбитый (9.6г); без неё — обломки.
+    pub ragdoll: Option<Ragdoll>,
 }
 
 /// Зона (9.6б): прямоугольник вокруг места предмета, поле сил в нём и кто из героев
@@ -324,6 +326,24 @@ pub(super) struct Break {
     pub(super) size: [f64; 2],
     pub(super) color: Color,
     pub(super) dir: f64,
+    /// Кукла (9.6г): её части, смотрел ли враг влево, сколько ей лежать.
+    pub(super) doll: Option<(Ragdoll, bool, f64)>,
+}
+
+impl Break {
+    /// Разбит враг `t`, били в сторону `dir`.
+    pub(super) fn of(t: &Target, dir: f64) -> Self {
+        Self {
+            at: t.dummy.body.pos,
+            size: t.dummy.tuning.size,
+            color: t.color,
+            dir,
+            doll: t
+                .ragdoll
+                .clone()
+                .map(|d| (d, t.dummy.body.facing < 0.0, t.dummy.respawn)),
+        }
+    }
 }
 
 /// Физика сцены (6.10).
@@ -351,6 +371,8 @@ pub(super) struct PhysicsRes {
     pub(super) extra: phys::Extra,
     /// Когда тело последний раз стучало (номер шага, 9.6): дребезг не звучит очередью.
     pub(super) knocks: std::collections::HashMap<reyvec_game::physics::Toucher, u64>,
+    /// Лежащие куклы разбитых врагов (9.6г).
+    pub(super) fallen: Vec<ragdoll::Fallen>,
     /// Руки героев (9.6в) по номеру героя.
     pub(super) hands: std::collections::HashMap<u64, reyvec_game::physics::Hands>,
     /// Герои нажали «взять» на этом шаге (со стрелкой вниз — положить).

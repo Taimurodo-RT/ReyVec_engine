@@ -119,12 +119,7 @@ fn touches(
                     },
                 ));
                 if broken {
-                    phys.breaks.push(Break {
-                        at: t.dummy.body.pos,
-                        size: t.dummy.tuning.size,
-                        color: t.color,
-                        dir,
-                    });
+                    phys.breaks.push(Break::of(&t, dir));
                 }
             }
         }
@@ -277,6 +272,16 @@ pub(super) fn physics_step(
     }
     // Обломки разбитых врагов.
     for brk in std::mem::take(&mut phys.breaks) {
+        // Кукла (9.6г) вместо обломков. Та же кукла ещё лежит — убрать её.
+        if let Some((doll, flip, life)) = &brk.doll {
+            if let Some(i) = phys.fallen.iter().position(|f| f.uses(&doll.entities)) {
+                let mut old = phys.fallen.swap_remove(i);
+                old.clear(&mut phys.physics);
+            }
+            let f = ragdoll::Fallen::start(&mut phys.physics, doll, brk.at, *flip, brk.dir, *life);
+            phys.fallen.push(f);
+            continue;
+        }
         for i in 0..PIECES_PER_BREAK {
             phys.seed = phys
                 .seed
@@ -349,6 +354,9 @@ pub(super) fn physics_step(
             place.angle = angle;
         }
     }
+    let mut fallen = std::mem::take(&mut phys.fallen);
+    fallen.retain_mut(|f| f.step(&mut phys.physics, &mut shapes, dt));
+    phys.fallen = fallen;
     for i in 0..phys.pieces.len() {
         let p = &mut phys.pieces[i];
         let Some(id) = p.body else {
