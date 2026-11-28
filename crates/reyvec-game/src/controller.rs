@@ -571,6 +571,9 @@ impl Body {
         self.on_platform = false;
         self.pos[1] += moved;
         self.take_vertical_hit(by, dy, moved, half, space, &vertical, &mut ev);
+        if was_on_ground && !self.on_ground && dy <= 0.0 {
+            self.rest_on_sunk_floor(tuning, space, platforms);
+        }
 
         // Пологие поверхности держат середину ног; бегущего по земле прижимают, а не
         // дают слететь.
@@ -660,6 +663,46 @@ impl Body {
                 self.vel[1] = 0.0;
             }
         }
+    }
+
+    /// Стоял, а опора чуть вошла в ноги (мягкое желе под ним «вздохнуло», 9.7): проба
+    /// вниз такую не видит — изнутри поверхность не держит. Пологая поверхность, вошедшая
+    /// в персонажа снизу не глубже `SUNK`, остаётся опорой, а персонаж встаёт на неё.
+    fn rest_on_sunk_floor(&mut self, tuning: &Tuning, space: &Space, platforms: bool) {
+        const SUNK: f64 = 0.01;
+        let b = self.bounds(tuning);
+        let mut best: Option<(usize, [f64; 2], f64)> = None;
+        for (i, s) in space.surfaces().iter().enumerate() {
+            if s.oneway && !platforms {
+                continue;
+            }
+            let Some((n, depth)) = space.contact(b, i) else {
+                continue;
+            };
+            if depth > SUNK || !space::walkable(n) {
+                continue;
+            }
+            if best.is_none_or(|(_, _, d)| depth > d) {
+                best = Some((i, n, depth));
+            }
+        }
+        let Some((i, n, depth)) = best else {
+            return;
+        };
+        let s = &space.surfaces()[i];
+        let skip = [s.id];
+        let push = depth + space::SKIN;
+        let way = [n[0] * push, n[1] * push];
+        let (t, _) = space.cast(b, way, &Filter::default().skip(&skip));
+        if t < 1.0 - 1e-6 {
+            return;
+        }
+        self.pos[0] += way[0];
+        self.pos[1] += way[1];
+        self.on_ground = true;
+        self.ground = Some(s.id);
+        self.on_platform = s.oneway;
+        self.vel[1] = 0.0;
     }
 
     /// Движущийся предмет въехал в персонажа (подъёмник опустился на голову, стена
