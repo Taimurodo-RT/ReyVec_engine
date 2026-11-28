@@ -165,6 +165,62 @@ pub fn hurt(rate: f32) -> Vec<f32> {
     })
 }
 
+/// Удар дерева (9.6): глухой стук двух деревянных призвуков и щелчок.
+pub fn knock_wood(rate: f32) -> Vec<f32> {
+    let mut noise = Noise::new(83);
+    let mut lp = LowPass { y: 0.0 };
+    render(0.16, rate, |t| {
+        let body = (TAU * 520.0 * t).sin() * envelope(t, 0.001, 0.035)
+            + 0.5 * (TAU * 1190.0 * t).sin() * envelope(t, 0.001, 0.02);
+        let click = lp.step(noise.next(), 2500.0, rate) * envelope(t, 0.0005, 0.008);
+        0.45 * body + 0.6 * click
+    })
+}
+
+/// Удар металла: звон из негармоничных призвуков (как у пластины), долго затухает.
+pub fn knock_metal(rate: f32) -> Vec<f32> {
+    let mut noise = Noise::new(89);
+    const PARTIALS: [(f32, f32, f32); 4] = [
+        (1.0, 1.0, 0.32),
+        (2.76, 0.6, 0.2),
+        (5.40, 0.4, 0.12),
+        (8.93, 0.25, 0.07),
+    ];
+    render(0.6, rate, |t| {
+        let base = 780.0;
+        let ring: f32 = PARTIALS
+            .iter()
+            .map(|&(k, a, d)| a * (TAU * base * k * t).sin() * envelope(t, 0.0008, d))
+            .sum();
+        let click = noise.next() * envelope(t, 0.0003, 0.004);
+        0.22 * ring + 0.35 * click
+    })
+}
+
+/// Удар камня: тяжёлый низкий удар и хруст.
+pub fn knock_stone(rate: f32) -> Vec<f32> {
+    let mut noise = Noise::new(97);
+    let mut lp = LowPass { y: 0.0 };
+    let mut phase = 0.0f32;
+    render(0.24, rate, |t| {
+        let freq = 110.0 * (-t * 12.0).exp() + 60.0;
+        phase += TAU * freq / rate;
+        let thump = phase.sin() * envelope(t, 0.001, 0.05);
+        let grit = lp.step(noise.next(), 1100.0, rate) * envelope(t, 0.001, 0.045);
+        0.45 * thump + 0.8 * grit
+    })
+}
+
+/// Удар резины: упругий шлепок с тоном, уходящим вниз.
+pub fn knock_rubber(rate: f32) -> Vec<f32> {
+    let mut phase = 0.0f32;
+    render(0.2, rate, |t| {
+        let freq = 120.0 + 180.0 * (-t * 25.0).exp();
+        phase += TAU * freq / rate;
+        0.55 * phase.sin() * envelope(t, 0.003, 0.05)
+    })
+}
+
 /// Частота ноты MIDI (69 — ля первой октавы, 440 Гц).
 fn note(midi: f32) -> f32 {
     440.0 * 2f32.powf((midi - 69.0) / 12.0)
@@ -222,6 +278,8 @@ pub struct Bank {
     pub hit: Arc<[f32]>,
     pub pickup: Arc<[f32]>,
     pub hurt: Arc<[f32]>,
+    /// Удары по материалам в порядке [`crate::Knock`].
+    pub knocks: [Arc<[f32]>; 4],
     pub music: Arc<[f32]>,
 }
 
@@ -239,6 +297,12 @@ impl Bank {
             hit: hit(r).into(),
             pickup: pickup(r).into(),
             hurt: hurt(r).into(),
+            knocks: [
+                knock_wood(r).into(),
+                knock_metal(r).into(),
+                knock_stone(r).into(),
+                knock_rubber(r).into(),
+            ],
             music: music(r).into(),
         }
     }
@@ -272,6 +336,28 @@ mod tests {
             assert!((0.1..=1.0).contains(&p), "{name}: пик {p}");
             // Конец тихий: обрезка не щёлкает.
             assert!(s.last().unwrap().abs() < 1e-3, "{name}");
+        }
+    }
+
+    #[test]
+    fn knocks_differ_by_material() {
+        let rate = 48_000.0;
+        let all = [
+            ("дерево", knock_wood(rate)),
+            ("металл", knock_metal(rate)),
+            ("камень", knock_stone(rate)),
+            ("резина", knock_rubber(rate)),
+        ];
+        for (name, s) in &all {
+            let p = peak(s);
+            assert!((0.1..=1.0).contains(&p), "{name}: пик {p}");
+            assert!(s.last().unwrap().abs() < 1e-3, "{name}");
+        }
+        // Металл звенит дольше всех: в его второй трети ещё слышно.
+        let tail = |s: &[f32]| peak(&s[(0.12 * rate) as usize..]);
+        assert!(tail(&all[1].1) > 0.05, "металл звенит");
+        for (name, s) in [&all[0], &all[2], &all[3]] {
+            assert!(tail(s) < tail(&all[1].1) * 0.5, "{name} глуше металла");
         }
     }
 

@@ -460,3 +460,83 @@ fn moved_hero_does_not_fling_what_it_stood_on() {
     }
     assert!(highest < -0.725 + 0.01, "ящик подбросило: {highest}");
 }
+
+#[test]
+fn falling_box_reports_one_hard_touch_and_rests_quietly() {
+    let mut w = Physics::new(9.3);
+    // Падает с высоты 0,8: о пол примерно со скоростью sqrt(2·9,3·0,8) ≈ 3,9.
+    let metal = BodyDesc {
+        material: Material::Metal,
+        bounce: 0.0,
+        ..BodyDesc::default()
+    };
+    let b = w.add([0.0, 0.0], 0.0, [0.0, 0.0], &metal);
+    let mut touches = Vec::new();
+    for _ in 0..180 {
+        w.set_solids([floor()]);
+        w.step(DT);
+        touches.extend(w.take_touches());
+    }
+    let begins: Vec<&Touch> = touches.iter().filter(|t| t.begin).collect();
+    assert!(!begins.is_empty(), "касание пола");
+    let first = begins[0].seen_by(Toucher::Body(b)).unwrap();
+    assert_eq!(first.b, Toucher::Solid(1));
+    assert!((3.2..4.6).contains(&first.speed), "{first:?}");
+    assert!(first.toward[0] > 3.0 && first.toward[1] < 1e-6, "{first:?}");
+    assert!(first.normal[1] < -0.9, "к полу — вниз: {first:?}");
+    assert!((first.at[1] - -0.8).abs() < 0.03, "{first:?}");
+    assert_eq!(first.materials, [Material::Metal, Material::Stone]);
+    assert_eq!(first.louder(), Material::Metal);
+    // Лежит — новых сильных касаний нет.
+    let hard = begins.iter().filter(|t| t.speed > 0.5).count();
+    assert_eq!(hard, 1, "{begins:?}");
+}
+
+#[test]
+fn falling_box_hits_what_is_under_it_but_a_runner_does_not_hit_the_box() {
+    let mut w = Physics::new(9.3);
+    let b = w.add([0.0, 0.3], 0.0, [0.0, 0.0], &BodyDesc::default());
+    let enemy = Collider::solid(Aabb::around([0.0, -0.66], [0.07, 0.14]));
+    let mut hit = None;
+    for _ in 0..120 {
+        w.set_solids([floor(), (7, enemy)]);
+        w.step(DT);
+        for t in w.take_touches() {
+            if let Some(t) = t.seen_by(Toucher::Solid(7))
+                && t.begin
+                && t.b == Toucher::Body(b)
+            {
+                hit.get_or_insert(t);
+            }
+        }
+    }
+    let hit = hit.expect("ящик упал на врага");
+    assert!(hit.toward[1] > 2.0 && hit.toward[0] < 1e-6, "{hit:?}");
+    // Бегущий в лежащий ящик: ящик к нему не летит.
+    let mut w = Physics::new(9.3);
+    let b = w.add([0.5, -0.725], 0.0, [0.0, 0.0], &BodyDesc::default());
+    for _ in 0..30 {
+        w.set_solids([floor()]);
+        w.step(DT);
+    }
+    w.take_touches();
+    let mut x = 0.0;
+    let mut seen = Vec::new();
+    for _ in 0..40 {
+        x += 3.0 * DT;
+        let runner = Collider::solid(Aabb::around([x, -0.66], [0.07, 0.14]));
+        w.set_solids([floor(), (7, runner)]);
+        w.step(DT);
+        seen.extend(
+            w.take_touches()
+                .into_iter()
+                .filter_map(|t| t.seen_by(Toucher::Solid(7)))
+                .filter(|t| t.begin && t.b == Toucher::Body(b)),
+        );
+    }
+    assert!(!seen.is_empty(), "коснулся ящика");
+    assert!(
+        seen.iter().all(|t| t.toward[1] < 0.3),
+        "ящик сам не летел: {seen:?}"
+    );
+}

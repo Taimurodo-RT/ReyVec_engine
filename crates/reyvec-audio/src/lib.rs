@@ -33,6 +33,17 @@ pub enum Sound {
     Pickup,
     /// Героя ранили (6.10б).
     Hurt,
+    /// Удар тел (9.6): звук материала.
+    Knock(Knock),
+}
+
+/// Как звучит удар: материал звонче из двух ударившихся.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Knock {
+    Wood,
+    Metal,
+    Stone,
+    Rubber,
 }
 
 /// Что видно о звуке на панели.
@@ -147,6 +158,7 @@ impl Audio {
             Sound::Hit => bank.hit.clone(),
             Sound::Pickup => bank.pickup.clone(),
             Sound::Hurt => bank.hurt.clone(),
+            Sound::Knock(k) => bank.knocks[k as usize].clone(),
         };
         self.next_id += 1;
         let sent = commands.send(Command::Play {

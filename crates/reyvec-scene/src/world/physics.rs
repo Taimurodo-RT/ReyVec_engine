@@ -10,6 +10,131 @@ pub(super) type PieceShapes<'w, 's> = Query<
     (Without<PhysBody>, Without<Player>),
 >;
 
+/// Тише этого удар не слышен, единиц в секунду.
+const KNOCK_SPEED: f64 = 0.6;
+/// Масса, у которой громкость удара — по скорости: ящик 0,15 × 0,15 плотности 1.
+/// Легче — тише, тяжелее — громче (до полутора раз).
+const KNOCK_MASS: f64 = 0.0225;
+/// Одно тело стучит не чаще раза за столько шагов: дребезг не звучит очередью.
+const KNOCK_GAP: u64 = 5;
+/// Ударов за шаг не больше: обвал пирамиды — несколько громких, а не сотня.
+const KNOCKS_PER_STEP: usize = 8;
+/// Тело, влетевшее в героя или врага быстрее этого, ранит (единиц в секунду).
+const CRUSH_SPEED: f64 = 2.5;
+/// Сколько «массы на скорость» в одной единице урона: ящик 0,2 × 0,2 плотности 2,
+/// упавший с высоты героя, отнимает 2–3.
+const CRUSH_UNIT: f64 = 0.08;
+
+/// Касания за шаг физики (9.6): удары звучат и искрят материалом, тело, влетевшее в
+/// героя или врага, ранит его.
+fn touches(
+    phys: &mut PhysicsRes,
+    step: u64,
+    events: &mut Events,
+    combat: &mut Combat,
+    players: &mut Query<(Entity, &mut Player)>,
+    targets: &mut Query<(Entity, &mut Target), Without<Player>>,
+) {
+    use reyvec_game::physics::Toucher;
+    let heroes: Vec<u64> = players.iter().map(|(e, _)| e.to_bits()).collect();
+    let enemies: Vec<u64> = targets.iter().map(|(e, _)| e.to_bits()).collect();
+    let character =
+        |t: Toucher| matches!(t, Toucher::Solid(k) if heroes.contains(&k) || enemies.contains(&k));
+    let mut knocks: Vec<(f64, GameEvent, Toucher)> = Vec::new();
+    for touch in phys.physics.take_touches() {
+        if !touch.begin {
+            continue;
+        }
+        // Персонаж сам звучит шагами и приземлением: слышно только тело, которое в него
+        // влетело. О пол и стены звучит само тело (резиновый мяч о камень — шлепок);
+        // два тела — звонкий из двух.
+        let (speed, material, who) = match (touch.a, touch.b) {
+            (a, _) if character(a) => (touch.toward[1], touch.materials[1], touch.b),
+            (_, b) if character(b) => (touch.toward[0], touch.materials[0], touch.a),
+            (Toucher::Body(_), Toucher::Body(_)) => (touch.speed, touch.louder(), touch.a),
+            (Toucher::Body(_), _) => (touch.speed, touch.materials[0], touch.a),
+            _ => (touch.speed, touch.materials[1], touch.b),
+        };
+        // Громкость — от силы удара: лёгкое (капля дождя, песчинка) стучит тише.
+        let speed = match who {
+            Toucher::Body(b) => {
+                let m = phys.physics.mass(b).unwrap_or(KNOCK_MASS);
+                speed * (m / KNOCK_MASS).sqrt().clamp(0.25, 1.5)
+            }
+            Toucher::Solid(_) => speed,
+        };
+        if speed >= KNOCK_SPEED && phys.knocks.get(&who).is_none_or(|&s| s + KNOCK_GAP <= step) {
+            knocks.push((
+                speed,
+                GameEvent::Impact {
+                    at: [touch.at[0] as f32, touch.at[1] as f32],
+                    speed: speed as f32,
+                    material: crate::Material::of_physics(material),
+                },
+                who,
+            ));
+        }
+        // Влетевшее тело ранит героя или врага.
+        for (victim, body, toward) in [
+            (touch.a, touch.b, touch.toward[1]),
+            (touch.b, touch.a, touch.toward[0]),
+        ] {
+            let (Toucher::Solid(key), Toucher::Body(body)) = (victim, body) else {
+                continue;
+            };
+            if toward < CRUSH_SPEED {
+                continue;
+            }
+            let mass = phys.physics.mass(body).unwrap_or(0.0);
+            let amount = (mass * toward / CRUSH_UNIT).floor() as u32;
+            if amount == 0 {
+                continue;
+            }
+            let from = phys.physics.pose(body).map_or(touch.at[0], |(at, _)| at[0]);
+            if let Some((_, mut p)) = players.iter_mut().find(|(e, _)| e.to_bits() == key) {
+                hurt_hero(&mut p, amount, from, step, events, combat);
+            } else if let Some((_, mut t)) = targets
+                .iter_mut()
+                .find(|(e, t)| e.to_bits() == key && t.dummy.alive())
+            {
+                let dir = if t.dummy.body.pos[0] >= from {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let broken = t.dummy.hurt(amount, [dir * 0.8, 1.0]);
+                let b = t.dummy.bounds();
+                events.list.push_back((
+                    step,
+                    GameEvent::Damage {
+                        at: [b.center()[0] as f32, b.max[1] as f32 + 0.04],
+                        amount,
+                        left: t.dummy.hp,
+                    },
+                ));
+                if broken {
+                    phys.breaks.push(Break {
+                        at: t.dummy.body.pos,
+                        size: t.dummy.tuning.size,
+                        color: t.color,
+                        dir,
+                    });
+                }
+            }
+        }
+    }
+    // Самые сильные удары шага.
+    knocks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (_, event, who) in knocks.into_iter().take(KNOCKS_PER_STEP) {
+        phys.knocks.insert(who, step);
+        events.list.push_back((step, event));
+    }
+    // Старые отметки не копятся.
+    if step.is_multiple_of(600) {
+        phys.knocks.retain(|_, s| *s + KNOCK_GAP > step);
+    }
+}
+
 /// Физика (6.10): уровень, герой и враги — кинематические тела, предметы с `body` и
 /// обломки — настоящие. Удар героя отбрасывает тела; разбитый враг разлетается на
 /// обломки, которые через несколько секунд гаснут.
@@ -18,8 +143,9 @@ pub(super) fn physics_step(
     solids: Res<Solids>,
     mut phys: ResMut<PhysicsRes>,
     mut events: ResMut<Events>,
+    mut combat: ResMut<Combat>,
     mut players: Query<(Entity, &mut Player)>,
-    targets: Query<(Entity, &Target)>,
+    mut targets: Query<(Entity, &mut Target), Without<Player>>,
     mut bodies: Query<(Entity, &PhysBody, &mut Placement), Without<Player>>,
     mut shapes: PieceShapes,
     mut slots: SlotPlaces,
@@ -159,6 +285,14 @@ pub(super) fn physics_step(
     phys.physics.step(dt);
     phys.extra
         .after_step(&mut phys.physics, dt, step, &mut events.list, &mut slots);
+    touches(
+        phys,
+        step,
+        &mut events,
+        &mut combat,
+        &mut players,
+        &mut targets,
+    );
     // Места тел и обломков после шага (тело создано уже повёрнутым, поворот — его).
     for (_, b, mut place) in &mut bodies {
         if let Some((at, angle)) = phys.physics.pose(b.id) {
