@@ -367,6 +367,8 @@ impl Space {
             compute_impact_geometry_on_penetration: true,
         };
         let mut best: (f64, Option<Hit>) = (1.0, None);
+        // Насколько лучшая встреча «в лоб» (доля пути вдоль нормали).
+        let mut best_into = 0.0;
         for (index, s) in self.surfaces.iter().enumerate() {
             if !aabb_touch(&swept, &s.aabb) || !self.takes(s, &b, delta, f) {
                 continue;
@@ -403,7 +405,12 @@ impl Space {
             // оставил бы зазор меньше `SKIN`, и скольжение вдоль неё уводило бы внутрь.
             let back_n = (SKIN / into).min(back * 8.0);
             let toi = (at - back_n).max(0.0);
-            if toi >= best.0 {
+            // Две встречи в одном месте (угол героя на стыке плоского верха и крутого
+            // бока желе, 9.7): держит та, что больше в лоб, а не первая в списке.
+            // Иначе стоящий на стыке через шаг «падал» на крутой бок.
+            let head_on = into / len;
+            let tie = best.1.is_some() && (toi - best.0).abs() < 1e-9;
+            if toi > best.0 || (toi >= best.0 && !tie) || (tie && head_on <= best_into) {
                 continue;
             }
             if let Some(pass) = f.normals
@@ -411,6 +418,7 @@ impl Space {
             {
                 continue;
             }
+            best_into = head_on;
             best = (
                 toi,
                 Some(Hit {
