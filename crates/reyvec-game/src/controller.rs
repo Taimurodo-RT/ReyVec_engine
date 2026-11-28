@@ -315,11 +315,25 @@ impl Body {
             && space.get(id).is_some_and(|g| g.moving())
         {
             let foot = [self.pos[0], self.pos[1] - half[1]];
-            let d = space.carry(id, foot);
+            let mut d = space.carry(id, foot);
+            if space.get(id).is_some_and(|g| g.pushable) {
+                // Тело физики под ногами (ящик, шар) несёт не быстрее бега: на ящике,
+                // который отбросило ударом, не удержаться — ноги проскальзывают.
+                let most = tuning.speed * dt;
+                let len = d[0].hypot(d[1]);
+                if len > most {
+                    d = [d[0] * most / len, d[1] * most / len];
+                }
+            }
             let skip = [id];
             let f = Filter::default().skip(&skip);
             self.pos[0] += space.sweep(self.bounds(tuning), 0, d[0], &f).0;
-            self.pos[1] += d[1];
+            // Вверх — не сквозь потолок (ящик под ногами подбросило к полке).
+            self.pos[1] += if d[1] > 0.0 {
+                space.sweep(self.bounds(tuning), 1, d[1], &f).0
+            } else {
+                d[1]
+            };
         }
         self.push_out(tuning, space);
         self.wall_lock -= dt;
@@ -766,6 +780,16 @@ impl Body {
             let solid = Filter::default().normals(space::not_slope);
             let (down, by) = space.sweep(self.bounds(tuning), 1, h - foot[1], &solid);
             if by.is_some() && down > h - foot[1] {
+                return;
+            }
+        }
+        if h > foot[1] {
+            // Подняться на склон можно, только если голове есть место (склон тела
+            // физики под полкой). Сам склон не в счёт: в него угол прямоугольника входит.
+            let skip = [hit.id];
+            let f = Filter::default().skip(&skip);
+            let (up, by) = space.sweep(self.bounds(tuning), 1, h - foot[1], &f);
+            if by.is_some() && up < h - foot[1] {
                 return;
             }
         }
