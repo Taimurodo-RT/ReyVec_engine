@@ -8,8 +8,8 @@
 //! от самой старой ещё живой частицы до последней новой, поэтому мало частиц — мало
 //! работы.
 //!
-//! Твёрдое для отскока — те же прямоугольники и склоны, на которых стоит герой
-//! (`Collider` логики), только видимые на экране, не больше [`MAX_SOLIDS`].
+//! Частицы отскакивают от того же, обо что ударяется герой (9.5): препятствия настоящей
+//! формы у экрана, разложенные по клеткам сетки ([`crate::particle_world`]).
 //!
 //! [`step_particle`] — зеркало шейдера на процессоре: тесты проверяют на нём отскок,
 //! склоны и платформы, а кадры в CI — что видеокарта делает то же.
@@ -25,14 +25,11 @@ use crate::resources::{BufferId, BufferMemory, GpuResources};
 pub const CAPACITY: u32 = 1 << 17;
 /// Сколько новых частиц можно добавить за один кадр.
 pub const MAX_EMIT: usize = 16_384;
-/// Сколько твёрдых прямоугольников видит расчёт за кадр.
-pub const MAX_SOLIDS: usize = 128;
 /// Размер частицы в буфере (как `struct Particle` в шейдере).
 pub(crate) const PARTICLE_SIZE: usize = 64;
-const SOLID_SIZE: usize = 32;
-/// Где в буфере загрузки начинается твёрдое.
-const SOLIDS_OFFSET: usize = MAX_EMIT * PARTICLE_SIZE;
-const UPLOAD_SIZE: usize = SOLIDS_OFFSET + MAX_SOLIDS * SOLID_SIZE;
+/// Где в буфере загрузки начинается мир для частиц.
+const WORLD_OFFSET: usize = MAX_EMIT * PARTICLE_SIZE;
+const UPLOAD_SIZE: usize = WORLD_OFFSET + crate::particle_world::WORLD_WORDS * 4;
 
 /// Тяжесть для частиц, единиц сцены в секунду за секунду (около тяжести героя).
 pub const GRAVITY: f32 = 8.0;
@@ -99,42 +96,10 @@ impl Particle {
     }
 }
 
-/// Твёрдое для отскока: прямоугольник, у склона ещё подъём слева направо.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ParticleSolid {
-    pub lo: [f32; 2],
-    pub hi: [f32; 2],
-    pub slope: f32,
-    pub oneway: bool,
-}
-
-impl ParticleSolid {
-    fn to_bytes(self) -> [u8; SOLID_SIZE] {
-        let mut b = [0u8; SOLID_SIZE];
-        for (i, v) in [self.lo[0], self.lo[1], self.hi[0], self.hi[1], self.slope]
-            .into_iter()
-            .enumerate()
-        {
-            b[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
-        }
-        b[20..24].copy_from_slice(&u32::from(self.oneway).to_ne_bytes());
-        b
-    }
-
-    #[cfg(test)]
-    fn surface(&self, x: f32) -> f32 {
-        let k = ((x - self.lo[0]) / (self.hi[0] - self.lo[0]).max(1e-6)).clamp(0.0, 1.0);
-        let k = if self.slope < 0.0 { 1.0 - k } else { k };
-        self.hi[1] - self.slope.abs() * (1.0 - k)
-    }
-}
-
+/// Шаг одной частицы на процессоре в мире `world` (слова [`crate::particle_world`]):
+/// то же, что `step_particle` в шейдере.
 #[cfg(test)]
-const EPS: f32 = 1e-4;
-
-/// Шаг одной частицы на процессоре: то же, что `step_particle` в шейдере.
-#[cfg(test)]
-pub fn step_particle(mut p: Particle, solids: &[ParticleSolid], gravity: f32, dt: f32) -> Particle {
+pub fn step_particle(mut p: Particle, world: &[u32], gravity: f32, dt: f32) -> Particle {
     if p.life <= 0.0 {
         return p;
     }
@@ -142,63 +107,14 @@ pub fn step_particle(mut p: Particle, solids: &[ParticleSolid], gravity: f32, dt
     p.vel[1] -= gravity * p.gravity * dt;
     let keep = (1.0 - p.drag * dt).max(0.0);
     p.vel = [p.vel[0] * keep, p.vel[1] * keep];
-    let from = p.pos;
-    let mut to = [p.pos[0] + p.vel[0] * dt, p.pos[1] + p.vel[1] * dt];
+    let to = [p.pos[0] + p.vel[0] * dt, p.pos[1] + p.vel[1] * dt];
     if p.flags & PARTICLE_COLLIDE != 0 {
-        for s in solids {
-            if to[0] <= s.lo[0] || to[0] >= s.hi[0] || to[1] <= s.lo[1] || to[1] >= s.hi[1] {
-                continue;
-            }
-            if s.slope != 0.0 {
-                let top = s.surface(to[0]);
-                if to[1] >= top || from[1] < s.surface(from[0]) - EPS {
-                    continue;
-                }
-                let nx = if s.slope > 0.0 {
-                    -s.slope.abs()
-                } else {
-                    s.slope.abs()
-                };
-                let ny = s.hi[0] - s.lo[0];
-                let len = nx.hypot(ny);
-                let n = [nx / len, ny / len];
-                to[1] = top + EPS;
-                let vn = p.vel[0] * n[0] + p.vel[1] * n[1];
-                if vn < 0.0 {
-                    p.vel[0] -= (1.0 + p.bounce) * vn * n[0];
-                    p.vel[1] -= (1.0 + p.bounce) * vn * n[1];
-                }
-                p.vel = [p.vel[0] * 0.8, p.vel[1] * 0.8];
-                continue;
-            }
-            if s.oneway {
-                if from[1] < s.hi[1] - EPS || p.vel[1] > 0.0 {
-                    continue;
-                }
-                to[1] = s.hi[1] + EPS;
-                p.vel[1] = -p.vel[1] * p.bounce;
-                p.vel[0] *= 0.8;
-                continue;
-            }
-            if from[1] >= s.hi[1] - EPS {
-                to[1] = s.hi[1] + EPS;
-                p.vel[1] = -p.vel[1] * p.bounce;
-                p.vel[0] *= 0.8;
-            } else if from[1] <= s.lo[1] + EPS {
-                to[1] = s.lo[1] - EPS;
-                p.vel[1] = -p.vel[1] * p.bounce;
-            } else if from[0] <= s.lo[0] + EPS {
-                to[0] = s.lo[0] - EPS;
-                p.vel[0] = -p.vel[0] * p.bounce;
-            } else if from[0] >= s.hi[0] - EPS {
-                to[0] = s.hi[0] + EPS;
-                p.vel[0] = -p.vel[0] * p.bounce;
-            } else {
-                p.life = 0.0;
-            }
-        }
+        let (at, vel) = crate::particle_world::collide(world, p.pos, to, p.vel, p.bounce);
+        p.pos = at;
+        p.vel = vel;
+    } else {
+        p.pos = to;
     }
-    p.pos = to;
     p
 }
 
@@ -265,8 +181,9 @@ pub(crate) struct ParticleFrame {
     pub span: RingSpan,
     pub ring: vk::DeviceAddress,
     pub emitted: vk::DeviceAddress,
-    pub solids: vk::DeviceAddress,
-    pub solid_count: u32,
+    /// Мир для частиц (слова [`crate::particle_world`]) и есть ли в нём препятствия.
+    pub world: vk::DeviceAddress,
+    pub world_on: u32,
     pub dt: f32,
     pub gravity: f32,
     /// Списки живых для рисования (собираются на последнем шаге кадра).
@@ -330,25 +247,22 @@ impl ParticleSystem {
     }
 
     /// Готовит шаги расчёта этого кадра: по шагу на каждый элемент `steps` (момент,
-    /// длина шага и новые частицы этого шага). Пишет новые частицы и твёрдое в буфер загрузки кадра `slot`, который
-    /// видеокарта в этот момент читать не должна.
+    /// длина шага и новые частицы этого шага). Пишет новые частицы и мир для частиц в
+    /// буфер загрузки кадра `slot`, который видеокарта в этот момент читать не должна.
     pub fn prepare(
         &mut self,
         res: &mut GpuResources,
         slot: usize,
         steps: Vec<(f64, f32, Vec<Particle>)>,
-        solids: &[ParticleSolid],
+        world: &crate::particle_world::ParticleWorld,
         gravity: f32,
     ) -> Vec<ParticleFrame> {
         let upload = self.uploads[slot % self.uploads.len()];
         let base = res.buffer_address(upload);
-        let solid_count = solids.len().min(MAX_SOLIDS);
-        if solid_count > 0 {
-            let bytes: Vec<u8> = solids[..solid_count]
-                .iter()
-                .flat_map(|s| s.to_bytes())
-                .collect();
-            res.write_buffer(upload, SOLIDS_OFFSET, &bytes);
+        let world_on = u32::from(!world.is_empty());
+        if world_on != 0 {
+            let bytes: Vec<u8> = world.words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+            res.write_buffer(upload, WORLD_OFFSET, &bytes);
         }
         let ring = res.buffer_address(self.ring_buffer);
         let draw = res.buffer_address(self.draw_list);
@@ -371,8 +285,8 @@ impl ParticleSystem {
                 span,
                 ring,
                 emitted: base + (offset * PARTICLE_SIZE) as u64,
-                solids: base + SOLIDS_OFFSET as u64,
-                solid_count: solid_count as u32,
+                world: base + WORLD_OFFSET as u64,
+                world_on,
                 dt,
                 gravity,
                 draw,
@@ -398,14 +312,14 @@ pub(crate) fn push(
     b[80..88].copy_from_slice(&f.draw.to_ne_bytes());
     b[0..8].copy_from_slice(&f.ring.to_ne_bytes());
     b[8..16].copy_from_slice(&f.emitted.to_ne_bytes());
-    b[16..24].copy_from_slice(&f.solids.to_ne_bytes());
+    b[16..24].copy_from_slice(&f.world.to_ne_bytes());
     let words = [
         CAPACITY,
         f.span.start,
         f.span.count,
         f.span.head,
         f.span.emit_count,
-        f.solid_count,
+        f.world_on,
     ];
     for (i, w) in words.into_iter().enumerate() {
         b[24 + i * 4..28 + i * 4].copy_from_slice(&w.to_ne_bytes());
@@ -494,6 +408,9 @@ pub struct ParticleStats {
     pub dropped: u64,
     /// Включён фонтан для замера (100 000 частиц).
     pub fountain: bool,
+    /// Препятствий у экрана, от которых отскакивают частицы (9.5), и сколько не влезло.
+    pub obstacles: u32,
+    pub obstacles_dropped: u32,
 }
 
 /// Простой повторяемый случайный ряд (splitmix64): одно событие — одни и те же частицы.
@@ -708,32 +625,42 @@ mod tests {
         }
     }
 
-    fn floor() -> ParticleSolid {
-        ParticleSolid {
-            lo: [-5.0, -1.0],
-            hi: [5.0, 0.0],
-            slope: 0.0,
-            oneway: false,
-        }
+    use reyvec_scene::game::{Aabb, Collider, Surface};
+
+    fn floor() -> Collider {
+        Collider::solid(Aabb {
+            min: [-5.0, -1.0],
+            max: [5.0, 0.0],
+        })
     }
 
-    fn run(mut p: Particle, solids: &[ParticleSolid], steps: usize) -> Particle {
+    /// Мир для частиц из твёрдого уровня, как его собирает сцена.
+    fn world(solids: &[Collider]) -> Vec<u32> {
+        let mut obstacles = Vec::new();
+        for c in solids {
+            reyvec_scene::game::obstacle::obstacles(&Surface::of_collider(c), 0.0, &mut obstacles);
+        }
+        crate::particle_world::ParticleWorld::build(&obstacles, [-3.0, -2.0], [3.0, 3.0]).words
+    }
+
+    fn run(mut p: Particle, solids: &[Collider], steps: usize) -> Particle {
+        let w = world(solids);
         for _ in 0..steps {
-            p = step_particle(p, solids, 9.8, 1.0 / 60.0);
+            p = step_particle(p, &w, 9.8, 1.0 / 60.0);
         }
         p
     }
 
     #[test]
     fn particle_falls_bounces_lower_and_rests_on_the_floor() {
-        let solids = [floor()];
+        let w = world(&[floor()]);
         let mut p = dust([0.0, 0.5], [0.0, 0.0]);
         let mut bounces = 0;
         let mut tops = Vec::new();
         let mut rising = false;
         for _ in 0..240 {
             let before = p.vel[1];
-            p = step_particle(p, &solids, 9.8, 1.0 / 60.0);
+            p = step_particle(p, &w, 9.8, 1.0 / 60.0);
             assert!(p.pos[1] >= 0.0, "в полу: {p:?}");
             if before < 0.0 && p.vel[1] > 0.0 {
                 bounces += 1;
@@ -758,12 +685,10 @@ mod tests {
 
     #[test]
     fn particle_hits_wall_from_the_side() {
-        let wall = ParticleSolid {
-            lo: [1.0, -1.0],
-            hi: [1.2, 2.0],
-            slope: 0.0,
-            oneway: false,
-        };
+        let wall = Collider::solid(Aabb {
+            min: [1.0, -1.0],
+            max: [1.2, 2.0],
+        });
         let mut p = dust([0.5, 1.0], [3.0, 0.0]);
         p.gravity = 0.0;
         let p = run(p, &[wall], 30);
@@ -773,12 +698,10 @@ mod tests {
 
     #[test]
     fn platform_holds_from_above_only() {
-        let plank = ParticleSolid {
-            lo: [-1.0, 0.0],
-            hi: [1.0, 0.05],
-            slope: 0.0,
-            oneway: true,
-        };
+        let plank = Collider::oneway(Aabb {
+            min: [-1.0, 0.0],
+            max: [1.0, 0.05],
+        });
         // Снизу пролетает сквозь.
         let mut up = dust([0.0, -0.3], [0.0, 3.0]);
         up.gravity = 0.0;
@@ -795,22 +718,72 @@ mod tests {
     #[test]
     fn particle_slides_down_a_slope_and_stays_above_it() {
         // Склон поднимается слева направо от 0 до 1 на ширине 1.
-        let slope = ParticleSolid {
-            lo: [0.0, -1.0],
-            hi: [1.0, 1.0],
-            slope: 1.0,
-            oneway: false,
-        };
-        let s = slope;
+        let slope = Collider::slope(
+            Aabb {
+                min: [0.0, -1.0],
+                max: [1.0, 1.0],
+            },
+            1.0,
+        );
+        let w = world(&[slope, floor()]);
         let mut p = dust([0.7, 1.2], [0.0, 0.0]);
         p.bounce = 0.0;
         for _ in 0..120 {
-            p = step_particle(p, &[s, floor()], 9.8, 1.0 / 60.0);
+            p = step_particle(p, &w, 9.8, 1.0 / 60.0);
             if p.pos[0] > 0.0 && p.pos[0] < 1.0 {
-                assert!(p.pos[1] >= s.surface(p.pos[0]) - 1e-3, "под склоном: {p:?}");
+                assert!(p.pos[1] >= p.pos[0] - 1e-3, "под склоном: {p:?}");
             }
         }
         assert!(p.pos[0] < 0.7, "скатилась влево: {p:?}");
+    }
+
+    #[test]
+    fn dust_lies_on_a_turned_box_and_a_ball() {
+        // 9.5: повёрнутый ящик и шар — настоящей формой, а не описанным прямоугольником.
+        let box_ = Surface::placed(
+            1,
+            reyvec_scene::game::SharedShape::cuboid(0.3, 0.05),
+            [0.0, 0.0],
+            0.4,
+        );
+        let ball = Surface::placed(
+            2,
+            reyvec_scene::game::SharedShape::ball(0.2),
+            [1.5, 0.0],
+            0.0,
+        );
+        let mut obstacles = Vec::new();
+        reyvec_scene::game::obstacle::obstacles(&box_, 0.0, &mut obstacles);
+        reyvec_scene::game::obstacle::obstacles(&ball, 0.0, &mut obstacles);
+        let w =
+            crate::particle_world::ParticleWorld::build(&obstacles, [-3.0, -2.0], [3.0, 3.0]).words;
+        // Над серединой ящика: ложится на наклонную грань и съезжает по ней, а не
+        // лежит на верху описанного прямоугольника.
+        let mut p = dust([0.0, 0.5], [0.0, 0.0]);
+        p.bounce = 0.0;
+        let (sn, cs) = 0.4f32.sin_cos();
+        let mut on_face = 0;
+        for _ in 0..40 {
+            p = step_particle(p, &w, 9.8, 1.0 / 60.0);
+            let along = p.pos[0] * cs + p.pos[1] * sn;
+            let above = -p.pos[0] * sn + p.pos[1] * cs - 0.05;
+            if along.abs() < 0.3 {
+                assert!(above > -1e-3, "в ящике: {p:?}");
+                on_face += usize::from(above < 0.01);
+            }
+        }
+        assert!(on_face > 5, "лежала на грани шагов: {on_face}");
+        assert!(p.pos[0] < -0.05, "съехала вниз по грани: {p:?}");
+        // На шар сбоку от верха: скатывается и падает мимо.
+        let mut q = dust([1.55, 0.5], [0.0, 0.0]);
+        q.bounce = 0.0;
+        q.life = 10.0;
+        for _ in 0..240 {
+            q = step_particle(q, &w, 9.8, 1.0 / 60.0);
+            let d = ((q.pos[0] - 1.5).powi(2) + q.pos[1].powi(2)).sqrt();
+            assert!(d > 0.2 - 1e-3, "внутри шара: {q:?}");
+        }
+        assert!(q.pos[1] < -0.3, "скатилась с шара: {q:?}");
     }
 
     #[test]

@@ -298,6 +298,9 @@ pub(super) struct PhysicsRes {
     pub(super) presses: Vec<Press>,
     /// Сколько шагать физике (пишет `play`: время шага без стоп-кадра).
     pub(super) dt: f64,
+    /// Длина последнего шага логики, за который сдвинулись поверхности (для скорости
+    /// препятствий частиц, 9.5).
+    pub(super) step_dt: f64,
     pub(super) breaks: Vec<Break>,
     pub(super) pieces: Vec<Piece>,
     pub(super) seed: u64,

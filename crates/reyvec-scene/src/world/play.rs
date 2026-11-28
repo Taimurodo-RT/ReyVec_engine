@@ -21,6 +21,7 @@ pub(super) fn play(
     phys.dt = 0.0;
     phys.presses.clear();
     let dt = (time.0 - last.0).clamp(0.0, 0.25);
+    phys.step_dt = dt;
     last.0 = time.0;
     events.step += 1;
     let step = events.step;
