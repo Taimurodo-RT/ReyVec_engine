@@ -351,6 +351,10 @@ pub(super) struct PhysicsRes {
     pub(super) extra: phys::Extra,
     /// Когда тело последний раз стучало (номер шага, 9.6): дребезг не звучит очередью.
     pub(super) knocks: std::collections::HashMap<reyvec_game::physics::Toucher, u64>,
+    /// Руки героев (9.6в) по номеру героя.
+    pub(super) hands: std::collections::HashMap<u64, reyvec_game::physics::Hands>,
+    /// Герои нажали «взять» на этом шаге (со стрелкой вниз — положить).
+    pub(super) grab: Option<bool>,
 }
 
 /// Невидимая заранее созданная копия предмета с `spawn`: место для выброшенного тела.
@@ -447,6 +451,9 @@ pub(super) struct Pending {
     pub(super) attack: bool,
     /// Удар нажат мышью «к курсору»: куда бить (6.12).
     pub(super) attack_at: Option<[f64; 2]>,
+    /// «Взять» (9.6в) и было ли нажато со стрелкой вниз (положить, а не бросить).
+    pub(super) grab: bool,
+    pub(super) grab_down: bool,
 }
 
 /// Твёрдое сцены в её координатах (собирается после расчёта мест): описанные

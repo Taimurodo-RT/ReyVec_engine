@@ -325,3 +325,92 @@ fn magnet_holds_the_iron_bar_in_the_air() {
     assert!(bar[1] > -0.6, "брусок в воздухе: {bar:?}");
     assert!(wood[1] < -0.7, "дерево на полу: {wood:?}");
 }
+
+fn press_grab(w: &mut SceneWorld, t: f64, held: &[reyvec_game::Action]) -> f64 {
+    use reyvec_game::{Action, InputFrame};
+    w.set_input(InputFrame::new(held, &[Action::Grab]));
+    let t = run(w, t, 1.0 / 60.0);
+    w.set_input(InputFrame::new(held, &[]));
+    t
+}
+
+fn dummy_hp(w: &mut SceneWorld, name: &str) -> u32 {
+    let e = w.find(name).unwrap();
+    w.world_mut()
+        .get::<crate::world::Target>(e)
+        .unwrap()
+        .dummy
+        .hp
+}
+
+#[test]
+fn hero_lifts_the_wooden_crate_and_throws_it_at_the_dummy() {
+    // 9.6в: на полигоне герой берёт деревянный ящик, несёт его над головой и бросает в
+    // манекен под полкой.
+    let mut w = polygon();
+    let mut t = run(&mut w, 0.0, 1.0);
+    let hp = dummy_hp(&mut w, "манекен под полкой");
+    let mut body = reyvec_game::Body::new([-7.66, -0.64]);
+    body.facing = -1.0;
+    w.set_player_body(body);
+    t = run(&mut w, t, 0.3);
+    t = press_grab(&mut w, t, &[]);
+    t = run(&mut w, t, 0.5);
+    let hero = w.player_body().unwrap();
+    let held = place(&mut w, "деревянный ящик").at;
+    eprintln!("герой {:?}, ящик {held:?}", hero.pos);
+    assert!(
+        held[1] > hero.pos[1] + 0.14 + 0.05,
+        "ящик не над головой: {held:?}"
+    );
+    assert!((held[0] - hero.pos[0]).abs() < 0.06);
+    // Бросок влево: ящик бьёт манекен.
+    t = press_grab(&mut w, t, &[]);
+    run(&mut w, t, 1.0);
+    let left = dummy_hp(&mut w, "манекен под полкой");
+    let at = place(&mut w, "деревянный ящик").at;
+    eprintln!("здоровье манекена {hp} → {left}, ящик {at:?}");
+    assert!(left < hp, "бросок не ранил: {hp} → {left}");
+}
+
+#[test]
+fn hero_drags_the_stone_plate_slowly() {
+    // 9.6в: каменную плиту не поднять, её тянут волоком, и герой идёт медленнее.
+    use reyvec_game::Action::Left;
+    let mut w = polygon();
+    let mut t = run(&mut w, 0.0, 0.5);
+    let start = place(&mut w, "каменная плита").at;
+    // Герой вплотную слева, смотрит на плиту.
+    let mut body = reyvec_game::Body::new([start[0] - 0.13 - 0.07 - 0.03, -0.64]);
+    body.facing = 1.0;
+    w.set_player_body(body);
+    t = run(&mut w, t, 0.2);
+    t = press_grab(&mut w, t, &[]);
+    // Идёт влево, держа плиту.
+    let from = w.player_body().unwrap().pos[0];
+    w.set_input(reyvec_game::InputFrame::new(&[Left], &[]));
+    t = run(&mut w, t, 1.0);
+    let hero = w.player_body().unwrap();
+    let plate = place(&mut w, "каменная плита").at;
+    let walked = from - hero.pos[0];
+    eprintln!("герой прошёл {walked:.2}, плита {start:?} → {plate:?}");
+    assert!(walked > 0.4 && walked < 1.6 * 0.9, "{walked}");
+    assert!(
+        start[0] - plate[0] > walked - 0.08,
+        "плита отстала: {plate:?}"
+    );
+    // Отпустил — плита остаётся, герой уходит.
+    t = press_grab(&mut w, t, &[Left]);
+    let from = w.player_body().unwrap().pos[0];
+    let left_at = place(&mut w, "каменная плита").at;
+    run(&mut w, t, 0.5);
+    let gone = from - w.player_body().unwrap().pos[0];
+    let plate = place(&mut w, "каменная плита").at;
+    eprintln!("без плиты прошёл {gone:.2} за 0,5 с, плита {plate:?}");
+    assert!(gone > 0.3, "{gone}");
+    // Плита в голубой зоне слабой тяжести: скользит дальше, но недалеко.
+    assert!(
+        (plate[0] - left_at[0]).abs() < 0.3,
+        "{left_at:?} → {plate:?}"
+    );
+}

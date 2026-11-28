@@ -26,10 +26,12 @@ use rapier2d::prelude::*;
 use crate::space::Surface;
 use crate::{Aabb, Collider};
 
+mod hands;
 mod joints;
 mod soft;
 mod touch;
 
+pub use hands::{CARRY_MASS, DRAG_MASS, Hands, HandsEvent, Hold, Holder};
 pub use joints::{JointDesc, JointId, JointKind, Motor};
 pub use soft::{Pin, SoftDesc, SoftId, SoftKind, SoftView};
 pub use touch::{Material, Touch, Toucher};
@@ -994,3 +996,6 @@ mod tests;
 
 #[cfg(test)]
 mod tests_soft;
+
+#[cfg(test)]
+mod tests_hands;
