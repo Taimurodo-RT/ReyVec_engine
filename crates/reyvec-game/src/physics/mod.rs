@@ -122,6 +122,34 @@ impl BodyDesc {
     }
 }
 
+/// Поле сил в области (9.6б): ветер или течение, другая тяжесть, магнит.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Field {
+    /// Скорость ветра, единиц в секунду: тела разгоняются к ней вдоль ветра, лёгкие
+    /// быстрее тяжёлых.
+    pub wind: [f64; 2],
+    /// Во сколько раз тяжесть в области (1 — как везде, 0 — невесомость, меньше нуля —
+    /// тянет вверх).
+    pub gravity: f64,
+    /// Магнит: тянет металлические тела к середине области с ускорением `magnet`
+    /// и гасит их раскачку.
+    pub magnet: f64,
+}
+
+impl Default for Field {
+    fn default() -> Self {
+        Self {
+            wind: [0.0, 0.0],
+            gravity: 1.0,
+            magnet: 0.0,
+        }
+    }
+}
+
+/// Масса, которую ветер разгоняет почти до своей скорости за шестую долю секунды: ящик
+/// 0,15 (тяжелее — медленнее, по корню из массы).
+const WIND_MASS: f32 = 0.0225;
+
 /// Номер тела в физике.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BodyId(RigidBodyHandle);
@@ -211,6 +239,8 @@ pub struct Physics {
     mover_keys: HashMap<RigidBodyHandle, u64>,
     /// Касания с прошлого [`Self::take_touches`].
     touches: Vec<Touch>,
+    /// Поля сил дали телам силы на этот шаг (сбросить после шага).
+    forced: bool,
 }
 
 /// Больше касаний не копим, если их никто не забирает.
@@ -252,6 +282,7 @@ impl Physics {
             vel_before: HashMap::new(),
             mover_keys: HashMap::new(),
             touches: Vec::new(),
+            forced: false,
         }
     }
 
@@ -472,6 +503,13 @@ impl Physics {
             &self.collector,
         );
         self.collect_touches();
+        if std::mem::take(&mut self.forced) {
+            for h in self.last.keys() {
+                if let Some(b) = self.bodies.get_mut(*h) {
+                    b.reset_forces(false);
+                }
+            }
+        }
         self.check_breaks(dt);
         self.step_ms = started.elapsed().as_secs_f64() * 1000.0;
     }
@@ -632,6 +670,77 @@ impl Physics {
                 }
                 let dir = if len > 1e-4 { d / len } else { Vector::Y };
                 let vel = s.particle_velocity(i) + dir * (1.0 - len / r) * speed as f32;
+                s.set_particle_velocity(i, vel);
+                woke = true;
+            }
+            if woke {
+                s.wake_up();
+            }
+        }
+    }
+
+    /// Поле сил `f` в прямоугольнике `area` на шаг `dt` (9.6б): действует на тела, чья
+    /// середина внутри, и на частицы мягких тел. Звать перед [`Self::step`].
+    pub fn field(&mut self, area: Aabb, f: &Field, dt: f64) {
+        let dt = dt as f32;
+        let g = self.gravity;
+        let center = v(area.center());
+        let inside = |q: Vector| area.contains([f64::from(q.x), f64::from(q.y)]);
+        let wind = v(f.wind);
+        let wind_len = wind.length();
+        let wind_dir = if wind_len > 1e-6 {
+            wind / wind_len
+        } else {
+            Vector::ZERO
+        };
+        // Скорость `vel` тела массой `mass` после шага в поле.
+        let push = |vel: Vector, mass: f32, at: Vector, metal: bool| {
+            let mut vel = vel;
+            if wind_len > 1e-6 {
+                let along = vel.dot(wind_dir);
+                if along < wind_len {
+                    let k = (6.0 * (WIND_MASS / mass.max(1e-6)).sqrt()).min(20.0) * dt;
+                    vel += wind_dir * (wind_len - along) * k.min(1.0);
+                }
+            }
+            if metal && f.magnet != 0.0 {
+                let to = center - at;
+                vel += to.normalize_or_zero() * f.magnet as f32 * dt;
+                vel -= vel * (3.0 * dt).min(1.0);
+            }
+            vel
+        };
+        for h in self.last.keys() {
+            let Some(b) = self.bodies.get_mut(*h) else {
+                continue;
+            };
+            if !b.is_dynamic() || !inside(b.translation()) {
+                continue;
+            }
+            let metal = b
+                .colliders()
+                .first()
+                .and_then(|c| self.colliders.get(*c))
+                .is_some_and(|c| Material::from_bits(c.user_data) == Material::Metal);
+            let vel = push(b.linvel(), b.mass(), b.translation(), metal);
+            b.set_linvel(vel, true);
+            // Другая тяжесть — силой: Rapier сложит её с тяжестью мира тем же способом,
+            // и в невесомости тело стоит точно. Силы сбрасываются после шага.
+            let extra = g * (f.gravity as f32 - 1.0) * b.gravity_scale() * b.mass();
+            b.add_force(extra, true);
+            self.forced = true;
+        }
+        for (_, s) in self.soft_bodies.iter_mut() {
+            let n = s.num_particles();
+            let mass = s.mass() / n.max(1) as f32;
+            let mut woke = false;
+            for i in 0..n {
+                let at = s.particle_position(i);
+                if s.particles()[i].is_pinned() || !inside(at) {
+                    continue;
+                }
+                let vel = push(s.particle_velocity(i), mass, at, false)
+                    + g * (f.gravity as f32 - 1.0) * dt;
                 s.set_particle_velocity(i, vel);
                 woke = true;
             }

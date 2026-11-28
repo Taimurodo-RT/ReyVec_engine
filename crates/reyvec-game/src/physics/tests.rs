@@ -580,3 +580,66 @@ fn ghost_body_falls_through_the_level_layer_it_ignores() {
         "призраку пол не мешает"
     );
 }
+
+#[test]
+fn fields_blow_lift_and_attract() {
+    // 9.6б: ветер гонит ящик, в невесомости ящик не падает, магнит тянет только железо.
+    let area = Aabb {
+        min: [-2.0, -1.0],
+        max: [2.0, 1.0],
+    };
+    let mut w = Physics::new(9.3);
+    let b = w.add([0.0, -0.725], 0.0, [0.0, 0.0], &BodyDesc::default());
+    let wind = Field {
+        wind: [1.5, 0.0],
+        ..Field::default()
+    };
+    for _ in 0..60 {
+        w.set_solids([floor()]);
+        w.field(area, &wind, DT);
+        w.step(DT);
+    }
+    assert!(
+        w.pose(b).unwrap().0[0] > 0.2,
+        "ветер сдвинул ящик: {:?}",
+        w.pose(b)
+    );
+    let mut w = Physics::new(9.3);
+    let b = w.add([0.0, 0.5], 0.0, [0.0, 0.0], &BodyDesc::default());
+    let still = Field {
+        gravity: 0.0,
+        ..Field::default()
+    };
+    for _ in 0..60 {
+        w.field(area, &still, DT);
+        w.step(DT);
+    }
+    assert!(
+        (w.pose(b).unwrap().0[1] - 0.5).abs() < 0.01,
+        "{:?}",
+        w.pose(b)
+    );
+    let mut w = Physics::new(9.3);
+    let iron = w.add(
+        [0.5, -0.725],
+        0.0,
+        [0.0, 0.0],
+        &BodyDesc {
+            material: Material::Metal,
+            ..BodyDesc::default()
+        },
+    );
+    let wood = w.add([-0.5, -0.725], 0.0, [0.0, 0.0], &BodyDesc::default());
+    let magnet = Field {
+        magnet: 20.0,
+        ..Field::default()
+    };
+    for _ in 0..120 {
+        w.set_solids([floor()]);
+        w.field(area, &magnet, DT);
+        w.step(DT);
+    }
+    let at = w.pose(iron).unwrap().0;
+    assert!(at[1] > -0.4, "магнит поднял железо: {at:?}");
+    assert!(w.pose(wood).unwrap().0[1] < -0.7, "дерево лежит");
+}

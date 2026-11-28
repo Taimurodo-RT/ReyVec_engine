@@ -15,6 +15,8 @@ pub(super) struct Spawner<'a> {
     /// наследуют слой родителя).
     pub(super) layers: crate::Layers,
     pub(super) layer: Option<String>,
+    /// Сколько зон уже собрано (номер следующей).
+    pub(super) zones: u32,
 }
 
 impl Spawner<'_> {
@@ -220,6 +222,19 @@ impl Spawner<'_> {
             (Name::new(name.clone()), placement, GlobalPlacement::ROOT),
             parent,
         );
+        if let Some(z) = &n.zone {
+            let index = self.zones;
+            self.zones += 1;
+            self.world.entity_mut(me).insert((
+                Zone {
+                    half: [z.size.0 * 0.5, z.size.1 * 0.5],
+                    field: z.field(),
+                    index,
+                    inside: Vec::new(),
+                },
+                Dynamic,
+            ));
+        }
         if let Some(p) = &n.player {
             let layer = self.layer_of(reyvec_game::layer::HERO);
             self.world.entity_mut(me).insert((

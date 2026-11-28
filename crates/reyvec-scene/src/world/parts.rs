@@ -268,6 +268,42 @@ pub struct Target {
     pub layer: (u32, u32),
 }
 
+/// Зона (9.6б): прямоугольник вокруг места предмета, поле сил в нём и кто из героев
+/// внутри (для «вошёл / вышел»).
+#[derive(Component, Clone, Debug)]
+pub struct Zone {
+    pub half: [f64; 2],
+    pub field: reyvec_game::physics::Field,
+    /// Номер по порядку в файле.
+    pub index: u32,
+    pub inside: Vec<u64>,
+}
+
+impl Zone {
+    pub fn area(&self, g: &GlobalPlacement) -> Aabb {
+        let c = g.affine.translation();
+        Aabb::around([c.x, c.y], self.half)
+    }
+}
+
+/// Поле сил, в котором точка `at` (зоны складываются: ветер — суммой, тяжесть —
+/// произведением, магнит — суммой).
+pub(super) fn field_at<'a>(
+    zones: impl IntoIterator<Item = (&'a Zone, &'a GlobalPlacement)>,
+    at: [f64; 2],
+) -> reyvec_game::physics::Field {
+    let mut f = reyvec_game::physics::Field::default();
+    for (z, g) in zones {
+        if z.area(g).contains(at) {
+            f.wind[0] += z.field.wind[0];
+            f.wind[1] += z.field.wind[1];
+            f.gravity *= z.field.gravity;
+            f.magnet += z.field.magnet;
+        }
+    }
+    f
+}
+
 /// Физическое тело предмета (6.10).
 #[derive(Component, Clone, Copy, Debug)]
 pub struct PhysBody {

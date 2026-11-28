@@ -149,6 +149,7 @@ pub(super) fn physics_step(
     mut bodies: Query<(Entity, &PhysBody, &mut Placement), Without<Player>>,
     mut shapes: PieceShapes,
     mut slots: SlotPlaces,
+    zones: Query<(&Zone, &GlobalPlacement)>,
 ) {
     let phys = &mut *phys;
     let dt = phys.dt;
@@ -282,6 +283,10 @@ pub(super) fn physics_step(
         }
     }
     phys.extra.before_step(&mut phys.physics, dt, &mut slots);
+    // Поля сил зон (9.6б): ветер, другая тяжесть, магнит.
+    for (z, g) in &zones {
+        phys.physics.field(z.area(g), &z.field, dt);
+    }
     phys.physics.step(dt);
     phys.extra
         .after_step(&mut phys.physics, dt, step, &mut events.list, &mut slots);
