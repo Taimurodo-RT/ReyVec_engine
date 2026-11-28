@@ -400,17 +400,135 @@ fn hero_drags_the_stone_plate_slowly() {
         "плита отстала: {plate:?}"
     );
     // Отпустил — плита остаётся, герой уходит.
+    // Скорость сразу полная (дальше слева вращается звезда, и через 0,2 с герой
+    // упирается в неё, поэтому смотрим только первые шаги).
     t = press_grab(&mut w, t, &[Left]);
-    let from = w.player_body().unwrap().pos[0];
     let left_at = place(&mut w, "каменная плита").at;
-    run(&mut w, t, 0.5);
-    let gone = from - w.player_body().unwrap().pos[0];
+    let mut fastest: f64 = 0.0;
+    for _ in 0..4 {
+        t = run(&mut w, t, 1.0 / 60.0);
+        fastest = fastest.max(-w.player_body().unwrap().vel[0]);
+    }
+    run(&mut w, t, 0.4);
     let plate = place(&mut w, "каменная плита").at;
-    eprintln!("без плиты прошёл {gone:.2} за 0,5 с, плита {plate:?}");
-    assert!(gone > 0.3, "{gone}");
+    eprintln!("без плиты скорость {fastest:.2}, плита {plate:?}");
+    assert!(fastest > 1.5, "{fastest}");
     // Плита в голубой зоне слабой тяжести: скользит дальше, но недалеко.
     assert!(
         (plate[0] - left_at[0]).abs() < 0.3,
         "{left_at:?} → {plate:?}"
     );
+}
+
+fn stress() -> SceneWorld {
+    let path = std::path::Path::new(EXAMPLE_DIR).join("physics-stress.ron");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let file = SceneFile::parse_in(&text, Some(std::path::Path::new(EXAMPLE_DIR))).unwrap();
+    SceneWorld::new(&file, &mut library(), &mut ShapeCache::new()).unwrap()
+}
+
+#[test]
+#[ignore = "замер: cargo test --release -p reyvec-scene stress_scene_timing -- --ignored --nocapture"]
+fn stress_scene_timing() {
+    let mut w = stress();
+    let mut t = 0.0;
+    let mut worst = 0.0f64;
+    for second in 0..12 {
+        let mut sum = 0.0;
+        let mut logic = 0.0;
+        for _ in 0..60 {
+            t += 1.0 / 60.0;
+            let started = std::time::Instant::now();
+            w.update_at(t);
+            logic += started.elapsed().as_secs_f64() * 1000.0;
+            sum += w.snapshot().physics.unwrap().step_ms;
+        }
+        let s = w.snapshot().physics.unwrap();
+        worst = worst.max(sum / 60.0);
+        eprintln!(
+            "{second:2} с: тел {} спят {} — физика {:.2} мс, логика {:.2} мс",
+            s.bodies,
+            s.sleeping,
+            sum / 60.0,
+            logic / 60.0
+        );
+    }
+    eprintln!("худшая секунда: физика {worst:.2} мс");
+}
+
+/// Места всех тел предметов по имени.
+fn body_places(w: &mut SceneWorld) -> Vec<(String, [f64; 2], f64)> {
+    let mut q = w.world_mut().query::<(
+        &bevy_ecs::name::Name,
+        &crate::world::Placement,
+        &crate::world::PhysBody,
+    )>();
+    let mut v: Vec<_> = q
+        .iter(w.world_mut())
+        .map(|(n, p, _)| (n.as_str().to_string(), p.at, p.angle))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+#[test]
+fn same_steps_give_the_same_result() {
+    // 9.7: на одном ПК тот же файл и те же шаги — те же места до последнего бита.
+    // Полигон: сочленения, мягкие тела, выброс тел, касания; плюс герой берёт и бросает.
+    let play = || {
+        let mut w = polygon();
+        let mut t = run(&mut w, 0.0, 1.0);
+        let mut body = reyvec_game::Body::new([-7.66, -0.64]);
+        body.facing = -1.0;
+        w.set_player_body(body);
+        t = run(&mut w, t, 0.3);
+        t = press_grab(&mut w, t, &[]);
+        t = run(&mut w, t, 0.5);
+        t = press_grab(&mut w, t, &[]);
+        w.set_pointer(crate::Pointer {
+            at: [-0.3, -0.6],
+            held: false,
+            blast: true,
+        });
+        run(&mut w, t, 2.0);
+        body_places(&mut w)
+    };
+    let (a, b) = (play(), play());
+    assert_eq!(a.len(), b.len());
+    let differ: Vec<_> = a.iter().zip(&b).filter(|(x, y)| x != y).take(5).collect();
+    assert!(differ.is_empty(), "разошлись: {differ:?}");
+}
+
+#[test]
+fn stress_scene_falls_asleep_and_a_blast_wakes_only_its_corner() {
+    // 9.7: 2 000 тел засыпают; взрыв у корзины будит шары, а пирамида и стена спят:
+    // уровень неподвижен и не связывает кучи в одну.
+    let mut w = stress();
+    let t = run(&mut w, 0.0, 8.0);
+    let count = |w: &mut SceneWorld| {
+        let mut m: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for (n, s) in w.bodies_sleeping() {
+            let e = m
+                .entry(n.split(' ').next().unwrap().to_string())
+                .or_default();
+            e.0 += 1;
+            e.1 += usize::from(s);
+        }
+        m
+    };
+    let m = count(&mut w);
+    eprintln!("через 8 с: {m:?}");
+    assert_eq!(m.values().map(|v| v.0).sum::<usize>(), 2000);
+    assert!(m.values().all(|v| v.1 == v.0), "не все спят: {m:?}");
+    w.set_pointer(crate::Pointer {
+        at: [1.8, -0.5],
+        held: false,
+        blast: true,
+    });
+    run(&mut w, t, 0.3);
+    let m = count(&mut w);
+    eprintln!("после взрыва: {m:?}");
+    assert!(m["шар"].1 < 100, "шары проснулись: {m:?}");
+    assert_eq!(m["кубик"].1, 820, "пирамида спит");
+    assert_eq!(m["ящик"].1, 500, "стена спит");
 }

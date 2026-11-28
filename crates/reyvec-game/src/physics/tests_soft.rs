@@ -117,7 +117,24 @@ fn hero_stands_on_a_jelly_and_soft_jelly_sinks_deeper() {
     let mut sink = Vec::new();
     for stiffness in [6.0, 12.0] {
         let mut world = World::new(jelly(stiffness), [0.0, 0.6]);
-        world.run(240, Intent::default());
+        // Мягкое желе на жёстком полу «дышит»: верх то входит в ноги, то подставляет
+        // крутой бок, и стоящий иногда на шаг теряет опору (9.7, слабое место в
+        // путеводителе). Проверяем, что на опоре он большую часть времени, а мерим — в
+        // шаг, когда он стоит.
+        world.run(140, Intent::default());
+        let mut held = 0;
+        for _ in 0..100 {
+            world.run(1, Intent::default());
+            held += usize::from(world.hero.on_ground);
+        }
+        eprintln!("на желе шагов {held} из 100 ({stiffness})");
+        assert!(held >= 50, "на желе шагов {held} из 100 ({stiffness})");
+        for _ in 0..10 {
+            if world.hero.on_ground {
+                break;
+            }
+            world.run(1, Intent::default());
+        }
         let top = jelly_top(&world.w, world.hero.pos[0], world.t.half()[0]);
         let feet = world.feet();
         assert!(world.hero.on_ground, "стоит на желе ({stiffness})");

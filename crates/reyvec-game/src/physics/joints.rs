@@ -248,6 +248,10 @@ impl Physics {
     /// Рвёт сочленения, которые держали силой больше своей `breaks`.
     pub(super) fn check_breaks(&mut self, dt: f32) {
         let mut gone = Vec::new();
+        // Решатель делит шаг на `num_solver_iterations` подшагов, и толчок сочленения —
+        // за последний подшаг. Сила = толчок / длина подшага, тогда она не зависит от
+        // числа подшагов.
+        let sub = dt / self.params.num_solver_iterations.max(1) as f32;
         self.joint_extras.retain(|e| {
             let Some(j) = self.impulse_joints.get(e.handle) else {
                 // Тело убрали, сочленения больше нет.
@@ -256,7 +260,7 @@ impl Physics {
             let Some(limit) = e.breaks else {
                 return true;
             };
-            let force = f64::from(j.impulses.length() / dt.max(1e-6));
+            let force = f64::from(j.impulses.length() / sub.max(1e-7));
             if force > limit {
                 gone.push(e.handle);
                 return false;

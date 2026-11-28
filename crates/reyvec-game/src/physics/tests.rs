@@ -257,7 +257,7 @@ fn joint_breaks_under_a_heavy_load() {
         },
     );
     let hold = |at| JointDesc {
-        breaks: Some(5.0),
+        breaks: Some(20.0),
         ..JointDesc::new(JointKind::Hinge { limits: None }, at)
     };
     let j1 = w.join(light, None, &hold([0.0, 0.0])).unwrap();
@@ -642,4 +642,44 @@ fn fields_blow_lift_and_attract() {
     let at = w.pose(iron).unwrap().0;
     assert!(at[1] > -0.4, "магнит поднял железо: {at:?}");
     assert!(w.pose(wood).unwrap().0[1] < -0.7, "дерево лежит");
+}
+
+#[test]
+fn ccd_rules_fast_ball_and_thin_walls() {
+    // 9.7, правила CCD. Тонкую неподвижную стену уровня быстрый мяч не пролетает.
+    // Едущую (кинематическую) — пролетает, если он не «пуля»: так и задумано, см.
+    // `Physics::add`.
+    let ball = |bullet| BodyDesc {
+        size: [0.03, 0.03],
+        shape: BodyShape::Ball,
+        gravity: 0.0,
+        bullet,
+        ..BodyDesc::default()
+    };
+    let wall_at = |x: f64| {
+        (
+            7,
+            Collider::solid(Aabb {
+                min: [x, -0.5],
+                max: [x + 0.01, 0.5],
+            }),
+        )
+    };
+    let fly = |bullet, moving: bool| {
+        let mut w = Physics::new(9.3);
+        let b = w.add([0.0, 0.0], 0.0, [40.0, 0.0], &ball(bullet));
+        for i in 0..30 {
+            let x = if moving { 1.0 + 0.001 * i as f64 } else { 1.0 };
+            w.set_solids([wall_at(x)]);
+            w.step(DT);
+        }
+        w.pose(b).unwrap().0[0]
+    };
+    assert!(fly(false, false) < 1.0, "сквозь неподвижную стену");
+    assert!(fly(true, false) < 1.0);
+    assert!(fly(true, true) < 1.0, "пуля сквозь едущую стену");
+    assert!(
+        fly(false, true) > 1.0,
+        "правило поменялось — обнови описание"
+    );
 }

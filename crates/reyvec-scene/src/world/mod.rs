@@ -290,6 +290,20 @@ impl SceneWorld {
         }
     }
 
+    /// Тела предметов: имя и спит ли (для проверок).
+    #[cfg(test)]
+    pub(crate) fn bodies_sleeping(&mut self) -> Vec<(String, bool)> {
+        let mut q = self.world.query::<(&Name, &PhysBody)>();
+        let list: Vec<(String, BodyId)> = q
+            .iter(&self.world)
+            .map(|(n, b)| (n.as_str().to_string(), b.id))
+            .collect();
+        let phys = self.world.resource::<PhysicsRes>();
+        list.into_iter()
+            .map(|(n, b)| (n, phys.physics.is_sleeping(b)))
+            .collect()
+    }
+
     /// Состояние персонажа игрока, если он есть.
     pub fn player_body(&mut self) -> Option<Body> {
         let mut q = self.world.query::<&Player>();
