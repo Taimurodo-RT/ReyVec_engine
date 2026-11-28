@@ -42,6 +42,7 @@ mod parts;
 mod physics;
 mod places;
 mod play;
+mod props;
 mod ragdoll;
 mod scripts;
 mod spawn;
@@ -56,6 +57,8 @@ pub use phys::Pointer;
 use physics::*;
 use places::*;
 use play::*;
+pub use props::Props;
+use props::{Hazard, hazards};
 pub use ragdoll::Ragdoll;
 use scripts::*;
 use spawn::*;
@@ -170,6 +173,8 @@ impl SceneWorld {
             spawn: None,
             layer: None,
             zone: None,
+            props: Default::default(),
+            tags: Vec::new(),
         };
         spawner.node(&root, None, "сцена")?;
         let entities = spawner.entities;
@@ -192,6 +197,7 @@ impl SceneWorld {
                 propagate,
                 gather_solids,
                 play,
+                hazards,
                 physics_step,
                 run_scripts,
                 drive_story,
@@ -405,6 +411,24 @@ impl SceneWorld {
         q.iter(&self.world)
             .find(|(_, n)| n.as_str() == name)
             .map(|(e, _)| e)
+    }
+
+    /// Свойства и метки предмета `name` из файла сцены (9.8).
+    pub fn props(&mut self, name: &str) -> Option<Props> {
+        let e = self.find(name)?;
+        self.world.get::<Props>(e).cloned()
+    }
+
+    /// Имена предметов с меткой `tag` (9.8), по порядку в файле.
+    pub fn tagged(&mut self, tag: &str) -> Vec<String> {
+        let mut q = self.world.query::<(&Name, &Props)>();
+        let mut found: Vec<(u32, String)> = q
+            .iter(&self.world)
+            .filter(|(_, p)| p.has_tag(tag))
+            .map(|(n, p)| (p.order, n.as_str().to_owned()))
+            .collect();
+        found.sort_by_key(|(o, _)| *o);
+        found.into_iter().map(|(_, n)| n).collect()
     }
 }
 

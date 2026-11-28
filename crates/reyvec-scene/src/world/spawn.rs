@@ -261,6 +261,17 @@ impl Spawner<'_> {
             (Name::new(name.clone()), placement, GlobalPlacement::ROOT),
             parent,
         );
+        if !n.props.is_empty() || !n.tags.is_empty() {
+            let order = self.next();
+            self.world.entity_mut(me).insert(Props {
+                values: n.props.clone(),
+                tags: n.tags.clone(),
+                order,
+            });
+        }
+        if let Some(h) = Hazard::of(n) {
+            self.world.entity_mut(me).insert((h, Dynamic));
+        }
         if let Some(z) = &n.zone {
             let index = self.zones;
             self.zones += 1;
@@ -302,6 +313,7 @@ impl Spawner<'_> {
                 &reyvec_game::physics::BodyDesc {
                     layer,
                     mask,
+                    grab: n.props.get("grab").and_then(crate::Prop::flag) != Some(false),
                     ..b.physics()
                 },
             );
@@ -329,6 +341,13 @@ impl Spawner<'_> {
             let id = res.scripts.load(&path);
             let touch = n.dummy.map(|d| d.size).or(n.touch).unwrap_or((0.1, 0.1));
             if let Some(actor) = res.scripts.actor(id) {
+                let props = Props {
+                    values: n.props.clone(),
+                    tags: n.tags.clone(),
+                    order: 0,
+                };
+                res.scripts
+                    .set_props(&actor, &props.for_script(), &props.tags);
                 self.world.entity_mut(me).insert((
                     Scripted {
                         actor,
@@ -574,7 +593,18 @@ impl Spawner<'_> {
                 Some(me),
             );
         }
+        let glow = n.props.get("glow").and_then(crate::Prop::flag) == Some(true);
         for object in &n.objects {
+            let glowing;
+            let object = if glow && !object.glow {
+                glowing = crate::ObjectDesc {
+                    glow: true,
+                    ..object.clone()
+                };
+                &glowing
+            } else {
+                object
+            };
             let order = self.next();
             let e = self.spawn(
                 (

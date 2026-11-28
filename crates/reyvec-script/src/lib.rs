@@ -89,6 +89,14 @@ pub const ME_FIELDS: &[Field] = &[
     given("alive", "цел (не разбит)"),
     given("touching", "касается героя"),
     given("time", "время сцены, секунды"),
+    given(
+        "props",
+        "свойства предмета из файла сцены (9.8): me.props.damage, русское имя — me.props[\"цвет\"]",
+    ),
+    given(
+        "tags",
+        "метки предмета (9.8): if me.tags[\"дверь\"] then … end",
+    ),
     written("move", "бег: от -1 (влево) до 1 (вправо)"),
     written("jump", "прыгнуть в этом шаге"),
     written("hidden", "не виден"),
@@ -103,6 +111,14 @@ pub const HERO_FIELDS: &[Field] = &[
     given("vy", "скорость героя по Y"),
     given("striking", "герой бьёт"),
 ];
+
+/// Значение свойства предмета для скрипта (9.8).
+#[derive(Clone, Debug, PartialEq)]
+pub enum PropValue {
+    Flag(bool),
+    Number(f64),
+    Text(String),
+}
 
 /// Номер загруженного скрипта.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -528,11 +544,39 @@ impl Scripts {
         n
     }
 
-    /// Новый предмет со скриптом `script`.
+    /// Новый предмет со скриптом `script`. Свойства и метки пустые, их кладёт
+    /// [`Self::set_props`].
     pub fn actor(&self, script: ScriptId) -> Option<Actor> {
         let me = self.lua.create_table().ok()?;
+        me.raw_set("props", self.lua.create_table().ok()?).ok()?;
+        me.raw_set("tags", self.lua.create_table().ok()?).ok()?;
         let me = self.lua.create_registry_value(me).ok()?;
         Some(Actor { script, me })
+    }
+
+    /// Свойства и метки предмета из файла сцены (9.8): `me.props.имя` — значение,
+    /// `me.tags.метка` — `true`. Скрипт может их менять, движок их больше не трогает.
+    pub fn set_props(&self, actor: &Actor, props: &[(String, PropValue)], tags: &[String]) {
+        let set = || -> mlua::Result<()> {
+            let me: Table = self.lua.registry_value(&actor.me)?;
+            let p = self.lua.create_table()?;
+            for (k, v) in props {
+                match v {
+                    PropValue::Flag(b) => p.raw_set(k.as_str(), *b)?,
+                    PropValue::Number(n) => p.raw_set(k.as_str(), *n)?,
+                    PropValue::Text(t) => p.raw_set(k.as_str(), t.as_str())?,
+                }
+            }
+            let t = self.lua.create_table()?;
+            for tag in tags {
+                t.raw_set(tag.as_str(), true)?;
+            }
+            me.raw_set("props", p)?;
+            me.raw_set("tags", t)
+        };
+        if let Err(e) = set() {
+            tracing::warn!("скрипт: свойства не положены: {e}");
+        }
     }
 
     /// Шаг скрипта для предмета.
@@ -702,6 +746,31 @@ mod tests {
         let mut described: Vec<String> = HERO_FIELDS.iter().map(|f| f.name.to_owned()).collect();
         described.sort();
         assert_eq!(hero, described);
+    }
+
+    #[test]
+    fn script_reads_props_and_tags() {
+        let mut s = Scripts::new();
+        let id = s.load_text(
+            "props.luau",
+            r##"
+            function update(me, hero, dt)
+                if me.tags["дверь"] and me.props.damage == 2 and me.props["цвет"] == "#ff0000" then
+                    me.hidden = me.props["открыта"]
+                end
+            end
+            "##,
+        );
+        let a = s.actor(id).unwrap();
+        let props = [
+            ("damage".to_owned(), PropValue::Number(2.0)),
+            ("цвет".to_owned(), PropValue::Text("#ff0000".into())),
+            ("открыта".to_owned(), PropValue::Flag(true)),
+        ];
+        s.set_props(&a, &props, &["дверь".to_owned()]);
+        let out = s.run(&a, &input(), &HeroIn::default(), 0.016);
+        assert!(s.errors().is_empty(), "{:?}", s.errors());
+        assert!(out.hidden);
     }
 
     #[test]
