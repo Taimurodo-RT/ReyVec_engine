@@ -504,6 +504,8 @@ impl RuiDemo {
                 screen.pointer_move([position.x as f32 - offset[0], position.y as f32 - offset[1]]);
                 return false;
             }
+            // Колесо над окном меню не крутит камеру за ним.
+            WindowEvent::MouseWheel { .. } => return screen.pointer_over(),
             WindowEvent::CursorLeft { .. } => {
                 screen.pointer_leave();
                 return false;

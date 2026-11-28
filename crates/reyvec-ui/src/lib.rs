@@ -178,6 +178,9 @@ pub struct UiDraw {
     pub quads: Vec<UiQuad>,
     /// Нажимаемые блоки в порядке файла (по нему ходит Tab).
     pub targets: Vec<UiTarget>,
+    /// Где у экрана есть фон или рамка (окна, плашки): нажатие туда забирает интерфейс,
+    /// а не игра или камера за ним, даже мимо кнопок.
+    pub solid: Vec<[f32; 4]>,
     /// Размер окна, под который разложен экран.
     pub viewport: [f32; 2],
 }
@@ -510,7 +513,8 @@ impl UiScreen {
     /// Кнопка мыши нажата. `true` — над кнопкой интерфейса: нажатие его, не игры.
     pub fn pointer_down(&mut self) -> bool {
         if self.hover.is_none() {
-            return false;
+            // Мимо кнопок, но по окну: нажатие всё равно интерфейса.
+            return self.covers(self.pointer);
         }
         self.pressed.clone_from(&self.hover);
         self.restyle = true;
@@ -641,6 +645,17 @@ impl UiScreen {
                 self.click(i)
             }
         }
+    }
+
+    /// Лежит ли точка окна на чём-то видимом у экрана (фон, рамка, кнопка).
+    pub fn covers(&self, p: [f32; 2]) -> bool {
+        let inside = |r: &[f32; 4]| p[0] >= r[0] && p[0] < r[2] && p[1] >= r[1] && p[1] < r[3];
+        self.draw.solid.iter().any(inside) || self.draw.targets.iter().any(|t| inside(&t.rect))
+    }
+
+    /// Мышь сейчас над интерфейсом: колесо и нажатия здесь — его, не камеры.
+    pub fn pointer_over(&self) -> bool {
+        self.covers(self.pointer)
     }
 
     /// Связь блока по пути в дереве (из последней раскладки).
@@ -956,6 +971,7 @@ impl UiScreen {
         let mut out = UiDraw {
             quads: Vec::new(),
             targets: Vec::new(),
+            solid: Vec::new(),
             viewport,
         };
         if viewport[0] <= 0.0 || viewport[1] <= 0.0 {
@@ -1073,6 +1089,9 @@ impl UiScreen {
             (width * scale, faded(c, opacity))
         });
         if (background.is_some() || border.0 > 0.0) && w > 0.0 && h > 0.0 {
+            if opacity > 0.0 {
+                out.solid.push(rect);
+            }
             out.quads.push(UiQuad {
                 rect,
                 color: background.map_or([0.0; 4], |c| faded(c, opacity)),
@@ -2092,6 +2111,27 @@ mod tests {
         bad.draw([1920.0, 1080.0]);
         let e = bad.problem().unwrap().to_string();
         assert!(e.contains("Может, game.hero.hp?"), "{e}");
+    }
+
+    #[test]
+    fn press_on_the_panel_belongs_to_the_ui() {
+        let mut ui = UiScreen::parse(
+            r#"screen S {
+                Column { Button("Да").size(100, 40) }
+                    .padding(50).background(#202020).align(top_left)
+            }"#,
+        )
+        .unwrap();
+        ui.draw([1920.0, 1080.0]);
+        // Мимо кнопки, но по окну: нажатие интерфейса, камера за окном не тянется.
+        assert!(!ui.pointer_move([10.0, 10.0]));
+        assert!(ui.pointer_over());
+        assert!(ui.pointer_down());
+        assert_eq!(ui.pointer_up(), None);
+        // Вне окна — нажатие игры.
+        assert!(!ui.pointer_move([900.0, 900.0]));
+        assert!(!ui.pointer_over());
+        assert!(!ui.pointer_down());
     }
 
     #[test]
